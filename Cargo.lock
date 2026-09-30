@@ -3636,6 +3636,7 @@ dependencies = [
  "ctor 0.2.9",
  "neuron",
  "serde",
+ "serde_json",
  "toml 0.8.2",
  "windows-sys 0.59.0",
 ]

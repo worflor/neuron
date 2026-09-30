@@ -73,6 +73,10 @@ pub struct CastConfig {
     /// gesture name -> action (names refer to templates in the gesture Vault).
     #[serde(default)]
     pub gestures: BTreeMap<String, Action>,
+    /// How strongly a pad aiming the radial feels it (see [`crate::knob`]): 0 is off, 1 as tuned,
+    /// up to 1.5.
+    #[serde(default = "d_haptics")]
+    pub haptics: f64,
 
     // ── CAST RHYTHM MAP — each rhythm on the cast trigger (N taps then hold) is a FIRST-CLASS
     // `Trigger::Cast { taps }` the engine resolves to an `Action` (remappable to anything). The
@@ -143,6 +147,9 @@ fn d_activation() -> String {
 fn d_assist() -> f64 {
     0.35
 }
+fn d_haptics() -> f64 {
+    1.0
+}
 /// The default cast rhythm map: teleport on tap-then-hold (taps=1) — exactly today's default
 /// (weave on the plain hold + teleport on tap-hold). Whiteboard stays OFF by default.
 fn d_rhythm_actions() -> Vec<RhythmBind> {
@@ -166,6 +173,7 @@ impl Default for CastConfig {
             hyper_radial_on: false,
             gestures: BTreeMap::new(),
             rhythm_actions: d_rhythm_actions(),
+            haptics: d_haptics(),
         }
     }
 }
@@ -185,6 +193,7 @@ impl crate::salvage::SalvageLoad for CastConfig {
             "assist" => assist,
             "mode" => mode,
             "hyper_radial_on" => hyper_radial_on,
+            "haptics" => haptics,
         });
         // radial/hyper_radial are POSITIONAL (index = sector): a bad wedge resets to Noop IN PLACE
         // so later wedges keep their sectors, instead of shifting them left. rhythm entries are

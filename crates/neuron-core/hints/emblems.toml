@@ -1,0 +1,45 @@
+# Product-name words that say what a device is where its HID collections can't: a headset's and a
+# microphone's controls are ordinary consumer keys, a keypad's are a keyboard's. Matched
+# case-insensitively against the device's product string; the first match wins. Everything not
+# named here is decided by the device's own top-level collections (see neuron::badge).
+# A run-root `emblems.toml` in the same shape is read first, so a user's words win.
+
+[[word]]
+match = "tartarus"
+emblem = "keypad"
+
+[[word]]
+match = "orbweaver"
+emblem = "keypad"
+
+[[word]]
+match = "keypad"
+emblem = "keypad"
+
+[[word]]
+match = "kraken"
+emblem = "headset"
+
+[[word]]
+match = "barracuda"
+emblem = "headset"
+
+[[word]]
+match = "blackshark"
+emblem = "headset"
+
+[[word]]
+match = "headset"
+emblem = "headset"
+
+[[word]]
+match = "headphone"
+emblem = "headset"
+
+[[word]]
+match = "seiren"
+emblem = "mic"
+
+[[word]]
+match = "microphone"
+emblem = "mic"

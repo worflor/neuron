@@ -25,7 +25,13 @@ pub fn battery_percent(dev: &Device) -> Result<u8> {
 /// Whether the device is currently charging.
 pub fn charging(dev: &Device) -> Result<bool> {
     let a = dev.run("charging_status")?;
-    Ok(a[0] != 0)
+    Ok(decode_charging(&a))
+}
+
+/// `07/84` replies `[00, flag]`: the flag is byte[1], like the battery level. Verified on the Naga
+/// V2 Pro 2026-09-29 (`00 01` on the cable, `00 00` on battery).
+fn decode_charging(a: &[u8]) -> bool {
+    a.get(1).is_some_and(|&b| b != 0)
 }
 
 /// Raw device mode byte (0x03 = driver mode on the Naga).
@@ -406,6 +412,14 @@ fn decode_idle_secs(reply: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charging_flag_is_byte_one() {
+        // live Naga V2 Pro replies, 2026-09-29.
+        assert!(decode_charging(&[0x00, 0x01]), "on the cable");
+        assert!(!decode_charging(&[0x00, 0x00]), "on battery");
+        assert!(!decode_charging(&[0x01]), "short reply is not charging");
+    }
 
     fn naga_device(pid: u16, phantom: crate::transport::mock::MockDevice) -> Device {
         let def = toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml"))

@@ -32,9 +32,8 @@
 /// One realm card on the teleport map: (card rect, its windows as (rect, brightness)).
 pub type MapRealm = ([f32; 4], Vec<([f32; 4], f32)>);
 
-/// How far out (fraction of the rim) the stroke must reach before a fannable wedge's second tier
-/// opens — so a quick flick still picks the wedge itself, but pushing onward fans the options.
-pub const FAN_REACH: f32 = 0.80;
+/// See [`neuron::radial::FAN_REACH`].
+pub const FAN_REACH: f32 = neuron::radial::FAN_REACH as f32;
 
 /// The sub-option index a stroke is aiming at within wedge `wedge`'s fan of `m` options — the ONE
 /// rule the overlay shows with and the beacon commits with, so they can never disagree. `aim` is

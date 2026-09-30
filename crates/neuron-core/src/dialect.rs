@@ -174,9 +174,9 @@ fn frame(tx: u8, class: u8, id: u8, size: u8, args: &[u8]) -> [u8; BUF_LEN] {
 /// The razer device-mode opcode pair + the NORMAL (firmware-owned rest) mode byte. This is razer
 /// WIRE knowledge, so its canonical home is the dialect (bytes live here). `writes::set_device_mode`
 /// is the Device-level CONVENIENCE built on this exact framing for the razer-explicit tool paths
-/// (`ensure_driver`, the CLI `mode` verb); it is deliberately NOT imported here so the dependency
+/// (`ensure_custody`, the CLI `mode` verb); it is deliberately NOT imported here so the dependency
 /// arrow stays writes → dialect and never loops back. (0x00/0x04 = [mode, 0x00]; 0x00 = normal,
-/// 0x03 = driver — same pair `ensure_driver` flips, verified live.)
+/// 0x03 = driver — same pair `ensure_custody` flips, verified live.)
 const DEVICE_MODE_CLASS: u8 = 0x00;
 const DEVICE_MODE_SET_ID: u8 = 0x04;
 const DEVICE_MODE_NORMAL: u8 = 0x00;
@@ -427,6 +427,8 @@ impl Dialect for RazerAudioDialect {
             // itself (`default_event_for`), so an empty def still arms correctly via
             // `event_dialect_for`; a per-device `[events]` override is a config addition later.
             events: None,
+            buttons: Vec::new(),
+            custody: crate::registry::Custody::default(),
         };
         Some(Synthesis::from_probe(
             def,

@@ -218,6 +218,91 @@ pub fn compass(sector: usize, n: usize) -> String {
     format!("{deg}\u{00b0}")
 }
 
+/// How far out (fraction of the rim) a stroke must reach before a fannable wedge's second tier
+/// opens, so a quick flick still picks the wedge itself but pushing onward fans the options.
+pub const FAN_REACH: f64 = 0.80;
+
+/// A stick aiming the radial. A stick springs back to centre on release and sweeps through weak
+/// angles on the way, so the choice is the LAST STRONG direction it held, not wherever it was
+/// when the trigger let go: `observe` latches every sample at or past [`StickAim::LATCH`] and
+/// ignores the weaker ones. A loose stick can overshoot past centre on the way back, so a strong
+/// sample pointing away from the latched direction only takes over once it has held for
+/// [`StickAim::TURN`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StickAim {
+    latched: Option<(f64, f64)>,
+    /// A reversal waiting to prove it is held: its direction and when it started (seconds).
+    turning: Option<((f64, f64), f64)>,
+    engaged: bool,
+}
+
+impl StickAim {
+    /// Deflection at which the stick is aiming at all.
+    pub const ENGAGE: f64 = 0.35;
+    /// Deflection at which a direction becomes the choice.
+    pub const LATCH: f64 = 0.5;
+    /// The stroke length, in mouse counts, full deflection maps to: the overlay's fan rim, so
+    /// pushing the stick all the way out reaches a wedge's second tier.
+    pub const REACH: f64 = 150.0;
+    /// How long (seconds) a strong sample more than a quarter turn from the latched direction must
+    /// hold before it replaces it.
+    pub const TURN: f64 = 0.04;
+
+    /// Feed a stick sample (x, y in -1..1, y down) taken at `t` seconds. Returns what the wheel
+    /// should show: the live aim while the stick is engaged, else the latched choice (so the wedge
+    /// stays lit after the stick is let go), else nothing.
+    pub fn observe(&mut self, x: f64, y: f64, t: f64) -> Option<(f64, f64)> {
+        let m = x.hypot(y);
+        self.engaged = m >= Self::ENGAGE;
+        if m >= Self::LATCH {
+            let reversal = self.latched.is_some_and(|(lx, ly)| lx * x + ly * y < 0.0);
+            if reversal {
+                let since = self.turning.map_or(t, |(_, t0)| t0);
+                self.turning = Some(((x, y), since));
+                if t - since >= Self::TURN {
+                    self.latched = Some((x, y));
+                    self.turning = None;
+                }
+            } else {
+                self.latched = Some((x, y));
+                self.turning = None;
+            }
+        } else {
+            self.turning = None;
+        }
+        if self.engaged { Some((x, y)) } else { self.latched }
+    }
+
+    /// Whether the stick is out of its rest right now.
+    #[must_use]
+    pub fn engaged(&self) -> bool {
+        self.engaged
+    }
+
+    /// The chosen direction, if the stick ever committed to one.
+    #[must_use]
+    pub fn latched(&self) -> Option<(f64, f64)> {
+        self.latched
+    }
+
+    /// A stroke, in mouse counts, that resolves to the latched direction through the same
+    /// `resolve`/fan path a mouse flick takes. Its length is the deflection times [`Self::REACH`],
+    /// never below twice `deadzone`, so a committed stick always clears the flick deadzone.
+    #[must_use]
+    pub fn path(&self, deadzone: f64) -> Option<Vec<C>> {
+        let (x, y) = self.latched?;
+        let m = x.hypot(y).min(1.0);
+        let len = (m * Self::REACH).max(2.0 * deadzone);
+        let (ux, uy) = (x / x.hypot(y), y / x.hypot(y));
+        Some(
+            [0.0, 0.5, 1.0]
+                .into_iter()
+                .map(|t| C { re: ux * len * t, im: uy * len * t })
+                .collect(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +515,44 @@ mod tests {
             assert_eq!(pick_wedge(dx, dy, dz, 1), Some(0), "any committed flick confirms");
         }
         assert_eq!(pick_wedge(6.0, -2.0, dz, 1), None, "under-deadzone = pass");
+    }
+
+    #[test]
+    fn a_stick_commits_its_last_strong_direction_not_its_spring_back() {
+        let mut a = StickAim::default();
+        assert_eq!(a.observe(0.1, 0.0, 0.0), None, "resting noise aims nowhere");
+        a.observe(0.0, -1.0, 0.01); // push north
+        a.observe(0.2, -0.3, 0.02); // spring back sweeps weakly east of north
+        a.observe(0.0, 0.6, 0.025); // and overshoots past centre, briefly
+        assert_eq!(a.observe(0.0, 0.0, 0.03), Some((0.0, -1.0)), "the wheel keeps showing the choice");
+        let path = a.path(40.0).unwrap();
+        let (dx, dy) = net_displacement(&path);
+        assert_eq!(sector_for(dx, dy, 8), 0, "north");
+        assert!(dx.hypot(dy) >= 40.0);
+    }
+
+    #[test]
+    fn a_held_change_of_mind_is_the_new_choice() {
+        let mut a = StickAim::default();
+        a.observe(0.0, -1.0, 0.0); // north
+        for i in 0..10 {
+            a.observe(0.0, 1.0, 0.1 + f64::from(i) * 0.01); // then held south for 90 ms
+        }
+        assert_eq!(a.latched(), Some((0.0, 1.0)));
+        assert!(a.engaged());
+        a.observe(0.0, 0.0, 0.3);
+        assert!(!a.engaged());
+    }
+
+    #[test]
+    fn a_full_push_reaches_the_fan_rim_and_a_half_push_still_clears_the_deadzone() {
+        let mut a = StickAim::default();
+        a.observe(1.0, 0.0, 0.0);
+        let (dx, _) = net_displacement(&a.path(40.0).unwrap());
+        assert!((dx - StickAim::REACH).abs() < 1e-9);
+        let mut b = StickAim::default();
+        b.observe(0.0, 0.5, 0.0);
+        let (_, dy) = net_displacement(&b.path(40.0).unwrap());
+        assert!(dy >= 80.0);
     }
 }

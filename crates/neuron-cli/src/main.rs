@@ -7,8 +7,23 @@
 
 //! Neuron CLI — the lightweight, open replacement for Razer Synapse.
 
+mod cast_cmd;
+mod control;
+mod device_cmds;
+mod light;
+mod live;
+mod macro_cmd;
+mod out;
+mod profile_cmd;
+mod setup_cmd;
+mod spec;
+
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use cast_cmd::{CastCmd, GestureCmd};
+use clap::{CommandFactory as _, Parser, Subcommand};
+use macro_cmd::MacroCmd;
+use profile_cmd::ProfileCmd;
+use spec::BindCmd;
 use std::fmt::Write as _;
 #[cfg(windows)]
 use neuron::{
@@ -18,7 +33,6 @@ use neuron::{
 };
 use neuron::{
     backup,
-    bindings::Bindings,
     capability as cap,
     cast::CastConfig,
     device::Device,
@@ -40,25 +54,44 @@ use neuron::{
     about = "Open, lightweight control for Razer devices: the anti-Synapse"
 )]
 struct Cli {
+    /// one JSON document on stdout; errors go to stderr as {"error": "..."}
+    #[arg(long, global = true)]
+    json: bool,
+    /// do not signal a running app after a config edit (then run `neuron reload`)
+    #[arg(long, global = true)]
+    no_live: bool,
+    /// show engine chatter (also `NEURON_DEBUG=1`)
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once per process; boxing every variant buys nothing
 enum Cmd {
     /// List connected, recognized Razer devices
+    ///
+    /// A device no definition covers yet is reported as `new device ...`; `neuron adopt` learns
+    /// it. This verb never writes.
     List,
-    /// Self-emergent capability discovery: probe ANY Razer `razer_report` device, no registry
+    /// Probe any Razer device with no registry (debug)
+    ///
+    /// Probes every `razer_report` device and compares their capability classes. `--emit` adopts
+    /// unknown devices, the same as `neuron adopt`.
+    #[command(hide = true)]
     Discover {
         /// adopt unknown devices: synthesize a FULL device def per unknown device and write it
         /// to devices/auto/ in the run root (same as `neuron adopt`)
         #[arg(long)]
         emit: bool,
     },
-    /// Adopt unknown Razer devices: probe the getter space, synthesize a complete device def
-    /// (commands + lighting dialect + measured link pacing) and write devices/auto/<pid>.toml
-    /// in the resolved run root.
-    /// From then on the file is plain per-device config — editable, never overwritten.
+    /// Learn unknown Razer devices into devices/auto/
+    ///
+    /// Probes the getter space of each unknown device, synthesizes a complete definition
+    /// (commands, lighting dialect, measured link pacing) and writes devices/auto/<pid>.toml in
+    /// the run root. The file is plain per-device config from then on: editable, never
+    /// overwritten.
     Adopt {
         /// print the synthesized TOML instead of writing files, and include ALREADY-KNOWN
         /// devices — diff against a curated def to verify synthesis on proven hardware
@@ -66,29 +99,44 @@ enum Cmd {
         dry_run: bool,
     },
     /// Show device info (firmware, mode, battery)
-    Info,
+    Info {
+        /// device pid (hex) when several are connected; default is the first
+        #[arg(long)]
+        pid: Option<String>,
+    },
     /// Show battery level and charging state
     Battery,
-    /// Mouse DPI: no value shows current; a value sets it (verified by read-back)
+    /// Mouse DPI: show, or set (same as `feel dpi`)
+    ///
+    /// A value sets it, verified by read-back.
+    #[command(hide = true)]
     Dpi { value: Option<u16> },
-    /// Polling rate (Hz): show, or set — snaps to 1000/500/250/125
+    /// Polling rate in Hz: show, or set (`feel polling`)
+    ///
+    /// Snaps to 1000/500/250/125.
+    #[command(hide = true)]
     Polling { hz: Option<u32> },
-    /// Mouse DPI STAGE LIST (the cycle): no values shows the current configured stages; a list of
-    /// values sets the whole table via the verify-gated `set_dpi_stages` write (e.g.
-    /// `neuron dpi-stages 800 1600 3200`). `--active` picks which stage is live (1-based); `--persist`
-    /// flashes the table to onboard memory.
+    /// DPI stage list: show, or set (`feel stages`)
+    ///
+    /// A list of values sets the whole table via the verify-gated `set_dpi_stages` write, e.g.
+    /// `neuron dpi-stages 800 1600 3200`. `--active` picks the live stage, counting from 1.
+    /// `--persist` flashes the table to onboard memory.
+    #[command(hide = true)]
     DpiStages {
         /// the DPI values that make up the cycle, in order (omit to just read the current table)
         stages: Vec<u16>,
-        /// which stage is active, 1-based (default: the first)
+        /// which stage is active, counting from 1 (bind indexes count from 0); default 1
         #[arg(long, default_value_t = 1)]
         active: u8,
         /// flash the stage table to onboard memory (survives with no software running)
         #[arg(long)]
         persist: bool,
     },
-    /// `HyperScroll` active wheel stage (tactile / free-spin / ...): no value shows the current stage;
-    /// a value selects it via the wire-confirmed `set_scroll_stage` write (class 0x15/0x00).
+    /// HyperScroll wheel stage: show, or set (`feel scroll`)
+    ///
+    /// A value selects the stage, counting from 1, via the wire-confirmed `set_scroll_stage`
+    /// write.
+    #[command(hide = true)]
     Scroll {
         /// the 1-based stage to make active (omit to just read the current stage)
         stage: Option<u8>,
@@ -96,9 +144,11 @@ enum Cmd {
         #[arg(long)]
         volatile: bool,
     },
-    /// Sensor LIFT-OFF DISTANCE (the height the mouse stops tracking). No args reads it;
-    /// `--lift N --landing M` sets an ASYMMETRIC split (separate lift/landing, verify-gated);
-    /// `--sym L` sets a symmetric level (0=low/1=med/2=high) and flips back out of async.
+    /// Lift-off distance: show, or set (`feel lod`)
+    ///
+    /// `--lift N --landing M` sets an asymmetric split (verify-gated); `--sym L` sets a symmetric
+    /// level (0=low, 1=med, 2=high).
+    #[command(hide = true)]
     Lod {
         /// asymmetric LIFT level 2..=26 (requires --landing)
         #[arg(long)]
@@ -110,55 +160,152 @@ enum Cmd {
         #[arg(long)]
         sym: Option<u8>,
     },
-    /// Lighting brightness 0..=100: show, or set
+    /// Lighting brightness 0-100 (`feel brightness`)
+    #[command(hide = true)]
     Brightness { pct: Option<u8> },
-    /// Keyboard FIRMWARE game mode — the FN+F10 Win-key kill. No arg reads it; `on`/`off` sets it
-    /// (write is read-back verified). This is the DEVICE-side Win-key kill (firmware, zero software),
-    /// distinct from the host-side KEY GUARD chord swallows. Resolves the keyboard by capability.
+    /// Keyboard firmware game mode (`feel game-mode`)
+    ///
+    /// No argument reads it; `on`/`off` sets it, verified by read-back. This is the firmware Win-
+    /// key kill (FN+F10), distinct from the host-side key guard.
+    #[command(hide = true)]
     GameMode {
         /// on | off (omit to just read the current state)
         state: Option<String>,
     },
-    /// Sniper / on-the-fly DPI: hold a control to drop to a precision DPI, release to snap back.
-    /// Authors the bind into the shared rule store; the resident neuron app enforces the hold.
-    /// First run asks you to PRESS the control you want — nothing hardcoded.
-    Sniper {
-        /// re-bind the hold control (press the one you want)
-        #[arg(long)]
-        bind: bool,
-        /// precision DPI while held (default 400, or whatever you last set)
-        #[arg(long)]
-        dpi: Option<u16>,
-    },
-    /// Onboard memory: unified pool view (macros + files + profiles share one 124 KB)
+    /// Hold a control for precision DPI (`feel sniper`)
+    ///
+    /// Authors the bind into the shared rule store; the running app enforces the hold. `--trigger
+    /// mouse:5 --dpi 400` sets it; a bare `--trigger` presses a control to pick it; no flags
+    /// shows it.
+    #[command(hide = true)]
+    Sniper(setup_cmd::SniperArgs),
+    /// Onboard memory: one pool for macros, files, profiles
+    ///
+    /// Shows the unified 124 KB pool. `--raw` also dumps the raw 06/8E and 06/8D device bytes.
     Storage {
         /// also dump the raw 06/8E + 06/8D device bytes (full transparency)
         #[arg(long)]
         raw: bool,
     },
-    /// Watch headset knob / mute / consumer control events (remap foundation)
+    /// Vibrate a pad's motors, or `--tour` every motor
+    Rumble {
+        #[arg(long, default_value_t = 0.0)]
+        low: f32,
+        #[arg(long, default_value_t = 0.0)]
+        high: f32,
+        #[arg(long, default_value_t = 0.0)]
+        left_trigger: f32,
+        #[arg(long, default_value_t = 0.0)]
+        right_trigger: f32,
+        #[arg(long, default_value_t = 500)]
+        ms: u64,
+        /// walk every motor through 25%, 50% and 100%, one at a time
+        #[arg(long)]
+        tour: bool,
+    },
+    /// Live view of gamepads: sticks, battery, motion
+    Pads {
+        /// how long to listen, seconds
+        #[arg(long, default_value_t = 20)]
+        seconds: u64,
+        /// pulse every pad's motors once (`neuron rumble` is the documented spelling)
+        #[arg(long, hide = true)]
+        rumble: bool,
+    },
+    /// Watch headset knob, mute and consumer-control events
     Watch {
         /// how long to listen, seconds
         #[arg(long, default_value_t = 20)]
         seconds: u64,
     },
-    /// Gesture engine (glyph eigenmotion): record / match / tune / list
+    /// Glyph gestures: record, list, rename, delete, bind, tune
     Gesture {
         #[command(subcommand)]
         action: GestureCmd,
     },
-    /// Audio endpoints (Core Audio) — cross-device remap targets: real mic gain & mute.
-    /// This is the exact OS path Synapse's `WinAudio` uses; no vendor RE needed.
+    /// Mic and speaker volume and mute (Windows Core Audio)
+    ///
+    /// The OS audio path, so it works on any endpoint, not only Razer ones.
     Audio {
         #[command(subcommand)]
         action: AudioCmd,
     },
-    /// Manage remap bindings (control event -> action), stored in bindings.toml
+    /// The Trigger -> Action binds: list, add, edit, remove
+    ///
+    /// List, add, edit, remove and reorder binds, the hypershift hold key, and the live rule set.
+    /// Triggers and actions are `kind:value` shorthands or JSON/TOML. Bind indexes count from 0.
     Bind {
         #[command(subcommand)]
         action: BindCmd,
     },
-    /// Run the remap daemon: listen for control events and fire bound actions (ESC to stop)
+    /// The controls a bind can name, and press-to-capture
+    Control {
+        #[command(subcommand)]
+        action: control::ControlCmd,
+    },
+    /// Every action a bind can run: ids, examples, checks
+    ///
+    /// Shorthand ids, a JSON example of each variant, and validation.
+    Action {
+        #[command(subcommand)]
+        action: spec::ActionCmd,
+    },
+    /// Every trigger kind, its shorthand, and validation
+    Trigger {
+        #[command(subcommand)]
+        action: spec::TriggerCmd,
+    },
+    /// Firmware button functions: plan, read, apply, restore
+    ///
+    /// Shows the plan the binds imply, reads the device, applies it (verified) or restores stock.
+    Button {
+        #[command(subcommand)]
+        action: device_cmds::ButtonCmd,
+    },
+    /// The emblem and name every surface shows for a device
+    Badge {
+        #[command(subcommand)]
+        action: device_cmds::BadgeCmd,
+    },
+    /// Timing windows, hypershift, sniper, and device feel verbs
+    ///
+    /// Timing windows, the hypershift stance, sniper, and the device feel verbs (dpi, polling,
+    /// stages, scroll, lod, brightness, game-mode, idle). The old top-level spellings, like
+    /// `neuron dpi`, still work.
+    Feel {
+        #[command(subcommand)]
+        action: setup_cmd::FeelCmd,
+    },
+    /// LED idle-off timeout in seconds (`feel idle`)
+    ///
+    /// 0 means never. A value sets it, verified by read-back.
+    #[command(hide = true)]
+    Idle { secs: Option<u32> },
+    /// Config file locations and the app's preferences
+    Config {
+        #[command(subcommand)]
+        action: setup_cmd::ConfigCmd,
+    },
+    /// Write the whole authored setup as one document
+    ///
+    /// Binds, cast, feel, routes, profiles with lighting and binds, badges, macros and
+    /// preferences.
+    Dump(setup_cmd::DumpArgs),
+    /// Make the machine match a setup document from `dump`
+    ///
+    /// Validated first, idempotent.
+    Apply(setup_cmd::ApplyArgs),
+    /// Tell a running app to re-read its config
+    Reload,
+    /// Version, run root, app running, active profile, counts
+    Status,
+    /// Everything an agent can name: actions, triggers, lighting
+    ///
+    /// Pass --json for the full machine-readable form.
+    Catalog,
+    /// Run the remap daemon (ESC stops it)
+    ///
+    /// Listens for control events and fires bound actions.
     Run {
         /// stop after N seconds (default: run until ESC)
         #[arg(long)]
@@ -168,29 +315,41 @@ enum Cmd {
         #[arg(long)]
         safe: bool,
     },
-    /// Unified lighting across both Chroma eras. No args = show capabilities (live).
-    /// `lighting effect spectrum` = dry-run the exact bytes per device (writes gated).
+    /// Lighting: capabilities, layers, presets, live effects
+    ///
+    /// No subcommand shows capabilities (live). `lighting effect spectrum` dry-runs the exact
+    /// bytes per device (writes gated). `lighting catalog` and `lighting stack` author the look
+    /// as data.
+    #[command(alias = "light")]
     Lighting {
         #[command(subcommand)]
         action: Option<LightingCmd>,
     },
-    /// Radial (pie / comms-wheel) menu — hold the trigger, flick a direction, release.
+    /// Radial menu: hold, flick a direction, release
     Radial {
         #[command(subcommand)]
         action: RadialCmd,
     },
-    /// Cast engine — one trigger fires gestures (drawn glyphs) AND radial flicks into actions.
+    /// Cast engine: one trigger for glyphs, flicks and rhythms
+    ///
+    /// One trigger fires gestures (drawn glyphs), radial flicks and tap rhythms. `cast show`,
+    /// `set`, `wedge`, `rhythm` and `glyph` edit it.
     Cast {
         #[command(subcommand)]
         action: CastCmd,
     },
-    /// Profiles — save/apply named bundles of settings (dpi + polling + brightness + lighting).
+    /// Profiles: settings, lighting and binds as one object
+    ///
+    /// new, set, apply, export, import, rename, delete, and `route` (which app switches to which
+    /// profile).
     Profile {
         #[command(subcommand)]
         action: ProfileCmd,
     },
-    /// Flip the device-control switch Razer gates host access behind: driver (host/Neuron
-    /// controls it, like Synapse does) | hardware (onboard profile runs autonomously).
+    /// Switch a device between driver and hardware control
+    ///
+    /// `driver`: the host (Neuron) controls the device, as Synapse does. `hardware`: the onboard
+    /// profile runs on its own.
     Mode {
         /// driver | hardware
         mode: String,
@@ -198,10 +357,11 @@ enum Cmd {
         #[arg(long)]
         pid: String,
     },
-    /// DEVICE-SIDE thumb-button remap (Razer 15/02, RE'd live): the physical button emits the new
-    /// key AT THE SOURCE — one keystroke, no host injection, no double-send. `--key <thumb key>`
-    /// names the stock keypad key to remap (e.g. `=`); `--button <hex>` targets a raw button id;
-    /// `--to <key>` is the target (e.g. `g`, `f13`, `space`). `--reset` restores the stock grid.
+    /// RETIRED spelling of a firmware rebind: it wrote a register (15/02) that never changed what
+    /// a key emits. It now authors the bind (`neuron bind add`) and leaves the firmware write to the
+    /// button planner (`neuron button apply`). `--key <stock key>` or `--button <hex id>` names the
+    /// button, `--to <key>` the key it should emit.
+    #[command(hide = true)]
     Remap {
         /// stock keypad key on the thumb grid to remap (e.g. "=", "5") — resolves to its button id
         #[arg(long)]
@@ -216,29 +376,39 @@ enum Cmd {
         #[arg(long)]
         reset: bool,
     },
-    /// Read-only: snapshot every recognized device's full state to backups/*.json. The first
-    /// move of every safe write — a known-good restore/verify reference.
+    /// Snapshot every device's state to backups/ (read-only)
+    ///
+    /// The first move of every safe write: a known-good restore and verify reference.
     Backup {
         /// only this PID (hex), e.g. 00a8
         #[arg(long)]
         pid: Option<String>,
     },
-    /// Read-only: re-snapshot a device and diff it against a saved backup (the round-trip
-    /// verify step — confirm only intended bytes moved, or detect drift).
+    /// Diff a device against a saved backup (read-only)
+    ///
+    /// Re-snapshots the device and compares it with a backups/*.json file, to confirm only
+    /// intended bytes moved.
     Verify {
         /// path to a backups/*.json file
         file: String,
     },
-    /// Eat existing Synapse config (any version) into Neuron. Version-agnostic: locates the
-    /// Razer vendor root and classifies config by content, never by a hard-coded v3 schema.
+    /// Import Synapse config, or a Synapse export file
+    ///
+    /// With no FILE, surveys the Razer config on this machine (`--deep` also prints sample
+    /// values). With a `*.synapse3` or `*.ChromaEffects` export, previews what would import;
+    /// `--apply` writes the profile and rules.
     Import {
-        /// also extract + print sample values (not just file classification)
-        #[arg(long)]
+        /// a Synapse export (`*.synapse3` / `*.ChromaEffects`); omit to survey this machine's config
+        file: Option<String>,
+        /// survey only: also extract and print sample values
+        #[arg(long, conflicts_with = "file")]
         deep: bool,
+        /// with FILE: write the imported profile and rules (default: preview)
+        #[arg(long, requires = "file")]
+        apply: bool,
     },
-    /// Import a Synapse EXPORT file (`*.synapse3` / `*.ChromaEffects`) into Neuron config.
-    /// Plaintext, no crypto: unzips the export, parses its XML, and (with --apply) writes the
-    /// resulting profile + spine rules to disk.
+    /// Import a Synapse export file (same as `import FILE`)
+    #[command(hide = true)]
     ImportExport {
         /// path to the exported file (a ZIP with a fake extension)
         file: String,
@@ -246,23 +416,28 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Python macros — bundled CPython starts on demand. New macros are BOUND to Neuron's
-    /// capabilities; `# neuron: raw` explicitly enables unrestricted Python for a file.
+    /// Python macros: add, run, check, options
+    ///
+    /// The bundled CPython starts on demand. New macros are bound to Neuron's capabilities; `#
+    /// neuron: raw` enables unrestricted Python for a file.
     Macro {
         #[command(subcommand)]
         action: MacroCmd,
     },
-    /// KNOCKBACK — the rhythm familiar. Prove the twin headless: play a scripted session,
-    /// print the brain's stats, and export the visual language (sigil + storyboard SVGs).
-    /// `neuron twin demo`  ·  `neuron twin sigil out.svg`  ·  `neuron twin stats`
+    /// KNOCKBACK rhythm familiar: demo, stats, SVG export
+    ///
+    /// Plays a scripted session headless, prints the brain's stats and exports the sigil and
+    /// storyboard SVGs.
     Twin {
         #[command(subcommand)]
         action: TwinCmd,
     },
-    /// Portable clipboards. `neuron pocket a` MOVES the clipboard into/out of pocket "a" (stash if
-    /// the clipboard has content, restore if the pocket does, swap if both) — carrying every
-    /// format, not just text. `--list` shows what each pocket holds; `--sigil out.svg` exports a
-    /// pocket's emergent content-sigil; `--keep` makes it survive a restart.
+    /// Portable clipboards: stash, restore, list
+    ///
+    /// `neuron pocket a` moves the clipboard into or out of pocket `a`: it stashes if the
+    /// clipboard has content, restores if the pocket does, swaps if both, carrying every format.
+    /// `--list` shows what each pocket holds, `--sigil out.svg` exports a pocket's content sigil,
+    /// `--keep` makes it survive a restart.
     Pocket {
         /// the pocket name (omit = the single default pocket)
         name: Option<String>,
@@ -276,8 +451,11 @@ enum Cmd {
         #[arg(long)]
         sigil: Option<String>,
     },
-    /// Read-only: interrogate a device's `razer_report` getter space with raw bytes.
-    /// `neuron probe 0221 --scan`  or  `neuron probe 0221 06 8e`
+    /// Read raw getters from a device (debug)
+    ///
+    /// Interrogates a device's `razer_report` getter space with raw bytes: `neuron probe 0221
+    /// --scan` or `neuron probe 0221 06 8e`.
+    #[command(hide = true)]
     Probe {
         /// device product id in hex, e.g. 0221 (keyboard) or 00a8 (mouse)
         pid: String,
@@ -289,11 +467,12 @@ enum Cmd {
         #[arg(long)]
         scan: bool,
     },
-    /// Measurement harness for the input pump — read-only diagnostics for the baseline the
-    /// upcoming pump rewrite is measured against (wake counts by reason, wake -> first-edge
-    /// latency histogram, tick-starvation watchdog). Counters are IN-PROCESS: `neuron run`
-    /// prints its own session's snapshot on exit; a bare `neuron prof pump` reads whatever this
-    /// process itself has pumped (zero, unless something in-process ran the loop first).
+    /// Input-pump counters (debug)
+    ///
+    /// Read-only diagnostics: wake counts by reason, wake-to-first-edge latency histogram,
+    /// tick-starvation watchdog.
+    /// Counters are in-process: `neuron run` prints its own session's snapshot on exit.
+    #[command(hide = true)]
     Prof {
         #[command(subcommand)]
         action: ProfCmd,
@@ -343,115 +522,6 @@ enum TwinCmd {
 }
 
 #[derive(Subcommand)]
-enum ProfileCmd {
-    /// List saved profiles
-    List,
-    /// Show a profile's settings
-    Show { name: String },
-    /// Save a profile from explicit values (only the flags you pass are stored)
-    Save {
-        name: String,
-        #[arg(long)]
-        dpi: Option<u16>,
-        #[arg(long)]
-        polling: Option<u32>,
-        #[arg(long)]
-        brightness: Option<u8>,
-        #[arg(long)]
-        disable_alt_tab: bool,
-        #[arg(long)]
-        disable_win: bool,
-        #[arg(long)]
-        disable_alt_f4: bool,
-        #[arg(long)]
-        disable_alt_esc: bool,
-        #[arg(long)]
-        idle_secs: Option<u32>,
-        #[arg(long)]
-        in_game_wired: Option<u32>,
-        #[arg(long)]
-        in_game_dongle: Option<u32>,
-        /// flash to onboard memory on apply (survives with no software running)
-        #[arg(long)]
-        persist: bool,
-    },
-    /// Apply a profile to the connected devices
-    Apply { name: String },
-    /// Delete a profile and the binds sidecar paired with it
-    Delete {
-        name: String,
-        /// skip the "this profile exists and here's what it holds" confirmation prompt
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Rename a profile, carrying its binds sidecar and any auto-switch rules with it
-    Rename { from: String, to: String },
-    /// Capture the CURRENT live device settings into a profile — the clean Synapse import
-    /// (reads what Synapse wrote to your hardware; no encrypted-file gimmicks).
-    Capture { name: String },
-    /// App-aware auto-switch: no args shows rules + the focused app; with args adds a rule
-    Autoswitch {
-        /// app substring (e.g. "valorant")
-        app: Option<String>,
-        /// profile to apply for that app
-        profile: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum MacroCmd {
-    /// List the python macros registered under `macros/scripts/`.
-    List,
-    /// Add a macro from a Python FILE: stores it under `macros/scripts/<name>.py` and registers it
-    /// into the warm `MacroHost` (so a syntax error surfaces now). The body defines `def macro(ctx):`
-    /// and may `import neuron` (ctx + key/clipboard/mouse/run helpers) or reach past it into any
-    /// raw API (`import ctypes`, `subprocess`, …).
-    Add {
-        /// a name for the macro (stored as macros/scripts/<name>.py)
-        name: String,
-        /// path to a .py file containing the macro
-        file: String,
-    },
-    /// Run a macro by name (registered) or from a --file, ONCE, against the live context, and print
-    /// its result/traceback. (Requires the python runtime; arms the helper input layer per --arm.)
-    Run {
-        /// run a registered macro by name
-        name: Option<String>,
-        /// or register+run a .py file directly
-        #[arg(long)]
-        file: Option<String>,
-        /// arm real input synthesis for this run (default: SAFE — helper input is traced, not fired)
-        #[arg(long)]
-        arm: bool,
-    },
-    /// Syntax-check a Python macro file (the honest "dry-run": parse + list defs, no execution —
-    /// python is full-power, so we never claim a behavioural trace).
-    Check {
-        /// path to a .py file
-        file: String,
-    },
-    /// Print the `neuron` host-module reference — what a macro gets (ctx + the helper surface).
-    Prelude,
-}
-
-#[derive(Subcommand)]
-enum CastCmd {
-    /// Show the cast config (trigger, mode, wheel bindings, glyph bindings)
-    Show,
-    /// Write a starter cast.toml you can edit
-    Init {
-        #[arg(long)]
-        force: bool,
-    },
-    /// Run the cast engine: hold trigger, flick or draw, release -> fires the action (ESC stops)
-    Run {
-        /// override the config's trigger VK
-        #[arg(long)]
-        trigger: Option<i32>,
-    },
-}
-
-#[derive(Subcommand)]
 enum RadialCmd {
     /// Print the sector map for N sectors (no device needed)
     Map {
@@ -469,6 +539,24 @@ enum RadialCmd {
 
 #[derive(Subcommand)]
 enum LightingCmd {
+    /// Every preset and pattern (with its knobs) a layer can use
+    Catalog,
+    /// The layer stack of a profile or device: list, add, set, rm, mv, clear, replace
+    Stack {
+        #[command(subcommand)]
+        action: light::StackCmd,
+    },
+    /// Paint a profile's lighting now (same as `profile apply NAME`)
+    Apply { profile: String },
+    /// The stream frame rate (1-30) a device's saved look uses: read, set, or `0` to clear
+    Fps {
+        /// device pid (hex)
+        #[arg(long)]
+        pid: String,
+        value: Option<u32>,
+    },
+    /// Stream a computed effect live.
+    ///
     /// Animate an emulated effect by streaming computed frames (the open-effects engine, live).
     Run {
         /// off | static | breathing | spectrum | wave | reactive | starlight
@@ -483,6 +571,8 @@ enum LightingCmd {
         #[arg(long)]
         pid: Option<String>,
     },
+    /// Preview an effect's bytes (dry run).
+    ///
     /// Preview (dry-run) the exact bytes to set an effect on every lit device. Writes gated.
     Effect {
         /// off | static | breathing | spectrum | wave | reactive | starlight
@@ -518,6 +608,8 @@ enum LightingCmd {
         #[arg(long)]
         store: bool,
     },
+    /// Paint the mouse's vitals onto the keyboard.
+    ///
     /// CROSS-DEVICE DATA SURFACE — paint the MOUSE's live vitals (battery / charge / active DPI
     /// stage) onto the KEYBOARD's LED matrix. One process speaking BOTH devices: the mouse is the
     /// data source, the keyboard the sink. Loops ~1s, repainting (on-demand, ACK'd) only when the
@@ -527,6 +619,8 @@ enum LightingCmd {
         #[arg(long)]
         seconds: Option<u64>,
     },
+    /// Walk the keymap key by key to verify it.
+    ///
     /// HARDWARE RE-VERIFY the key map: walk the keyboard key by key (reading order), lighting ONLY
     /// each key's mapped cell in a bright accent so you can confirm the LIT key matches its printed
     /// name — and flag any that don't, for a map correction. Uses the ACK'd on-demand custom-frame
@@ -542,6 +636,8 @@ enum LightingCmd {
         #[arg(long)]
         color: Option<String>,
     },
+    /// Light every matrix cell in turn.
+    ///
     /// REVERSE-ENGINEER wide-key LED footprints: walk EVERY cell of the matrix — (row, col) for row
     /// in 0..rows, col in 0..cols, INCLUDING the unmapped "gap" cells the keymap/keytest skip — and
     /// light ONLY that one cell in a bright accent via the ACK'd on-demand custom-frame paint (not
@@ -562,6 +658,8 @@ enum LightingCmd {
         #[arg(long)]
         color: Option<String>,
     },
+    /// Light a block of cells to map a wide key.
+    ///
     /// BLOCK-VERIFY a wide key's span: light a CONTIGUOUS BLOCK of cells (row N, colA..=colB) ALL AT
     /// ONCE and HOLD, so you can confirm on hardware which cells a wide key physically covers. Paints
     /// every cell in the block simultaneously via the ACK'd on-demand custom-frame paint (not
@@ -586,18 +684,6 @@ enum LightingCmd {
         /// hold for N seconds (default: hold until ESC)
         #[arg(long)]
         seconds: Option<u64>,
-    },
-}
-
-#[derive(Subcommand)]
-enum BindCmd {
-    /// Show the active bindings (from bindings.toml, or built-in defaults if none)
-    List,
-    /// Write the default bindings.toml so you can edit it
-    Init {
-        /// overwrite an existing bindings.toml
-        #[arg(long)]
-        force: bool,
     },
 }
 
@@ -645,46 +731,6 @@ enum AudioCmd {
 /// Default `HyperShift` trigger: mouse thumb button 1 (`VK_XBUTTON1` = 0x05). Hold it,
 /// draw, release. Override with --trigger <vk> (e.g. 0x02 right, 0x06 thumb2, 0x12 alt).
 const DEFAULT_TRIGGER: i32 = 0x05;
-
-#[derive(Subcommand)]
-enum GestureCmd {
-    /// Validate the eigenmotion engine against synthetic shapes (no device needed)
-    Selftest,
-    /// Record a named gesture: hold the trigger, draw, release
-    Record {
-        name: String,
-        #[arg(long, default_value_t = DEFAULT_TRIGGER)]
-        trigger: i32,
-    },
-    /// Recognize a gesture against the vault: hold the trigger, draw, release
-    Match {
-        #[arg(long, default_value_t = DEFAULT_TRIGGER)]
-        trigger: i32,
-    },
-    /// List stored gestures and the current attunement
-    List,
-    /// Attune the three glyph properties + match threshold (persisted in the vault)
-    Tune {
-        /// weight on damping |λ| (open arc vs sustained loop)
-        #[arg(long)]
-        damping: Option<f64>,
-        /// weight on signed curvature (handedness + tightness)
-        #[arg(long)]
-        curve: Option<f64>,
-        /// weight on irregularity (residual)
-        #[arg(long)]
-        resid: Option<f64>,
-        /// DTW match threshold (lower = stricter)
-        #[arg(long)]
-        threshold: Option<f64>,
-        /// arc-length resample count
-        #[arg(long)]
-        resample: Option<usize>,
-        /// weight on physical invariants (winding / bending / closure)
-        #[arg(long)]
-        invariant: Option<f64>,
-    },
-}
 
 // ── KNOCKBACK — the rhythm familiar (headless proof + SVG export) ───────────
 
@@ -914,7 +960,136 @@ fn twin_cmd(action: TwinCmd) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+/// `--help` groups.
+///
+/// clap 4 groups options under headings but not subcommands, so the top-level command list is
+/// built here and every subcommand is hidden from clap's own (flat) list. Hidden commands (the
+/// old spellings, the debug harnesses) stay reachable by name. A test keeps this table and the
+/// command tree in step.
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    ("Devices", &["list", "info", "battery", "adopt", "storage", "mode", "backup", "verify", "badge", "button"]),
+    ("Feel", &["feel"]),
+    ("Input", &["bind", "control", "action", "trigger", "cast", "gesture", "radial", "macro", "pocket", "run", "watch", "pads", "rumble", "audio", "twin"]),
+    ("Lighting", &["lighting"]),
+    ("Setup", &["profile", "config", "dump", "apply", "reload", "status", "catalog", "import"]),
+];
+
+/// Exit for a command line clap rejected: help and version as clap prints them, anything else as
+/// plain lines (`{"error": ...}` under `--json`) with exit code 2.
+fn usage_error(e: &clap::Error) -> ! {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if !e.use_stderr() {
+        e.exit();
+    }
+    let rendered = e.render().to_string();
+    let mut lines: Vec<String> = rendered
+        .lines()
+        .map(|l| l.trim().trim_start_matches("error: ").to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with("Usage:") && !l.starts_with("For more information"))
+        .collect();
+    if let Some(first) = lines.first_mut() {
+        *first = human_usage_line(first);
+    }
+    if lines.len() > 1 && lines[0].ends_with(':') {
+        let next = lines.remove(1);
+        lines[0] = format!("{} {next}", lines[0]);
+    }
+    // Belt and braces for the top level, where every subcommand is hidden (see `grouped_command`).
+    if e.kind() == ErrorKind::InvalidSubcommand && !lines.iter().any(|l| l.starts_with("tip:")) {
+        if let Some(ContextValue::String(bad)) = e.get(ContextKind::InvalidSubcommand) {
+            let names: Vec<String> = Cli::command().get_subcommands().map(|s| s.get_name().to_string()).collect();
+            if let Some(near) = neuron::authoring::nearest(bad, names.iter().map(String::as_str)) {
+                lines.push(format!("Did you mean {near}?"));
+            }
+        }
+    }
+    if out::json() {
+        eprintln!("{}", serde_json::json!({ "error": lines.join(" ") }));
+    } else {
+        eprintln!("error: {}
+Run `neuron help` for usage.", lines.join("
+"));
+    }
+    std::process::exit(2);
+}
+
+/// Rewrites clap's `invalid value 'x' for '<ARG>': <Rust parse error>` into plain words.
+fn human_usage_line(line: &str) -> String {
+    let Some(rest) = line.strip_prefix("invalid value '") else { return line.to_string() };
+    let Some((value, rest)) = rest.split_once("' for '") else { return line.to_string() };
+    let Some((arg, reason)) = rest.split_once("': ") else { return line.to_string() };
+    let arg = arg.trim_matches(|c| matches!(c, '[' | ']' | '<' | '>'));
+    let why = if reason.contains("invalid digit") {
+        "expected a whole number".to_string()
+    } else if reason.contains("empty string") {
+        "a number is required".to_string()
+    } else if reason.contains("too large") {
+        "that number is too large".to_string()
+    } else if reason.contains("too small") {
+        "that number is too small".to_string()
+    } else if reason.contains("invalid float") {
+        "expected a number, like 0.5".to_string()
+    } else if let Some((_, range)) = reason.split_once(" is not in ") {
+        match range.split_once("..=") {
+            Some((lo, hi)) => format!("must be between {lo} and {hi}"),
+            None => reason.to_string(),
+        }
+    } else {
+        reason.to_string()
+    };
+    format!("'{value}' is not valid for {arg}: {why}.")
+}
+
+fn grouped_command() -> clap::Command {
+    let mut cmd = Cli::command();
+    let about = |c: &clap::Command, name: &str| c.find_subcommand(name).and_then(|s| s.get_about()).map(ToString::to_string).unwrap_or_default();
+    let width = HELP_GROUPS.iter().flat_map(|(_, names)| names.iter()).map(|n| n.len()).max().unwrap_or(0);
+    let mut listing = String::new();
+    for (heading, names) in HELP_GROUPS {
+        listing.push_str(&format!("{heading}:
+"));
+        for n in *names {
+            listing.push_str(&format!("  {n:<width$}  {}
+", about(&cmd, n)));
+        }
+        listing.push('\n');
+    }
+    listing.push_str("Run `neuron help <command>` for a command's options and examples.");
+    let names: Vec<String> = cmd.get_subcommands().map(|s| s.get_name().to_string()).collect();
+    for n in names {
+        cmd = cmd.mut_subcommand(n, |s| s.hide(true));
+    }
+    cmd.after_help(listing)
+        .bin_name("neuron")
+        .override_usage("neuron [OPTIONS] <COMMAND>")
+        .help_template("{about}
+
+{usage-heading} {usage}{after-help}
+
+{all-args}")
+}
+
+fn main() -> std::process::ExitCode {
+    // `--json` is read before clap so even a failure to parse or to start reports in the shape the
+    // caller asked for.
+    out::set_json(std::env::args().any(|a| a == "--json"));
+    // The command tree is large enough that building it in an unoptimized build overflows the 1 MB
+    // main-thread stack on Windows, so the whole run happens on a thread with room.
+    let worker = std::thread::Builder::new().name("neuron-cli".into()).stack_size(32 << 20).spawn(run);
+    let result = match worker {
+        Ok(h) => h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("the command panicked"))),
+        Err(e) => Err(anyhow::anyhow!("could not start the command thread: {e}")),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}", out::error_line(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     // Before ANY config read: carry a build-tree config universe forward (see
     // `runroot::adopt_legacy_run_root`). Both binaries do this because either one can be the first
     // to start after an upgrade, and they share one config universe — whoever gets there first
@@ -922,7 +1097,13 @@ fn main() -> Result<()> {
     if let Some((from, to)) = neuron::runroot::adopt_legacy_run_root()? {
         eprintln!("carried config forward: {} -> {}", from.display(), to.display());
     }
-    let cli = Cli::parse();
+    let cli = {
+        use clap::FromArgMatches as _;
+        Cli::from_arg_matches(&grouped_command().try_get_matches().unwrap_or_else(|e| usage_error(&e))).unwrap_or_else(|e| e.exit())
+    };
+    out::set_json(cli.json);
+    out::set_verbose(cli.verbose);
+    live::set_skip(cli.no_live);
     let reg = Registry::load()?;
     // Adoption is NOT a startup step (it would give read-only commands a hidden HID-probe + file
     // write): it fires lazily inside device resolution, the moment a command actually reaches for
@@ -931,7 +1112,10 @@ fn main() -> Result<()> {
         Cmd::List => list(&reg)?,
         Cmd::Discover { emit } => discover_cmd(emit),
         Cmd::Adopt { dry_run } => adopt_cmd(&reg, dry_run)?,
-        Cmd::Info => info(&open_first(&reg)?),
+        Cmd::Info { pid } => {
+            let (d, pos, total) = open_for_info(&reg, pid.as_deref())?;
+            info(&d, pos, total)?;
+        }
         Cmd::Battery => {
             // Resolve by CAPABILITY, not enumeration order — "the device with a battery",
             // never "the first device" (which is a keyboard whenever one sorts first). Via the
@@ -939,10 +1123,12 @@ fn main() -> Result<()> {
             let d = open_with_command(&reg, "battery_level")?;
             let pct = cap::battery_percent(&d)?;
             let charging = cap::charging(&d).unwrap_or(false);
-            println!(
-                "Battery: {pct}%{}",
-                if charging { " (charging)" } else { "" }
-            );
+            out::emit(&serde_json::json!({ "percent": pct, "charging": charging }), || {
+                println!(
+                    "Battery: {pct}%{}",
+                    if charging { " (charging)" } else { "" }
+                );
+            })?;
         }
         Cmd::Dpi { value } => dpi_cmd(&reg, value)?,
         Cmd::Polling { hz } => polling_cmd(&reg, hz)?,
@@ -955,12 +1141,31 @@ fn main() -> Result<()> {
         Cmd::Lod { lift, landing, sym } => lod_cmd(&reg, lift, landing, sym)?,
         Cmd::Brightness { pct } => brightness_cmd(&reg, pct)?,
         Cmd::GameMode { state } => gamemode_cmd(&reg, state.as_deref())?,
-        Cmd::Sniper { bind, dpi } => sniper_cmd(bind, dpi)?,
+        Cmd::Sniper(a) => setup_cmd::sniper(a)?,
         Cmd::Storage { raw } => storage_status(&reg, raw)?,
         Cmd::Watch { seconds } => neuron::controls::watch(seconds),
-        Cmd::Gesture { action } => gesture_cmd(action)?,
+        Cmd::Pads { seconds, rumble } => neuron::controls::pads(seconds, rumble),
+        Cmd::Rumble { low, high, left_trigger, right_trigger, ms, tour } => rumble_cmd(
+            neuron::haptics::Rumble { low, high, left_trigger, right_trigger },
+            ms,
+            tour,
+        )?,
+        Cmd::Gesture { action } => cast_cmd::gesture(action)?,
         Cmd::Audio { action } => audio_cmd(action)?,
-        Cmd::Bind { action } => bind_cmd(action)?,
+        Cmd::Bind { action } => spec::bind(action)?,
+        Cmd::Control { action } => control::run(action, &reg)?,
+        Cmd::Action { action } => spec::action(action)?,
+        Cmd::Trigger { action } => spec::trigger(action)?,
+        Cmd::Button { action } => device_cmds::button(action, &reg)?,
+        Cmd::Badge { action } => device_cmds::badge(action)?,
+        Cmd::Feel { action } => setup_cmd::feel(action, &reg)?,
+        Cmd::Idle { secs } => device_cmds::idle(&reg, secs)?,
+        Cmd::Config { action } => setup_cmd::config(action)?,
+        Cmd::Dump(a) => setup_cmd::dump(a)?,
+        Cmd::Apply(a) => setup_cmd::apply(a)?,
+        Cmd::Reload => setup_cmd::reload()?,
+        Cmd::Status => setup_cmd::status()?,
+        Cmd::Catalog => setup_cmd::catalog()?,
         Cmd::Run { seconds, safe } => run_daemon(&reg, seconds, safe),
         Cmd::Lighting { action } => lighting_cmd(&reg, action)?,
         Cmd::Mode { mode, pid } => mode_cmd(&reg, &mode, &pid)?,
@@ -969,15 +1174,16 @@ fn main() -> Result<()> {
             button,
             to,
             reset,
-        } => remap_cmd(&reg, key.as_deref(), button.as_deref(), to.as_deref(), reset)?,
+        } => device_cmds::remap(&reg, key.as_deref(), button.as_deref(), to.as_deref(), reset)?,
         Cmd::Backup { pid } => backup_cmd(&reg, pid.as_deref())?,
         Cmd::Verify { file } => verify_cmd(&file)?,
-        Cmd::Import { deep } => import_cmd(deep),
+        Cmd::Import { file: Some(f), apply, .. } => import_export_cmd(&f, apply)?,
+        Cmd::Import { file: None, deep, .. } => import_cmd(deep),
         Cmd::ImportExport { file, apply } => import_export_cmd(&file, apply)?,
-        Cmd::Macro { action } => macro_cmd(action)?,
+        Cmd::Macro { action } => macro_cmd::run(action)?,
         Cmd::Radial { action } => radial_cmd(action),
-        Cmd::Cast { action } => cast_cmd(action)?,
-        Cmd::Profile { action } => profile_cmd(&reg, action)?,
+        Cmd::Cast { action } => cast_cmd::cast(action)?,
+        Cmd::Profile { action } => profile_cmd::run(action, &reg)?,
         Cmd::Twin { action } => twin_cmd(action)?,
         Cmd::Probe {
             pid,
@@ -1054,212 +1260,6 @@ fn pocket_cmd(name: Option<String>, list: bool, keep: bool, sigil: Option<String
     Ok(())
 }
 
-fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
-    match action {
-        ProfileCmd::List => {
-            let names = neuron::profile::try_list()?;
-            if names.is_empty() {
-                println!("no profiles (create one: neuron profile save <name> --dpi 1600)");
-            }
-            for n in names {
-                match Profile::load(&n) {
-                    Ok(p) => println!("  {n:<16} {}", p.summary()),
-                    Err(_) => println!("  {n:<16} (unreadable)"),
-                }
-            }
-        }
-        ProfileCmd::Show { name } => {
-            let p = Profile::load(&name)?;
-            println!("{name}: {}", p.summary());
-        }
-        ProfileCmd::Save {
-            name,
-            dpi,
-            polling,
-            brightness,
-            disable_alt_tab,
-            disable_win,
-            disable_alt_f4,
-            disable_alt_esc,
-            idle_secs,
-            in_game_wired,
-            in_game_dongle,
-            persist,
-        } => {
-            let p = Profile {
-                name: name.clone(),
-                dpi,
-                dpi_stages: Vec::new(),
-                polling_hz: polling,
-                brightness,
-                disable_alt_tab,
-                disable_win,
-                disable_alt_f4,
-                disable_alt_esc,
-                idle_secs,
-                in_game_polling: match (in_game_wired, in_game_dongle) {
-                    (Some(w), Some(d)) => Some((w, d)),
-                    _ => None,
-                },
-                persist,
-                ..Default::default()
-            };
-            if let Some(why) = neuron::profile::name_conflict(&name) {
-                bail!("{why}");
-            }
-            if p.is_empty() {
-                bail!("nothing to save — pass at least one setting flag (see 'neuron profile save --help')");
-            }
-            // The GUI says "overwrite" before it clobbers; the CLI used to overwrite in silence.
-            // Same guard, said the way a terminal says it — the write still happens, you just know.
-            if let Ok(existing) = Profile::load(&name) {
-                println!("overwriting '{name}' ({})", existing.summary());
-            }
-            p.save().map_err(anyhow::Error::msg)?;
-            println!("saved profile '{name}': {}", p.summary());
-        }
-        ProfileCmd::Apply { name } => profile_apply(reg, &name)?,
-        ProfileCmd::Delete { name, yes } => {
-            let p = Profile::load(&name)
-                .map_err(|_| anyhow::anyhow!("no profile '{name}' (neuron profile list)"))?;
-            let sidecar = Profile::rules_path(&name);
-            let binds = std::fs::read_to_string(&sidecar)
-                .ok()
-                .and_then(|s| toml::from_str::<neuron::engine::RuleDoc>(&s).ok())
-                .map_or(0, |d| d.rules.len());
-            if !yes {
-                println!("'{name}': {}", p.summary());
-                if binds > 0 {
-                    println!("  and {binds} bind(s) in {}", sidecar.display());
-                }
-                bail!("refusing to delete without --yes");
-            }
-            Profile::delete(&name).map_err(anyhow::Error::msg)?;
-            match binds {
-                0 => println!("deleted '{name}'"),
-                n => println!("deleted '{name}' and its {n} bind(s)"),
-            }
-            // Rules are NOT pruned: they are the user's config, and a route is the thing you most
-            // likely want to re-point rather than lose. But a dangling route can never fire, so
-            // name each one and the exact repair instead of a bare count. (The live daemon no
-            // longer churns on them either — it only reassembles the spine when a switch lands.)
-            let rules = neuron::profile::AppRules::load();
-            let dangling: Vec<&str> = rules
-                .rules
-                .iter()
-                .filter(|r| r.profile == name)
-                .map(|r| r.app.as_str())
-                .collect();
-            if !dangling.is_empty() {
-                println!(
-                    "  {} auto-switch route(s) still point at '{name}' and can no longer fire: {}",
-                    dangling.len(),
-                    dangling.join(", ")
-                );
-                println!(
-                    "  re-point or remove them in {}",
-                    neuron::profile::AppRules::path().display()
-                );
-            }
-            if rules.default.as_deref() == Some(name.as_str()) {
-                println!("  it was also the fallback profile · clear `default` in apps.toml");
-            }
-        }
-        ProfileCmd::Rename { from, to } => {
-            let landed = Profile::rename(&from, &to).map_err(anyhow::Error::msg)?;
-            println!("renamed '{from}' to '{landed}'");
-            // auto-switch rules name a profile by string, so a rename without this quietly breaks them.
-            let mut rules = neuron::profile::AppRules::load();
-            let mut moved = 0;
-            for r in rules.rules.iter_mut().filter(|r| r.profile == from) {
-                r.profile.clone_from(&landed);
-                moved += 1;
-            }
-            if rules.default.as_deref() == Some(from.as_str()) {
-                rules.default = Some(landed.clone());
-                moved += 1;
-            }
-            if moved > 0 {
-                // The profile has already moved by this point, so a failed save leaves apps.toml
-                // pointing at a name that is gone. It can't be rolled back (rolling the rename back
-                // could itself fail), so say exactly what is broken and how to repair it rather
-                // than bailing with a bare IO error the user has to reverse-engineer.
-                match rules.save() {
-                    Ok(()) => println!("  {moved} auto-switch entr(y/ies) followed it"),
-                    Err(e) => {
-                        // Two files have to change together and only one can be written atomically,
-                        // so on a failed apps.toml write put the PROFILE back rather than leave a
-                        // rename that silently broke every route pointing at it. Renaming back is
-                        // itself fallible; if it works the whole command is a clean no-op, and if
-                        // it doesn't the user gets the exact repair instead of a bare IO error.
-                        eprintln!("  apps.toml could not be written: {e}");
-                        match neuron::profile::Profile::rename(&landed, &from) {
-                            Ok(_) => bail!(
-                                "rename rolled back · '{from}' is unchanged and its {moved} \
-                                 auto-switch entr(y/ies) still work"
-                            ),
-                            Err(re) => {
-                                eprintln!("  and rolling the rename back failed too: {re}");
-                                eprintln!(
-                                    "  '{from}' is now '{landed}', but {moved} auto-switch \
-                                     entr(y/ies) still name '{from}' and will not fire."
-                                );
-                                eprintln!(
-                                    "  repair: edit {} and change '{from}' to '{landed}'.",
-                                    neuron::profile::AppRules::path().display()
-                                );
-                                bail!("apps.toml not updated");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        ProfileCmd::Capture { name } => profile_capture(reg, &name)?,
-        ProfileCmd::Autoswitch { app, profile } => {
-            use neuron::profile::{AppRule, AppRules};
-            if let (Some(a), Some(p)) = (app, profile) {
-                // the rule is only as real as its target — the GUI refuses a typo'd profile,
-                // and the CLI used to accept one and fail forever at focus-switch time.
-                if Profile::load(&p).is_err() {
-                    bail!("no profile '{p}' · save it first (neuron profile list)");
-                }
-                let mut rules = AppRules::load();
-                rules.rules.push(AppRule {
-                    app: a.clone(),
-                    profile: p.clone(),
-                });
-                rules.save().map_err(|e| anyhow::anyhow!("saving apps.toml: {e}"))?;
-                println!(
-                    "rule added: focus '{a}' -> profile '{p}'  ({})",
-                    AppRules::path().display()
-                );
-            } else {
-                let rules = AppRules::load();
-                let now = neuron::app::foreground_app();
-                println!("focused app: {}", now.as_deref().unwrap_or("(unknown)"));
-                if rules.rules.is_empty() {
-                    println!(
-                        "no rules yet — add one: neuron profile autoswitch <app> <profile>"
-                    );
-                }
-                for r in &rules.rules {
-                    let hit = now
-                        .as_deref()
-                        .is_some_and(|n| n.contains(&r.app.to_lowercase()));
-                    println!(
-                        "  '{}' -> {}{}",
-                        r.app,
-                        r.profile,
-                        if hit { "   <= active" } else { "" }
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Capture the current live device state into a profile — the no-gimmick Synapse import: read
 /// what's actually on the hardware (which Synapse configured) rather than decrypting its files.
 fn profile_capture(reg: &Registry, name: &str) -> Result<()> {
@@ -1279,15 +1279,16 @@ fn profile_capture(reg: &Registry, name: &str) -> Result<()> {
         );
     }
     p.save().map_err(anyhow::Error::msg)?;
-    println!("captured '{name}' from live device state: {}", p.summary());
-    Ok(())
+    out::emit(&serde_json::json!({ "captured": name, "summary": p.summary(), "profile": p }), || {
+        println!("captured '{name}' from live device state: {}", p.summary());
+    })
 }
 
 /// Apply a profile — write each set field to whichever device owns that capability. The
 /// orchestration spine: settings via the typed setters, lighting via the unified backend.
 fn profile_apply(reg: &Registry, name: &str) -> Result<()> {
     let p = Profile::load(name)?;
-    println!("applying '{name}': {}", p.summary());
+    say!("applying '{name}': {}", p.summary());
 
     // Delegate to the ONE canonical apply orchestration in neuron-core (`Profile::apply`). It applies
     // the FULL DPI stage list (not just the single active DPI), polling/brightness, the per-LED frame
@@ -1296,13 +1297,13 @@ fn profile_apply(reg: &Registry, name: &str) -> Result<()> {
     // from this exact same report — no duplicated apply logic.
     let report = p.apply(reg);
     for line in &report.applied {
-        println!("  {line}");
+        say!("  {line}");
     }
     for line in &report.gated {
-        println!("  {line} [gated — derived write off by default; enable via env flag]");
+        say!("  {line} [gated — derived write off by default; enable via env flag]");
     }
     for line in &report.skipped {
-        println!("  skipped: {line}");
+        say!("  skipped: {line}");
     }
     // Push the applied profile's gaming-mode policy to the ONE shared carrier in `neuron::hook`
     // (the same cell the GUI drives). If the run-daemon's listener thread is live it picks this up on
@@ -1310,7 +1311,7 @@ fn profile_apply(reg: &Registry, name: &str) -> Result<()> {
     // works from the daemon's AppFocus->ProfileSwitch path AND the one-shot CLI `profile apply`.
     neuron::hook::set_policy(report.gaming_mode);
     if report.gaming_mode.any() {
-        println!(
+        say!(
             "  gaming-mode -> policy active (host-side Alt+Tab/Win/Alt+F4 suppression {})",
             if neuron::hook::is_installed() {
                 "hook live on the daemon listener thread"
@@ -1319,63 +1320,20 @@ fn profile_apply(reg: &Registry, name: &str) -> Result<()> {
             }
         );
     }
-    Ok(())
-}
-
-fn cast_cmd(action: CastCmd) -> Result<()> {
-    match action {
-        CastCmd::Show => cast_show(),
-        CastCmd::Init { force } => {
-            if CastConfig::path().exists() && !force {
-                bail!("cast.toml already exists (use --force to overwrite)");
-            }
-            neuron::salvage::atomic_write(&CastConfig::path(), neuron::cast::TEMPLATE_TOML.as_bytes())?;
-            println!(
-                "wrote {} — record glyphs with `neuron gesture record <name>`, then bind them.",
-                CastConfig::path().display()
-            );
-        }
-        CastCmd::Run { trigger } => cast_run(trigger),
+    if out::json() {
+        out::print_json(&serde_json::json!({
+            "profile": name, "summary": p.summary(),
+            "applied": report.applied, "gated": report.gated, "skipped": report.skipped,
+            "gaming_mode": report.gaming_mode.any(),
+        }));
     }
     Ok(())
 }
 
-fn cast_show() {
-    let cfg = CastConfig::load();
-    let custom = CastConfig::path().exists();
-    println!(
-        "cast config ({}):  trigger={}  mode={:?}  sectors={}  deadzone={}",
-        if custom { "cast.toml" } else { "defaults" },
-        cfg.trigger.label(),
-        cfg.mode,
-        cfg.sectors,
-        cfg.deadzone
-    );
-    println!("  radial wheel:");
-    if cfg.radial.is_empty() {
-        println!("    (none bound)");
-    }
-    for (i, a) in cfg.radial.iter().enumerate() {
-        println!(
-            "    [{i}] {:>3}  ->  {}",
-            radial::compass(i, cfg.sectors),
-            a.describe()
-        );
-    }
-    println!("  glyph spells:");
-    if cfg.gestures.is_empty() {
-        println!("    (none bound)");
-    }
-    for (name, a) in &cfg.gestures {
-        println!("    {name:<14} ->  {}", a.describe());
-    }
-}
-
-fn cast_run(trigger_override: Option<i32>) {
+fn cast_run(trigger_override: Option<neuron::controls::ControlRef>) {
     let cfg = CastConfig::load();
     let vault = Vault::load();
-    let trigger = trigger_override
-        .map_or(cfg.trigger, neuron::controls::ControlRef::from_vk);
+    let trigger = trigger_override.unwrap_or(cfg.trigger);
     println!(
         "Cast engine — mode={:?}, trigger={}, {} wheel wedge(s), {} glyph(s), {} recorded template(s).",
         cfg.mode,
@@ -1476,6 +1434,10 @@ fn lit_devices(reg: &Registry) -> Result<Vec<(DeviceDef, u16, lighting::Lighting
 fn lighting_cmd(reg: &Registry, action: Option<LightingCmd>) -> Result<()> {
     match action {
         None => lighting_show(reg),
+        Some(LightingCmd::Catalog) => light::catalog(),
+        Some(LightingCmd::Stack { action }) => light::stack(action),
+        Some(LightingCmd::Apply { profile }) => profile_apply(reg, &profile),
+        Some(LightingCmd::Fps { pid, value }) => light::fps(&pid, value),
         Some(LightingCmd::Run {
             name,
             color,
@@ -2342,75 +2304,6 @@ fn mode_cmd(reg: &Registry, mode_str: &str, pid_str: &str) -> Result<()> {
     Ok(())
 }
 
-/// DEVICE-SIDE thumb-button remap (Razer 15/02). Resolves the target Razer mouse by DPI capability,
-/// confirms it speaks the class-0x15 button-map protocol, then writes the reassignment so the button
-/// emits the new key at the source. Volatile — see the printed note.
-fn remap_cmd(
-    reg: &Registry,
-    key: Option<&str>,
-    button: Option<&str>,
-    to: Option<&str>,
-    reset: bool,
-) -> Result<()> {
-    let d = open_with_command(reg, "dpi")
-        .context("no DPI-capable Razer mouse found for a device-side remap")?;
-    if !writes::supports_button_remap(&d) {
-        bail!(
-            "{} does not speak the class-0x15 button-map protocol — device-side remap unsupported \
-             on this device",
-            d.def.name
-        );
-    }
-    // REFUSE contradictory invocations instead of silently picking one. This verb rewrites what a
-    // physical button emits, so resolving an ambiguous request could remap the WRONG control and
-    // still print success — the one outcome a device-write path must never produce.
-    if reset && (key.is_some() || button.is_some() || to.is_some()) {
-        bail!(
-            "--reset restores the WHOLE thumb grid, so it can't be combined with \
-             --key/--button/--to; run the reset on its own, or drop --reset to remap one button"
-        );
-    }
-    if reset {
-        writes::reset_thumb_buttons(&d)?;
-        println!("thumb grid restored to stock: 1 2 3 4 5 6 7 8 9 0 - =");
-        return Ok(());
-    }
-    if key.is_some() && button.is_some() {
-        bail!("--key and --button both name the button to remap — pass exactly one, not both");
-    }
-    let button_id = match (key, button) {
-        (Some(k), _) => {
-            let usage = neuron::action::hid_usage_for_key(k)
-                .ok_or_else(|| anyhow::anyhow!("'{k}' is not a key I can resolve to a HID usage"))?;
-            writes::thumb_button_id_for_usage(usage).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'{k}' is not one of the stock thumb keys (1..9 0 - =); use --button <hex> \
-                     to target a raw button id"
-                )
-            })?
-        }
-        (None, Some(b)) => u8::from_str_radix(b.trim_start_matches("0x"), 16)
-            .context("--button must be a hex byte, e.g. 4b")?,
-        (None, None) => bail!(
-            "say what to remap: --key <thumb key> or --button <hex>, plus --to <key> (or --reset)"
-        ),
-    };
-    let to = to.ok_or_else(|| anyhow::anyhow!("--to <key> is required (e.g. --to g)"))?;
-    let usage = neuron::action::hid_usage_for_key(to).ok_or_else(|| {
-        anyhow::anyhow!(
-            "target '{to}' can't be expressed as a single device key (chords / media / numpad \
-             aren't supported device-side)"
-        )
-    })?;
-    writes::set_mouse_button_key(&d, button_id, usage)?;
-    println!(
-        "remapped button 0x{button_id:02X} -> emits '{to}' (HID usage 0x{usage:02X}) at the source.\n\
-         NOTE: volatile — it holds while a host keeps the mouse in driver mode (the neuron app does); \
-         the mouse reverts to its onboard profile otherwise. `neuron remap --reset` restores stock."
-    );
-    Ok(())
-}
-
 fn verify_cmd(file: &str) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let json = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
@@ -2615,147 +2508,9 @@ fn rules_sidecar_path(name: &str) -> std::path::PathBuf {
     neuron::profile::Profile::rules_path(name)
 }
 
-// ───────────────────────────────────────── macros ────────────────────────────────────────────
-
-/// `neuron macro <add|run|list|check|prelude>` — drive the Python Macro Host.
-fn macro_cmd(action: MacroCmd) -> Result<()> {
-    use neuron::macros;
-    use neuron::macros::macro_host;
-    match action {
-        MacroCmd::Prelude => {
-            // print the host-module reference straight from the BUNDLED neuron.py source (embedded
-            // in the binary — always matches the interpreter this build ships, no disk lookup).
-            print!("{}", neuron::macros::pyruntime::host_module_source());
-        }
-        MacroCmd::List => {
-            let dir = macro_host::macros_dir();
-            println!("python macros (in {}):", dir.display());
-            let names = macro_host::list_macros();
-            if names.is_empty() {
-                println!("  (none yet — `neuron macro add <name> <file.py>`)");
-            }
-            for n in names {
-                println!("  {n}");
-            }
-            if !macro_host().available() {
-                println!(
-                    "note: no python runtime resolved — macros are stored but cannot run here."
-                );
-            }
-        }
-        MacroCmd::Add { name, file } => {
-            let src = std::fs::read_to_string(&file)
-                .with_context(|| format!("reading macro source {file}"))?;
-            match macro_host().register(&name, &src) {
-                Ok(()) => println!("registered macro '{name}' (warm + ready)"),
-                Err(e) => bail!("register '{name}': {e}"),
-            }
-        }
-        MacroCmd::Run { name, file, arm } => {
-            // Arm the helper input layer for this run if requested (raw ctypes is unaffected either way).
-            neuron::action::arm_input(arm);
-            macro_host().set_armed(arm);
-            let (id, src) = match (name, file) {
-                (_, Some(f)) => {
-                    let src =
-                        std::fs::read_to_string(&f).with_context(|| format!("reading {f}"))?;
-                    let id = std::path::Path::new(&f)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("adhoc")
-                        .to_string();
-                    (id, Some(src))
-                }
-                (Some(n), None) => (n, None),
-                (None, None) => bail!("pass a macro --name or a --file to run"),
-            };
-            // Service BEACONS on the terminal: a macro's neuron.ask() becomes a y/n prompt here
-            // (the GUI presents the same event as the binary radial). Daemon-style thread — it
-            // blocks on stdin between prompts and dies with the process.
-            let beacons = macro_host().beacon_events();
-            std::thread::spawn(move || {
-                use neuron::macros::BeaconEvent;
-                while let Ok(ev) = beacons.recv() {
-                    match ev {
-                        BeaconEvent::Ask {
-                            pid,
-                            macro_id,
-                            text,
-                            ..
-                        } => {
-                            eprintln!("[beacon] {macro_id} asks: {text}  [y/n, enter = dismiss]");
-                            let mut line = String::new();
-                            let ans = match std::io::stdin().read_line(&mut line) {
-                                // tolerate the BOM PowerShell prepends to piped stdin (U+FEFF is
-                                // not whitespace, so a plain trim leaves it and "y" stops matching)
-                                Ok(_) => match line
-                                    .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
-                                    .to_ascii_lowercase()
-                                    .as_str()
-                                {
-                                    // answer() now takes the chosen OPTION INDEX; the default ask is
-                                    // ["yes","no"] (beacon: west=yes=0, east=no=1), so y→0, n→1.
-                                    "y" | "yes" => Some(0_usize),
-                                    "n" | "no" => Some(1_usize),
-                                    _ => None,
-                                },
-                                Err(_) => None,
-                            };
-                            macro_host().answer(pid, ans);
-                        }
-                        BeaconEvent::Notify { macro_id, text } => eprintln!("[{macro_id}] {text}"),
-                        BeaconEvent::Retire { .. } | BeaconEvent::RetireDomain { .. } => {}
-                    }
-                }
-            });
-            let ctx = macros::Context::capture();
-            // A file is an ad-hoc candidate, not an implicit `macro add`: run its exact source
-            // without writing macros/scripts or replacing a registered macro of the same stem.
-            let result = match src.as_deref() {
-                Some(source) => macro_host().invoke_source_with_budget(
-                    &id,
-                    source,
-                    &ctx,
-                    std::time::Duration::from_mins(10),
-                ),
-                None => macro_host().invoke_with_budget(
-                    &id,
-                    &ctx,
-                    std::time::Duration::from_mins(10),
-                ),
-            };
-            println!("{result}");
-            // surface any macro print()/traceback the sidecar logged.
-            for line in macro_host().drain_log() {
-                println!("  | {line}");
-            }
-        }
-        MacroCmd::Check { file } => {
-            let src = std::fs::read_to_string(&file).with_context(|| format!("reading {file}"))?;
-            match macro_host().check(&src) {
-                Ok(defs) => {
-                    println!(
-                        "ok — defines: {}",
-                        if defs.is_empty() {
-                            "(none)".into()
-                        } else {
-                            defs.join(", ")
-                        }
-                    );
-                    if !defs.iter().any(|d| d == "macro" || d == "main") {
-                        println!("warning: no `def macro(ctx):` (or `def main(ctx):`) entry point");
-                    }
-                }
-                Err(e) => bail!("check: {e}"),
-            }
-        }
-    }
-    Ok(())
-}
-
 fn parse_hex16(s: &str) -> Result<u16> {
     u16::from_str_radix(s.trim_start_matches("0x"), 16)
-        .map_err(|_| anyhow::anyhow!("invalid hex '{s}'"))
+        .map_err(|_| anyhow::anyhow!("'{s}' is not hex. Use digits and a-f, like 00a8."))
 }
 
 /// A parsed `--mute on|off|toggle` request — the pure decode shared by `audio mic` and `audio out`.
@@ -2866,27 +2621,18 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
             .or_else(|_| d.run("dpi_stages"))?;
         let cur = decode_dpi_stages(&s);
         let act = decode_dpi_active(&s).unwrap_or(0);
-        if cur.is_empty() {
-            println!("DPI stages: (none reported)");
-        } else {
-            let list: Vec<String> = cur
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    if i as u8 == act {
-                        format!("[{v}]")
-                    } else {
-                        v.to_string()
-                    }
-                })
-                .collect();
-            println!(
-                "DPI stages: {}  (active marked, {} stage(s))",
-                list.join(" "),
-                cur.len()
-            );
-        }
-        return Ok(());
+        return out::emit(&serde_json::json!({ "stages": cur, "active_index": act, "active": act + 1 }), || {
+            if cur.is_empty() {
+                println!("DPI stages: (none reported)");
+            } else {
+                let list: Vec<String> = cur
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| if i as u8 == act { format!("[{v}]") } else { v.to_string() })
+                    .collect();
+                println!("DPI stages: {}  (active marked, {} stage(s))", list.join(" "), cur.len());
+            }
+        });
     }
 
     // active is 1-based on the CLI (matching Synapse's stage numbering); the write API is 0-based.
@@ -2903,7 +2649,7 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     // kept resurrecting. `--persist` is still accepted but is now the standing behaviour.
     let _ = persist;
     let list: Vec<String> = stages.iter().map(std::string::ToString::to_string).collect();
-    println!(
+    say!(
         "setting DPI stages [{}] active {} (live + onboard)...",
         list.join("/"),
         active,
@@ -2911,7 +2657,7 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     // VISITOR discipline: `set_dpi_stages` flips to driver mode INTERNALLY (no prior returned to us),
     // so read the mode BEFORE and restore it after by the same rule — a one-shot CLI never leaves the
     // driver lease held (the `dpi_trap` self-poisoning loop). `unwrap_or(0)` = treat an unanswered
-    // getter as non-driver, matching `ensure_driver`'s own "flip when unsure".
+    // getter as non-driver, matching `ensure_custody`'s own "flip when unsure".
     let prior = writes::device_mode(&d).unwrap_or(0);
     // Name WHICH plane landed if the pair breaks apart. A bare propagated error can't distinguish
     // "nothing was written" from "the live plane took it and onboard didn't", and those need
@@ -2928,7 +2674,10 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     });
     restore_custody_if_visitor(&d, prior);
     res?;
-    println!("  done — write verified against the device's stage-table read-back.");
+    say!("  done — write verified against the device's stage-table read-back.");
+    if out::json() {
+        out::print_json(&serde_json::json!({ "stages": stages, "active": active, "verified": true, "planes": ["live", "onboard"] }));
+    }
     Ok(())
 }
 
@@ -2939,13 +2688,17 @@ fn lod_cmd(reg: &Registry, lift: Option<u8>, landing: Option<u8>, sym: Option<u8
     // The DPI-capable mouse (the Naga); its sensor class rides the same control interface.
     let d = open_with_command(reg, "dpi")?;
     let show = |d: &Device| match writes::lift_off_async(d) {
-        Some((lf, la)) => println!("  LOD now: ASYMMETRIC — lift {lf} / landing {la}"),
-        None => println!(
+        Some((lf, la)) => say!("  LOD now: ASYMMETRIC — lift {lf} / landing {la}"),
+        None => say!(
             "  LOD now: symmetric level {}",
             writes::lift_off_distance(d).map_or_else(|_| "?".into(), |v| v.to_string())
         ),
     };
-    println!("current lift-off state:");
+    let state = |d: &Device| match writes::lift_off_async(d) {
+        Some((lf, la)) => serde_json::json!({ "mode": "asymmetric", "lift": lf, "landing": la }),
+        None => serde_json::json!({ "mode": "symmetric", "level": writes::lift_off_distance(d).ok() }),
+    };
+    say!("current lift-off state:");
     show(&d);
     match (sym, lift, landing) {
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
@@ -2957,12 +2710,12 @@ fn lod_cmd(reg: &Registry, lift: Option<u8>, landing: Option<u8>, sym: Option<u8
             }
             // VISITOR discipline: restore the found custody on exit (the write verifies internally
             // BEFORE we hand the lease back, so the round-trip is unaffected).
-            let prior = ensure_driver(&d);
-            println!("setting SYMMETRIC lift-off level {level}...");
+            let prior = ensure_custody(&d);
+            say!("setting SYMMETRIC lift-off level {level}...");
             let res = writes::set_lift_off_distance(&d, level);
             restore_custody_if_visitor(&d, prior);
             res?;
-            println!("  ACCEPTED + read-back VERIFIED (0x0B/0x85 echoed mode=symmetric + level).");
+            say!("  ACCEPTED + read-back VERIFIED (0x0B/0x85 echoed mode=symmetric + level).");
             show(&d);
         }
         (None, Some(lf), Some(la)) => {
@@ -2973,37 +2726,43 @@ fn lod_cmd(reg: &Registry, lift: Option<u8>, landing: Option<u8>, sym: Option<u8
                 bail!("--landing is 1..=25 (Focus Pro level); got {la}");
             }
             // VISITOR discipline: restore the found custody on exit (verify happens inside the write).
-            let prior = ensure_driver(&d);
-            println!("setting ASYMMETRIC lift-off: lift {lf} / landing {la}...");
+            let prior = ensure_custody(&d);
+            say!("setting ASYMMETRIC lift-off: lift {lf} / landing {la}...");
             // The write itself re-reads 0x0B/0x85 and bails unless the device echoes
             // mode=async + this exact lift/landing pair — so reaching the line below IS the
             // hardware round-trip.
             let res = writes::set_lift_off_asymmetric(&d, lf, la);
             restore_custody_if_visitor(&d, prior);
             res?;
-            println!("  ACCEPTED + read-back VERIFIED on the shared 0x0B/0x85 getter — hardware round-trip.");
+            say!("  ACCEPTED + read-back VERIFIED on the shared 0x0B/0x85 getter — hardware round-trip.");
             show(&d);
         }
         (None, Some(_), None) | (None, None, Some(_)) => {
             bail!("an asymmetric split needs BOTH --lift and --landing (e.g. `neuron lod --lift 12 --landing 3`)");
         }
         (None, None, None) => {
-            println!("(pass --lift N --landing M to set a split, or --sym 0|1|2 to set/restore symmetric)");
+            say!("(pass --lift N --landing M to set a split, or --sym 0|1|2 to set/restore symmetric)");
         }
+    }
+    if out::json() {
+        out::print_json(&serde_json::json!({ "lod": state(&d), "verified": sym.is_some() || lift.is_some() }));
     }
     Ok(())
 }
 
 /// Select the active `HyperScroll` wheel stage via the wire-confirmed `set_scroll_stage` write
-/// (class 0x15/0x00). With no value, explains there's no read getter for the active stage.
+/// (class 0x15/0x00). With no value, reads the active stage and enabled count (0x15/0x80, 0x15/0x81).
 fn scroll_cmd(reg: &Registry, stage: Option<u8>, volatile: bool) -> Result<()> {
     let d = open_with_command(reg, "set_scroll_stage")?;
     match stage {
         None => {
-            println!(
-                "scroll stage select: pass a 1-based stage to set it (e.g. `neuron scroll 2`)."
-            );
-            println!("  (the device exposes no getter for the active scroll stage — set-only.)");
+            let store = cap::Store::Volatile;
+            let stage = writes::scroll_stage(&d, store)?;
+            let count = writes::scroll_stage_count(&d, store)?;
+            return out::emit(&serde_json::json!({ "stage": stage, "count": count }), || {
+                println!("scroll stage {stage} of {count} enabled");
+                println!("  (pass a 1-based stage to select it, e.g. `neuron scroll 2`.)");
+            });
         }
         Some(s) => {
             // stages are 1-based; reject 0 before writing a no-op the device silently ignores.
@@ -3014,7 +2773,7 @@ fn scroll_cmd(reg: &Registry, stage: Option<u8>, volatile: bool) -> Result<()> {
             } else {
                 cap::Store::Persist
             };
-            println!(
+            say!(
                 "selecting scroll stage {s} ({})...",
                 if volatile {
                     "volatile"
@@ -3028,9 +2787,54 @@ fn scroll_cmd(reg: &Registry, stage: Option<u8>, volatile: bool) -> Result<()> {
             let res = writes::set_scroll_stage(&d, s, store);
             restore_custody_if_visitor(&d, prior);
             res?;
-            println!("  done — scroll stage {s} active.");
+            say!("  done — scroll stage {s} active.");
+            if out::json() {
+                out::print_json(&serde_json::json!({ "stage": s, "persisted": !volatile }));
+            }
         }
     }
+    Ok(())
+}
+
+/// Drive every pad's motors: one setting for `ms`, or a tour of each motor at three strengths.
+fn rumble_cmd(r: neuron::haptics::Rumble, ms: u64, tour: bool) -> Result<()> {
+    use neuron::haptics::Rumble;
+    neuron::pad::start_platform_sources();
+    // Pads publish their sticks from the first report; give sources a moment to see them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut pads = Vec::new();
+    while pads.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        pads = neuron::haptics::devices();
+    }
+    if pads.is_empty() {
+        bail!("no pad with motors found");
+    }
+    let steps: Vec<(Rumble, u64)> = if tour {
+        let motor = |i: usize, v: f32| {
+            let mut m = [0.0f32; 4];
+            m[i] = v;
+            Rumble { low: m[0], high: m[1], left_trigger: m[2], right_trigger: m[3] }
+        };
+        let mut s = Vec::new();
+        for (i, name) in ["low", "high", "left trigger", "right trigger"].iter().enumerate() {
+            println!("  {name}: 25% → 50% → 100%");
+            for v in [0.25, 0.5, 1.0] {
+                s.push((motor(i, v), 450));
+                s.push((Rumble::OFF, 150));
+            }
+            s.push((Rumble::OFF, 500));
+        }
+        s
+    } else {
+        vec![(r, ms)]
+    };
+    let total: u64 = steps.iter().map(|(_, ms)| ms).sum();
+    for p in &pads {
+        println!("rumble {p}");
+        neuron::haptics::play(p, steps.clone());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(total + 200));
     Ok(())
 }
 
@@ -3081,11 +2885,11 @@ fn probe_cmd(pid: &str, class: Option<&str>, id: Option<&str>, scan: bool) -> Re
         };
         match explicit {
             Some((c, i)) => {
+                // An explicit getter prints whatever answered: an all-zero reply is a real value
+                // (device mode 0x00 = normal), only the sweep below drops empties as noise.
                 if let Some(a) = discover::exec(&*t, tid, c, i, 0x20, &[]) {
-                    if discover::classify(&a) != "empty" {
-                        dump(info.usage_page, info.usage, c, i, &a);
-                        any = true;
-                    }
+                    dump(info.usage_page, info.usage, c, i, &a);
+                    any = true;
                 }
             }
             None => {
@@ -3108,43 +2912,6 @@ fn probe_cmd(pid: &str, class: Option<&str>, id: Option<&str>, scan: bool) -> Re
                 println!("  {c:02X}/{i:02X} gave no valid reply (unsupported, unavailable, or busy)");
             }
             None => println!("  (no getters responded)"),
-        }
-    }
-    Ok(())
-}
-
-fn bind_cmd(action: BindCmd) -> Result<()> {
-    match action {
-        BindCmd::List => {
-            let b = Bindings::load();
-            let custom = Bindings::path().exists();
-            println!(
-                "bindings ({}):",
-                if custom {
-                    "from bindings.toml"
-                } else {
-                    "built-in defaults"
-                }
-            );
-            if b.bindings.is_empty() {
-                println!("  (none)");
-            }
-            for bind in &b.bindings {
-                if !bind.desc.is_empty() {
-                    println!("  # {}", bind.desc);
-                }
-                println!("  {}", bind.summary());
-            }
-        }
-        BindCmd::Init { force } => {
-            if Bindings::path().exists() && !force {
-                bail!("bindings.toml already exists (use --force to overwrite)");
-            }
-            neuron::salvage::atomic_write(&Bindings::path(), neuron::bindings::TEMPLATE_TOML.as_bytes())?;
-            println!(
-                "wrote {} — edit it to customize.",
-                Bindings::path().display()
-            );
         }
     }
     Ok(())
@@ -3350,6 +3117,8 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
     // control dispatches, not just the first hit) and (b) precise HyperShift release (only the
     // input that actually went up releases ITS layer — no blanket release_all on any empty report).
     let edges = RefCell::new(HoldEdges::new());
+    // Pads that only a platform API delivers (GameInput) feed the same pump.
+    neuron::pad::start_platform_sources();
 
     neuron::controls::listen(
         seconds,
@@ -3689,11 +3458,11 @@ fn audio_out(
 
 /// Device writes only take in DRIVER mode (Razer gates host control behind it). Ensure it —
 /// reversible, idempotent, no-op if already there. Delegates to the canonical
-/// [`neuron::writes::ensure_driver`] (one driver-mode sequence, no CLI-local copy of the magic
+/// [`neuron::writes::ensure_custody`] (one driver-mode sequence, no CLI-local copy of the magic
 /// bytes that could drift from core). RETURNS the PRIOR mode byte so a one-shot command can hand
 /// custody back on the way out (see [`restore_custody_if_visitor`]) — a CLI is a VISITOR.
-fn ensure_driver(d: &Device) -> u8 {
-    neuron::writes::ensure_driver(d)
+fn ensure_custody(d: &Device) -> u8 {
+    neuron::writes::ensure_custody(d)
 }
 
 /// The device-mode byte for DRIVER (host-control) custody. Kept here only so the visitor-restore
@@ -3709,7 +3478,7 @@ const DRIVER_MODE: u8 = 0x03;
 /// out (success OR error), restores it. EXCEPTION: when the prior mode was ALREADY driver (0x03) some
 /// resident holds the lease (the app) — a visitor must NOT yank it, so we leave it exactly as found.
 /// (Callers that read the prior via [`writes::device_mode`] pass its `unwrap_or(0)` — an unanswered
-/// getter reads as non-driver, matching `ensure_driver`'s own "flip when unsure" assumption, so we
+/// getter reads as non-driver, matching `ensure_custody`'s own "flip when unsure" assumption, so we
 /// restore in that case too.)
 fn restore_custody_if_visitor(d: &Device, prior: u8) {
     if prior != DRIVER_MODE {
@@ -3773,7 +3542,7 @@ fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
     if let Some(v) = value {
         // VISITOR discipline: capture the mode we found, write, then restore it whatever happens —
         // the whole reason `dpi_trap` looped was this verb leaving the driver lease held on exit.
-        let prior = ensure_driver(&d);
+        let prior = ensure_custody(&d);
         let res = cap::set_dpi(&d, v, v, cap::Store::Persist, neuron::dpi_origin::Cause::UserApplied);
         // volatile too — a Persist write lands onboard; the LIVE plane must match right now
         // (dual-plane discipline, same as the app's apply_dpi).
@@ -3793,41 +3562,32 @@ fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
     }
     // Read-back runs AFTER the restore — getters are mode-independent, so verified/MISMATCH still holds.
     let (x, y) = cap::dpi(&d)?;
-    match value {
-        Some(v) => println!(
+    let verified = value.map(|v| x == v && y == v);
+    out::emit(&serde_json::json!({ "x": x, "y": y, "requested": value, "verified": verified }), || match value {
+        Some(_) => println!(
             "DPI -> {x} x {y}  [{}]",
-            if x == v && y == v {
-                "verified"
-            } else {
-                "MISMATCH"
-            }
+            if verified == Some(true) { "verified" } else { "MISMATCH" }
         ),
         None => println!("DPI: {x} x {y}"),
-    }
-    Ok(())
+    })
 }
 
 fn polling_cmd(reg: &Registry, hz: Option<u32>) -> Result<()> {
     let d = open_with_command(reg, "polling_rate")?;
     if let Some(h) = hz {
         // VISITOR discipline: restore the found custody state on exit (success or error).
-        let prior = ensure_driver(&d);
+        let prior = ensure_custody(&d);
         let res = cap::set_polling_hz(&d, h);
         restore_custody_if_visitor(&d, prior);
         let target = res?;
         let got = cap::polling_rate_hz(&d)?;
-        println!(
-            "polling -> {got} Hz  [{}]",
-            if got == target {
-                "verified"
-            } else {
-                "MISMATCH"
-            }
-        );
+        out::emit(&serde_json::json!({ "hz": got, "requested": target, "verified": got == target }), || {
+            println!("polling -> {got} Hz  [{}]", if got == target { "verified" } else { "MISMATCH" });
+        })
     } else {
-        println!("polling: {} Hz", cap::polling_rate_hz(&d)?);
+        let hz = cap::polling_rate_hz(&d)?;
+        out::emit(&serde_json::json!({ "hz": hz }), || println!("polling: {hz} Hz"))
     }
-    Ok(())
 }
 
 fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
@@ -3850,26 +3610,17 @@ fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
         // lighting writes need driver mode; ensure it (reversible) via the canonical core helper.
         // VISITOR discipline: capture the prior mode and restore it on exit — don't leave the driver
         // lease held from a one-shot command (the `dpi_trap` self-poisoning class of bug).
-        let prior = neuron::writes::ensure_driver(&d);
+        let prior = neuron::writes::ensure_custody(&d);
         let res = cap::set_brightness(&d, p, cap::Store::Persist);
         restore_custody_if_visitor(&d, prior);
         res?;
     }
-    match pct {
-        Some(p) => {
-            let got = cap::brightness_percent(&d)?;
-            println!(
-                "brightness -> {got}%  [{}]",
-                if got.abs_diff(p) <= 1 {
-                    "verified"
-                } else {
-                    "MISMATCH"
-                }
-            );
-        }
-        None => println!("brightness: {}%", cap::brightness_percent(&d)?),
-    }
-    Ok(())
+    let got = cap::brightness_percent(&d)?;
+    let verified = pct.map(|p| got.abs_diff(p) <= 1);
+    out::emit(&serde_json::json!({ "percent": got, "requested": pct, "verified": verified }), || match pct {
+        Some(_) => println!("brightness -> {got}%  [{}]", if verified == Some(true) { "verified" } else { "MISMATCH" }),
+        None => println!("brightness: {got}%"),
+    })
 }
 
 /// Keyboard FIRMWARE game mode — the FN+F10 Win-key kill (`GAME_LED` state). No arg reads it; `on`/
@@ -3911,12 +3662,14 @@ fn gamemode_cmd(reg: &Registry, state: Option<&str>) -> Result<()> {
     }
     // Report the verified state (a re-read: after a set it confirms the write, else it's the plain
     // readout). ON means the board is eating the Win key in firmware, right now.
-    if cap::game_mode(&d)? {
-        println!("game mode: ON — the keyboard is eating the Win key in firmware");
-    } else {
-        println!("game mode: off");
-    }
-    Ok(())
+    let on = cap::game_mode(&d)?;
+    out::emit(&serde_json::json!({ "game_mode": on, "requested": want, "verified": want.map(|w| w == on) }), || {
+        if on {
+            println!("game mode: ON — the keyboard is eating the Win key in firmware");
+        } else {
+            println!("game mode: off");
+        }
+    })
 }
 
 #[cfg(windows)]
@@ -3927,156 +3680,6 @@ fn key_down(vk: i32) -> bool {
 #[cfg(not(windows))]
 fn key_down(_vk: i32) -> bool {
     false
-}
-
-// ── SNIPER binding — a held Action on the shared rule spine (profiles/gui.rules.toml) ─────────
-// Sniper is `Trigger::Input -> Action::Sniper { dpi }` in the SAME rule store the GUI authors and
-// the resident app dispatches. This command just authors that one rule; the app enforces the hold
-// (its immortal listener owns the DPI drop/restore, like every other bind). No `sniper.toml`, no
-// standalone GetAsyncKeyState loop — one config, one dispatcher, CLI and GUI can't drift.
-
-#[cfg(windows)]
-fn gui_rules_path() -> std::path::PathBuf {
-    neuron::profile::profiles_dir().join("gui.rules.toml")
-}
-
-#[cfg(windows)]
-fn load_gui_rules() -> Vec<neuron::engine::Rule> {
-    std::fs::read_to_string(gui_rules_path())
-        .ok()
-        .and_then(|s| toml::from_str::<neuron::engine::RuleDoc>(&s).ok())
-        .map(|d| d.rules)
-        .unwrap_or_default()
-}
-
-#[cfg(windows)]
-fn save_gui_rules(rules: Vec<neuron::engine::Rule>) -> Result<()> {
-    std::fs::create_dir_all(neuron::profile::profiles_dir())?;
-    let doc = neuron::engine::RuleDoc { rules };
-    let body = toml::to_string_pretty(&doc)?;
-    neuron::salvage::atomic_write(&gui_rules_path(), body.as_bytes())?;
-    Ok(())
-}
-
-/// Headless press-to-bind: listen for the first HID control (any key / button / knob) and return its
-/// `(page, usage, pid)` — the native `Trigger::Input` form the GUI captures too. ESC or a 30 s
-/// timeout cancels. Skips left-mouse so a stray click can't self-bind.
-#[cfg(windows)]
-fn capture_sniper_control() -> Option<(u16, u16, Option<neuron::registry::CanonicalPid>)> {
-    use std::cell::Cell;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
-    // TWIN-EVENT PREFERENCE, mirroring the GUI capture: a side-plate press can emit BOTH its
-    // keyboard usage and a receiver-echoed macro-page code; park the macro hit briefly and
-    // prefer the same-device keyboard identity if it follows.
-    const TWIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
-    let stop = AtomicBool::new(false);
-    let found: Cell<Option<(u16, u16, Option<neuron::registry::CanonicalPid>)>> = Cell::new(None);
-    let parked: Cell<Option<(u16, u16, Option<neuron::registry::CanonicalPid>, Instant)>> =
-        Cell::new(None);
-    neuron::controls::listen_until(
-        Some(30),
-        &stop,
-        true, // interactive: ESC cancels
-        |ev| {
-            if let Some(&(page, usage)) = ev.hits.first() {
-                if (page, usage) == (0x09, 1) {
-                    return; // left mouse operates the terminal, not a bindable control
-                }
-                // Device-scoped, macro page included. Nothing to unpack: the deferred-button
-                // stream is its own field on the event now, so `ev.pid` is already the canonical
-                // device whichever stream carried the press.
-                let pid = ev.pid;
-                match parked.get() {
-                    None if page == neuron::controls::RAZER_MACRO_PAGE => {
-                        parked.set(Some((page, usage, pid, Instant::now())));
-                    }
-                    Some((pp, pu, ppid, at)) => {
-                        if at.elapsed() >= TWIN_SETTLE {
-                            found.set(Some((pp, pu, ppid))); // the macro press WAS the bind
-                            stop.store(true, Ordering::Relaxed);
-                        } else if page != neuron::controls::RAZER_MACRO_PAGE && pid == ppid {
-                            found.set(Some((page, usage, pid))); // the keyboard twin wins
-                            stop.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    None => {
-                        found.set(Some((page, usage, pid)));
-                        stop.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
-        },
-        // on_tick: commit a parked macro candidate once its settle window closes with no twin.
-        || {
-            if let Some((pp, pu, ppid, at)) = parked.get() {
-                if at.elapsed() >= TWIN_SETTLE {
-                    found.set(Some((pp, pu, ppid)));
-                    stop.store(true, Ordering::Relaxed);
-                }
-            }
-            std::time::Duration::from_millis(5)
-        },
-    );
-    found.get()
-}
-
-/// Sniper / on-the-fly DPI: author the held `Action::Sniper` rule (hold a control -> precision DPI,
-/// release -> restore). `--bind` — or a first run with nothing bound yet — captures the hold control
-/// by PRESSING it; `--dpi` sets the precision DPI. The bind lives in `profiles/gui.rules.toml` (the
-/// same store the GUI edits) and the resident neuron app enforces the hold. Nothing hardcoded.
-#[cfg(windows)]
-fn sniper_cmd(rebind: bool, dpi_override: Option<u16>) -> Result<()> {
-    use neuron::action::Action;
-    use neuron::engine::{Rule, Trigger};
-
-    let mut rules = load_gui_rules();
-    let existing = rules
-        .iter()
-        .position(|r| matches!(r.action, Action::Sniper { .. }));
-    let mut dpi = existing
-        .and_then(|i| match rules[i].action {
-            Action::Sniper { dpi } => Some(dpi),
-            _ => None,
-        })
-        .filter(|d| *d != 0)
-        .unwrap_or(400);
-    if let Some(d) = dpi_override {
-        if d != 0 {
-            dpi = d;
-        }
-    }
-
-    if let Some(i) = existing.filter(|_| !rebind) {
-        rules[i].action = Action::Sniper { dpi };
-        let label = match &rules[i].trigger {
-            Trigger::Input { page, usage, .. } => neuron::controls::control_label(*page, *usage),
-            other => other.describe(),
-        };
-        save_gui_rules(rules)?;
-        println!("sniper: hold {label} -> {dpi} DPI.");
-    } else {
-        println!("Press the control you want as your sniper hold button (ESC to cancel)...");
-        let Some((page, usage, pid)) = capture_sniper_control() else {
-            bail!("cancelled — sniper unchanged");
-        };
-        let label = neuron::controls::control_label(page, usage);
-        // keep it to exactly ONE sniper rule — a re-bind MOVES the button, never stacks a second.
-        rules.retain(|r| !matches!(r.action, Action::Sniper { .. }));
-        rules.push(Rule::new(Trigger::Input { page, usage, pid }, Action::Sniper { dpi }));
-        save_gui_rules(rules)?;
-        println!("sniper armed: hold {label} -> {dpi} DPI.");
-    }
-    println!("The neuron app enforces this hold while it runs (the resident dispatcher).");
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn sniper_cmd(_rebind: bool, _dpi_override: Option<u16>) -> Result<()> {
-    anyhow::bail!(
-        "sniper is Windows-only for now: it needs control capture to learn your button, and a \
-         running neuron to hold the DPI while you press it. Neither exists on this platform yet."
-    );
 }
 
 fn storage_status(reg: &Registry, raw: bool) -> Result<()> {
@@ -4136,24 +3739,6 @@ fn hex_dump(a: &[u8; 80], n: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn gesture_cmd(action: GestureCmd) -> Result<()> {
-    match action {
-        GestureCmd::Selftest => gesture_selftest()?,
-        GestureCmd::Record { name, trigger } => gesture_record(&name, trigger)?,
-        GestureCmd::Match { trigger } => gesture_match(trigger)?,
-        GestureCmd::List => gesture_list(),
-        GestureCmd::Tune {
-            damping,
-            curve,
-            resid,
-            threshold,
-            resample,
-            invariant,
-        } => gesture_tune(damping, curve, resid, threshold, resample, invariant)?,
-    }
-    Ok(())
 }
 
 fn report_fit(label: &str, f: &glyph::GlyphFit, expect: Option<(f64, f64)>) {
@@ -4239,10 +3824,10 @@ fn gesture_selftest() -> Result<()> {
     Ok(())
 }
 
-fn gesture_record(name: &str, trigger: i32) -> Result<()> {
+fn gesture_record(name: &str, trigger: neuron::controls::ControlRef) -> Result<()> {
     let mut vault = Vault::load();
-    println!("Recording '{name}'. HOLD trigger 0x{trigger:02X}, draw, release (ESC aborts)...");
-    let stroke = glyph::capture_held(neuron::controls::ControlRef::from_vk(trigger), 8192);
+    println!("Recording '{name}'. HOLD {}, draw, release (ESC aborts)...", trigger.label());
+    let stroke = glyph::capture_held(trigger, 8192);
     if stroke.len() < 8 {
         bail!("not enough motion captured ({} pts)", stroke.len());
     }
@@ -4264,14 +3849,14 @@ fn gesture_record(name: &str, trigger: i32) -> Result<()> {
     Ok(())
 }
 
-fn gesture_match(trigger: i32) -> Result<()> {
+fn gesture_match(trigger: neuron::controls::ControlRef) -> Result<()> {
     let vault = Vault::load();
     if vault.templates.is_empty() {
         println!("vault is empty — record gestures first: neuron gesture record <name>");
         return Ok(());
     }
-    println!("HOLD trigger 0x{trigger:02X}, draw, release...");
-    let stroke = glyph::capture_held(neuron::controls::ControlRef::from_vk(trigger), 8192);
+    println!("HOLD {}, draw, release...", trigger.label());
+    let stroke = glyph::capture_held(trigger, 8192);
     if stroke.len() < 8 {
         bail!("not enough motion captured ({} pts)", stroke.len());
     }
@@ -4289,29 +3874,6 @@ fn gesture_match(trigger: i32) -> Result<()> {
         ),
     }
     Ok(())
-}
-
-fn gesture_list() {
-    let v = Vault::load();
-    let c = v.config;
-    println!(
-        "attunement: w_damping={} w_curve={} w_resid={} w_invariant={} threshold={} resample={}",
-        c.w_damping, c.w_curve, c.w_resid, c.w_invariant, c.threshold, c.resample
-    );
-    if v.templates.is_empty() {
-        println!("(no gestures recorded)");
-        return;
-    }
-    for t in &v.templates {
-        println!(
-            "  {:<16} {} blocks  winding {:+.2} bending {:.2} closure {:.2}",
-            t.name,
-            t.word.sigs.len(),
-            t.word.inv.winding,
-            t.word.inv.bending,
-            t.word.inv.closure
-        );
-    }
 }
 
 fn gesture_tune(
@@ -4351,36 +3913,52 @@ fn gesture_tune(
     Ok(())
 }
 
-fn list(reg: &Registry) -> Result<()> {
-    // list ENUMERATES the bus, so it must SEE brand-new hardware. If any unknown Razer razer_report
-    // pipe is present, adopt once and list against the fresh registry. unknown_present is a single
-    // HID enumeration (no per-device probes) — cheap enough for list's "show me what's here"
-    // semantics, unlike the resolution helpers that only adopt on an actual miss. The recursion
-    // terminates: once adopted the pid is known (unknown_present drains), and adopt_and_reload is
-    // once-per-process anyway.
-    if !neuron::synth::unknown_present(reg).is_empty() {
-        if let Some(reg2) = adopt_and_reload() {
-            return list(&reg2);
-        }
+/// Connected devices no registry def covers yet: `(pid, name)`. Reads report these and leave the
+/// learning to `neuron adopt`, so a read verb never writes `devices/auto/`.
+fn unknown_devices(reg: &Registry) -> Vec<(u16, String)> {
+    let pids = neuron::synth::unknown_present(reg);
+    if pids.is_empty() {
+        return Vec::new();
     }
+    let infos = transport::enumerate().unwrap_or_default();
+    pids.into_iter()
+        .map(|pid| {
+            let name = infos.iter().find(|i| i.pid == pid && !i.product.is_empty()).map_or_else(|| format!("Razer device {pid:04x}"), |i| i.product.clone());
+            (pid, name)
+        })
+        .collect()
+}
+
+fn list(reg: &Registry) -> Result<()> {
     let infos = transport::enumerate()?;
-    let mut found = false;
+    let mut rows = Vec::new();
     for i in &infos {
         // find_for_pipe: one line per DRIVEN control pipe — on a two-family pid each pipe lists
         // under the family that frames it, rather than both collapsing to find_by_pid's first def.
         if let Some(def) = reg.find_for_pipe(i) {
             let mode = def.mode_for(i.pid).map_or("?", |m| m.name.as_str());
-            println!(
-                "{}  [{}]  pid={:04x}  mode={}",
-                def.name, def.codename, i.pid, mode
-            );
-            found = true;
+            rows.push(serde_json::json!({ "name": def.name, "codename": def.codename, "pid": format!("{:04x}", i.pid), "mode": mode }));
         }
     }
-    if !found {
-        println!("No recognized Razer devices found.");
-    }
-    Ok(())
+    let unknown = unknown_devices(reg);
+    let unknown_json: Vec<_> = unknown.iter().map(|(pid, name)| serde_json::json!({ "name": name, "pid": format!("{pid:04x}") })).collect();
+    out::emit(&serde_json::json!({ "devices": rows, "unknown": unknown_json }), || {
+        if rows.is_empty() {
+            println!("No recognized Razer devices found.");
+        }
+        for (pid, name) in &unknown {
+            println!("new device {name} (pid {pid:04x}): run `neuron adopt` to learn it");
+        }
+        for r in &rows {
+            println!(
+                "{}  [{}]  pid={}  mode={}",
+                r["name"].as_str().unwrap_or(""),
+                r["codename"].as_str().unwrap_or(""),
+                r["pid"].as_str().unwrap_or(""),
+                r["mode"].as_str().unwrap_or("")
+            );
+        }
+    })
 }
 
 fn discover_cmd(emit: bool) {
@@ -4518,55 +4096,88 @@ fn adopt_cmd(reg: &Registry, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn open_first(reg: &Registry) -> Result<Device> {
+/// The device `info` describes: the one `--pid` names, else the first recognized one. Returns the
+/// device with `(its position, how many are connected)`.
+fn open_for_info(reg: &Registry, pid: Option<&str>) -> Result<(Device, usize, usize)> {
+    let want = pid.map(|p| parse_pid(p)).transpose()?;
     let infos = transport::enumerate()?;
+    // one entry per driven control pipe, deduplicated by (pid, family) like `list`
+    let mut found: Vec<(&neuron::transport::HidDeviceInfo, &DeviceDef)> = Vec::new();
     for i in &infos {
-        // find_for_pipe: open the def that DRIVES the first resolvable control pipe (family-aware),
-        // not find_by_pid's first-by-pid def which could be a different family on a shared pid.
         if let Some(def) = reg.find_for_pipe(i) {
-            return Device::open(def.clone(), i.pid);
+            if !found.iter().any(|(j, d)| j.pid == i.pid && d.dialect == def.dialect) {
+                found.push((i, def));
+            }
         }
     }
-    // MISS: the connected hardware may just be unknown to the registry — adopt once and retry
-    // against the fresh registry (the recursion terminates: adopt_and_reload is once-per-process,
-    // so the second miss returns None and we bail for real).
-    if let Some(reg2) = adopt_and_reload() {
-        return open_first(&reg2);
+    if found.is_empty() {
+        let unknown = unknown_devices(reg);
+        if let Some((pid, name)) = unknown.first() {
+            bail!("{name} (pid {pid:04x}) is not known yet: run `neuron adopt` to learn it");
+        }
+        bail!("no recognized Razer device connected");
     }
-    bail!("no recognized Razer device connected")
+    let total = found.len();
+    let idx = match want {
+        Some(w) => found.iter().position(|(i, _)| i.pid == w).ok_or_else(|| anyhow::anyhow!("no connected device has pid {w:04x} (see `neuron list`)"))?,
+        None => 0,
+    };
+    let (i, def) = found[idx];
+    Ok((Device::open(def.clone(), i.pid)?, idx + 1, total))
 }
 
-fn info(d: &Device) {
-    println!("{} [{}]", d.def.name, d.def.codename);
-    println!("  pid:      {:04x}", d.pid);
+/// A device pid typed as hex, with or without `0x`.
+fn parse_pid(s: &str) -> Result<u16> {
+    u16::from_str_radix(s.trim().trim_start_matches("0x"), 16).map_err(|_| anyhow::anyhow!("'{s}' is not a device pid. Use hex, like 00a8 (see `neuron list`)."))
+}
+
+fn info(d: &Device, pos: usize, total: usize) -> Result<()> {
+    let mut v = serde_json::json!({ "name": d.def.name, "codename": d.def.codename, "pid": format!("{:04x}", d.pid) });
+    let mut lines = vec![format!("{} [{}]", d.def.name, d.def.codename), format!("  pid:      {:04x}", d.pid)];
+    if total > 1 {
+        v["device"] = serde_json::json!({ "index": pos, "of": total });
+        lines[0].push_str(&format!("  ({pos} of {total} devices; --pid to pick)"));
+    }
     if let Ok(fw) = cap::firmware(d) {
-        println!("  firmware: v{fw}");
+        v["firmware"] = fw.clone().into();
+        lines.push(format!("  firmware: v{fw}"));
     }
     if let Ok(m) = cap::device_mode(d) {
-        println!("  mode:     0x{m:02x}");
+        v["mode"] = m.into();
+        lines.push(format!("  mode:     0x{m:02x}"));
     }
     if let Ok((x, y)) = cap::dpi(d) {
-        println!("  dpi:      {x} x {y}");
+        v["dpi"] = serde_json::json!({ "x": x, "y": y });
+        lines.push(format!("  dpi:      {x} x {y}"));
     }
     if let Ok(hz) = cap::polling_rate_hz(d) {
-        println!("  polling:  {hz} Hz");
+        v["polling_hz"] = hz.into();
+        lines.push(format!("  polling:  {hz} Hz"));
     }
     if let Ok(br) = cap::brightness_percent(d) {
-        println!("  lighting: {br}% brightness");
+        v["brightness"] = br.into();
+        lines.push(format!("  lighting: {br}% brightness"));
     }
     if let Ok(b) = cap::battery_percent(d) {
         let c = cap::charging(d).unwrap_or(false);
-        println!("  battery:  {b}%{}", if c { " (charging)" } else { "" });
+        v["battery"] = serde_json::json!({ "percent": b, "charging": c });
+        lines.push(format!("  battery:  {b}%{}", if c { " (charging)" } else { "" }));
     }
     if let Ok(s) = cap::storage(d) {
-        println!(
+        v["onboard"] = serde_json::json!({ "percent_free": s.pct_remaining(), "free_kb": s.free_bytes() / 1024, "max_kb": s.max_bytes / 1024, "macro_slots": s.max_macros });
+        lines.push(format!(
             "  onboard:  {}% free ({} KB of {} KB, {} macro slots)",
             s.pct_remaining(),
             s.free_bytes() / 1024,
             s.max_bytes / 1024,
             s.max_macros
-        );
+        ));
     }
+    out::emit(&v, || {
+        for l in &lines {
+            println!("{l}");
+        }
+    })
 }
 
 // ───────────────────────────────────────── tests ──────────────────────────────────────────────
@@ -4587,6 +4198,43 @@ mod tests {
     #[ctor::ctor]
     fn deny_hardware_for_all_tests() {
         std::mem::forget(neuron::transport::deny_hardware());
+    }
+
+    #[test]
+    fn help_is_grouped_one_line_each_and_hides_the_harnesses() {
+        let cmd = Cli::command();
+        let grouped: std::collections::BTreeSet<&str> = HELP_GROUPS.iter().flat_map(|(_, n)| n.iter().copied()).collect();
+        for s in cmd.get_subcommands() {
+            let name = s.get_name();
+            if s.is_hide_set() {
+                assert!(!grouped.contains(name), "{name} is hidden but listed in a help group");
+                continue;
+            }
+            assert!(grouped.contains(name), "{name} is visible but in no help group");
+            let about = s.get_about().map(ToString::to_string).unwrap_or_default();
+            assert!(!about.is_empty() && !about.contains('\n') && about.chars().count() <= 70, "{name}: {about:?}");
+        }
+        for n in &grouped {
+            assert!(cmd.find_subcommand(n).is_some(), "group lists unknown command {n}");
+        }
+        for n in ["prof", "probe", "discover", "dpi", "polling", "dpi-stages", "scroll", "lod", "brightness", "game-mode", "sniper", "idle", "import-export", "remap"] {
+            assert!(cmd.find_subcommand(n).is_some_and(clap::Command::is_hide_set), "{n} should be hidden");
+        }
+    }
+
+    #[test]
+    fn rust_parse_errors_become_plain_words() {
+        assert_eq!(human_usage_line("invalid value 'abc' for '[VALUE]': invalid digit found in string"), "'abc' is not valid for VALUE: expected a whole number.");
+        assert_eq!(human_usage_line("invalid value '99999' for '[VALUE]': 99999 is not in 0..=65535"), "'99999' is not valid for VALUE: must be between 0 and 65535.");
+        assert_eq!(human_usage_line("unrecognized subcommand 'x'"), "unrecognized subcommand 'x'");
+    }
+
+    #[test]
+    fn sniper_takes_trigger_and_still_accepts_bind() {
+        for flag in ["--trigger", "--bind"] {
+            let c = Cli::try_parse_from(["neuron", "sniper", flag, "mouse:5", "--dpi", "400"]).unwrap();
+            assert!(matches!(c.cmd, Cmd::Sniper(_)));
+        }
     }
 
     // Convenience: parse an argv (with the leading "neuron") into a `Cmd`, panicking on a clap error

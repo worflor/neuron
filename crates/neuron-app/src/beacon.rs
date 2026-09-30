@@ -380,6 +380,7 @@ fn live_weave(
     }
     let gen = crate::dispatch::reload_generation();
     let cast = neuron::cast::CastConfig::load();
+    neuron::knob::set_intensity(cast.haptics);
     let vault = neuron::gesture::Vault::load();
     let feel = neuron::feel::FeelConfig::load();
 
@@ -460,6 +461,14 @@ fn live_weave(
         },
     };
     let active = std::cell::Cell::new(u32::MAX);
+    // A gamepad stick aiming the radial while the weave trigger is held (see `radial::StickAim`).
+    let stick_aim = std::cell::RefCell::new(neuron::radial::StickAim::default());
+    let stick_epoch = std::time::Instant::now();
+    // How many options each wedge fans into, so the knob can mark the second tier's rim.
+    let fan_counts: Vec<usize> = match &weave_mode {
+        crate::overlay::WeaveMode::Radial { fans, .. } => fans.iter().map(Vec::len).collect(),
+        _ => Vec::new(),
+    };
     // a "fire via the spine" rhythm landed (capture id >= 100): carries the tap count so, after
     // the capture ends WITHOUT a drawing session, we inject `Trigger::Cast { taps }` and the live
     // Engine resolves it to the bound action — the proof that a rhythm is a first-class trigger.
@@ -663,6 +672,20 @@ fn live_weave(
                         overlay,
                         weak,
                     );
+                }
+            }
+        }
+        // ── THE STICK: while the weave is held, a pushed gamepad stick aims the wheel. The cancel
+        // predicate ticks every few ms whether or not the mouse moves, so a stick-only user aims
+        // here; the overlay just draws the stroke it is given. ──
+        if active.get() == 0 && matches!(weave_mode, crate::overlay::WeaveMode::Radial { .. }) {
+            if let Some((device, x, y)) = neuron::analog::strongest_stick_on(cast.trigger.pid) {
+                // The wheel as a knob under the stick, felt on the pad (see `neuron::knob`).
+                neuron::knob::aim(&device, x, y, cast.sectors, &fan_counts);
+                if let Some((ax, ay)) = stick_aim.borrow_mut().observe(x, y, stick_epoch.elapsed().as_secs_f64()) {
+                    let r = neuron::radial::StickAim::REACH;
+                    weave_aim.set((ax * r, ay * r));
+                    overlay.push(vec![(0.0, 0.0), ((ax * r) as f32, (ay * r) as f32)]);
                 }
             }
         }
@@ -966,11 +989,24 @@ fn live_weave(
             return;
         }
         // cancelled (beacon/editor/reload) or ESC — never spin hot.
+        neuron::knob::cancel();
         if active.get() != u32::MAX {
             overlay.end();
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
         return;
+    };
+    // A stick that committed to a direction is the stroke: it resolves through the same fan and
+    // `resolve` path a mouse flick takes (see `radial::StickAim`). A mouse flick past the deadzone
+    // wins unless the stick is still out when the trigger lets go: whichever the hand is on.
+    let (mdx, mdy) = neuron::radial::net_displacement(&path);
+    let mouse_flicked = mdx.hypot(mdy) >= cast.deadzone;
+    let path = match stick_aim.borrow().path(cast.deadzone) {
+        Some(stick) if id == 0 && (stick_aim.borrow().engaged() || !mouse_flicked) => {
+            neuron::knob::fire();
+            stick
+        }
+        _ => path,
     };
 
     match id {
@@ -1937,7 +1973,7 @@ fn present(
     let feel = neuron::feel::FeelConfig::load();
     let phrase = neuron::feel::Phrase::hold(); // answering is always the plain hold — predictable
     let deadzone = cast.deadzone;
-    let trigger_name = cast.trigger.label();
+    let trigger_name = crate::glue::control_text(cast.trigger);
     // built as its two REAL parts — how to engage, then the answer set — separated by a line break, so
     // the wrapper keeps the options together on their own row instead of splitting the list mid-way.
     // (Not a hardcoded row: it's the grammar's actual structure; the wrapper just honours the '\n'.)

@@ -28,6 +28,7 @@ const TAG: &str = "20260610";
 const PYVER: &str = "3.12.13";
 
 fn main() {
+    embed_layouts();
     // build.rs only needs to re-run when itself or the selected target changes; the cache makes the
     // download a one-time cost. (Cargo reruns build scripts when build-dep inputs change anyway.)
     println!("cargo:rerun-if-changed=build.rs");
@@ -539,4 +540,21 @@ mod tests {
         assert!(!should_prune("python/lib/libpython3.12.so.1.0"));
         assert!(!should_prune("python/python.exe"));
     }
+}
+
+/// Every `layouts/*.toml` becomes an embedded layout (`$OUT_DIR/layouts.rs`, a `&[&str]`), so a new
+/// device layout is a new data file and nothing else.
+fn embed_layouts() {
+    let dir = Path::new(&std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR")).join("layouts");
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "toml")).collect())
+        .unwrap_or_default();
+    files.sort();
+    let body: String = files.iter().map(|f| format!("    include_str!({:?}),
+", f.display().to_string())).collect();
+    let out = Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("layouts.rs");
+    std::fs::write(&out, format!("&[
+{body}]
+")).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
 }

@@ -2550,7 +2550,15 @@ fn run_act(
     // ── SENSE: read-back verbs (never gated — reading state has no side effect) ──────────────────
     match verb {
         "active_profile" => return (true, crate::profile::active()),
-        "scroll_stage" => return (true, crate::writes::scroll_stage_cursor().to_string()),
+        "scroll_stage" => {
+            return match open_capable(crate::registry::Capability::SetScrollStage) {
+                Some(d) => match crate::writes::scroll_stage(&d, cap::Store::Volatile) {
+                    Ok(s) => (true, s.to_string()),
+                    Err(e) => (false, format!("scroll stage read failed: {e}")),
+                },
+                None => (false, "no scroll-stage device".into()),
+            }
+        }
         "battery" => {
             return match open_capable(crate::registry::Capability::Battery) {
                 Some(d) => match cap::battery_percent(&d) {
@@ -3155,15 +3163,21 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
-fn validate_macro_id(id: &str) -> Result<(), String> {
+/// A macro name is a file stem: ASCII letters, digits, `_` and `-` only.
+pub fn validate_macro_id(id: &str) -> Result<(), String> {
     if id.is_empty() || sanitize_id(id) != id {
         Err("macro name may contain only ASCII letters, digits, '_' and '-'".into())
+    } else if crate::profile::is_windows_device_name(id) {
+        Err(format!("windows won't let a file be called '{id}'"))
+    } else if id.len() > 120 {
+        Err("that macro name is too long to file".into())
     } else {
         Ok(())
     }
 }
 
-fn write_macro_file(id: &str, source: &str) -> Result<(), String> {
+/// Persist a macro source under its name, atomically (no runtime registration).
+pub fn write_macro_file(id: &str, source: &str) -> Result<(), String> {
     let dir = macros_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     crate::salvage::atomic_write(&macro_path(id), source.as_bytes()).map_err(|e| e.to_string())
@@ -3383,9 +3397,11 @@ fn seed_option_defaults(id: &str, manifest: &Value) {
 /// Scan macros/scripts/*.py into (id, source) pairs (id = file stem).
 #[must_use]
 pub fn scan_macro_dir() -> Vec<(String, String)> {
+    // A failed migration (a file another process holds open mid-rename) is retried on the next
+    // scan; meanwhile an unstamped legacy macro loads under the stricter BOUND default, so the
+    // list never empties on a transient filesystem error.
     if let Err(e) = ensure_macro_policy_migration() {
-        eprintln!("[macro] legacy authority migration failed: {e}");
-        return Vec::new();
+        eprintln!("[macro] legacy authority migration failed (will retry): {e}");
     }
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(macros_dir()) {

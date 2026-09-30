@@ -590,6 +590,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
         // Naga side-plate key bound to the weave) gets its keystroke swallowed device-scoped,
         // so holding it to weave stops typing into the focused app. See `intercept`.
         neuron::intercept::configure_from_engine_with(&rt.engine, Some(rt.cast_trigger));
+        crate::buttonfw::set_rules(rt.engine.to_rules(), Some(rt.cast_trigger));
     }
 
     // ── THE IMMORTAL LISTENER ── this worker is the organ that fires every cast and remap; if it
@@ -668,21 +669,26 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     SNIPER_HELD.store(false, Ordering::Relaxed);
     push_hold_state();
     neuron::intercept::deactivate(); // uninstall the remap-shim hook; the desktop returns to normal
+    crate::buttonfw::stop(); // and every firmware-performed bind returns to its factory key
     drop(ctx); // the hook (among everything else) drops here (uninstalls)
 }
 
 /// The live worker's per-event edge handler — the exact body of `run_worker`'s old `on_event`
 /// closure, verbatim (capture-active check, edge loop, down/up arms, `publish_held`), now callable
 /// one edge at a time so a test can drive it directly instead of only through the immortal loop.
-/// Does the device-side remap shim own this trigger? Only pid-scoped keyboard-page `Input`
-/// triggers can be shim-owned; everything else dispatches through the engine as before.
+/// Is this trigger's bind already performed below the engine: by the device firmware (a button
+/// reassigned to emit the bound key itself) or by the remap shim? Only pid-scoped keyboard-page
+/// `Input` triggers can be; everything else dispatches through the engine as before.
 fn interceptor_owns(t: &Trigger) -> bool {
     match t {
         Trigger::Input {
             page,
             usage,
             pid: Some(pid),
-        } => neuron::intercept::owns(*page, *usage, pid.get()),
+        } => {
+            neuron::buttons::performs(*page, *usage, pid.get())
+                || neuron::intercept::owns(*page, *usage, pid.get())
+        }
         _ => false,
     }
 }
@@ -859,6 +865,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
         {
             let rt = ctx.rt.borrow();
             neuron::intercept::configure_from_engine_with(&rt.engine, Some(rt.cast_trigger));
+            crate::buttonfw::set_rules(rt.engine.to_rules(), Some(rt.cast_trigger));
         }
         ctx.exec.borrow_mut().clear();
         ctx.devices.borrow_mut().clear();
@@ -868,6 +875,16 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         publish_held(&ctx.rt, &ctx.status, &ctx.weak);
+    }
+    // Firmware button functions landed or were lost: the interceptor's private-key claims and its
+    // stand-down on firmware-performed buttons follow the table the devices actually hold.
+    crate::buttonfw::tick();
+    if neuron::buttons::take_drift() {
+        crate::buttonfw::reapply();
+    }
+    if neuron::buttons::take_changed() {
+        let rt = ctx.rt.borrow();
+        neuron::intercept::configure_from_engine_with(&rt.engine, Some(rt.cast_trigger));
     }
     // Injected triggers (the weave watcher's resolved flicks/glyphs) — same Engine,
     // same fire path, so a cast composes with layers/intents/SAFE exactly like hardware.

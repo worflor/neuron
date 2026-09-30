@@ -13,6 +13,7 @@
 
 import { Theme, Signal } from "../theme.slint";
 import { State } from "../state.slint";
+import { BadgeView } from "../models.slint";
 
 // A SIGNAL LAMP — shaped by its signal so it reads without colour: live = solid dot, listening =
 // aperture (ring + pupil), provisional = half dot, consequence = square. Unlit, any signal draws the
@@ -1416,6 +1417,7 @@ export component PanelHead inherits HorizontalLayout {
             }
         }
         if root.caption != "" : Text {
+            min-width: 0px;
             text: root.caption;
             color: Theme.text-faint;
             font-size: Theme.fs-small;
@@ -1428,8 +1430,10 @@ export component PanelHead inherits HorizontalLayout {
     // right-hand signal slot — panels drop their live pill/controls here, vertically CENTRED in the
     // 46px head (an HBox doesn't centre children, so a bare pill/button rode high — the slot centres
     // them for every caller so panels needn't each wrap in a centring layout).
+    // The slot keeps its natural width: a squeezed head elides its caption, never the live pill.
     VerticalLayout {
         alignment: center;
+        min-width: self.preferred-width;
         HorizontalLayout { spacing: 0px; @children }
     }
 }
@@ -2257,6 +2261,135 @@ export component SelectableRow inherits Rectangle {
     }
 }
 
+// A DEVICE EMBLEM — the shape a device wears in its badge (`neuron::badge::Emblem` keys), stroked on a
+// 24-unit grid so it tints with `ink` and stays crisp from 12px up. An unknown key draws nothing.
+export component DeviceEmblem inherits Rectangle {
+    in property <string> kind;
+    in property <color> ink: Theme.text-mid;
+    width: 14px;
+    height: 14px;
+    property <string> shape: root.kind == "mouse" ? "M9 3 H15 Q19 3 19 8 V15 Q19 21 12 21 Q5 21 5 15 V8 Q5 3 9 3 Z M12 3 V9"
+        : root.kind == "keyboard" ? "M2 6 H22 V18 H2 Z M5 9.5 H6.5 M9 9.5 H10.5 M13.5 9.5 H15 M17.5 9.5 H19 M7 14.5 H17"
+        : root.kind == "keypad" ? "M3 3 H8 V8 H3 Z M9.5 3 H14.5 V8 H9.5 Z M16 3 H21 V8 H16 Z M3 9.5 H8 V14.5 H3 Z M9.5 9.5 H14.5 V14.5 H9.5 Z M16 9.5 H21 V14.5 H16 Z M6 17.5 H18 V21 H6 Z"
+        : root.kind == "pad" ? "M7 7 H17 Q21 7 22 12 Q23 18 20 18 Q18 18 16 15 H8 Q6 18 4 18 Q1 18 2 12 Q3 7 7 7 Z M5.5 11 H9.5 M7.5 9 V13 M15.5 10 V10.5 M17.5 12 V12.5"
+        : root.kind == "stick" ? "M10 4 A2 2 0 1 0 14 4 A2 2 0 1 0 10 4 Z M12 6 L13.5 15 M3 15 H21 L19.5 20 H4.5 Z"
+        : root.kind == "headset" ? "M4.5 14 V12 Q4.5 4 12 4 Q19.5 4 19.5 12 V14 M3 13 H6.5 V20 H3 Z M17.5 13 H21 V20 H17.5 Z"
+        : root.kind == "mic" ? "M9 5 Q9 2 12 2 Q15 2 15 5 V11 Q15 14 12 14 Q9 14 9 11 Z M6 10 Q6 17 12 17 Q18 17 18 10 M12 17 V21 M8 21 H16"
+        : root.kind == "dial" ? "M7 13 A5 5 0 1 0 17 13 A5 5 0 1 0 7 13 Z M12 13 L14.5 10.5 M3 13 H4.5 M19.5 13 H21 M5.6 6.6 L6.7 7.7 M18.4 6.6 L17.3 7.7 M12 4 V5.5"
+        : root.kind == "device" ? "M7 7 H17 V17 H7 Z M10 3 V7 M14 3 V7 M10 17 V21 M14 17 V21 M3 10 H7 M3 14 H7 M17 10 H21 M17 14 H21" : "";
+    if root.shape != "" : Path {
+        width: 100%; height: 100%; viewbox-width: 24; viewbox-height: 24;
+        fill: transparent; stroke: root.ink; stroke-width: 1.2px;
+        commands: root.shape;
+    }
+}
+
+// A DEVICE BADGE — which device a control belongs to, as its emblem and name. A click opens the
+// badge in place: pick an emblem, type a local name (the chip previews it as you type; enter or
+// closing keeps it), or go back to what the device says about itself. Every surface that names
+// the device follows.
+export component DeviceBadge inherits VerticalLayout {
+    in property <BadgeView> badge;
+    property <bool> open: false;
+    property <string> typed: name-field.text;
+    property <string> shown: root.open && root.typed != "" ? root.typed : root.open ? root.badge.own : root.badge.name;
+    spacing: 6px;
+    changed badge => {
+        if !name-field.has-focus {
+            name-field.text = root.badge.custom-name ? root.badge.name : "";
+        }
+    }
+    function commit-name() {
+        if root.typed != (root.badge.custom-name ? root.badge.name : "") {
+            State.badge-set(root.badge.pid, root.badge.custom-emblem ? root.badge.emblem : "", root.typed);
+        }
+    }
+    Rectangle {
+        height: 22px;
+        border-radius: Theme.radius-sm;
+        background: (cta.has-hover || root.open) ? Theme.well : transparent;
+        animate background { duration: cta.has-hover ? Theme.hover-in : Theme.hover-out; }
+        HorizontalLayout {
+            padding-left: 4px; padding-right: 6px; spacing: 7px;
+            alignment: start;
+            VerticalLayout { alignment: center; DeviceEmblem { kind: root.badge.emblem; ink: root.open ? Theme.accent : Theme.text-mid; } }
+            Mono {
+                text: root.shown;
+                color: cta.has-hover || root.open ? Theme.text : Theme.text-mid;
+                font-size: Theme.fs-small;
+                overflow: elide;
+            }
+            Mono {
+                text: root.open ? "\u{25b4}" : "\u{25be}";   // ▴ / ▾
+                color: Theme.text-faint;
+                font-size: Theme.fs-small;
+            }
+        }
+        cta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => {
+                if root.open { root.commit-name(); }
+                root.open = !root.open;
+            }
+        }
+    }
+    Rectangle {
+        height: root.open ? drawer.preferred-height : 0px;
+        clip: true;
+        animate height { duration: Theme.settle; easing: ease-out; }
+        drawer := VerticalLayout {
+            y: 0px;
+            height: self.preferred-height;
+            spacing: 8px;
+            padding-left: 4px; padding-bottom: 4px;
+            HorizontalLayout {
+                spacing: 3px;
+                alignment: start;
+                for g in State.emblems : Rectangle {
+                    property <bool> on: root.badge.emblem == g;
+                    width: 26px;
+                    height: 26px;
+                    border-radius: Theme.radius-sm;
+                    background: self.on ? Theme.accent-glow : gta.has-hover ? Theme.well-hi : transparent;
+                    border-width: Theme.hair;
+                    border-color: self.on ? Theme.accent-line : gta.has-hover ? Theme.text-faint : Theme.line;
+                    animate background, border-color { duration: Theme.quick; }
+                    DeviceEmblem {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        kind: g;
+                        ink: parent.on ? Theme.accent : gta.has-hover ? Theme.text : Theme.text-mid;
+                    }
+                    gta := TouchArea {
+                        mouse-cursor: MouseCursor.pointer;
+                        clicked => { State.badge-set(root.badge.pid, g, root.typed); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                name-field := Field {
+                    field-width: 196px;
+                    placeholder: root.badge.own;
+                    text: root.badge.custom-name ? root.badge.name : "";
+                    accepted(t) => { root.commit-name(); }
+                }
+                if root.badge.custom-emblem || root.badge.custom-name : VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "auto";
+                        clicked => {
+                            name-field.text = "";
+                            State.badge-set(root.badge.pid, "", "");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // A TRIGGER WELL — the press-to-bind status well (the bindings TRIGGER slot, the hypershift REACHED-BY
 // slot, the cast TRIGGER slot: three hand-rolled copies). A row-h well with a hair frame that lights to
 // accent-line once a trigger is `live`, holding an elided mono value (the bound trigger) or a dim
@@ -2271,6 +2404,7 @@ export component TriggerWell inherits Rectangle {
     in property <bool> lamp: false;    // wear a leading lamp dot (the hypershift / cast wells)
     in property <bool> clickable: false;
     in property <string> hint: "";     // a trailing tracked-out hint when live + clickable (e.g. "REBIND")
+    in property <string> emblem: "";   // the bound control's device emblem; "" = none drawn
     callback clicked();
     height: Theme.row-h;
     border-radius: Theme.radius-sm;
@@ -2283,6 +2417,10 @@ export component TriggerWell inherits Rectangle {
         padding-left: 11px; padding-right: 10px; spacing: 9px;
         // the lamp — accent when bound, a dim line gutter when empty (the hypershift/cast idiom).
         if root.lamp : Lamp { lit: root.live; }
+        if root.live && root.emblem != "" : VerticalLayout {
+            alignment: center;
+            DeviceEmblem { kind: root.emblem; ink: Theme.accent; }
+        }
         Text {
             horizontal-stretch: 1;
             text: root.live ? root.text : root.prompt;

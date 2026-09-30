@@ -419,6 +419,8 @@ impl Dialect for HidppDialect {
             side_plates: None,
             // No push-report vocabulary probed this wave — an auto HID++ def carries none.
             events: None,
+            buttons: Vec::new(),
+            custody: crate::registry::Custody::default(),
         };
 
         // Mint through the cross-dialect seam: tx/dims/stream_wait are all Heuristic/None (HID++ has

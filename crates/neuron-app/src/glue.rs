@@ -21,7 +21,7 @@ use crate::mic;
 use crate::migrate;
 use crate::runtime::AppRuntime;
 use crate::ui::{
-    AppRuleRow, AppWindow, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, DeviceRow, DiagRow, EffectParam,
+    AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, DeviceRow, DiagRow, EffectParam,
     EffectRow, EffectTile, GlyphChip, ImportLine, KnobRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
     PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame,
     SpectrumStop,
@@ -278,7 +278,8 @@ pub fn reconcile_setup() {
     }));
     // CHUNK D — the HyperScroll active-stage editor showed a hardcoded "tactile/free" literal
     // forever (ui/state.slint): nothing persists a chosen scroll-stage/table anywhere (no Profile
-    // field, no Prefs field, no device getter — writes.rs's scroll-stage commands are SET-ONLY), so
+    // field, no Prefs field, and the device's 0x15/0x80 getter reads only the ACTIVE stage, not the
+    // mode table this editor edits), so
     // there is no honest value to assert. `Truth::Unknown` is the truthful answer; deps `&[]` because
     // no readiness would ever change that answer.
     crate::reconcile::register(ReconcileUnit::new("scroll_stage", &[], || {
@@ -1420,6 +1421,26 @@ pub fn install(app: &AppWindow) -> SharedRt {
             );
         });
     }
+    // Badges learned in the background (a device's own name and kind) land here: redraw when any
+    // badge changes. Idle cost is one atomic load a second.
+    {
+        let w = app.as_weak();
+        let sh = shared.clone();
+        let seen = Cell::new(neuron::badge::generation());
+        BADGE_TIMER.with(|t| {
+            t.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(1), move || {
+                let now = neuron::badge::generation();
+                if seen.replace(now) != now {
+                    if let Some(app) = w.upgrade() {
+                        refresh_badges(&app, &sh);
+                    }
+                }
+            });
+        });
+    }
+    st.set_emblems(ModelRc::new(VecModel::from(
+        neuron::badge::Emblem::ALL.iter().map(|e| SharedString::from(e.key())).collect::<Vec<_>>(),
+    )));
     refresh_rules(app, &shared);
     refresh_pockets(app);
     // a truly-fresh install gets the bundled exemplar macro before the registry first reads disk.
@@ -1452,7 +1473,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
     mic::refresh_output(app);
     st.set_brush_color(rgb_to_color(brush(app)));
     // the cast hold-trigger label comes from cast.toml — never a hardcoded button name.
-    st.set_cast_trigger_label(shared.borrow().rt.cast.trigger.label().into());
+    sync_cast_trigger(&st, shared.borrow().rt.cast.trigger);
     // the activation rhythm + HyperShift stance come from persisted config too.
     sync_activation_view(&st, &shared.borrow().rt.cast.activation);
     {
@@ -2829,7 +2850,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // cast.toml feeds the wheel + trigger label too — one reload, one world.
                 refresh_radial(&app, &sh);
                 let st = app.global::<State>();
-                st.set_cast_trigger_label(sh.borrow().rt.cast.trigger.label().into());
+                sync_cast_trigger(&st, sh.borrow().rt.cast.trigger);
                 sync_activation_view(&st, &sh.borrow().rt.cast.activation);
                 st.set_editing_sector(-1); // drop any in-flight wedge edit targeting the old config
                 // …and any OPEN inline rule editor: a reload rebuilds the rules model from disk and
@@ -2943,6 +2964,63 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    // PAD FEEL: the radial knob's strength, persisted with the cast config it belongs to.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_set_pad_feel(move |pct| {
+            let Some(app) = w.upgrade() else { return };
+            let pct = pct.clamp(0, (neuron::knob::MAX_INTENSITY * 100.0) as i32);
+            let saved = {
+                let mut s = sh.borrow_mut();
+                s.rt.cast.haptics = f64::from(pct) / 100.0;
+                neuron::knob::set_intensity(s.rt.cast.haptics);
+                crate::editor::save_cast(&s.rt.cast)
+            };
+            let st = app.global::<State>();
+            st.set_pad_feel(pct);
+            st.set_status_line(
+                match (saved, pct) {
+                    (Err(e), _) => format!("pad feel not saved: {e}"),
+                    (Ok(()), 0) => "pad feel off".to_string(),
+                    (Ok(()), p) => format!("pad feel {p}%"),
+                }
+                .into(),
+            );
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_feel_pad(move || {
+            let Some(app) = w.upgrade() else { return };
+            let st = app.global::<State>();
+            match neuron::haptics::devices().into_iter().next() {
+                Some(device) => {
+                    neuron::knob::demo(&device);
+                    let who = u16::from_str_radix(&neuron::controls::pid_from_path(&device), 16)
+                        .map_or_else(|_| "the pad".to_string(), |p| neuron::badge::name(neuron::registry::CanonicalPid::of(p)));
+                    st.set_status_line(format!("feel it · {who}").into());
+                }
+                None => st.set_status_line("no pad with motors is connected".into()),
+            }
+        });
+    });
+    // A DEVICE BADGE edit: set (or return to automatic) a device's emblem and name; every surface
+    // that names the device redraws.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_badge_set(move |pid, emblem, name| {
+            let Some(app) = w.upgrade() else { return };
+            let Ok(raw) = u16::from_str_radix(pid.as_str(), 16) else { return };
+            let emblem = neuron::badge::Emblem::parse(emblem.as_str());
+            let name = Some(name.as_str()).filter(|n| !n.trim().is_empty());
+            match neuron::badge::set(neuron::registry::CanonicalPid::of(raw), emblem, name) {
+                Ok(()) => refresh_badges(&app, &sh),
+                Err(e) => app.global::<State>().set_status_line(format!("couldn't save the device badge: {e}").into()),
+            }
+        });
+    });
     // PRESS-TO-BIND a trigger: capture the HID control the user presses (no hardcoded button).
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
@@ -2956,15 +3034,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         // stash the captured (page,usage,pid) for add-binding, show its name.
                         CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = Some(c));
                         // a friendly, layout-independent control name ("F13", "Button 4",
-                        // "Left Ctrl"), device-scoped when the capture carries a pid — the
-                        // label tells the truth about WHICH device's key this bind owns.
-                        let label = neuron::controls::ControlRef {
+                        // "Left Ctrl"); WHICH device's control it is rides beside it as the
+                        // device's badge.
+                        let (label, _, _) = control_badge(neuron::controls::ControlRef {
                             page: c.page,
                             usage: c.usage,
                             pid: c.pid,
-                        }
-                        .label();
+                        });
                         st.set_bind_trigger_label(label.into());
+                        st.set_bind_trigger_badge(badge_view(c.pid));
                         st.set_bind_trigger_ready(true);
                         // DUPLICATE-TRIGGER honesty: if another rule on the SAME target layer
                         // already claims this control, say so. The live executor RESOLVES + RUNS
@@ -3105,10 +3183,12 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                 pid: *pid,
                             });
                         });
-                        neuron::controls::control_label(*page, *usage)
+                        st.set_bind_trigger_badge(badge_view(*pid));
+                        control_badge(neuron::controls::ControlRef { page: *page, usage: *usage, pid: *pid }).0
                     }
                     other => {
                         CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = None);
+                        st.set_bind_trigger_badge(badge_view(None));
                         other.describe()
                     }
                 };
@@ -3176,7 +3256,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         st.set_bind_trigger_label("—".into());
                         st.set_status_line("binding updated — live now".into());
                     }
-                    Err(e) => st.set_status_line(format!("update failed: {e}").into()),
+                    Err(e) => st.set_status_line(format!("binding not updated: {e}").into()),
                 }
             }
         });
@@ -3223,7 +3303,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                             .into(),
                                     );
                                 }
-                                Err(e) => st.set_status_line(format!("failed: {e}").into()),
+                                Err(e) => st.set_status_line(format!("hold key not set: {e}").into()),
                             }
                         }
                         None => st.set_status_line("capture cancelled".into()),
@@ -3248,7 +3328,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         crate::dispatch::request_reload();
                         st.set_status_line("HyperShift hold key cleared".into());
                     }
-                    Err(e) => st.set_status_line(format!("failed: {e}").into()),
+                    Err(e) => st.set_status_line(format!("hold key not cleared: {e}").into()),
                 }
             }
         });
@@ -3284,32 +3364,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let sh = sh.clone();
         app.global::<State>().on_clear_gestures(move || {
             if let Some(app) = w.upgrade() {
-                let (n, err) = {
-                    let mut s = sh.borrow_mut();
-                    s.rt.vault.templates.clear();
-                    // capture the FIRST save error instead of swallowing it — the clear applies live either
-                    // way, but the status line must not claim success on a disk write that failed.
-                    let mut err = s.rt.vault.save().err();
-                    // a cleared vault orphans every glyph→action binding: phantom rules for
-                    // glyphs that can never be recognized again — and a future re-recorded
-                    // "glyph_1" would silently inherit a stale action. Clear them together.
-                    let n = s.rt.cast.gestures.len();
-                    s.rt.cast.gestures.clear();
-                    if let Err(e) = crate::editor::save_cast(&s.rt.cast) {
-                        err.get_or_insert(e);
-                    }
-                    (n, err)
-                };
+                // Templates and their bindings go together (see `authoring::clear_gestures`).
+                let res = neuron::authoring::clear_gestures();
+                reload_glyphs(&sh);
                 refresh_gestures(&app, &sh);
                 refresh_rules(&app, &sh);
                 crate::dispatch::request_reload();
                 let st = app.global::<State>();
                 st.set_gesture_bind_target("".into()); // the bind card can't target a dead glyph
-                match err {
-                    Some(e) => st.set_status_line(format!("gesture vault clear failed: {e}").into()),
-                    None => st.set_status_line(
-                        format!("gesture vault cleared ({n} glyph binding(s) removed)").into(),
-                    ),
+                match res {
+                    Ok(n) => st.set_status_line(format!("gesture vault cleared ({n} glyph(s) and their binds)").into()),
+                    Err(e) => st.set_status_line(format!("gesture vault clear failed: {e}").into()),
                 }
             }
         });
@@ -3320,18 +3385,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let sh = sh.clone();
         app.global::<State>().on_delete_gesture(move |name| {
             if let Some(app) = w.upgrade() {
-                // capture the FIRST save error rather than swallow it — the delete applies live either way,
-                // but the status line must not report success on a disk write that failed.
-                let err = {
-                    let mut s = sh.borrow_mut();
-                    s.rt.vault.templates.retain(|t| t.name != name.as_str());
-                    let mut err = s.rt.vault.save().err();
-                    s.rt.cast.gestures.remove(name.as_str());
-                    if let Err(e) = crate::editor::save_cast(&s.rt.cast) {
-                        err.get_or_insert(e);
-                    }
-                    err
-                };
+                let err = neuron::authoring::delete_gesture(name.as_str()).err();
+                reload_glyphs(&sh);
                 refresh_gestures(&app, &sh);
                 refresh_rules(&app, &sh);
                 crate::dispatch::request_reload();
@@ -3353,45 +3408,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_rename_gesture(move |old, new| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                let new = new.to_string();
-                let new = new.trim();
-                if new.is_empty() {
-                    st.set_status_line("a glyph needs a name".into());
-                    return;
-                }
-                let res: Result<(), String> = {
-                    let mut s = sh.borrow_mut();
-                    if s.rt.vault.templates.iter().any(|t| t.name == new) {
-                        Err(format!("a glyph named '{new}' already exists"))
-                    } else if let Some(t) =
-                        s.rt.vault
-                            .templates
-                            .iter_mut()
-                            .find(|t| t.name == old.as_str())
-                    {
-                        t.name = new.to_string();
-                        // the rename applies live regardless; but fold a failed disk write into `res` so
-                        // the status line reports it instead of falsely claiming the rename was saved.
-                        let mut r = s.rt.vault.save().map_err(|e| format!("rename save failed: {e}"));
-                        if let Some(a) = s.rt.cast.gestures.remove(old.as_str()) {
-                            s.rt.cast.gestures.insert(new.to_string(), a);
-                            if let Err(e) = crate::editor::save_cast(&s.rt.cast) {
-                                if r.is_ok() {
-                                    r = Err(format!("rename save failed: {e}"));
-                                }
-                            }
-                        }
-                        r
-                    } else {
-                        Err(format!("no glyph '{old}'"))
-                    }
-                };
+                let new = new.trim().to_string();
+                let res = neuron::authoring::rename_gesture(old.as_str(), &new);
+                reload_glyphs(&sh);
                 match res {
                     Ok(()) => {
                         refresh_gestures(&app, &sh);
                         refresh_rules(&app, &sh);
                         crate::dispatch::request_reload();
-                        st.set_gesture_bind_target(new.into());
+                        st.set_gesture_bind_target(new.as_str().into());
                         st.set_status_line(format!("renamed '{old}' → '{new}'").into());
                     }
                     Err(e) => st.set_status_line(e.into()),
@@ -3451,7 +3476,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 crate::dispatch::request_reload();
                 let st = app.global::<State>();
                 match saved {
-                    Ok(()) => st.set_status_line(format!("radial -> {n} sectors").into()),
+                    Ok(()) => st.set_status_line(format!("radial → {n} sectors").into()),
                     Err(e) => st.set_status_line(format!("sector count not saved: {e}").into()),
                 }
             }
@@ -3475,7 +3500,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let st = app.global::<State>();
                 let profile_name = name.to_string();
                 let persist = st.get_persist_to_onboard();
-                st.set_status_line(format!("applying '{profile_name}'...").into());
+                st.set_status_line(format!("applying '{profile_name}'…").into());
                 // FREE the device before apply: a live lighting stream holds the keyboard open and
                 // writes it every frame, so apply's own device writes (brightness/DPI/…) fight it —
                 // two writers stall each other and apply blows its deadline. Snapshot the SELECTED
@@ -5614,7 +5639,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         usage: c.usage,
                         pid: c.pid,
                     };
-                    let name = ctl.label();
+                    let name = control_text(ctl);
                     // the trigger applies live regardless; a failed disk write must SAY so, not report ok.
                     let err = {
                         let mut s = sh2.borrow_mut();
@@ -5622,10 +5647,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         crate::editor::save_cast(&s.rt.cast).err()
                     };
                     crate::dispatch::request_reload();
-                    st.set_cast_trigger_label(name.clone().into());
+                    sync_cast_trigger(&st, ctl);
                     match err {
                         Some(e) => st.set_status_line(format!("cast trigger save failed: {e}").into()),
-                        None => st.set_status_line(format!("cast trigger -> {name}").into()),
+                        None => st.set_status_line(format!("cast trigger → {name}").into()),
                     }
                 });
             }
@@ -5809,7 +5834,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             "HyperShift radial off".into()
                         });
                     }
-                    Err(e) => st.set_status_line(format!("save failed: {e}").into()),
+                    Err(e) => st.set_status_line(format!("hypershift radial not saved: {e}").into()),
                 }
             }
         });
@@ -6077,13 +6102,7 @@ fn init_perf_controls(app: &AppWindow) {
             if dpi != 0 {
                 st.set_sniper_dpi(f32::from(dpi));
             }
-            let label = match &trigger {
-                neuron::engine::Trigger::Input { page, usage, .. } => {
-                    neuron::controls::control_label(*page, *usage)
-                }
-                other => other.describe(),
-            };
-            st.set_sniper_button(label.into());
+            st.set_sniper_button(trigger_text(&trigger).into());
         }
         None => st.set_sniper_button("—".into()),
     }
@@ -6668,7 +6687,7 @@ fn install_perf_callbacks(app: &AppWindow, shared: &SharedRt) {
                         0 => 400, // never author a drop-to-0; fall back to a sane precision default
                         d => d,
                     };
-                    let name = neuron::controls::control_label(c.page, c.usage);
+                    let name = trigger_text(&trigger);
                     match crate::editor::set_sniper_button(trigger, dpi) {
                         Ok(()) => {
                             crate::dispatch::request_reload(); // the live worker adopts the sniper rule
@@ -6712,7 +6731,7 @@ fn install_perf_callbacks(app: &AppWindow, shared: &SharedRt) {
                 match crate::editor::set_sniper_dpi(dpi) {
                     Ok(true) => {
                         crate::dispatch::request_reload();
-                        st.set_perf_status(format!("sniper DPI -> {dpi}").into());
+                        st.set_perf_status(format!("sniper DPI → {dpi}").into());
                     }
                     // no button bound yet: the fader value is remembered (state holds it) and will
                     // arm at the precision DPI the moment a hold control is captured.
@@ -7463,7 +7482,7 @@ fn macro_trigger_map(sh: &SharedRt) -> HashMap<String, Vec<String>> {
         if ids.is_empty() {
             continue;
         }
-        let label = r.trigger.describe();
+        let label = trigger_text(&r.trigger);
         for id in ids {
             let entry = map.entry(id).or_default();
             if !entry.contains(&label) {
@@ -7952,30 +7971,130 @@ fn gui_row_index_of(total: i32, editable: i32, row: i32) -> Option<usize> {
     (row >= first_editable).then(|| (row - first_editable) as usize)
 }
 
+/// Re-read the glyph vault and the cast config after a core edit wrote them.
+fn reload_glyphs(sh: &SharedRt) {
+    let mut s = sh.borrow_mut();
+    s.rt.vault = neuron::gesture::Vault::load();
+    s.rt.cast = neuron::cast::CastConfig::load();
+}
+
+/// A device's badge as the view shows it; a device-any control (`None`) is the empty badge.
+fn badge_view(pid: Option<neuron::registry::CanonicalPid>) -> BadgeView {
+    let Some(pid) = pid else { return BadgeView::default() };
+    let b = neuron::badge::of(pid);
+    BadgeView {
+        pid: pid.to_string().into(),
+        emblem: b.emblem.key().into(),
+        name: b.name.into(),
+        own: b.own_name.into(),
+        custom_emblem: b.custom_emblem,
+        custom_name: b.custom_name,
+    }
+}
+
+/// A control as the view names it: its own name (a pointer's buttons by their mouse names), its
+/// device's emblem key and its device's badge name; emblem and name are "" for a device-any control.
+/// The one place the view turns a control into words.
+pub(crate) fn control_badge(c: neuron::controls::ControlRef) -> (String, &'static str, String) {
+    match c.pid {
+        Some(p) => {
+            let b = neuron::badge::of(p);
+            (c.name_as(b.emblem == neuron::badge::Emblem::Mouse), b.emblem.key(), b.name)
+        }
+        None => (c.name(), "", String::new()),
+    }
+}
+
+/// [`control_badge`] as one line: "Pad south · couch pad".
+pub(crate) fn control_text(c: neuron::controls::ControlRef) -> String {
+    match control_badge(c) {
+        (control, _, device) if device.is_empty() => control,
+        (control, _, device) => format!("{control} \u{00b7} {device}"),
+    }
+}
+
+/// A trigger as the view names it: a control by its badge, anything else by its own description.
+pub(crate) fn trigger_text(t: &neuron::engine::Trigger) -> String {
+    match t {
+        neuron::engine::Trigger::Input { page, usage, pid } => control_text(neuron::controls::ControlRef { page: *page, usage: *usage, pid: *pid }),
+        other => other.describe(),
+    }
+}
+
+/// A rule row's trigger jack: the control's own name and its device's emblem and name. Emblem ""
+/// for a trigger that isn't device-scoped, which the row draws as its `describe()` text.
+fn rule_badge(t: &neuron::engine::Trigger) -> (String, String, String) {
+    match t {
+        neuron::engine::Trigger::Input { page, usage, pid: pid @ Some(_) } => {
+            let (control, emblem, device) = control_badge(neuron::controls::ControlRef { page: *page, usage: *usage, pid: *pid });
+            (control, emblem.to_string(), device)
+        }
+        _ => Default::default(),
+    }
+}
+
+/// The cast trigger's well: its name (with its device's) and its device's emblem.
+fn sync_cast_trigger(st: &State, ctl: neuron::controls::ControlRef) {
+    let (_, emblem, _) = control_badge(ctl);
+    st.set_cast_trigger_label(control_text(ctl).into());
+    st.set_cast_trigger_emblem(emblem.into());
+}
+
+/// The pid (hex) a trigger is scoped to; "" when device-any.
+fn trigger_pid(t: &neuron::engine::Trigger) -> String {
+    match t {
+        neuron::engine::Trigger::Input { pid: Some(p), .. } => p.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Redraw every surface that names a device by its badge. Rule rows are updated in place, so an
+/// editor open inside the list (and a badge drawer in it) keeps its state.
+pub fn refresh_badges(app: &AppWindow, sh: &SharedRt) {
+    let st = app.global::<State>();
+    for model in [st.get_rules(), st.get_hypershift_rules()] {
+        for i in 0..model.row_count() {
+            let Some(mut row) = model.row_data(i) else { continue };
+            let Ok(raw) = u16::from_str_radix(row.pid.as_str(), 16) else { continue };
+            let b = neuron::badge::of(neuron::registry::CanonicalPid::of(raw));
+            if row.emblem.as_str() != b.emblem.key() || row.device.as_str() != b.name {
+                row.emblem = b.emblem.key().into();
+                row.device = b.name.into();
+                model.set_row_data(i, row);
+            }
+        }
+    }
+    let hold = crate::editor::load_gui_rules()
+        .into_iter()
+        .find(|r| r.layer.as_deref() == Some("hypershift") && r.action == neuron::action::Action::Noop);
+    if let Some(r) = hold {
+        st.set_hypershift_hold_label(trigger_text(&r.trigger).into());
+    }
+    let pid = CAPTURED_CONTROL.with(|cell| cell.borrow().and_then(|c| c.pid));
+    st.set_bind_trigger_badge(badge_view(pid));
+    sync_cast_trigger(&st, sh.borrow().rt.cast.trigger);
+}
+
 pub fn refresh_rules(app: &AppWindow, sh: &SharedRt) {
     let (base_views, hyper_views) = sh.borrow().rt.rules();
     // toml/cast-sourced rows are read-only provenance; GUI-authored rows (gui.rules.toml) are the
     // removable tail. HyperShift-layered authored rules land in the hyper list (all removable).
-    let mut base: Vec<RuleRow> = base_views
-        .into_iter()
-        .map(|r| RuleRow {
+    let view_row = |r: crate::runtime::RuleView| {
+        let (control, emblem, device) = rule_badge(&r.source);
+        RuleRow {
             trigger: r.trigger.into(),
+            control: control.into(),
+            emblem: emblem.into(),
+            device: device.into(),
+            pid: trigger_pid(&r.source).into(),
             action: r.action.into(),
             layer: r.layer.into(),
             kind: r.kind.into(),
             removable: false,
-        })
-        .collect();
-    let mut hyper: Vec<RuleRow> = hyper_views
-        .into_iter()
-        .map(|r| RuleRow {
-            trigger: r.trigger.into(),
-            action: r.action.into(),
-            layer: r.layer.into(),
-            kind: r.kind.into(),
-            removable: false,
-        })
-        .collect();
+        }
+    };
+    let mut base: Vec<RuleRow> = base_views.into_iter().map(view_row).collect();
+    let mut hyper: Vec<RuleRow> = hyper_views.into_iter().map(view_row).collect();
     let gui = crate::editor::load_gui_rules();
     let mut editable_base = 0i32;
     let mut editable_hyper = 0i32;
@@ -7984,11 +8103,16 @@ pub fn refresh_rules(app: &AppWindow, sh: &SharedRt) {
     let mut hold_label: Option<String> = None;
     for r in &gui {
         if r.layer.as_deref() == Some("hypershift") && r.action == neuron::action::Action::Noop {
-            hold_label = Some(r.trigger.describe());
+            hold_label = Some(trigger_text(&r.trigger));
             continue;
         }
+        let (control, emblem, device) = rule_badge(&r.trigger);
         let row = RuleRow {
             trigger: r.trigger.describe().into(),
+            control: control.into(),
+            emblem: emblem.into(),
+            device: device.into(),
+            pid: trigger_pid(&r.trigger).into(),
             action: r.action.describe().into(),
             layer: if r.layer.is_some() {
                 "hypershift"
@@ -8370,6 +8494,8 @@ pub fn refresh_radial(app: &AppWindow, sh: &SharedRt) {
     let s = sh.borrow();
     let n = s.rt.cast.sectors.max(1);
     let st = app.global::<State>();
+    st.set_pad_feel((s.rt.cast.haptics * 100.0).round() as i32);
+    neuron::knob::set_intensity(s.rt.cast.haptics);
     // the editor authors EITHER the base radial or the HyperShift one — the flag retargets the view.
     let hyper = st.get_radial_edit_hyper();
     let set = if hyper {
@@ -8444,6 +8570,8 @@ thread_local! {
     /// ~a minute of waking with no user action. Idles as a per-second in-memory flag check when
     /// nothing is being adopted and no retry is due.
     static ADOPT_WATCH_TIMER: slint::Timer = slint::Timer::default();
+    /// Redraws device badges when one changes (see `neuron::badge::generation`).
+    static BADGE_TIMER: slint::Timer = slint::Timer::default();
     /// Debounce timer for the lighting-state disk write (UI-thread). Restarted on each change so a
     /// rapid gesture (dragging the speed slider) coalesces into ONE app.toml write ~400ms after the
     /// last edit, instead of one write per emitted value.
@@ -11249,8 +11377,8 @@ mod reconcile_units_tests {
     #[test]
     fn scroll_stage_truth_is_unknown_nothing_persists_it() {
         // The investigated reality (see `reconcile_setup`'s doc): no Profile field, no Prefs field,
-        // and no device getter (writes.rs's scroll-stage commands are SET-ONLY) ever makes a scroll
-        // stage re-assertable at launch, so the only honest `Truth` is `Unknown` — never the old
+        // and no device getter for the mode TABLE (0x15/0x80 reads only the active stage) ever makes
+        // this editor's value re-assertable at launch, so the only honest `Truth` is `Unknown` — never the old
         // hardcoded "tactile/free".
         assert_eq!(scroll_stage_truth(), crate::reconcile::Truth::Unknown);
     }

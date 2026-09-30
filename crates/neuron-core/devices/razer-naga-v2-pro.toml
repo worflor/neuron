@@ -25,6 +25,12 @@ stream_wait_us = 31000
 # it must sit ABOVE the [[modes]] tables or TOML files it into the last mode.)
 event_alias_pids = [0x0529]
 
+# Kept in NORMAL device mode. Verified 2026-09-30 over the cable (00a7) with the mode read 0x00
+# throughout: DPI writes read back, static and custom-frame lighting land on both zones (0x04
+# logo, 0x05 side), and firmware button functions (02/0C) are live, which they are NOT in driver
+# mode. Normal mode also leaves the DPI/scroll/profile buttons to the firmware.
+custody = "firmware"
+
 # The device changes USB PID per link mode.
 [[modes]]
 name = "wired"
@@ -123,6 +129,34 @@ class = 0x15
 id = 0x00
 size = 0x02
 
+# Active scroll stage READ: args = [varstore]; response [varstore, stage(1-based)]. Verified live
+# 2026-09-29 over the dongle: tracked 2 -> 1 -> 2 across 15/00 writes on the volatile plane.
+[commands.scroll_stage]
+class = 0x15
+id = 0x80
+size = 0x02
+
+# Enabled scroll-stage COUNT: args = [varstore]; response [varstore, count]. Verified live
+# 2026-09-29: reads 2 with two stages enabled, and a 15/00 write of stage 3 is rejected (FAIL).
+[commands.scroll_stage_count]
+class = 0x15
+id = 0x81
+size = 0x02
+
+# Button function SET: args = [profile, button, hypershift, category, len, data x5]; profile 0 is
+# the volatile direct profile. Verified live 2026-09-29: keyboard record [00 4B 00 02 02 00 0A ..]
+# made the '=' thumb key emit 'g' in firmware.
+[commands.set_button_function]
+class = 0x02
+id = 0x0C
+size = 0x0A
+
+# Button function GET: args = [profile, button, hypershift] -> the record as SET writes it.
+[commands.button_function]
+class = 0x02
+id = 0x8C
+size = 0x0A
+
 # Set lighting brightness: args = [varstore, led(0x04 visible region), level 0..255].
 [commands.set_brightness]
 class = 0x0F
@@ -194,7 +228,7 @@ protocol = "matrix"
 rows = 1
 cols = 2                       # ~2 LED zones (exact per-LED count TBD; effects don't need it)
 varstore = 0x00               # NOSTORE = volatile (safest)
-led_id = 0x04                 # the VISIBLE region (confirmed)
+led_id = 0x04                 # the logo; 0x05 is the side (thumb-grid) backlight (live 2026-09-30)
 # Effect-id that DISPLAYS a written custom frame. The default (0x05) is OpenRazer's *standard*-matrix
 # CUSTOMFRAME — but on this EXTENDED-matrix device 0x05 is REACTIVE, so streaming was painting a row
 # then setting reactive each frame (paint → dark → paint → dark = flicker). OpenRazer's extended-matrix
@@ -226,3 +260,42 @@ class = 0x0F
 id = 0x04
 size = 0x03
 args = [0x00, 0x04]
+
+# Firmware-assignable thumb-grid buttons (12-button plate) and the keyboard usage each emits from
+# the factory, read live via 02/8C on 2026-09-29. Printed plate labels do not follow id order.
+[[buttons]]
+id = 0x40
+stock_usage = 0x1E
+[[buttons]]
+id = 0x41
+stock_usage = 0x1F
+[[buttons]]
+id = 0x42
+stock_usage = 0x20
+[[buttons]]
+id = 0x43
+stock_usage = 0x21
+[[buttons]]
+id = 0x44
+stock_usage = 0x22
+[[buttons]]
+id = 0x45
+stock_usage = 0x23
+[[buttons]]
+id = 0x46
+stock_usage = 0x24
+[[buttons]]
+id = 0x47
+stock_usage = 0x25
+[[buttons]]
+id = 0x48
+stock_usage = 0x26
+[[buttons]]
+id = 0x49
+stock_usage = 0x27
+[[buttons]]
+id = 0x4A
+stock_usage = 0x2D
+[[buttons]]
+id = 0x4B
+stock_usage = 0x2E

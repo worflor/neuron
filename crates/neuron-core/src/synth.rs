@@ -560,6 +560,9 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         // Synthesis never probes push-only report vocabularies (no HID reader in this pass) —
         // an auto def carries no `[events]` block; hidwatch's collection-shape arming is unaffected.
         events: None,
+        // Button functions are a write surface; synthesis never adopts writes it hasn't proven.
+        buttons: Vec::new(),
+        custody: crate::registry::Custody::default(),
     };
     Some(Synthesis {
         def,

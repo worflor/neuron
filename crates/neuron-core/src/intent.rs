@@ -31,12 +31,6 @@ impl ProfileCursor for ProcessProfileCursor {
     }
 }
 
-/// How many `HyperScroll` wheel stages [`Intent::ScrollStageCycle`] cycles over. The device exposes no
-/// active-stage getter and there's no per-profile stage count yet, so this is the common enabled-stage
-/// count (tactile / free-spin / smart-reel); the resident cursor wraps within it. Make profile-driven
-/// when a stage-count source lands.
-pub const SCROLL_STAGE_COUNT: u8 = 3;
-
 /// The next DPI for a [`Intent::DpiCycle`]: WITH `stages` it's the next stage's value (snap current to
 /// the nearest stage, step, wrap); WITHOUT, a ±200 nudge so a stage-less setup still moves. Pure +
 /// testable — the cycle's whole policy in one place.
@@ -145,21 +139,16 @@ pub fn run_shared_intent_observe(
             }
         }
         ScrollStageCycle(dir) => {
-            // The device is set-only (no active-stage getter), so we step a RESIDENT cursor and WRITE
-            // the wire-confirmed stage-select (0x15/0x00, ungated). No more "pending" — it cycles for
-            // real. The device's first stage is 1; we wrap over `SCROLL_STAGE_COUNT`.
-            let prev = crate::writes::scroll_stage_cursor();
-            let next = crate::writes::cycle_scroll_stage(prev, dir.step(), SCROLL_STAGE_COUNT);
+            // Current stage and enabled count both come from the device: the firmware walks the
+            // stage itself in normal mode, so a host-side cursor goes stale and then asks for a
+            // stage the device rejects on every press.
             match devices.with_writable("set_scroll_stage", |d| {
-                crate::writes::set_scroll_stage(d, next, cap::Store::Volatile)?;
-                Ok(d.pid) // carry the acting device's pid for the per-device confirm de-dup
+                let (from, to, count) = crate::writes::cycle_device_scroll_stage(d, dir.step())?;
+                Ok((d.pid, from, to, count))
             }) {
-                Ok(pid) => {
-                    crate::writes::set_scroll_stage_cursor(next);
-                    // confirm past the committed stage-select — a true old→new (we held the prior
-                    // cursor). Was missing, so cycling sensitivity earned no card.
-                    crate::confirm::scroll(pid, u32::from(next), u32::from(SCROLL_STAGE_COUNT), Some(u32::from(prev)));
-                    format!("scroll stage {} -> {next}", dir.label())
+                Ok((pid, from, to, count)) => {
+                    crate::confirm::scroll(pid, u32::from(to), u32::from(count), Some(u32::from(from)));
+                    format!("scroll stage {} -> {to}", dir.label())
                 }
                 Err(e) => format!("scroll stage skipped ({e})"),
             }

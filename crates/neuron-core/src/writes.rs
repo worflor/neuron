@@ -11,11 +11,10 @@
 //! [`crate::engine::Rule`] values consumed by the Engine.
 //!
 //! Scope (the WRITES agent owns this file):
-//! * **Button remap** — TWO layers. Host-side: produce the [`crate::engine::Rule`] the Engine
-//!   consumes. Device-side (NEW, RE'd live 2026-07-22): [`set_mouse_button_key`] writes the Razer
-//!   `15/02` "set button function" command so a physical mouse button emits the remapped key AT THE
-//!   SOURCE — the true fix for the thumb-grid double-send (the button no longer types its default).
-//!   No getter reflects the map, so it is ACK-gated, not read-back-verified; volatile.
+//! * **Button remap** — host-side: produce the [`crate::engine::Rule`] the Engine consumes. The
+//!   firmware path is [`crate::buttons`] (`02/0C`). [`set_mouse_button_key`] writes `15/02`, which
+//!   reads back through `15/82` but does not change what a key emits (live 2026-07-22 and
+//!   2026-09-29); no verb calls it now (the CLI `remap` authors a bind, `neuron button` writes `02/0C`).
 //! * **DPI-stage apply** — write the full DPI stage LIST (the cycle), not just the active DPI
 //!   (active-stage read = `dpi_stages` class 0x04/0x86; SET = 0x04/0x06, hardware-proven, verified
 //!   against the 0x04/0x86 read-back).
@@ -27,7 +26,7 @@
 //!
 //! ## The gate (every write goes through it)
 //! 1. **Driver mode** — Razer gates host control behind `device_mode` 0x03 (00/04 = [0x03,0x00]).
-//!    [`ensure_driver`] flips it idempotently; reopening Synapse / power-cycling reverts it.
+//!    [`ensure_custody`] flips it idempotently; reopening Synapse / power-cycling reverts it.
 //! 2. **Volatile first** — write NOSTORE ([`Store::Volatile`], varstore byte 0x00) so nothing is
 //!    flashed to onboard memory until a write has proven correct. Persist is opt-in per call.
 //! 3. **Read-back verify** — re-read the relevant getter and confirm the bytes we set landed
@@ -82,44 +81,51 @@ pub fn writes_paused() -> bool {
 // ---------------------------------------------------------------------------------------------
 
 /// Device-mode getter/setter codes — the ONE home of the device-mode opcode; every mode switch
-/// (`ensure_driver`, the CLI `mode` verb, macro-key arming, lighting's take-control) routes through
+/// (`ensure_custody`, the CLI `mode` verb, macro-key arming, lighting's take-control) routes through
 /// [`set_device_mode`] and these consts. (Verified live: `mode driver` flips 00/04=[0x03,0x00];
 /// lighting/DPI writes only land in driver mode.)
 pub const CLASS_DEVICE_MODE: u8 = 0x00;
 pub const ID_DEVICE_MODE_GET: u8 = 0x84;
 pub const ID_DEVICE_MODE_SET: u8 = 0x04;
 const DRIVER_MODE: u8 = 0x03;
+const NORMAL_MODE: u8 = 0x00;
 
 /// The raw device-mode switch: `(class 0x00, id 0x04, size 0x02, args [mode, 0x00])`. This is
-/// [`ensure_driver`]'s unconditional building block (no read-first guard — that's `ensure_driver`'s
+/// [`ensure_custody`]'s unconditional building block (no read-first guard — that's `ensure_custody`'s
 /// job), exported so the CLI's explicit `neuron mode` verb and the app's macro-key arming don't
 /// re-derive the opcode. Returns the device's reply body. driver=0x03, hardware=0x00.
 ///
 /// TEARDOWN must NOT call this directly — use [`Device::release_custody`](crate::device::Device::release_custody)
 /// (dialect-routed), so a non-razer family can't be handed a razer-framed mode packet. This raw form
-/// is for the RAZER-EXPLICIT paths only (`ensure_driver`, the CLI `mode` verb).
+/// is for the RAZER-EXPLICIT paths only (`ensure_custody`, the CLI `mode` verb).
 pub fn set_device_mode(d: &Device, mode: u8) -> Result<[u8; 80]> {
     d.exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_SET, 0x02, &[mode, 0x00])
 }
 
-/// Ensure the device is in DRIVER mode — Razer gates host control behind it, so every firmware
-/// write must flip it first. Idempotent: a no-op if already in driver mode. Reversible (reopening
-/// Synapse or `mode hardware` reverts it). Returns the prior mode byte so a caller can restore it.
+/// Put the device in the mode its [`Custody`](crate::registry::Custody) policy needs for host
+/// writes, before a write. `Driver` devices only honour writes in driver mode, so they are flipped
+/// there; `Firmware` devices take every write in normal mode, so one left in driver mode is
+/// returned to normal. Idempotent. Returns the prior mode byte so a caller can restore it.
 ///
-/// Best-effort by design: if the mode getter doesn't answer (e.g. an asleep wireless mouse) we
-/// still send the SET, because that is exactly what Synapse does on every command burst.
-pub fn ensure_driver(d: &Device) -> u8 {
-    let prior = d
-        .exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, 0x02, &[])
-        .map_or(0, |a| a[0]);
-    if prior != DRIVER_MODE {
-        let _ = set_device_mode(d, DRIVER_MODE);
+/// Best-effort by design: if the mode getter doesn't answer (e.g. an asleep wireless mouse) a
+/// `Driver` device still gets the SET, because that is exactly what Synapse does on every command
+/// burst; a `Firmware` device is left alone.
+pub fn ensure_custody(d: &Device) -> u8 {
+    let prior = d.exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, 0x02, &[]).ok().map(|a| a[0]);
+    match d.def.custody {
+        crate::registry::Custody::Driver if prior != Some(DRIVER_MODE) => {
+            let _ = set_device_mode(d, DRIVER_MODE);
+        }
+        crate::registry::Custody::Firmware if prior == Some(DRIVER_MODE) => {
+            let _ = set_device_mode(d, NORMAL_MODE);
+        }
+        _ => {}
     }
-    prior
+    prior.unwrap_or(0)
 }
 
 /// Read the device's CURRENT device-mode byte (0x00 = hardware/firmware, 0x03 = driver) WITHOUT
-/// changing it — the read-only sibling of [`ensure_driver`] (which flips). `None` when the getter
+/// changing it — the read-only sibling of [`ensure_custody`] (which flips). `None` when the getter
 /// doesn't answer (asleep link). (Formerly the wake-reconcile gated on this — a "driver mode owns the
 /// wake" assumption the 2026-07-07 trap DISPROVED, since a NORMAL-mode wake restored stale volatile
 /// state too; the reconcile is now disagreement-gated and mode-independent, see
@@ -137,7 +143,13 @@ pub fn device_mode(d: &Device) -> Option<u8> {
 /// owns the wake" premise — but is kept as the honest read-only mode probe.)
 #[must_use]
 pub fn is_driver_mode(d: &Device) -> bool {
-    device_mode(d) == Some(DRIVER_MODE)
+    mode_is_driver(device_mode(d))
+}
+
+/// Does a [`device_mode`] answer say driver mode? `None` (no answer) is not.
+#[must_use]
+pub fn mode_is_driver(mode: Option<u8>) -> bool {
+    mode == Some(DRIVER_MODE)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -232,7 +244,7 @@ pub fn set_mouse_button_key(d: &Device, button_id: u8, usage: u8) -> Result<()> 
     if writes_paused() {
         bail!("device writes are paused");
     }
-    ensure_driver(d);
+    ensure_custody(d);
     write_button_func(d, button_id, BTN_FN_TYPE_KEYBOARD, &[0x01, usage])
 }
 
@@ -241,7 +253,7 @@ pub fn set_mouse_button_click(d: &Device, button_id: u8, index: u8) -> Result<()
     if writes_paused() {
         bail!("device writes are paused");
     }
-    ensure_driver(d);
+    ensure_custody(d);
     write_button_func(d, button_id, BTN_FN_TYPE_MOUSE, &[0x01, index])
 }
 
@@ -253,7 +265,7 @@ pub fn reset_thumb_buttons(d: &Device) -> Result<()> {
     if writes_paused() {
         bail!("device writes are paused");
     }
-    ensure_driver(d);
+    ensure_custody(d);
     for (i, &usage) in THUMB_STOCK_USAGES.iter().enumerate() {
         write_button_func(d, THUMB_BUTTON_BASE + i as u8, BTN_FN_TYPE_KEYBOARD, &[0x01, usage])?;
     }
@@ -499,7 +511,7 @@ pub fn set_dpi_stages(
     });
 
     let landed = (|| -> Result<()> {
-        ensure_driver(d);
+        ensure_custody(d);
         d.exec_dynamic(CLASS_DPI, ID_DPI_STAGES_SET, DPI_STAGES_SIZE, &payload)
             .map_err(|e| anyhow::anyhow!("DPI-stage write (0x04/0x06) was not accepted: {e}"))?;
 
@@ -716,6 +728,9 @@ const SCROLL_STAGES_SIZE: u8 = 0x10;
 const CLASS_SCROLL: u8 = 0x15;
 const ID_SCROLL_STAGE_SET: u8 = 0x00;
 const SCROLL_STAGE_SIZE: u8 = 0x02;
+// Verified live on the Naga V2 Pro (2026-09-29): both answer `[varstore, value]` for `[varstore]`.
+const ID_SCROLL_STAGE_GET: u8 = 0x80;
+const ID_SCROLL_STAGE_COUNT_GET: u8 = 0x81;
 
 /// Whether the unverified `HyperScroll` device-write path is enabled. Two independent gates open it:
 /// the compile-time `hyperscroll-write` Cargo feature (the clean, preferred gate) OR the
@@ -769,7 +784,7 @@ pub fn set_scroll_stages(d: &Device, modes: &[u8], active_idx: u8, store: Store)
              before trusting it. (TODO: promote this to a `hyperscroll-write` Cargo feature.)"
         );
     }
-    ensure_driver(d);
+    ensure_custody(d);
     d.exec_dynamic(
         CLASS_HYPERSCROLL,
         ID_SCROLL_STAGES_SET,
@@ -800,12 +815,14 @@ pub fn build_scroll_stage_payload(stage: u8, store: Store) -> [u8; 2] {
 
 /// Select the active scroll-wheel stage. CAPTURED LIVE from Synapse via `USBPcap` (2026-06):
 /// class 0x15 / id 0x00, size 0x02, payload `[store, stage]` (Synapse sent store=0x01=persist).
-/// `stage` is the 1-based stage value Synapse cycles over the ENABLED stages. The per-stage
-/// tension/steps curves are host-side software (never written to the device), so this only switches
-/// which stage is active. Wire-confirmed opcode — no env gate, unlike the old derived 0x0B path.
+/// `stage` is the 1-based stage value Synapse cycles over the ENABLED stages; the device FAILs a
+/// stage past [`scroll_stage_count`]. The per-stage tension/steps curves are host-side software
+/// (never written to the device), so this only switches which stage is active.
+///
+/// Read-back verified: the `0x15/0x80` getter on the same plane must report `stage`, or this errors.
 pub fn set_scroll_stage(d: &Device, stage: u8, store: Store) -> Result<()> {
     let payload = build_scroll_stage_payload(stage, store);
-    ensure_driver(d);
+    ensure_custody(d);
     d.exec_dynamic(
         CLASS_SCROLL,
         ID_SCROLL_STAGE_SET,
@@ -813,31 +830,62 @@ pub fn set_scroll_stage(d: &Device, stage: u8, store: Store) -> Result<()> {
         &payload,
     )
     .map_err(|e| anyhow::anyhow!("scroll-stage write (0x15/0x00) was not accepted: {e}"))?;
+    let got = scroll_stage(d, store)?;
+    if got != stage {
+        bail!(
+            "VERIFY FAILED on 0x15/0x80: selected scroll stage {stage} but device reports {got} — write NOT trusted"
+        );
+    }
     Ok(())
+}
+
+/// Read one `[varstore] -> [varstore, value]` scroll getter, refusing a reply that doesn't echo the
+/// plane asked for or carries a zero (both stage and count are 1-based on the wire).
+fn read_scroll_getter(d: &Device, id: u8, store: Store, what: &str) -> Result<u8> {
+    let a = d
+        .exec_dynamic(CLASS_SCROLL, id, SCROLL_STAGE_SIZE, &[store.byte()])
+        .map_err(|e| anyhow::anyhow!("{what} read (0x15/{id:#04x}) failed: {e}"))?;
+    decode_scroll_getter(&a, store).ok_or_else(|| {
+        anyhow::anyhow!("{what} read (0x15/{id:#04x}) returned an unusable reply {}", hex_slice(&a[..2]))
+    })
+}
+
+/// The pure half of [`read_scroll_getter`]: `[varstore, value]` -> `value` when the plane echoes
+/// and the value is a real 1-based number.
+#[must_use]
+pub fn decode_scroll_getter(reply: &[u8], store: Store) -> Option<u8> {
+    match reply {
+        [vs, v, ..] if *vs == store.byte() && *v >= 1 => Some(*v),
+        _ => None,
+    }
+}
+
+/// The device's active scroll stage (1-based) on `store`'s plane — `0x15/0x80`.
+pub fn scroll_stage(d: &Device, store: Store) -> Result<u8> {
+    read_scroll_getter(d, ID_SCROLL_STAGE_GET, store, "scroll stage")
+}
+
+/// How many scroll stages the device has enabled on `store`'s plane — `0x15/0x81`. A stage select
+/// past this count is rejected by the firmware.
+pub fn scroll_stage_count(d: &Device, store: Store) -> Result<u8> {
+    read_scroll_getter(d, ID_SCROLL_STAGE_COUNT_GET, store, "scroll stage count")
+}
+
+/// Step the device's scroll stage by `step` over its enabled stages, reading both the current stage
+/// and the count from the device rather than remembering them: the firmware moves the stage itself
+/// in normal mode, so any host-side memory goes stale. Returns `(from, to, count)`.
+pub fn cycle_device_scroll_stage(d: &Device, step: i32) -> Result<(u8, u8, u8)> {
+    let count = scroll_stage_count(d, Store::Volatile)?;
+    let from = scroll_stage(d, Store::Volatile)?;
+    let to = cycle_scroll_stage(from, step, count);
+    set_scroll_stage(d, to, Store::Volatile)?;
+    Ok((from, to, count))
 }
 
 /// Apply the active scroll stage via the real wire-confirmed command (0x15/0x00).
 pub fn apply_scroll_stages(d: &Device, stages: &[u16]) -> Result<()> {
     let stage = stages.first().copied().unwrap_or(1) as u8;
     set_scroll_stage(d, stage, Store::Volatile)
-}
-
-// ── SCROLL-STAGE CURSOR — the daemon's "which stage is live" memory ───────────────────────────────
-// The device is SET-ONLY (no active-stage getter), so a true `ScrollStageCycle` needs a resident
-// cursor: remember the stage we last selected and step from it. Process-global like `profile::ACTIVE`,
-// and 1-based to match the wire (`set_scroll_stage` takes a 1-based stage). Starts at 1 until moved.
-static SCROLL_STAGE_CURSOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
-
-/// The daemon's current scroll-stage cursor (1-based; 1 until a cycle moves it).
-pub fn scroll_stage_cursor() -> u8 {
-    SCROLL_STAGE_CURSOR
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .max(1)
-}
-
-/// Record the scroll stage we just selected (call only after a committed `set_scroll_stage`).
-pub fn set_scroll_stage_cursor(stage: u8) {
-    SCROLL_STAGE_CURSOR.store(stage.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Step a 1-based stage cursor by `step` (+1 / -1) over `count` stages, wrapping at both ends. Pure +
@@ -900,7 +948,7 @@ pub fn set_idle_secs(d: &Device, secs: u32) -> Result<()> {
     if !idle_write_enabled() {
         bail!(idle_write_disabled_message());
     }
-    ensure_driver(d);
+    ensure_custody(d);
     d.exec_dynamic(CLASS_POWER, ID_IDLE_SET, IDLE_SIZE, &payload)
         .map_err(|e| anyhow::anyhow!("idle-timeout write (0x07/0x03) was not accepted: {e}"))?;
     verify_getter(d, CLASS_POWER, ID_IDLE_GET, IDLE_SIZE, 0, &payload)?;
@@ -999,7 +1047,7 @@ pub fn set_in_game_polling(d: &Device, wired_hz: u32, _dongle_hz: u32) -> Result
     if !ingame_poll_write_enabled() {
         bail!(ingame_poll_write_disabled_message());
     }
-    ensure_driver(d);
+    ensure_custody(d);
     d.exec_dynamic(
         CLASS_POLLING,
         ID_HYPERPOLL_SET,
@@ -1080,7 +1128,7 @@ pub fn set_lift_off_distance(d: &Device, level: u8) -> Result<()> {
         bail!("[writes paused]");
     }
     let lvl = level.min(2);
-    ensure_driver(d);
+    ensure_custody(d);
     d.exec_dynamic(CLASS_SENSOR, ID_LOD_SET, LOD_SET_SIZE, &[0x00, 0x04, 0x01, lvl])
         .map_err(|e| anyhow::anyhow!("lift-off-distance write (0x0B/0x0B) was not accepted: {e}"))?;
     verify_getter(
@@ -1152,7 +1200,7 @@ pub fn set_lift_off_asymmetric(d: &Device, lift: u8, landing: u8) -> Result<()> 
     }
     let lift = lift.clamp(LOD_LIFT_MIN, LOD_LIFT_MAX);
     let landing = landing.clamp(LOD_LAND_MIN, LOD_LAND_MAX);
-    ensure_driver(d);
+    ensure_custody(d);
 
     // 1) enable async.
     d.exec_dynamic(
@@ -1302,7 +1350,7 @@ pub fn set_snap_tap(d: &Device, pairs: &[SnapTapPair], enable: bool) -> Result<(
     if !snap_tap_write_enabled() {
         bail!(snap_tap_write_disabled_message());
     }
-    ensure_driver(d);
+    ensure_custody(d);
     d.exec_dynamic(CLASS_SNAP_TAP, ID_SNAP_TAP_SET, SNAP_TAP_SIZE, &payload)
         .map_err(|e| anyhow::anyhow!("Snap Tap write (0x02/0x27) was not accepted: {e}"))?;
     // The getter echoes the same [enable, count, pairs..] layout; verify the whole written body.
@@ -1682,6 +1730,23 @@ mod tests {
     }
 
     #[test]
+    fn scroll_getter_decodes_value_only_on_the_asked_plane() {
+        // live Naga V2 Pro replies, 2026-09-29: 15/80 [00] -> [00 02], 15/80 [01] -> [01 02].
+        assert_eq!(decode_scroll_getter(&[0x00, 0x02, 0x00], Store::Volatile), Some(2));
+        assert_eq!(decode_scroll_getter(&[0x01, 0x02], Store::Persist), Some(2));
+        assert_eq!(decode_scroll_getter(&[0x01, 0x02], Store::Volatile), None, "wrong plane echoed");
+        assert_eq!(decode_scroll_getter(&[0x00, 0x00], Store::Volatile), None, "stages are 1-based");
+        assert_eq!(decode_scroll_getter(&[0x00], Store::Volatile), None);
+    }
+
+    #[test]
+    fn scroll_cycle_stays_inside_the_device_count() {
+        // the dead-button shape: 2 enabled stages, stage 3 is rejected by the firmware.
+        assert_eq!(cycle_scroll_stage(2, 1, 2), 1);
+        assert_eq!(cycle_scroll_stage(1, 1, 2), 2);
+    }
+
+    #[test]
     fn scroll_stage_payload_is_store_then_stage() {
         // The wire-confirmed 0x15/0x00 layout: exactly [store, stage], 2 bytes. These are the
         // literal bytes captured off the wire as the user cycled stages (`01 01`, `01 02`).
@@ -1971,18 +2036,18 @@ mod tests {
     //
     // Target: `set_lift_off_distance` — a real, UNGATED verify-gated write (SET 0x0B/0x0B, then
     // `verify_getter` on 0x0B/0x85 expecting `[mode, level]` at offset 2), so the whole
-    // conversation (ensure_driver → SET → verify read-back) runs with zero env/feature gating.
+    // conversation (ensure_custody → SET → verify read-back) runs with zero env/feature gating.
 
     use crate::transport::mock::{Fault, MockDevice};
     use std::sync::Arc;
 
-    /// A phantom that answers the LOD conversation HONESTLY: driver-mode getter says "already in
-    /// driver mode" (so `ensure_driver` writes nothing), the SET ACKs, and the LOD getter reports
-    /// the written level back at the layout `verify_getter` inspects.
+    /// A phantom that answers the LOD conversation HONESTLY: the mode getter says the Naga is
+    /// already in its custody mode (normal, so `ensure_custody` writes nothing), the SET ACKs, and
+    /// the LOD getter reports the written level back at the layout `verify_getter` inspects.
     fn honest_lod_phantom(level: u8) -> Arc<MockDevice> {
         Arc::new(
             MockDevice::razer(0x00A8, "phantom naga")
-                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[NORMAL_MODE])
                 .answering(CLASS_SENSOR, ID_LOD_SET, &[])
                 // getter layout: [0x00, 0x04, mode, level] — expect is checked at offset 2.
                 .answering(
@@ -1991,6 +2056,37 @@ mod tests {
                     &[0x00, 0x04, LOD_MODE_SYMMETRIC, level],
                 ),
         )
+    }
+
+    #[test]
+    fn firmware_custody_returns_a_device_left_in_driver_mode_to_normal() {
+        let phantom = Arc::new(
+            MockDevice::razer(0x00A8, "phantom naga")
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_SET, &[]),
+        );
+        assert_eq!(ensure_custody(&lod_device(&phantom)), DRIVER_MODE, "reports the prior mode");
+        assert_eq!(
+            phantom.asked(),
+            vec![(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET), (CLASS_DEVICE_MODE, ID_DEVICE_MODE_SET)]
+        );
+    }
+
+    #[test]
+    fn driver_custody_still_takes_driver_mode() {
+        let mut def: crate::registry::DeviceDef =
+            toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();
+        def.custody = crate::registry::Custody::Driver;
+        let phantom = Arc::new(
+            MockDevice::razer(0x00A8, "phantom driver-custody mouse")
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[NORMAL_MODE])
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_SET, &[]),
+        );
+        ensure_custody(&Device::with_transport(def, 0x00A8, Box::new(phantom.handle())));
+        assert_eq!(
+            phantom.asked(),
+            vec![(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET), (CLASS_DEVICE_MODE, ID_DEVICE_MODE_SET)]
+        );
     }
 
     fn lod_device(phantom: &Arc<MockDevice>) -> Device {
@@ -2024,7 +2120,7 @@ mod tests {
     #[test]
     fn a_short_reading_device_never_yields_a_trusted_write() {
         let mut phantom = MockDevice::razer(0x00A8, "phantom naga")
-            .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+            .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[NORMAL_MODE])
             .answering(CLASS_SENSOR, ID_LOD_SET, &[])
             .answering(
                 CLASS_SENSOR,
@@ -2058,7 +2154,7 @@ mod tests {
     fn a_parroting_device_fails_the_verify_instead_of_faking_success() {
         let phantom = Arc::new(
             MockDevice::razer(0x00A8, "phantom parrot")
-                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[NORMAL_MODE])
                 .parroting(),
         );
         let err = set_lift_off_distance(&lod_device(&phantom), 2)
@@ -2075,7 +2171,7 @@ mod tests {
     fn a_yanked_device_surfaces_an_error_not_a_trusted_write() {
         let phantom = Arc::new(
             MockDevice::razer(0x00A8, "phantom naga")
-                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[NORMAL_MODE])
                 .answering(CLASS_SENSOR, ID_LOD_SET, &[])
                 .answering(
                     CLASS_SENSOR,
@@ -2111,7 +2207,7 @@ mod tests {
         use crate::dpi_origin::{classify, expect, forget, Cause, Origin};
         let phantom = Arc::new(
             MockDevice::razer(REFUSED_PID, "phantom naga")
-                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[NORMAL_MODE])
                 .faulting(Fault::Yank),
         );
         let d = dpi_device(&phantom, REFUSED_PID);
@@ -2142,7 +2238,7 @@ mod tests {
         // well against a funnel that never stamped anything at all.
         let phantom = Arc::new(
             MockDevice::razer(LANDED_PID, "phantom naga")
-                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[NORMAL_MODE])
                 .answering(CLASS_DPI, 0x05, &[]) // set_dpi, per the Naga def
                 .answering(CLASS_DPI, 0x85, &[0, 0x03, 0x20, 0x03, 0x20]),
         );

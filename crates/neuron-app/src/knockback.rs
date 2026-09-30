@@ -220,7 +220,7 @@ mod imp {
         let mut fam = load_or_new();
         let cast = neuron::cast::CastConfig::load();
         let trigger = cast.trigger;
-        let trigger_name = trigger.label();
+        let trigger_name = crate::glue::control_text(trigger);
         let mut detector = OnsetDetector::new(DetectorConfig::default());
         let mut builder = MotifBuilder::new(MotifConfig {
             phrase_gap_ms: PHRASE_GAP_MS,

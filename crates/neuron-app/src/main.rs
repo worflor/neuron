@@ -26,6 +26,7 @@
 
 mod autostart;
 mod beacon;
+mod buttonfw;
 mod capture;
 mod chroma_lab;
 #[cfg(windows)]
@@ -73,6 +74,9 @@ mod apptest;
 
 #[cfg(test)]
 mod testsupport;
+
+#[cfg(test)]
+mod readme_shots;
 
 use slint::ComponentHandle;
 use std::cell::RefCell;
@@ -178,6 +182,8 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // Tells `neuron status` / live signalling which run root this app serves.
+    neuron::livesync::publish_app_root();
 
     // PROFILER (inert unless NEURON_PROFILE is set): 1 Hz hot-path counters + per-thread/sidecar
     // CPU to neuron_profile.log, so a "never stops" spin localizes to a counter or a thread.
@@ -511,6 +517,8 @@ fn main() {
     // through it from a reader thread that starts as soon as `hidwatch::start()` returns.
     glue::install_ui(weak.clone());
     hidwatch::start();
+    // Standard-pad sources for controllers no HID path reaches (GameInput on Windows).
+    neuron::pad::start_platform_sources();
     // Heal every configured device from the host's recorded feel intent at launch — the wake
     // triggers only cover sleep/wake while the app runs; a power-cycle that happened while the
     // app was down (the factory-DPI-restore incident, 2026-07-23) is only caught here.
@@ -602,6 +610,10 @@ fn main() {
                     handle_tray(&poll_res, action);
                 }
                 let r = poll_res.borrow();
+                let live = neuron::livesync::take();
+                if !live.is_empty() {
+                    apply_live_commands(r.window.as_ref(), r.shared.as_ref(), live);
+                }
                 let (Some(app), Some(shared)) = (r.window.as_ref(), r.shared.as_ref()) else {
                     return;
                 };
@@ -826,6 +838,9 @@ fn main() {
     if let Some(shared) = resident.borrow().shared.as_ref() {
         shared.borrow_mut().rt.stop_all_animation();
     }
+    // Before custody goes back: a button left on a private F13..F24 key would outlive neuron.
+    buttonfw::restore_all();
+    neuron::haptics::stop_all();
     restore_devices_to_firmware();
     // keep the tray alive for the whole loop
     drop(tray);
@@ -1008,6 +1023,44 @@ fn raise_self() {
     }
     if found != 0 {
         crate::teleport::force_foreground(found);
+    }
+}
+
+/// Act on edits the CLI handed over (`neuron::livesync`). A reload re-reads every config file the
+/// window mirrors through the same refreshers the GUI's own editors use, so a CLI edit and a GUI
+/// edit end in the same state; with no window built yet only the live engine needs the reload.
+fn apply_live_commands(
+    window: Option<&AppWindow>,
+    shared: Option<&glue::SharedRt>,
+    cmds: Vec<neuron::livesync::Command>,
+) {
+    use neuron::livesync::Command;
+    for cmd in cmds {
+        match (cmd, window, shared) {
+            (Command::Reload, Some(app), Some(sh)) => {
+                let st = app.global::<State>();
+                st.invoke_reload_bindings();
+                glue::refresh_profiles(app, sh);
+                glue::refresh_app_rules(app, sh);
+                glue::refresh_gestures(app, sh);
+                glue::refresh_rhythms(app, sh);
+                glue::refresh_badges(app, sh);
+                glue::refresh_macro_catalog(app);
+                let feel = neuron::feel::FeelConfig::load();
+                st.set_feel_hold_ms(feel.hold_ms as i32);
+                st.set_feel_gap_ms(feel.gap_ms as i32);
+                st.set_feel_coyote_ms(feel.coyote_ms as i32);
+                st.set_hypershift_mode(feel.hypershift.describe().into());
+            }
+            (Command::Reload, _, _) => dispatch::request_reload(),
+            (Command::ApplyProfile { name }, Some(app), _) => {
+                app.global::<State>().invoke_apply_profile(name.into());
+            }
+            (Command::ApplyProfile { name }, None, _) => {
+                flight::trace("live", "profile apply dropped (no window)", 0);
+                eprintln!("neuron-app: cannot apply '{name}' before the window exists");
+            }
+        }
     }
 }
 

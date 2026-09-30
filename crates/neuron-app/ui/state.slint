@@ -12,7 +12,7 @@
 // Actions), Radial (folded into Spellweaving), and Import (a wizard flow) aren't top-level seats.
 
 import {
-    DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
+    DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
     SpectrumStop, SpectrumFrame,
@@ -434,6 +434,10 @@ export global State {
     // the GUI rules sidecar (profiles/gui.rules.toml). No hardcoded buttons.
     in-out property <string> bind-trigger-label: "—"; // friendly name of the captured trigger
     in-out property <bool> bind-trigger-ready: false; // a trigger has been captured
+    in-out property <BadgeView> bind-trigger-badge;    // the captured control's device (pid "" = any)
+    in-out property <[string]> emblems;                // every emblem a badge can wear (neuron::badge::Emblem)
+    // Set a device's badge: (pid hex, emblem key or "" for automatic, name or "" for automatic).
+    callback badge-set(string, string, string);
     in-out property <bool> bind-hypershift: false;    // author this on the HyperShift layer
     // DUPLICATE-TRIGGER honesty: set by glue at capture time when the captured trigger is ALREADY
     // claimed by another rule on the SAME layer (base vs HyperShift). The live dispatch runs EVERY
@@ -564,6 +568,7 @@ export global State {
     callback rename-gesture(string, string);          // (old, new) — keeps the cast binding attached
     // cast trigger (the hold button) — press-to-bind, NEVER hardcoded (seeded from cast.toml)
     in-out property <string> cast-trigger-label: "—";
+    in-out property <string> cast-trigger-emblem: "";  // the cast trigger's device emblem; "" = any device
     callback capture-cast-trigger();
     // the ACTIVATION RHYTHM on that trigger — a feel::Phrase ("hold", "tap hold", "tap tap", …).
     // Presets cover the sane ones; record-activation captures YOUR rhythm and normalizes it.
@@ -591,6 +596,9 @@ export global State {
     callback commit-rhythm-bind();                      // write the chosen action into cast.toml's rhythm_actions
     callback delete-rhythm(int);                        // unbind a rhythm (remove the RhythmBind by taps)
     in-out property <int> radial-sectors: 8;
+    in-out property <int> pad-feel: 100;              // the radial's feel on a pad's motors, % (0 = off)
+    callback set-pad-feel(int);                       // persist a strength
+    callback feel-pad();                              // play the knob's phrase on the connected pad
     in-out property <int> radial-max: 16;             // COMPUTED cap: 2π·deadzone / hand-jitter (no manual cap)
     in-out property <[RadialSector]> radial-items;
     in-out property <int> radial-preview-sector: -1; // hovered/active wedge

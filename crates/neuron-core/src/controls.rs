@@ -20,13 +20,33 @@
 /// registry and in every pid-scoped bind. A `debug_assert` guarded it, and `debug_assert` is
 /// compiled out of the build users run. Splitting the stream into its own field means the
 /// truncation has nowhere to happen: no mask, no prefix, no reachable collision.
+///
+/// Every source that reports a full snapshot of ITS OWN controls is its own stream, because one
+/// device exposes several (a mouse's pointer, its keyboard collection, its consumer collection):
+/// diffing one source's snapshot against another's would read a click as a key's release.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
 pub enum Stream {
-    /// The device's normal Raw-Input reports.
+    /// A source with no finer identity (synthetic observations, tests).
     #[default]
     RawInput,
     /// The driver-mode deferred-button pipe (macro keys, side-plate grid).
     Deferred,
+    /// A keyboard's Raw-Input key transitions.
+    Keyboard,
+    /// A pointer's Raw-Input button transitions.
+    Pointer,
+    /// One HID collection's reports, by [`collection_id`] of its path.
+    Collection(u32),
+    /// A pad delivered by a platform pad API.
+    Pad,
+    /// Firmware-assigned private keys, delivered by the keyboard hook ([`crate::buttons`]).
+    Private,
+}
+
+/// A stable id for one HID collection's device path (FNV-1a over the lowercased path).
+#[must_use]
+pub fn collection_id(path: &str) -> u32 {
+    path.bytes().fold(0x811C_9DC5u32, |h, b| (h ^ u32::from(b.to_ascii_lowercase())).wrapping_mul(0x0100_0193))
 }
 
 /// One decoded control report from a Razer device.
@@ -133,7 +153,7 @@ pub fn inject_event(ev: ControlEvent) {
     // so they are first-class candidates for held binds (the cast trigger) exactly like a native
     // control. The registry speaks the device's canonical identity — which `ev.pid` now simply IS,
     // with the stream carried alongside it instead of packed into the same 16 bits.
-    note_held(&format!("inject:{}", ev.pid_hex()), ev.pid, &ev.hits);
+    note_held(&format!("inject:{}:{:?}", ev.pid_hex(), ev.stream), ev.pid, ev.stream, &ev.hits);
     // Stamp BEFORE taking the lock: the stamp means "when this edge became visible to us", and lock
     // acquisition is part of the delivery cost we want the hop to include, not excluded from it.
     let ev = Injected {
@@ -224,6 +244,16 @@ pub fn usage_name(page: u16, usage: u16) -> &'static str {
         (0x0C, 0xB7) => "Stop",
         (0x0B, 0x2F) => "Phone Mute",
         (0x0B, 0x20) => "Hook Switch",
+        // Generic Desktop D-pad and system controls (HID Usage Tables §4), as pads report them.
+        (0x01, 0x90) => "D-pad ↑",
+        (0x01, 0x91) => "D-pad ↓",
+        (0x01, 0x92) => "D-pad →",
+        (0x01, 0x93) => "D-pad ←",
+        (0x01, 0x85) => "Menu",
+        (0x01, 0x86) => "App Menu",
+        (0x0C, 0x223) => "Home",
+        (0x0C, 0x224) => "Back",
+        (0x0C, 0x40) => "Menu",
         _ => "?",
     }
 }
@@ -283,9 +313,10 @@ pub fn control_label(page: u16, usage: u16) -> String {
             0x20..=0x4F => format!("Macro M{}", usage - 0x1F),
             _ => format!("Macro 0x{usage:02X}"),
         },
-        _ => match usage_name(page, usage) {
-            "?" => format!("0x{page:02X}/0x{usage:02X}"),
-            name => name.to_string(),
+        _ => match (crate::analog::control_label(page, usage).or_else(|| crate::pad::control_label(page, usage)), usage_name(page, usage)) {
+            (Some(label), _) => label,
+            (None, "?") => format!("0x{page:02X}/0x{usage:02X}"),
+            (None, name) => name.to_string(),
         },
     }
 }
@@ -303,6 +334,7 @@ pub fn watch(seconds: u64) {
     println!("Watching headset knob / mute / consumer controls for {seconds}s (ESC to stop).");
     println!("Turn the knob, press the mute toggle, tap the mic - events print below:\n");
     static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    crate::pad::start_platform_sources();
     win::listen(
         Some(seconds),
         &NEVER,
@@ -314,7 +346,7 @@ pub fn watch(seconds: u64) {
             let decoded: Vec<String> = ev
                 .hits
                 .iter()
-                .map(|&(p, u)| format!("{} (0x{p:02X}/0x{u:02X})", usage_name(p, u)))
+                .map(|&(p, u)| format!("{} (0x{p:02X}/0x{u:02X})", control_label(p, u)))
                 .collect();
             let hex: String = ev
                 .raw
@@ -334,6 +366,68 @@ pub fn watch(seconds: u64) {
         || std::time::Duration::from_millis(5),
     );
     println!("\ncaptured {count} Razer control event(s).");
+}
+
+/// Live pad report: every stick and sensor reading as it changes, for `seconds`. `rumble` makes
+/// every button press buzz the pad it came from.
+#[cfg(windows)]
+pub fn pads(seconds: u64, rumble: bool) {
+    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    crate::pad::start_platform_sources();
+    println!("Pads for {seconds}s (ESC to stop): sticks and sensors print as they change.
+");
+    let mut last: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut held: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    win::listen(
+        Some(seconds),
+        &NEVER,
+        true,
+        |ev| {
+            let Some(pid) = ev.pid else { return };
+            let pid = format!(":{pid}#");
+            // A press edge (more controls down than before) buzzes the pad that sent it.
+            let before = held.insert(pid.clone(), ev.hits.len()).unwrap_or(0);
+            if rumble && ev.hits.len() > before {
+                for (path, _) in crate::analog::sticks() {
+                    if path.contains(&pid) {
+                        let ok = crate::haptics::pulse(&path, crate::haptics::Rumble { low: 0.8, high: 0.8, left_trigger: 0.0, right_trigger: 0.0 }, 150);
+                        println!("  press -> rumble {path}: {}", if ok { "sent" } else { "no motor backend" });
+                        break;
+                    }
+                }
+            }
+        },
+        || {
+            for (path, s) in crate::analog::sticks() {
+                let key = format!("{path} stick {:04x}/{:04x}", s.axes.0, s.axes.1);
+                let line = format!("({:+.1}, {:+.1})", s.x, s.y);
+                if last.get(&key) != Some(&line) {
+                    println!("  {key}: {line}");
+                    last.insert(key, line);
+                }
+            }
+            for e in crate::sensors::snapshot() {
+                let key = format!("{} {}", e.device, e.key);
+                let line = match e.reading {
+                    crate::sensors::Reading::Motion { accel, gyro } => format!(
+                        "accel ({:+.1}, {:+.1}, {:+.1}) gyro ({:+.1}, {:+.1}, {:+.1})",
+                        accel[0], accel[1], accel[2], gyro[0], gyro[1], gyro[2]
+                    ),
+                    r => crate::sensors::describe(&r),
+                };
+                if last.get(&key) != Some(&line) {
+                    println!("  {key}: {line}");
+                    last.insert(key, line);
+                }
+            }
+            std::time::Duration::from_millis(100)
+        },
+    );
+}
+
+#[cfg(not(windows))]
+pub fn pads(_seconds: u64, _rumble: bool) {
+    println!("pad reporting is Windows-only for now");
 }
 
 #[cfg(not(windows))]
@@ -704,26 +798,37 @@ impl ControlRef {
         self.page == 0x09 && (1..=5).contains(&self.usage)
     }
 
-    /// Human label: the shared control name, plus the device scope when pid-bound — the honest
-    /// "this key on THIS device" the old VK label couldn't say.
+    /// The control's own name, without its device. `pointer`: the device is a pointer, so its
+    /// five standard buttons read as mouse buttons; on a pad, Button 1 is Button 1.
     #[must_use]
-    pub fn label(self) -> String {
-        // the five standard mouse buttons keep their friendly names (label parity with the old
-        // VK captures); everything else speaks the shared control vocabulary.
-        let name = match (self.page, self.usage) {
-            (0x09, 1) => "Left Mouse".to_string(),
-            (0x09, 2) => "Right Mouse".to_string(),
-            (0x09, 3) => "Middle Mouse".to_string(),
-            (0x09, 4) => "Mouse 4 (thumb 1)".to_string(),
-            (0x09, 5) => "Mouse 5 (thumb 2)".to_string(),
+    pub fn name_as(self, pointer: bool) -> String {
+        let mouse = self.page == 0x09 && pointer;
+        match (self.page, self.usage) {
+            (0x09, 1) if mouse => "Left Mouse".to_string(),
+            (0x09, 2) if mouse => "Right Mouse".to_string(),
+            (0x09, 3) if mouse => "Middle Mouse".to_string(),
+            (0x09, 4) if mouse => "Mouse 4 (thumb 1)".to_string(),
+            (0x09, 5) if mouse => "Mouse 5 (thumb 2)".to_string(),
             (0x07, CONTROL_ANY_SHIFT) => "Shift (either side)".to_string(),
             (0x07, CONTROL_ANY_CTRL) => "Ctrl (either side)".to_string(),
             (0x07, CONTROL_ANY_ALT) => "Alt (either side)".to_string(),
             (p, u) => control_label(p, u),
-        };
+        }
+    }
+
+    /// The control's name knowing nothing of its device: a device-any button is the pointer's.
+    #[must_use]
+    pub fn name(self) -> String {
+        self.name_as(self.pid.is_none())
+    }
+
+    /// Plain label for logs and the CLI: the name, plus the device's pid when pid-bound. Surfaces
+    /// that know the device name it by its badge instead.
+    #[must_use]
+    pub fn label(self) -> String {
         match self.pid {
-            Some(p) => format!("{name} @{p}"),
-            None => name,
+            Some(p) => format!("{} @{p}", self.name()),
+            None => self.name(),
         }
     }
 }
@@ -908,11 +1013,12 @@ pub fn observe_controls() -> ControlObserver {
 
 fn publish_control_observation(
     pid: Option<crate::registry::CanonicalPid>,
+    stream: Stream,
     hits: &[(u16, u16)],
 ) {
     let ev = ControlEvent {
         pid,
-        stream: Stream::RawInput,
+        stream,
         hits: hits.to_vec(),
         raw: Vec::new(),
     };
@@ -927,6 +1033,7 @@ fn publish_control_observation(
 pub(crate) fn note_held(
     source: &str,
     pid: Option<crate::registry::CanonicalPid>,
+    stream: Stream,
     hits: &[(u16, u16)],
 ) {
     let mut set = hits.to_vec();
@@ -962,7 +1069,7 @@ pub(crate) fn note_held(
     if changed {
         crate::capture::note_key_transition();
     }
-    publish_control_observation(pid, &set);
+    publish_control_observation(pid, stream, &set);
 }
 
 /// The canonical source identity for a device path — the one transformation between "the pid this
@@ -1159,7 +1266,7 @@ mod control_ref_tests {
     fn passive_observer_receives_the_normalized_held_stream() {
         let observer = observe_controls();
         let pid = crate::registry::CanonicalPid::of(0xEFFE);
-        note_held("observer-regression", Some(pid), &[(0x09, 5), (0x07, 0x1E)]);
+        note_held("observer-regression", Some(pid), Stream::RawInput, &[(0x09, 5), (0x07, 0x1E)]);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let ev = loop {
@@ -1172,7 +1279,7 @@ mod control_ref_tests {
         assert_eq!(ev.hits, vec![(0x07, 0x1E), (0x09, 5)]);
         assert!(ev.raw.is_empty(), "the passive tap carries semantic state only");
 
-        note_held("observer-regression", Some(pid), &[]);
+        note_held("observer-regression", Some(pid), Stream::RawInput, &[]);
     }
 
     #[test]
@@ -1180,12 +1287,12 @@ mod control_ref_tests {
         // No live pump in tests → the public query reports "no registry"; drive the internals.
         assert_eq!(control_held(0x07, 0x1E, None), None);
         let generation = crate::capture::key_transition_generation();
-        note_held("test:naga-kbd", Some(crate::registry::CanonicalPid::of(0xa8)), &[(0x07, 0x1E)]);
+        note_held("test:naga-kbd", Some(crate::registry::CanonicalPid::of(0xa8)), Stream::RawInput, &[(0x07, 0x1E)]);
         assert!(
             crate::capture::key_transition_generation() > generation,
             "the held snapshot must publish before its transition notification returns"
         );
-        note_held("test:kbd", Some(crate::registry::CanonicalPid::of(0x221)), &[(0x07, 0x1E)]);
+        note_held("test:kbd", Some(crate::registry::CanonicalPid::of(0x221)), Stream::RawInput, &[(0x07, 0x1E)]);
         {
             let g = HELD.lock().unwrap();
             let hit = |pid: Option<crate::registry::CanonicalPid>| {
@@ -1203,7 +1310,7 @@ mod control_ref_tests {
         }
         // a mouse-interface snapshot from the SAME device must not clobber the keyboard
         // interface's held key — entries are per SOURCE, not per pid.
-        note_held("test:naga-mouse", Some(crate::registry::CanonicalPid::of(0xa8)), &[(0x09, 1)]);
+        note_held("test:naga-mouse", Some(crate::registry::CanonicalPid::of(0xa8)), Stream::RawInput, &[(0x09, 1)]);
         {
             let g = HELD.lock().unwrap();
             assert!(
@@ -1213,9 +1320,9 @@ mod control_ref_tests {
             );
         }
         // an empty snapshot releases (and drops) the source.
-        note_held("test:naga-kbd", Some(crate::registry::CanonicalPid::of(0xa8)), &[]);
-        note_held("test:naga-mouse", Some(crate::registry::CanonicalPid::of(0xa8)), &[]);
-        note_held("test:kbd", Some(crate::registry::CanonicalPid::of(0x221)), &[]);
+        note_held("test:naga-kbd", Some(crate::registry::CanonicalPid::of(0xa8)), Stream::RawInput, &[]);
+        note_held("test:naga-mouse", Some(crate::registry::CanonicalPid::of(0xa8)), Stream::RawInput, &[]);
+        note_held("test:kbd", Some(crate::registry::CanonicalPid::of(0x221)), Stream::RawInput, &[]);
         assert!(HELD.lock().unwrap().iter().all(|(s, _, _)| !s.starts_with("test:")));
     }
 }
@@ -1825,6 +1932,16 @@ mod spine_tests {
         assert_eq!(control_label(0x0C, 0xE9), "Volume Up");
         assert_eq!(control_label(0xFF07, 0x42), "Scancode 0x042");
         assert_eq!(control_label(0x42, 0x99), "0x42/0x99"); // unknown page → exact hex
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn usb_and_bluetooth_paths_both_name_their_device() {
+        use super::{pid_from_path, vid_from_path};
+        let usb = r"\?\HID#VID_24C6&PID_543A&IG_00#7&1&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!((vid_from_path(usb).as_str(), pid_from_path(usb).as_str()), ("24c6", "543a"));
+        let bt = r"\?\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&0002057e_PID&2009#9&2&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!((vid_from_path(bt).as_str(), pid_from_path(bt).as_str()), ("057e", "2009"));
     }
 
     #[cfg(windows)]
@@ -2666,13 +2783,42 @@ mod plan_wait_tests {
     }
 }
 
+/// The device VID from a device path, as a 4-hex lowercase string ("" if absent). USB paths carry
+/// `vid_XXXX`; Bluetooth paths carry `_vid&SSSSXXXX`, a 4-hex source prefix before the id; a
+/// GameInput pad's path is `gameinput#VVVV:PPPP#…`.
+pub fn vid_from_path(path: &str) -> String {
+    let p = path.to_lowercase();
+    if let Some(ids) = p.strip_prefix("gameinput#") {
+        return ids.chars().take(4).collect();
+    }
+    if let Some(s) = p.split("vid_").nth(1) {
+        return s.chars().take(4).collect();
+    }
+    p.split("vid&").nth(1).map(|s| s.chars().skip(4).take(4).collect()).unwrap_or_default()
+}
+
+/// The device PID (`pid_XXXX`, or Bluetooth's `pid&XXXX`) from a Raw-Input device path, as a
+/// 4-hex lowercase string ("" if absent) — the same key the capture + dispatch tag triggers with.
+pub fn pid_from_path(path: &str) -> String {
+    let p = path.to_lowercase();
+    if let Some(ids) = p.strip_prefix("gameinput#") {
+        return ids.chars().skip(5).take(4).collect();
+    }
+    p.split("pid_")
+        .nth(1)
+        .or_else(|| p.split("pid&").nth(1))
+        .map(|s| s.chars().take(4).collect::<String>())
+        .unwrap_or_default()
+}
+
 #[cfg(windows)]
 pub(crate) mod win {
-    use super::{ControlEvent, PROBE_PAGES};
+    use super::{pid_from_path, vid_from_path, ControlEvent, PROBE_PAGES};
     use std::ffi::c_void;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-        HidP_GetUsages, HidP_Input, HidP_MaxUsageListLength, HIDP_STATUS_SUCCESS,
+        HidP_GetCaps, HidP_GetUsageValue, HidP_GetUsages, HidP_GetValueCaps, HidP_Input,
+        HidP_MaxUsageListLength, HIDP_CAPS, HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS,
     };
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
     use windows_sys::Win32::System::Threading::{
@@ -2682,14 +2828,16 @@ pub(crate) mod win {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows_sys::Win32::UI::Input::{
         GetRawInputData, GetRawInputDeviceInfoW, RegisterRawInputDevices, HRAWINPUT, RAWINPUT,
-        RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDI_DEVICENAME, RIDI_PREPARSEDDATA,
+        RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDI_DEVICENAME, RIDI_PREPARSEDDATA,
         RID_INPUT, RIM_TYPEHID, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
         MsgWaitForMultipleObjectsEx, PeekMessageW, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
-        PM_REMOVE, QS_ALLINPUT, WM_INPUT, WM_QUIT,
+        PM_REMOVE, QS_ALLINPUT, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_QUIT,
     };
+    /// `WM_INPUT_DEVICE_CHANGE` wParam: the device was removed.
+    const GIDC_REMOVAL: usize = 2;
 
     // RAWKEYBOARD.Flags bits (windows-sys doesn't name them).
     const RI_KEY_BREAK: u16 = 0x01; // this report is a key-UP (release)
@@ -2720,16 +2868,6 @@ pub(crate) mod win {
     pub(super) fn rearm_and_wake() {
         REARM.store(true, std::sync::atomic::Ordering::Relaxed);
         super::wake_pump();
-    }
-
-    /// The device PID (`pid_XXXX` segment) from a Raw-Input device path, as a 4-hex lowercase string
-    /// ("" if absent) — the same key the capture + dispatch already tag triggers with.
-    fn pid_from_path(path: &str) -> String {
-        path.to_lowercase()
-            .split("pid_")
-            .nth(1)
-            .map(|s| s.chars().take(4).collect::<String>())
-            .unwrap_or_default()
     }
 
     /// PS/2 scan-code set 1 (`RAWKEYBOARD.MakeCode`) → HID Keyboard/Keypad (page 0x07) usage. The
@@ -2836,6 +2974,87 @@ pub(crate) mod win {
         buf
     }
 
+    /// One value field of a device's input reports, with what reading it back needs.
+    #[derive(Clone, Copy)]
+    struct ValueField {
+        field: crate::analog::Field,
+        bits: u16,
+    }
+
+    /// The absolute value fields a device's input reports declare, from its preparsed data.
+    unsafe fn value_fields(preparsed: &[u8]) -> Vec<ValueField> {
+        if preparsed.is_empty() {
+            return Vec::new();
+        }
+        let pp = preparsed.as_ptr() as isize;
+        let mut caps: HIDP_CAPS = std::mem::zeroed();
+        if HidP_GetCaps(pp, &raw mut caps) != HIDP_STATUS_SUCCESS {
+            return Vec::new();
+        }
+        let mut n = caps.NumberInputValueCaps;
+        let mut vcaps: Vec<HIDP_VALUE_CAPS> = vec![std::mem::zeroed(); usize::from(n)];
+        if n == 0 || HidP_GetValueCaps(HidP_Input, vcaps.as_mut_ptr(), &raw mut n, pp) != HIDP_STATUS_SUCCESS {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for v in &vcaps[..usize::from(n)] {
+            if v.IsAbsolute == 0 {
+                continue; // a relative delta (a wheel tick) is motion, not a position
+            }
+            let (lo, hi) = if v.IsRange != 0 {
+                (v.Anonymous.Range.UsageMin, v.Anonymous.Range.UsageMax)
+            } else {
+                (v.Anonymous.NotRange.Usage, v.Anonymous.NotRange.Usage)
+            };
+            for usage in lo..=hi {
+                out.push(ValueField {
+                    field: crate::analog::Field {
+                        page: v.UsagePage,
+                        usage,
+                        logical_min: v.LogicalMin,
+                        logical_max: v.LogicalMax,
+                    },
+                    bits: v.BitSize,
+                });
+            }
+        }
+        // Controls feed the analog model; every other declared value (a battery level, a
+        // sensor) is a reading.
+        out.retain(|f| f.field.logical_max > f.field.logical_min);
+        out
+    }
+
+    /// Read every field this report carries. A field of another report id is skipped (the call
+    /// fails for it); a signed field is sign-extended from its bit size.
+    unsafe fn read_values(preparsed: &[u8], report: &mut [u8], fields: &[ValueField]) -> Vec<(crate::analog::Field, i32)> {
+        let pp = preparsed.as_ptr() as isize;
+        let mut out = Vec::with_capacity(fields.len());
+        for f in fields {
+            let mut raw: u32 = 0;
+            let st = HidP_GetUsageValue(
+                HidP_Input,
+                f.field.page,
+                0,
+                f.field.usage,
+                &raw mut raw,
+                pp,
+                report.as_mut_ptr(),
+                report.len() as u32,
+            );
+            if st != HIDP_STATUS_SUCCESS {
+                continue;
+            }
+            let v = if f.field.logical_min < 0 && f.bits > 0 && f.bits < 32 {
+                let shift = 32 - u32::from(f.bits);
+                ((raw << shift) as i32) >> shift
+            } else {
+                raw as i32
+            };
+            out.push((f.field, v));
+        }
+        out
+    }
+
     /// Decode the active usages on one page from a report, given its preparsed data.
     unsafe fn decode(preparsed: &[u8], report: &mut [u8], page: u16) -> Vec<u16> {
         if preparsed.is_empty() {
@@ -2905,10 +3124,11 @@ pub(crate) mod win {
             // Register EVERY input collection so any control on any device is visible — keyboard,
             // mouse, gamepad/joystick, AND the original Consumer (knob/media) + Telephony (mute).
             // `RIDEV_INPUTSINK` = receive even when not foreground (the whole point of a binder).
+            // `RIDEV_DEVNOTIFY` = hear removals, so a device unplugged mid-press releases.
             let rid = |page: u16, usage: u16| RAWINPUTDEVICE {
                 usUsagePage: page,
                 usUsage: usage,
-                dwFlags: RIDEV_INPUTSINK,
+                dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
                 hwndTarget: hwnd,
             };
             let rids = [
@@ -2938,7 +3158,16 @@ pub(crate) mod win {
             // wants a SNAPSHOT of what's currently down per device (like a HID report). So we keep the
             // live down-set per device path and emit the whole set on each change — exactly the shape
             // the HID path already produces. (HID devices report their own full state, so they skip this.)
-            let mut down_sets: std::collections::HashMap<String, Vec<(u16, u16)>> =
+            // Analog state per device: its value fields (read once) and what each has learned.
+            let mut analog_fields: std::collections::HashMap<String, Vec<ValueField>> = std::collections::HashMap::new();
+            let mut analog = crate::analog::Devices::default();
+            let mut honesty: std::collections::HashMap<String, crate::honesty::Monitor> = std::collections::HashMap::new();
+            // The last raw value of each non-control field, so a reading is published when it moves.
+            let mut sensor_last: std::collections::HashMap<(String, u16, u16), i32> = std::collections::HashMap::new();
+            // Each HID device handle's path, so a removal (which names only the handle) can be traced.
+            let mut hid_paths: std::collections::HashMap<isize, String> = std::collections::HashMap::new();
+            let analog_epoch = Instant::now();
+            let mut down_sets: std::collections::HashMap<String, (super::Stream, Vec<(u16, u16)>)> =
                 std::collections::HashMap::new();
             // Foreground window at the last tick — a change means we may have MISSED transitions (see
             // the focus-loss flush below). 0 = not yet sampled, so the first tick never flushes.
@@ -3035,6 +3264,22 @@ pub(crate) mod win {
                     if msg.message == WM_QUIT {
                         break 'listen;
                     }
+                    if msg.hwnd == hwnd && msg.message == WM_INPUT_DEVICE_CHANGE && msg.wParam == GIDC_REMOVAL {
+                        // A HID device left: whatever it held is released, and what was learned
+                        // about it (sticks, shapes, a descriptor verdict) starts afresh on replug.
+                        if let Some(path) = hid_paths.remove(&(msg.lParam as isize)) {
+                            let pid = super::source_pid(&pid_from_path(&path));
+                            crate::analog::publish_sticks(&path, Vec::new());
+                            crate::sensors::forget(&path);
+                            sensor_last.retain(|(p, _, _), _| *p != path);
+                            analog.forget(&path);
+                            analog_fields.remove(&path);
+                            honesty.remove(&path);
+                            let stream = super::Stream::Collection(super::collection_id(&path));
+                            super::note_held(&path, pid, stream, &[]);
+                            on_event(&ControlEvent { pid, stream, hits: Vec::new(), raw: Vec::new() });
+                        }
+                    }
                     if msg.hwnd == hwnd && msg.message == WM_INPUT {
                         got_msg = true;
                         n_input += 1;
@@ -3061,9 +3306,9 @@ pub(crate) mod win {
                                 match ri.header.dwType {
                                     // ── ANY HID device: gamepad, multi-button mouse, the headset knob,
                                     // an oddball controller. No vendor filter, every probed page decoded.
-                                    RIM_TYPEHID => {
+                                    RIM_TYPEHID => 'hid: {
                                         n_hid += 1;
-                                        let path = device_path(hdev);
+                                        let path = hid_paths.entry(hdev).or_insert_with(|| device_path(hdev)).clone();
                                         let n =
                                             (ri.data.hid.dwSizeHid * ri.data.hid.dwCount) as usize;
                                         if dbg {
@@ -3080,9 +3325,34 @@ pub(crate) mod win {
                                             n,
                                         )
                                         .to_vec();
+                                        // An XInput-compatible HID shadow ("IG_" in its path) is
+                                        // withheld from background Raw Input, and GameInput serves
+                                        // it; so does any pad GameInput already delivers.
+                                        if crate::gameinput::running()
+                                            && (path.to_ascii_lowercase().contains("&ig_")
+                                                || u16::from_str_radix(&pid_from_path(&path), 16).is_ok_and(crate::gameinput::owns))
+                                        {
+                                            break 'hid;
+                                        }
                                         let pp = preparsed_data(hdev);
                                         let mut hits = Vec::new();
-                                        {
+                                        // A device whose descriptor doesn't describe its stream is
+                                        // decoded by its layout file instead (see `layout`).
+                                        let ids = u16::from_str_radix(&vid_from_path(&path), 16)
+                                            .ok()
+                                            .zip(u16::from_str_radix(&pid_from_path(&path), 16).ok());
+                                        let layout = ids.and_then(|(vid, pid)| crate::layout::find(vid, pid).map(|l| (l, vid, pid)));
+                                        if let Some((layout, vid, pid)) = layout {
+                                            let Some(pad) = layout.decode(&report) else {
+                                                break 'hid; // a report the layout doesn't describe
+                                            };
+                                            crate::layout::note_report(vid, pid);
+                                            hits.extend(pad.button_hits());
+                                            let now = analog_epoch.elapsed().as_millis() as u64;
+                                            let dev = analog.device(&path);
+                                            hits.extend(dev.observe(&pad.values(), now));
+                                            crate::analog::publish_sticks(&path, dev.sticks());
+                                        } else {
                                             // The HidP usage walk across every probed page — the
                                             // only real CPU on the pump's receive path.
                                             let _t = crate::latency::start(&crate::latency::RAW_DECODE);
@@ -3091,12 +3361,45 @@ pub(crate) mod win {
                                                     hits.push((page, u));
                                                 }
                                             }
+                                            // Sticks, triggers, hats: controls learned from the
+                                            // descriptor's value fields (see `analog`).
+                                            let fields = analog_fields
+                                                .entry(path.clone())
+                                                .or_insert_with(|| value_fields(&pp));
+                                            let mut sticks = Vec::new();
+                                            if !fields.is_empty() {
+                                                let values = read_values(&pp, &mut report, fields);
+                                                for &(field, raw) in values.iter().filter(|(f, _)| !f.is_control()) {
+                                                    if sensor_last.insert((path.clone(), field.page, field.usage), raw) != Some(raw) {
+                                                        let (key, reading) = crate::sensors::from_field(&field, raw);
+                                                        crate::sensors::publish(&path, &key, reading);
+                                                    }
+                                                }
+                                                let now = analog_epoch.elapsed().as_millis() as u64;
+                                                let dev = analog.device(&path);
+                                                hits.extend(dev.observe(&values, now));
+                                                sticks = dev.sticks();
+                                            }
+                                            // A stream its descriptor doesn't describe feeds no binds
+                                            // and aims nothing.
+                                            let now = analog_epoch.elapsed().as_millis() as u64;
+                                            let monitor = honesty.entry(path.clone()).or_default();
+                                            let was = monitor.is_dishonest();
+                                            if !monitor.observe(&hits, now) {
+                                                if !was {
+                                                    eprintln!("[controls] {path}: reports don't match the device's descriptor; ignoring its controls (needs a layout file)");
+                                                }
+                                                hits.clear();
+                                                sticks.clear();
+                                            }
+                                            crate::analog::publish_sticks(&path, sticks);
                                         }
                                         let pid = super::source_pid(&pid_from_path(&path));
-                                        super::note_held(&path, pid, &hits);
+                                        let stream = super::Stream::Collection(super::collection_id(&path));
+                                        super::note_held(&path, pid, stream, &hits);
                                         on_event(&ControlEvent {
                                             pid,
-                                            stream: super::Stream::RawInput,
+                                            stream,
                                             hits,
                                             raw: report,
                                         });
@@ -3137,8 +3440,23 @@ pub(crate) mod win {
                                                 .unwrap_or(0);
                                                 crate::intercept::on_raw_keyboard(physkey, !up, pid);
                                             }
-                                            let set = down_sets.entry(path.clone()).or_default();
-                                            let changed = if up {
+                                            // A firmware-reassigned button still binds by its stock
+                                            // key: map what it emitted back to the physical button.
+                                            // A private key is the hook's to deliver, so it is dropped
+                                            // here while the hook takes it; otherwise (mid-capture,
+                                            // disarmed) it arrives here and reads as its button.
+                                            let raw_pid = u16::from_str_radix(&pid_from_path(&path), 16).unwrap_or(0);
+                                            let private = key.0 == 0x07
+                                                && crate::buttons::is_private(raw_pid, key.1)
+                                                && crate::intercept::takes_private_keys();
+                                            let key = match key {
+                                                (0x07, u) => (0x07, crate::buttons::translate(raw_pid, u)),
+                                                other => other,
+                                            };
+                                            let (_, set) = down_sets.entry(path.clone()).or_insert((super::Stream::Keyboard, Vec::new()));
+                                            let changed = if private {
+                                                false
+                                            } else if up {
                                                 let before = set.len();
                                                 set.retain(|&k| k != key);
                                                 set.len() != before
@@ -3153,11 +3471,12 @@ pub(crate) mod win {
                                                 super::note_held(
                                                     &path,
                                                     pid,
+                                                    super::Stream::Keyboard,
                                                     set,
                                                 );
                                                 on_event(&ControlEvent {
                                                     pid,
-                                                    stream: super::Stream::RawInput,
+                                                    stream: super::Stream::Keyboard,
                                                     hits: set.clone(),
                                                     raw: Vec::new(),
                                                 });
@@ -3206,7 +3525,7 @@ pub(crate) mod win {
                                                     }
                                                 }
                                             }
-                                            let set = down_sets.entry(path.clone()).or_default();
+                                            let (_, set) = down_sets.entry(path.clone()).or_insert((super::Stream::Pointer, Vec::new()));
                                             let mut changed = false;
                                             for &(d, u, n) in &BTN {
                                                 let key = (0x09u16, n);
@@ -3225,11 +3544,12 @@ pub(crate) mod win {
                                                 super::note_held(
                                                     &path,
                                                     pid,
+                                                    super::Stream::Pointer,
                                                     set,
                                                 );
                                                 on_event(&ControlEvent {
                                                     pid,
-                                                    stream: super::Stream::RawInput,
+                                                    stream: super::Stream::Pointer,
                                                     hits: set.clone(),
                                                     raw: Vec::new(),
                                                 });
@@ -3257,18 +3577,18 @@ pub(crate) mod win {
                 // stale state so the next real press registers cleanly.
                 let fg = GetForegroundWindow() as isize;
                 if last_fg != 0 && fg != last_fg && !down_sets.is_empty() {
-                    let stale: Vec<String> = down_sets
+                    let stale: Vec<(String, super::Stream)> = down_sets
                         .iter()
-                        .filter(|(_, set)| !set.is_empty())
-                        .map(|(path, _)| path.clone())
+                        .filter(|(_, (_, set))| !set.is_empty())
+                        .map(|(path, (stream, _))| (path.clone(), *stream))
                         .collect();
                     down_sets.clear();
-                    for path in stale {
+                    for (path, stream) in stale {
                         let pid = super::source_pid(&pid_from_path(&path));
-                        super::note_held(&path, pid, &[]);
+                        super::note_held(&path, pid, stream, &[]);
                         on_event(&ControlEvent {
                             pid,
-                            stream: super::Stream::RawInput,
+                            stream,
                             hits: Vec::new(),
                             raw: Vec::new(),
                         });

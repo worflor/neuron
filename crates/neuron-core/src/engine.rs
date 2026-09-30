@@ -77,18 +77,9 @@ impl Trigger {
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
-            Trigger::Input { page, usage, pid } => {
-                // a friendly, layout-independent control name ("F13", "Button 4", "Left Ctrl") instead
-                // of raw hex — the ONE place a HID control becomes rule-list text.
-                let name = crate::controls::control_label(*page, *usage);
-                // A pid-scoped bind says so — macro-page included, now that captures keep the
-                // device identity there (two boards share the macro code space, so "which device"
-                // is signal, not noise). Device-any binds stay clean.
-                match pid {
-                    Some(p) => format!("{name} @pid {p}"),
-                    None => name,
-                }
-            }
+            // A layout-independent control name, device-scoped when pid-bound (two boards share
+            // the macro code space, so "which device" is signal, not noise).
+            Trigger::Input { page, usage, pid } => crate::controls::ControlRef { page: *page, usage: *usage, pid: *pid }.label(),
             Trigger::Gesture { name } => format!("gesture '{name}'"),
             Trigger::RadialSector { menu, sector } => format!("radial '{menu}' sector {sector}"),
             Trigger::AppFocus { app } => format!("app focus '{app}'"),

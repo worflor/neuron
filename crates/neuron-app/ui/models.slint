@@ -141,8 +141,23 @@ export struct ChromaLabMark {
 }
 
 // A spine rule row (Bindings / HyperShift / Radial / Gesture editors all render these).
+// A device's badge as a surface shows it: the emblem key, the display name, the name the device gives
+// itself (the hint behind a custom one), and which parts the user chose. `pid` "" = no device.
+export struct BadgeView {
+    pid: string,
+    emblem: string,
+    name: string,
+    own: string,
+    custom-emblem: bool,
+    custom-name: bool,
+}
+
 export struct RuleRow {
     trigger: string,    // Trigger::describe()
+    control: string,    // the control's own name, without its device
+    emblem: string,      // the device's badge emblem; "" = device-any (draw `trigger` as text)
+    device: string,     // the device's badge name
+    pid: string,        // the device's pid (hex); "" = device-any
     action: string,     // Action::describe()
     layer: string,      // "base" | "hypershift" | ""
     kind: string,       // "input" | "gesture" | "radial" | "app" | "mic" | "hold" | "cast"
