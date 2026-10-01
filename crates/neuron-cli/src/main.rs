@@ -28,7 +28,7 @@ use std::fmt::Write as _;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(windows)]
-use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 #[cfg(windows)]
 use std::sync::Arc;
 #[cfg(windows)]
@@ -3251,8 +3251,18 @@ fn cli_worker_callback(tx: SyncSender<CliWorkerIntent>) -> neuron::executor::Wor
         let ticket = Arc::new(AtomicU8::new(0));
         let (reply, rx) = std::sync::mpsc::channel();
         let request = CliWorkerIntent { intent: intent.clone(), ticket: ticket.clone(), reply };
-        if tx.try_send(request).is_err() {
-            return "host intent unavailable: daemon queue full".into();
+        match tx.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let message = "host intent unavailable: daemon queue full";
+                eprintln!("  {message}");
+                return message.into();
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                let message = "host intent unavailable: daemon stopped";
+                eprintln!("  {message}");
+                return message.into();
+            }
         }
         match rx.recv_timeout(std::time::Duration::from_secs(20)) {
             Ok(result) => { eprintln!("  {result}"); result }
