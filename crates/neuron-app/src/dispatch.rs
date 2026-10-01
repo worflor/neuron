@@ -1507,9 +1507,7 @@ fn undo_latest(devices: &mut neuron::device::DeviceSession<'_>) -> String {
     let result = match &record.entry {
         crate::undo::Entry::Audio { .. } => crate::undo::undo_audio(&record.entry),
         crate::undo::Entry::Profile { before, applied } => {
-            if neuron::profile::active() != *applied {
-                Err(format!("profile changed since it was switched to '{applied}'"))
-            } else {
+            if neuron::profile::active() == *applied {
                 let status = run_intent_recording(
                     devices,
                     &neuron::action::Intent::ProfileSwitch(before.clone()),
@@ -1523,6 +1521,8 @@ fn undo_latest(devices: &mut neuron::device::DeviceSession<'_>) -> String {
                 } else {
                     Err(format!("profile restore failed ({status}); active profile is '{}'", neuron::profile::active()))
                 }
+            } else {
+                Err(format!("profile changed since it was switched to '{applied}'"))
             }
         }
         crate::undo::Entry::Lighting { pid, unit, before, applied } => {

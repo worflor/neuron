@@ -194,9 +194,7 @@ impl Dial {
             let (dx, dy) = (pt.0 - prev.0, pt.1 - prev.1);
             // the DOMINANT axis this frame: up / right = more, down / left = less. A curve
             // transitions smoothly between the two as the hand turns.
-            let raw = if matches!(self.target, DialTarget::ScrollHover | DialTarget::ScrollAnchored) {
-                -dy
-            } else if dy.abs() >= dx.abs() {
+            let raw = if matches!(self.target, DialTarget::ScrollHover | DialTarget::ScrollAnchored) || dy.abs() >= dx.abs() {
                 -dy
             } else {
                 dx
@@ -364,7 +362,7 @@ fn send_wheel(target: ScrollTarget, delta: i16) -> bool {
 }
 
 fn wheel_point_fits_lparam(x: i32, y: i32) -> bool {
-    (i16::MIN as i32..=i16::MAX as i32).contains(&x) && (i16::MIN as i32..=i16::MAX as i32).contains(&y)
+    (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&x) && (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&y)
 }
 
 fn plan_scroll(
@@ -446,7 +444,7 @@ mod tests {
         let saved = target((-120, 240));
         let mut latch = ScrollLatch::default();
         latch.begin(Some(saved.clone()));
-        assert_eq!(latch.current(true, Some(target((30, 40)))), Some(saved.clone()));
+        assert_eq!(latch.current(true, Some(target((30, 40)))), Some(saved));
         latch.clear();
         assert_eq!(latch.current(true, None), None);
     }
