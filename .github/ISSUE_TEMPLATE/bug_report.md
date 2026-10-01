@@ -6,6 +6,8 @@ labels: bug, needs-triage
 assignees: ''
 ---
 
+Rather talk it through? An AI agent can help investigate and draft this from your description. Writing it yourself is just as welcome.
+
 **device + PID**
 which device, and its product id. the DEVICE page shows both, or run `neuron list`.
 
