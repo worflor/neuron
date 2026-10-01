@@ -26,6 +26,7 @@
 
 mod autostart;
 mod beacon;
+mod binding_list;
 mod buttonfw;
 mod capture;
 mod chroma_lab;

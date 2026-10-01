@@ -876,6 +876,7 @@ export component Toggle inherits Rectangle {
 // A single-line text field — a data-entry cell. Well on the void, accent hairline on focus, and a
 // danger hairline when `invalid` (validation lives ON the control, not in a distant status line).
 export component Field inherits Rectangle {
+    in property <bool> enabled: true;
     in property <string> placeholder;
     in-out property <string> text;
     in property <length> field-width: 160px;
@@ -892,7 +893,8 @@ export component Field inherits Rectangle {
     // Lands the cursor at the END of any existing text (good for an empty just-added field).
     public function focus-field() {
         ti.focus();
-        ti.set-selection-offsets(root.text.character-count, root.text.character-count);
+        ti.select-all();
+        ti.clear-selection();
     }
     // a data cell PREFERS its field-width but is NOT rigid: it carries the row's horizontal-stretch so
     // a tight inspector row shrinks THE FIELD (down to a usable floor) and leaves the action button at
@@ -915,6 +917,7 @@ export component Field inherits Rectangle {
         padding-left: 10px;
         padding-right: 10px;
         ti := TextInput {
+            enabled: root.enabled;
             text <=> root.text;
             color: Theme.text;
             font-size: Theme.fs-body;

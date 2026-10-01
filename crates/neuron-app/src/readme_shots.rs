@@ -90,7 +90,6 @@ fn shot() {
                 let app = weak3.upgrade().unwrap();
                 finish_seed(&app, &scene3);
                 let weak4 = app.as_weak();
-                let out = out.clone();
                 let frames: u32 = env("NEURON_SHOT_FRAMES").and_then(|s| s.parse().ok()).unwrap_or(0);
                 if frames > 0 {
                     // an animation take: N snapshots, one every NEURON_SHOT_STEP_MS
@@ -383,6 +382,8 @@ fn finish_seed(app: &AppWindow, scene: &str) {
         st.set_active_profile("\u{2014}".into());
         st.set_profile_sheet_open(true);
     }
+    crate::binding_list::refresh(app, false);
+    crate::binding_list::refresh(app, true);
 }
 
 // Overlay instruments: the real renderer, tapped where its pixels leave for the screen.

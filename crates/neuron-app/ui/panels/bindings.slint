@@ -535,6 +535,12 @@ component RuleList inherits VerticalLayout {
     // which layer this list shows — disambiguates the (shared-per-layer) editing-rule row index, and
     // is handed to begin-edit-rule so the glue edits the right tier.
     in property <bool> hyper: false;
+    in property <bool> adding: false;
+    property <[int]> indices: root.hyper ? State.hyper-rule-indices : State.rule-indices;
+    property <string> query: root.hyper ? State.hyper-rule-query : State.rule-query;
+    property <int> page: root.hyper ? State.hyper-rule-page : State.rule-page;
+    property <int> matches: root.hyper ? State.hyper-rule-matches : State.rule-matches;
+    property <bool> locked: State.editing-rule >= 0 || root.adding;
     callback remove(int);
     callback reorder(int, int);   // move row `i` by dir (-1 up / +1 down)
     // the FIRST editable/removable row's index — the removable rows are the contiguous tail, so the
@@ -549,6 +555,24 @@ component RuleList inherits VerticalLayout {
         Rectangle {}
         Mono { text: root.rules.length + (root.rules.length == 1 ? " rule" : " rules"); color: Theme.text-faint; }
     }
+    if root.rules.length > 8 || root.query != "" : HorizontalLayout {
+        spacing: 8px;
+        Field {
+            field-width: 300px;
+            placeholder: "find a control or action";
+            text: root.query;
+            enabled: !root.locked;
+            edited(value) => { State.filter-rules(value, root.hyper); }
+        }
+        Rectangle {}
+        Mono {
+            text: root.matches == 0 ? "0 matches"
+                : (root.page * 8 + 1) + "–" + min((root.page + 1) * 8, root.matches) + " / " + root.matches;
+            color: Theme.text-faint;
+        }
+        Button { text: "‹"; enabled: root.page > 0 && !root.locked; clicked => { State.page-rules(-1, root.hyper); } }
+        Button { text: "›"; enabled: (root.page + 1) * 8 < root.matches && !root.locked; clicked => { State.page-rules(1, root.hyper); } }
+    }
     if root.rules.length == 0 : Rectangle {
         height: 64px;
         VerticalLayout {
@@ -558,16 +582,20 @@ component RuleList inherits VerticalLayout {
     }
     // each row is EITHER its read-only line OR — when it's the one being edited — the inline wire
     // editor, expanded in place (seeded by begin-edit-rule). The wrapper sizes to whichever shows.
-    for r[i] in root.rules : VerticalLayout {
-        if !(State.editing-rule == i && State.editing-rule-hyper == root.hyper) : RuleLine {
-            r: r;
-            can-up: i > root.first-removable;
-            can-down: i < root.rules.length - 1;
-            remove => { root.remove(i); }
-            edit => { State.begin-edit-rule(i, root.hyper); }
-            reorder(dir) => { root.reorder(i, dir); }
+    if root.rules.length > 0 && root.matches == 0 : Rectangle {
+        height: 48px;
+        VerticalLayout { alignment: center; Mono { text: "no matching binds"; color: Theme.text-faint; horizontal-alignment: center; } }
+    }
+    for source in root.indices : VerticalLayout {
+        if !(State.editing-rule == source && State.editing-rule-hyper == root.hyper) : RuleLine {
+            r: root.rules[source];
+            can-up: root.query == "" && source > root.first-removable;
+            can-down: root.query == "" && source < root.rules.length - 1;
+            remove => { root.remove(source); }
+            edit => { State.begin-edit-rule(source, root.hyper); }
+            reorder(dir) => { root.reorder(source, dir); }
         }
-        if (State.editing-rule == i && State.editing-rule-hyper == root.hyper) : WireEditor {
+        if (State.editing-rule == source && State.editing-rule-hyper == root.hyper) : WireEditor {
             editing: true;
             hyper: root.hyper;
             commit => { State.commit-edit-rule(); }
@@ -1048,7 +1076,7 @@ export component BindingsPanel inherits VerticalLayout {
                                     letter-spacing: Theme.track-4; vertical-alignment: center;
                                 }
                             }
-                            bflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 0; root.add-open = false; State.editing-rule = -1; } }
+                            bflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 0; root.add-open = false; State.editing-rule = -1; State.reset-rule-view(false); } }
                         }
                         Rectangle { width: Theme.hair; background: Theme.line; }
                         Rectangle {
@@ -1064,7 +1092,7 @@ export component BindingsPanel inherits VerticalLayout {
                                     letter-spacing: Theme.track-4; vertical-alignment: center;
                                 }
                             }
-                            hflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 1; root.add-open = false; State.editing-rule = -1; } }
+                            hflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 1; root.add-open = false; State.editing-rule = -1; State.reset-rule-view(true); } }
                         }
                         Rectangle { width: Theme.hair; background: Theme.line; }
                         // ⚙ configure — toggles the hold/stance/feel disclosure. Accent while open OR
@@ -1100,7 +1128,7 @@ export component BindingsPanel inherits VerticalLayout {
                                 padding-left: 10px; padding-right: 11px;
                                 VerticalLayout { alignment: center; Text { text: "\u{00d7}"; color: xta.has-hover ? Theme.text : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; animate color { duration: Theme.quick; } } }
                             }
-                            xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.hyper-open = false; root.config-open = false; root.view-layer = 0; root.add-open = false; State.editing-rule = -1; } }
+                            xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.hyper-open = false; root.config-open = false; root.view-layer = 0; root.add-open = false; State.editing-rule = -1; State.reset-rule-view(false); } }
                         }
                     }
                 }
@@ -1234,6 +1262,7 @@ export component BindingsPanel inherits VerticalLayout {
                     accent: root.view-layer == 1;
                     hyper: root.view-layer == 1;
                     rules: root.view-layer == 0 ? State.rules : State.hypershift-rules;
+                    adding: root.add-open;
                     empty-hint: root.view-layer == 0
                         ? "no base binds yet · press-to-bind a control below"
                         : "no shifted binds yet · bind a control while you're on this layer";
