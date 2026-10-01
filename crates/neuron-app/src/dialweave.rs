@@ -93,12 +93,21 @@ impl ScrollLatch {
 const WHEEL_DELTA: f32 = 120.0;
 const MAX_NOTCHES_PER_FRAME: i16 = 4;
 
+fn finish_volume_receipt(
+    receipt: &mut Option<neuron::session_undo::VolumeReceipt>,
+    current: Option<f32>,
+) -> Option<neuron::session_undo::Entry> {
+    receipt.take()?.finish(current)
+}
+
 /// The live state of one slide.
 pub struct Dial {
     pub target: DialTarget,
     ctl: Option<VolumeCtl>,
+    receipt: Option<neuron::session_undo::VolumeReceipt>,
     /// the value being turned, 0..1
     pub value: f32,
+    volume_read: bool,
     /// last stroke point (canvas-relative), for per-frame velocity
     last: Option<(f64, f64)>,
     /// when the last point arrived — the dt basis for the smoothing (points do not always land
@@ -118,7 +127,9 @@ impl Default for Dial {
         Dial {
             target: DialTarget::OutputVolume,
             ctl: None,
-            value: 0.5,
+            receipt: None,
+            value: 0.0,
+            volume_read: false,
             last: None,
             last_at: None,
             speed: 0.0,
@@ -134,24 +145,41 @@ impl Dial {
     /// Begin a slide for `target`: resolve + open its endpoint and read where it sits now, so the
     /// stroke nudges FROM the real current value (not a jump). Captures the device name for the hub.
     pub fn begin(&mut self, target: DialTarget) {
+        self.finish_volume_receipt();
         self.target = target;
         self.scroll_latch.clear();
         self.wheel.clear();
         self.scroll_direction = 0;
-        let ep = match target {
-            DialTarget::OutputVolume => neuron::audio::resolve_render(None),
-            DialTarget::MicVolume => neuron::audio::resolve_capture(None),
-            DialTarget::ScrollHover | DialTarget::ScrollAnchored => None,
+        let (flow, ep) = match target {
+            DialTarget::OutputVolume => (Some(neuron::audio::Flow::Render), neuron::audio::resolve_render(None)),
+            DialTarget::MicVolume => (Some(neuron::audio::Flow::Capture), neuron::audio::resolve_capture(None)),
+            DialTarget::ScrollHover | DialTarget::ScrollAnchored => (None, None),
         };
         self.device = ep
             .as_ref()
             .map(|e| short_device(&e.name))
             .unwrap_or_default();
-        self.ctl = ep.and_then(|e| VolumeCtl::open(&e.id));
+        self.ctl = ep.as_ref().and_then(|e| VolumeCtl::open(&e.id));
+        self.receipt = None;
+        self.volume_read = false;
+        if let (Some(ep), Some(flow), Some(ctl)) = (ep, flow, self.ctl.as_ref()) {
+            if let Some(before) = ctl.try_get_volume() {
+                self.receipt = neuron::session_undo::VolumeReceipt::new(ep.id, flow, before);
+                if self.receipt.is_some() {
+                    self.value = before;
+                    self.volume_read = true;
+                } else {
+                    self.value = 0.0;
+                }
+            } else {
+                self.value = 0.0;
+            }
+        } else {
+            self.value = 0.0;
+        }
         if matches!(target, DialTarget::ScrollAnchored) {
             self.scroll_latch.begin(capture_scroll_target());
         }
-        self.value = self.ctl.as_ref().map_or(0.5, neuron::audio::VolumeCtl::get_volume);
         self.last = None;
         self.last_at = None;
         self.speed = 0.0;
@@ -167,10 +195,18 @@ impl Dial {
     }
 
     pub fn finish(&mut self) {
+        self.finish_volume_receipt();
         self.scroll_latch.clear();
         self.wheel.clear();
         self.last = None;
         self.last_at = None;
+    }
+
+    fn finish_volume_receipt(&mut self) {
+        let current = self.ctl.as_ref().and_then(VolumeCtl::try_get_volume);
+        if let Some(entry) = finish_volume_receipt(&mut self.receipt, current) {
+            neuron::session_undo::push(entry);
+        }
     }
 
     /// Is the turned endpoint muted right now? — rings the gauge red.
@@ -207,10 +243,20 @@ impl Dial {
             let accel = ((mag * 0.0011 + mag * mag * 0.00013) * f64::from(dtn)).min(0.16);
             if matches!(self.target, DialTarget::ScrollHover | DialTarget::ScrollAnchored) {
                 self.scroll(raw);
-            } else {
-                self.value = (self.value + (raw.signum() * accel) as f32).clamp(0.0, 1.0);
-                if let Some(c) = &self.ctl {
-                    c.set_volume(self.value);
+            } else if self.volume_read {
+                let desired = (self.value + (raw.signum() * accel) as f32).clamp(0.0, 1.0);
+                if let (Some(ctl), Some(receipt)) = (&self.ctl, &mut self.receipt) {
+                    if let Some(applied) = neuron::session_undo::apply_verified_volume_step(
+                        receipt,
+                        desired,
+                        neuron::safety::input_armed,
+                        |value| ctl.set_volume(value),
+                        || ctl.try_get_volume(),
+                    ) {
+                        self.value = applied;
+                    } else if neuron::safety::input_armed() && ctl.try_get_volume().is_none() {
+                        self.volume_read = false;
+                    }
                 }
             }
             let target = (mag as f32 * 0.02).min(1.0);
@@ -234,6 +280,7 @@ impl Dial {
             };
             return (label.into(), 0.0, self.speed.clamp(0.0, 1.0));
         }
+        if !self.volume_read { return ("—".into(), 0.0, self.speed.clamp(0.0, 1.0)); }
         let pct = (self.value * 100.0).round() as i32;
         (format!("{pct}%"), self.value, self.speed.clamp(0.0, 1.0))
     }
@@ -268,6 +315,7 @@ impl Dial {
 
 impl Drop for Dial {
     fn drop(&mut self) {
+        self.finish_volume_receipt();
         self.scroll_latch.clear();
         self.wheel.clear();
     }
@@ -403,6 +451,18 @@ pub fn target_from_code(code: u8) -> DialTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finishing_a_dial_receipt_records_once_and_stale_end_state_records_nothing() {
+        let mut receipt = Some(neuron::session_undo::VolumeReceipt::new("id".into(), neuron::audio::Flow::Capture, 0.2).unwrap());
+        receipt.as_mut().unwrap().verified_applied(0.6);
+        assert!(finish_volume_receipt(&mut receipt, Some(0.6)).is_some());
+        assert!(finish_volume_receipt(&mut receipt, Some(0.6)).is_none(), "release plus Drop cannot record twice");
+
+        let mut stale = Some(neuron::session_undo::VolumeReceipt::new("id".into(), neuron::audio::Flow::Capture, 0.2).unwrap());
+        stale.as_mut().unwrap().verified_applied(0.6);
+        assert!(finish_volume_receipt(&mut stale, Some(0.8)).is_none());
+    }
 
     fn target(point: (i32, i32)) -> ScrollTarget {
         ScrollTarget { hwnd: 1, pid: 2, tid: 3, point, desktop: DesktopIdentity { units: [0; 128], len: 0 } }

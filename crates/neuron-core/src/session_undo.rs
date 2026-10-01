@@ -29,6 +29,53 @@ pub struct Record {
     pub entry: Entry,
 }
 
+/// Verified audio edits collected across one continuous dial gesture.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VolumeReceipt {
+    id: String,
+    flow: Flow,
+    before: f32,
+    applied: f32,
+}
+
+impl VolumeReceipt {
+    /// Start only from a trusted finite endpoint read.
+    #[must_use]
+    pub fn new(id: String, flow: Flow, before: f32) -> Option<Self> {
+        (before.is_finite() && (0.0..=1.0).contains(&before)).then_some(Self { id, flow, before, applied: before })
+    }
+
+    /// Advance the receipt only after a setter and its trusted read-back succeed.
+    pub fn verified_applied(&mut self, applied: f32) -> bool {
+        if !applied.is_finite() || !(0.0..=1.0).contains(&applied) { return false; }
+        self.applied = applied;
+        true
+    }
+
+    /// Finish the gesture only if the endpoint still has its last verified value.
+    #[must_use]
+    pub fn finish(self, current: Option<f32>) -> Option<Entry> {
+        let current = AudioValue::Volume(current?);
+        let applied = AudioValue::Volume(self.applied);
+        let before = AudioValue::Volume(self.before);
+        if !same_value(&current, &applied) || !actual_change(&before, &applied) { return None; }
+        Some(Entry::Audio { id: self.id, flow: self.flow, before, applied })
+    }
+}
+
+/// Run one dial frame through an arm check, setter and trusted read-back before advancing its receipt.
+pub fn apply_verified_volume_step(
+    receipt: &mut VolumeReceipt,
+    desired: f32,
+    mut armed: impl FnMut() -> bool,
+    set: impl FnOnce(f32) -> bool,
+    read: impl FnOnce() -> Option<f32>,
+) -> Option<f32> {
+    if !desired.is_finite() || !(0.0..=1.0).contains(&desired) || !armed() || !set(desired) { return None; }
+    let applied = read()?;
+    receipt.verified_applied(applied).then_some(applied)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
     Audio(AudioValue),
@@ -99,10 +146,11 @@ pub fn apply_audio_action(
         (AudioRequest::Nudge(_) | AudioRequest::Absolute(_), AudioValue::Volume(_)) => return Err("invalid gain or endpoint value".into()),
         _ => return Err("audio endpoint returned the wrong value kind".into()),
     };
-    if same_value(&before, &target) { return Ok(AudioActionResult::Unchanged { name: endpoint.1 }); }
+    if !actual_change(&before, &target) { return Ok(AudioActionResult::Unchanged { name: endpoint.1 }); }
     write(&endpoint.0, flow, &target).map_err(|e| format!("endpoint write failed: {e}"))?;
     let applied = read(&endpoint.0, flow, kind).map_err(|e| format!("endpoint read-back failed: {e}"))?;
     if !same_value(&applied, &target) { return Err("endpoint read-back mismatch".into()); }
+    if !actual_change(&before, &applied) { return Ok(AudioActionResult::Unchanged { name: endpoint.1 }); }
     Ok(AudioActionResult::Changed { id: endpoint.0, flow, name: endpoint.1, before, applied })
 }
 
@@ -242,6 +290,14 @@ pub fn same_value(a: &AudioValue, b: &AudioValue) -> bool {
     }
 }
 
+fn actual_change(a: &AudioValue, b: &AudioValue) -> bool {
+    match (a, b) {
+        (AudioValue::Volume(a), AudioValue::Volume(b)) => a.is_finite() && b.is_finite() && (a - b).abs() > f32::EPSILON,
+        (AudioValue::Mute(a), AudioValue::Mute(b)) => a != b,
+        _ => true,
+    }
+}
+
 /// Restore one recorded mutation only while its resource still matches the committed value.
 /// The host binds `read` and `write` to the concrete endpoint/profile/device in the entry.
 pub fn restore_transaction(
@@ -311,6 +367,40 @@ mod tests {
         assert!(profile_restore_complete("desktop", "desktop", &[]));
         assert!(!profile_restore_complete("desktop", "desktop", &["DPI".into()]));
         assert!(!profile_restore_complete("game", "desktop", &[]));
+    }
+
+    #[test]
+    fn dial_volume_receipt_requires_verified_change_and_unchanged_final_resource() {
+        use crate::audio::Flow;
+        let mut receipt = VolumeReceipt::new("endpoint-id".into(), Flow::Render, 0.4).unwrap();
+        assert!(receipt.verified_applied(0.4));
+        assert!(receipt.clone().finish(Some(0.4)).is_none(), "no-op dial movement is not journaled");
+        assert!(receipt.clone().finish(Some(0.8)).is_none(), "external mixer changes make the receipt stale");
+        assert!(receipt.verified_applied(0.7));
+        assert_eq!(receipt.clone().finish(None), None, "unreadable final state cannot be claimed");
+        assert_eq!(
+            receipt.finish(Some(0.7)),
+            Some(Entry::Audio { id: "endpoint-id".into(), flow: Flow::Render, before: AudioValue::Volume(0.4), applied: AudioValue::Volume(0.7) }),
+        );
+        let mut tiny = VolumeReceipt::new("endpoint-id".into(), Flow::Render, 0.500).unwrap();
+        assert!(tiny.verified_applied(0.501));
+        assert!(tiny.finish(Some(0.501)).is_some(), "a sub-half-percent change is still a real edit");
+
+        let failed_set = VolumeReceipt::new("endpoint-id".into(), Flow::Capture, 0.25).unwrap();
+        assert_eq!(failed_set.finish(Some(0.25)), None, "a failed setter never advances the verified receipt");
+        assert!(VolumeReceipt::new("endpoint-id".into(), Flow::Capture, f32::NAN).is_none());
+    }
+
+    #[test]
+    fn dial_volume_step_checks_arm_and_requires_setter_and_readback_success() {
+        let mut receipt = VolumeReceipt::new("endpoint-id".into(), Flow::Render, 0.4).unwrap();
+        let mut writes = 0;
+        assert_eq!(apply_verified_volume_step(&mut receipt, 0.7, || false, |_| { writes += 1; true }, || Some(0.7)), None);
+        assert_eq!(writes, 0, "disarmed skips the setter");
+        assert_eq!(apply_verified_volume_step(&mut receipt, 0.7, || true, |_| false, || panic!("failed setter skips read-back")), None);
+        assert_eq!(apply_verified_volume_step(&mut receipt, 0.7, || true, |_| true, || None), None);
+        assert_eq!(apply_verified_volume_step(&mut receipt, 0.7, || true, |_| true, || Some(0.7)), Some(0.7));
+        assert_eq!(receipt.finish(Some(0.7)).unwrap().states().1, State::Audio(AudioValue::Volume(0.7)));
     }
 
     #[test]
@@ -419,5 +509,23 @@ mod tests {
             |_, _, next| { *gain.borrow_mut() = next.clone(); Ok(()) },
         ).unwrap();
         assert!(matches!(result, AudioActionResult::Changed { applied: AudioValue::Volume(v), .. } if (v - 0.55).abs() < 0.005));
+
+        let tiny = RefCell::new(AudioValue::Volume(0.500));
+        let result = apply_audio_action(
+            &Action::MicGain { device: None, delta_pct: 0.1 }, true,
+            |_, _| Ok(Some(("mic-id".into(), "mic".into()))),
+            |_, _, _| Ok(tiny.borrow().clone()),
+            |_, _, next| { *tiny.borrow_mut() = next.clone(); Ok(()) },
+        ).unwrap();
+        assert!(matches!(result, AudioActionResult::Changed { applied: AudioValue::Volume(v), .. } if (v - 0.501).abs() < f32::EPSILON));
+
+        let unchanged = RefCell::new(AudioValue::Volume(0.500));
+        let result = apply_audio_action(
+            &Action::MicGain { device: None, delta_pct: 0.1 }, true,
+            |_, _| Ok(Some(("mic-id".into(), "mic".into()))),
+            |_, _, _| Ok(unchanged.borrow().clone()),
+            |_, _, _| Ok(()),
+        ).unwrap();
+        assert_eq!(result, AudioActionResult::Unchanged { name: "mic".into() });
     }
 }
