@@ -348,6 +348,11 @@ export struct ClipboardVariable {
     delimiter: string,
 }
 
+export struct ClipboardOperationRow {
+    label: string,
+    editable: bool,
+}
+
 // One imported feature line in the migration wizard preview. `category` groups the preview:
 // "perf" (scalar settings) | "lighting" | "binding" | "note" (not migrated).
 export struct ImportLine {

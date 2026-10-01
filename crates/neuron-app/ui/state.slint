@@ -14,7 +14,7 @@
 import {
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
-    PocketCard, ClipboardVariable, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
+    PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
     SpectrumStop, SpectrumFrame,
     ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene
 } from "models.slint";
@@ -471,9 +471,16 @@ export global State {
     in-out property <string> clipboard-preview-status: "sample a pattern";
     in-out property <[string]> clipboard-operations: [];
     in-out property <[ClipboardVariable]> clipboard-variables: [];
+    in-out property <[ClipboardOperationRow]> clipboard-operation-rows: [];
+    in-out property <int> clipboard-editing-index: -1;
+    in-out property <string> clipboard-pattern-input: "";
+    in-out property <string> clipboard-replacement-input: "${id}";
+    in-out property <bool> clipboard-raw-mode: false;
     in-out property <[string]> param-suggestions;     // clickable fills for the param (windows / profiles / macros)
     callback action-choice-changed();                  // the picker moved — recompute suggestions
     callback append-clipboard-operation(string, string, string); // op, pattern, replacement
+    callback edit-clipboard-operation(int);
+    callback save-clipboard-operation(int, string, string);
     callback move-clipboard-operation(int, int);
     callback remove-clipboard-operation(int);
     callback mark-clipboard-variable(string, int, int, string, string, string, string, string, bool);

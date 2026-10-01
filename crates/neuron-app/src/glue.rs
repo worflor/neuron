@@ -21,7 +21,7 @@ use crate::mic;
 use crate::migrate;
 use crate::runtime::AppRuntime;
 use crate::ui::{
-    AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, ClipboardVariable, DeviceRow, DiagRow, EffectParam,
+    AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, ClipboardOperationRow, ClipboardVariable, DeviceRow, DiagRow, EffectParam,
     EffectRow, EffectTile, GlyphChip, ImportLine, KnobRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
     PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame,
     SpectrumStop,
@@ -1359,15 +1359,19 @@ fn parse_transform_ops(source: &str) -> Option<Vec<neuron::clipboard_transform::
 }
 
 fn refresh_clipboard_operations(state: &State, ops: &[neuron::clipboard_transform::TransformOp]) {
-    let labels = ops.iter().map(|op| {
+    let rows = ops.iter().filter_map(|op| {
         let encoded = serde_json::to_value(op).ok()?;
         let label = encoded.get("op")?.as_str()?;
-        Some(match op {
-            neuron::clipboard_transform::TransformOp::Regex { pattern, .. } => format!("regex /{pattern}/"),
-            _ => label.to_string(),
+        Some(ClipboardOperationRow {
+            label: match op {
+                neuron::clipboard_transform::TransformOp::Regex { pattern, .. } => format!("regex /{pattern}/").into(),
+                _ => label.to_string().into(),
+            },
+            editable: matches!(op, neuron::clipboard_transform::TransformOp::Regex { .. }),
         })
-    }).flatten().collect::<Vec<_>>();
-    state.set_clipboard_operations(slint::ModelRc::new(slint::VecModel::from(labels.into_iter().map(SharedString::from).collect::<Vec<_>>())));
+    }).collect::<Vec<_>>();
+    state.set_clipboard_operations(slint::ModelRc::new(slint::VecModel::from(rows.iter().map(|row| row.label.clone()).collect::<Vec<_>>())));
+    state.set_clipboard_operation_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
 }
 
 fn clipboard_selections(state: &State) -> Vec<neuron::clipboard_transform::VariableSelection> {
@@ -1438,6 +1442,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
     neuron::screenshot::install_region_selector(crate::overlay::select_screenshot_region);
     {
         let weak = app.as_weak();
+        neuron::pocket::install_persist_failure_sink(move |message| {
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.global::<State>().set_status_line(message.into());
+                }
+            });
+        });
+    }
+    {
+        let weak = app.as_weak();
         neuron::screenshot::install_completion_sink(move |message| {
             let weak = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
@@ -1453,6 +1468,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         move |operation, pattern, replacement| {
             let Some(app) = w.upgrade() else { return; };
             let state = app.global::<State>();
+            if current_action(&state).0 != "clipboard-transform" {
+                state.set_clipboard_preview_status("select clipboard transform first".into());
+                return;
+            }
             let current = state.get_action_param().to_string();
             let mut ops: Vec<neuron::clipboard_transform::TransformOp> = if current.trim().is_empty() {
                 Vec::new()
@@ -1505,6 +1524,61 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         }
     });
+    st.on_edit_clipboard_operation({
+        let w = app.as_weak();
+        move |index| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            if current_action(&state).0 != "clipboard-transform" { return; }
+            let Some(ops) = parse_transform_ops(&state.get_action_param()) else { return; };
+            let Some(neuron::clipboard_transform::TransformOp::Regex { pattern, replace }) = ops.get(index.max(0) as usize) else { return; };
+            state.set_clipboard_editing_index(index);
+            state.set_clipboard_pattern_input(pattern.clone().into());
+            state.set_clipboard_replacement_input(replace.clone().into());
+            state.set_clipboard_raw_mode(true);
+            state.set_clipboard_variables(ModelRc::new(VecModel::<ClipboardVariable>::default()));
+            preview_clipboard_example(&state, "order 7391 shipped", pattern, replace, true);
+        }
+    });
+    st.on_save_clipboard_operation({
+        let w = app.as_weak();
+        move |index, pattern, replacement| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            if current_action(&state).0 != "clipboard-transform" {
+                state.set_clipboard_preview_status("select clipboard transform first".into());
+                return;
+            }
+            if let Err(error) = neuron::clipboard_transform::validate_regex(&pattern, &replacement) {
+                state.set_clipboard_preview_status(error.to_string().into());
+                return;
+            }
+            let Some(mut ops) = parse_transform_ops(&state.get_action_param()) else {
+                state.set_clipboard_preview_status("operation list must be a JSON/TOML array".into());
+                return;
+            };
+            let regex = neuron::clipboard_transform::TransformOp::Regex { pattern: pattern.to_string(), replace: replacement.to_string() };
+            if index >= 0 {
+                let Some(slot @ neuron::clipboard_transform::TransformOp::Regex { .. }) = ops.get_mut(index as usize) else {
+                    state.set_clipboard_preview_status("regex operation changed; reopen it before saving".into());
+                    return;
+                };
+                *slot = regex;
+            } else {
+                if ops.len() >= neuron::clipboard_transform::MAX_OPERATIONS {
+                    state.set_clipboard_preview_status("operation limit reached (32)".into());
+                    return;
+                }
+                ops.push(regex);
+            }
+            if let Ok(encoded) = serde_json::to_string(&ops) {
+                state.set_action_param(encoded.into());
+                state.set_clipboard_editing_index(-1);
+                refresh_clipboard_operations(&state, &ops);
+                state.set_clipboard_preview_status(format!("{} operation(s)", ops.len()).into());
+            }
+        }
+    });
     st.on_move_clipboard_operation({
         let w = app.as_weak();
         move |index, delta| {
@@ -1514,6 +1588,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let from = index.max(0) as usize;
             let to = from as isize + delta as isize;
             if from >= ops.len() || to < 0 || to >= ops.len() as isize { return; }
+            let editing = state.get_clipboard_editing_index();
+            if editing >= 0 {
+                let editing = editing as usize;
+                let adjusted = if editing == from { to as usize }
+                    else if to < from as isize && editing >= to as usize && editing < from { editing + 1 }
+                    else if to > from as isize && editing > from && editing <= to as usize { editing - 1 }
+                    else { editing };
+                state.set_clipboard_editing_index(adjusted as i32);
+            }
             let op = ops.remove(from);
             ops.insert(to as usize, op);
             if let Ok(encoded) = serde_json::to_string(&ops) {
@@ -1531,6 +1614,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let index = index.max(0) as usize;
             if index >= ops.len() { return; }
             ops.remove(index);
+            let editing = state.get_clipboard_editing_index();
+            if editing >= 0 {
+                let editing = editing as usize;
+                state.set_clipboard_editing_index(if editing == index { -1 } else if editing > index { (editing - 1) as i32 } else { editing as i32 });
+            }
             if let Ok(encoded) = serde_json::to_string(&ops) {
                 state.set_action_param(encoded.into());
                 refresh_clipboard_operations(&state, &ops);
@@ -6017,6 +6105,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     if let Some(ops) = parse_transform_ops(&state.get_action_param()) {
                         refresh_clipboard_operations(&state, &ops);
                     }
+                } else {
+                    state.set_clipboard_editing_index(-1);
+                    state.set_clipboard_pattern_input("".into());
+                    state.set_clipboard_replacement_input("${id}".into());
+                    state.set_clipboard_raw_mode(false);
+                    state.set_clipboard_variables(ModelRc::new(VecModel::<ClipboardVariable>::default()));
+                    state.set_clipboard_pattern("".into());
+                    state.set_clipboard_preview("".into());
+                    state.set_clipboard_preview_status("sample a pattern".into());
                 }
             }
         });
