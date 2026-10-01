@@ -2441,3 +2441,80 @@ export component TriggerWell inherits Rectangle {
         clicked => { root.clicked(); }
     }
 }
+
+// SheenText — an invisible moving clip window reveals an accent duplicate of the exact
+// text, so the light lives on the ink rather than washing the row. Used on the device
+// page for connected rows and on the lighting page for the live-on-device name.
+export component SheenText inherits Rectangle {
+    in property <string> value;
+    in property <bool> live;
+    in property <color> ink: Theme.text-mid;
+    in property <length> size: Theme.fs-data;
+    in property <int> weight: 700;
+    in property <length> tracking: Theme.track-1;
+    horizontal-stretch: 1;
+    height: root.size + 4px;
+    background: transparent;
+    clip: true;
+    property <length> band-width: min(58px, max(24px, root.width * 0.18));
+    property <length> band-x: root.live ? root.width + 8px : -root.band-width - 8px;
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.value;
+        color: root.ink;
+        font-size: root.size;
+        font-weight: root.weight;
+        font-family: Theme.mono;
+        letter-spacing: root.tracking;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        x: root.band-x;
+        y: 0px;
+        width: root.band-width;
+        height: parent.height;
+        clip: true;
+        background: transparent;
+        opacity: root.live ? 1.0 : 0.0;
+        animate x, opacity { duration: Theme.sheen; }
+        Text {
+            x: -parent.x;
+            width: root.width;
+            height: root.height;
+            text: root.value;
+            color: Theme.accent;
+            font-size: root.size;
+            font-weight: root.weight;
+            font-family: Theme.mono;
+            letter-spacing: root.tracking;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    Rectangle {
+        x: root.band-x + root.band-width * 0.54;
+        y: 0px;
+        width: 3px;
+        height: parent.height;
+        clip: true;
+        background: transparent;
+        opacity: root.live ? 0.82 : 0.0;
+        animate x, opacity { duration: Theme.sheen; }
+        Text {
+            x: -parent.x;
+            width: root.width;
+            height: root.height;
+            text: root.value;
+            color: Theme.text;
+            font-size: root.size;
+            font-weight: root.weight;
+            font-family: Theme.mono;
+            letter-spacing: root.tracking;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}

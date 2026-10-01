@@ -4,7 +4,7 @@
 
 import { Theme, Signal } from "../theme.slint";
 import { ChromaLab } from "chromalab.slint";
-import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Lamp } from "../widgets/controls.slint";
+import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Lamp, SheenText } from "../widgets/controls.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
 import { EffectTile, EffectParam } from "../models.slint";
@@ -676,12 +676,15 @@ export component LightingPanel inherits VerticalLayout {
             spacing: 7px;
             // status strip — the device geometry on the left, the honest "what this is" on the right.
             HorizontalLayout {
-                Mono {
-                    text: State.selected-device-name + " · " + State.grid-rows + " × " + State.grid-cols + " led";
-                    color: Theme.text-faint;
-                    overflow: elide; horizontal-stretch: 1;
+                SheenText {
+                    value: State.selected-device-name + " · " + State.grid-rows + " × " + State.grid-cols + " led";
+                    live: State.compositing && !State.light-foreign;
+                    ink: Theme.text-faint;
+                    size: Theme.fs-data;
+                    weight: 400;
+                    tracking: 0px;
                 }
-                // the live-truth slot: a visitor painting OUTRANKS "~ live on device" (it IS
+                // the live-truth slot: a visitor painting OUTRANKS the live name (it IS
                 // what's live on the device); suppressed rides beside it as a quiet fact.
                 if State.light-foreign : HorizontalLayout {
                     spacing: 6px;
@@ -694,13 +697,6 @@ export component LightingPanel inherits VerticalLayout {
                 if State.light-suppressed && !State.light-foreign : Mono {
                     text: (State.light-foreign-app == "" ? "a visitor" : State.light-foreign-app) + " connected \u{00b7} suppressed \u{00b7} ";
                     color: Theme.text-faint;
-                }
-                // no "~" prefix: the app's leader glyphs are "›" and "·" — a stray tilde was a
-                // one-off ornament that read as a typo rather than a status.
-                if State.compositing && !State.light-foreign : HorizontalLayout {
-                    spacing: 6px;
-                    VerticalLayout { alignment: center; Lamp {} }
-                    Mono { text: "live on device"; color: Theme.text-mid; }
                 }
                 if !State.compositing && !State.light-foreign && !State.light-brush-on && State.light-effect != "" : Mono {
                     text: "preview only"; color: Theme.text-faint;
