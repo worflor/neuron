@@ -215,7 +215,7 @@ pub enum Action {
     PocketHistory { index: usize },
     /// Capture the screen, trigger-time foreground window, or an app-provided native region.
     Screenshot {
-        #[serde(default)]
+        #[serde(default, rename = "mode", alias = "target")]
         target: crate::screenshot::CaptureTarget,
         #[serde(default)]
         path: Option<String>,

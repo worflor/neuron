@@ -550,7 +550,23 @@ fn preset_picker(st: &State, action: &neuron::action::Action) {
         .unwrap_or(1);
     st.set_action_choice(idx as i32);
     st.set_action_param(param.into());
-    refresh_param_suggestions(st);
+    refresh_action_editor(st);
+}
+
+fn refresh_action_editor(state: &State) {
+    refresh_param_suggestions(state);
+    state.set_clipboard_editing_index(-1);
+    state.set_clipboard_pattern_input("".into());
+    state.set_clipboard_replacement_input("${id}".into());
+    state.set_clipboard_raw_mode(false);
+    state.set_clipboard_variables(ModelRc::new(VecModel::<ClipboardVariable>::default()));
+    state.set_clipboard_pattern("".into());
+    state.set_clipboard_preview("".into());
+    state.set_clipboard_preview_status("sample a pattern".into());
+    let ops = if current_action(state).0 == "clipboard-transform" {
+        parse_transform_ops(&state.get_action_param()).unwrap_or_default()
+    } else { Vec::new() };
+    refresh_clipboard_operations(state, &ops);
 }
 
 /// SUGGESTION CHIPS for the param field — live, clickable fills, by what the chosen action
@@ -3301,9 +3317,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 st.set_editing_rule(-1);
                 // the live engine reloads from the same disk truth.
                 crate::dispatch::request_reload();
-                let n = neuron::engine::Engine::new(sh.borrow().rt.spine_rules())
-                    .rules
-                    .len();
+                let mut rules = sh.borrow().rt.spine_rules();
+                rules.extend(crate::editor::load_gui_rules());
+                let n = neuron::engine::Engine::new(rules).to_rules().len();
                 st.set_status_line(format!("bindings reloaded ({n} spine rules)").into());
             }
         });
@@ -6102,22 +6118,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_action_choice_changed(move || {
             if let Some(app) = w.upgrade() {
                 let state = app.global::<State>();
-                refresh_param_suggestions(&state);
-                let (id, _) = current_action(&state);
-                if id == "clipboard-transform" {
-                    if let Some(ops) = parse_transform_ops(&state.get_action_param()) {
-                        refresh_clipboard_operations(&state, &ops);
-                    }
-                } else {
-                    state.set_clipboard_editing_index(-1);
-                    state.set_clipboard_pattern_input("".into());
-                    state.set_clipboard_replacement_input("${id}".into());
-                    state.set_clipboard_raw_mode(false);
-                    state.set_clipboard_variables(ModelRc::new(VecModel::<ClipboardVariable>::default()));
-                    state.set_clipboard_pattern("".into());
-                    state.set_clipboard_preview("".into());
-                    state.set_clipboard_preview_status("sample a pattern".into());
-                }
+                refresh_action_editor(&state);
             }
         });
     });
