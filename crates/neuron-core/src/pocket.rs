@@ -460,6 +460,7 @@ pub fn restore_history(index: usize) -> String {
         Ok(()) => {},
         Err(ClipboardWriteError::Changed) => return "clipboard history: clipboard changed; nothing restored".into(),
         Err(ClipboardWriteError::Busy) => return "clipboard history: clipboard is busy; nothing changed".into(),
+        Err(ClipboardWriteError::Disarmed) => return "clipboard history [disarmed]".into(),
         Err(ClipboardWriteError::WriteFailed) => return "clipboard history: write failed; original preserved".into(),
         Err(ClipboardWriteError::RollbackFailed) => return "clipboard history: write and rollback failed; contents may be incomplete".into(),
     }
@@ -505,6 +506,7 @@ pub fn transform(ops: &[crate::clipboard_transform::TransformOp]) -> String {
         }
         Err(ClipboardWriteError::Changed) => "clipboard transform: clipboard changed; nothing replaced".into(),
         Err(ClipboardWriteError::Busy) => "clipboard transform: clipboard is busy; nothing replaced".into(),
+        Err(ClipboardWriteError::Disarmed) => "clipboard transform [disarmed]".into(),
         Err(ClipboardWriteError::WriteFailed) => "clipboard transform: write failed; original restored".into(),
         Err(ClipboardWriteError::RollbackFailed) => "clipboard transform: write and rollback failed; contents may be incomplete".into(),
     }
@@ -576,6 +578,7 @@ pub fn activate(slot: &str, persist: bool) -> String {
             Ok(()) => {},
             Err(ClipboardWriteError::Changed) => return format!("pocket{tag}: clipboard changed; nothing moved"),
             Err(ClipboardWriteError::Busy) => return format!("pocket{tag}: clipboard is held by another app \u{2014} nothing moved"),
+            Err(ClipboardWriteError::Disarmed) => return format!("pocket{tag} [disarmed]"),
             Err(ClipboardWriteError::WriteFailed) => return format!("pocket{tag}: write failed; prior contents restored"),
             Err(ClipboardWriteError::RollbackFailed) => return format!("pocket{tag}: write and rollback failed; contents may be incomplete"),
         }
@@ -590,10 +593,13 @@ pub fn activate(slot: &str, persist: bool) -> String {
         // Persist OFF the dispatch path: a multi-MB image pocket shouldn't block the live tick on a
         // synchronous file write. Snapshot under the lock, write on a worker.
         let slot = slot.to_string();
+        let failure_tag = tag.clone();
         let snapshot = entry.pocket.clone();
         let revision = entry.revision;
         crate::worker::spawn_detached("neuron-pocket-persist", move || {
-            let _ = persist_if_current(&slot, revision, &snapshot);
+            if let Err(error) = persist_if_current(&slot, revision, &snapshot) {
+                publish_persist_failure(format!("pocket{failure_tag}: durable save failed: {error}"));
+            }
         });
     }
     GEN.fetch_add(1, Ordering::Relaxed); // a real move happened — let the GUI repaint
@@ -777,7 +783,7 @@ fn dib_dims(b: &[u8]) -> Option<(u32, u32)> {
 /// live tick on a multi-MB file write), but a process that exits right after the move kills that
 /// worker mid-write and the user's payload with it. A one-shot caller (the CLI) runs this before
 /// returning. Idempotent full re-mirror: full slots written, emptied slots' files removed.
-pub fn flush_durable_sync() {
+pub fn flush_durable_sync() -> std::io::Result<()> {
     let snapshot: Vec<(String, Pocket, u64)> = {
         let g = slots()
             .lock()
@@ -788,8 +794,22 @@ pub fn flush_durable_sync() {
             .collect()
     };
     for (slot, p, revision) in snapshot {
-        let _ = persist_if_current(&slot, revision, &p);
+        persist_if_current(&slot, revision, &p)?;
     }
+    Ok(())
+}
+
+type PersistFailureSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+static PERSIST_FAILURE_SINK: std::sync::OnceLock<std::sync::Mutex<Option<PersistFailureSink>>> = std::sync::OnceLock::new();
+
+/// Install the resident host's nonblocking surface for durable pocket write failures.
+pub fn install_persist_failure_sink<F>(sink: F)
+where F: Fn(String) + Send + Sync + 'static {
+    *PERSIST_FAILURE_SINK.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(sink));
+}
+
+fn publish_persist_failure(message: String) {
+    if let Some(sink) = PERSIST_FAILURE_SINK.get().and_then(|cell| cell.lock().ok().and_then(|g| g.clone())) { sink(message); }
 }
 
 // ---- durable-pocket persistence (binary, handles any payload) ---------------------------------
@@ -1014,9 +1034,9 @@ fn fake_clip() -> &'static Mutex<Option<FakeClip>> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClipboardWriteError { Changed, Busy, WriteFailed, RollbackFailed }
+enum ClipboardWriteError { Changed, Busy, Disarmed, WriteFailed, RollbackFailed }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImpWriteError { Changed, Busy, WriteFailed, RollbackFailed }
+enum ImpWriteError { Changed, Busy, Disarmed, WriteFailed, RollbackFailed }
 
 fn read_clip_snapshot() -> (ClipState, u64) {
     if let Some(fake) = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
@@ -1081,10 +1101,11 @@ fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket) -> Re
         return Ok(());
     }
     drop(g);
-    if !crate::action::input_armed() { return Err(ClipboardWriteError::Busy); }
+    if !crate::action::input_armed() { return Err(ClipboardWriteError::Disarmed); }
     imp::set_clipboard_if_sequence(p, expected, rollback).map_err(|error| match error {
         ImpWriteError::Changed => ClipboardWriteError::Changed,
         ImpWriteError::Busy => ClipboardWriteError::Busy,
+        ImpWriteError::Disarmed => ClipboardWriteError::Disarmed,
         ImpWriteError::WriteFailed => ClipboardWriteError::WriteFailed,
         ImpWriteError::RollbackFailed => ClipboardWriteError::RollbackFailed,
     })
@@ -1099,6 +1120,7 @@ pub(crate) fn replace_at_sequence(replacement: &Pocket, original: &Pocket, seque
         Ok(()) => { if changed { remember_history(original); } Ok(()) }
         Err(ClipboardWriteError::Changed) => Err("changed"),
         Err(ClipboardWriteError::Busy) => Err("busy"),
+        Err(ClipboardWriteError::Disarmed) => Err("disarmed"),
         Err(ClipboardWriteError::WriteFailed) => Err("write-failed"),
         Err(ClipboardWriteError::RollbackFailed) => Err("rollback-failed"),
     }
@@ -1131,7 +1153,7 @@ fn text_pocket(text: &str) -> Pocket {
 }
 
 fn utf16_text(bytes: &[u8]) -> Result<String, ()> {
-    if bytes.len() % 2 != 0 { return Err(()); }
+    if !bytes.len().is_multiple_of(2) { return Err(()); }
     let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
     let end = units.iter().position(|unit| *unit == 0).unwrap_or(units.len());
     String::from_utf16(&units[..end]).map_err(|_| ())
@@ -1349,9 +1371,18 @@ mod imp {
                 CloseClipboard();
                 return Err(ImpWriteError::Changed);
             }
+            if !crate::action::input_armed() {
+                CloseClipboard();
+                return Err(ImpWriteError::Disarmed);
+            }
             if EmptyClipboard() == 0 {
                 CloseClipboard();
                 return Err(ImpWriteError::WriteFailed);
+            }
+            if !crate::action::input_armed() {
+                let rolled_back = EmptyClipboard() != 0 && install(&mut backup);
+                CloseClipboard();
+                return if rolled_back { Err(ImpWriteError::Disarmed) } else { Err(ImpWriteError::RollbackFailed) };
             }
             let installed = install(&mut output);
             let rolled_back = installed || (EmptyClipboard() != 0 && install(&mut backup));
@@ -1513,7 +1544,7 @@ mod tests {
 
         testclip::reset_store();
         testclip::seed_slot("flushme", text_pocket("payload"), true);
-        flush_durable_sync();
+        flush_durable_sync().unwrap();
         assert!(
             disk_path("flushme").exists(),
             "durable slot not mirrored synchronously"
@@ -1529,7 +1560,7 @@ mod tests {
 
         // emptied durable slot -> file removed by the same flush
         testclip::seed_slot("flushme", Pocket::empty(), true);
-        flush_durable_sync();
+        flush_durable_sync().unwrap();
         assert!(
             !disk_path("flushme").exists(),
             "emptied durable slot left a ghost file (would resurrect on next boot)"
