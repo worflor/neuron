@@ -89,6 +89,7 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 | **[talks to your gear](docs/GDD.md#talks-to-your-gear)** | dpi (single or the whole stage table), polling to 8000 Hz where the hardware has it, brightness, idle timer, scroll stage, lift-off distance, onboard storage, battery. reads decode the device's own bytes and match synapse byte-for-byte. no driver, no vendor SDK: razer's control collection answers feature reports on an access-zero handle, and that one trick is the whole foundation. |
 | **[lighting](docs/GDD.md#lighting)** | native firmware effects invoked by their real effect-id, per-key frames painted at the device's true LED count, and an open effects engine where a look is a **pattern** (shape and motion) composed with a **spectrum** (colour as a whole program). a preset is pure data. live vitals drop in as another layer in the same stack. |
 | **[audio](docs/GDD.md#audio)** | mute and gain for any mic or output, and flipping your default device, from a binding. your mic's mute is itself a trigger. |
+| **[actions](docs/CLI.md#triggers-and-actions)** | absolute mic gain stays distinct from relative nudges; dial actions can scroll at the pointer or at a hold-anchored window. Undo restores the last successful audio, profile, or app lighting change only while its resource still matches. |
 | **[the spine](docs/GDD.md#the-spine)** | binds, hypershift layers with four stances (hold · latch · smart · one-shot), side-plate layers that scope binds to the plate actually seated on the mouse, and app-aware profile switching with a fallback so closing a game puts you back. |
 | **[spellweaving](docs/GDD.md#spellweaving)** | hold, weave a stroke, release, and it fires as a real keybind. recognised by **eigenmotion** — a stroke fit as a damped complex oscillator, where the eigenvalues are the stroke's identity, so it's invariant to where you drew it, how big, and how fast. the same capture drives a family of instruments: teleport, tether, whiteboard, glance, window verbs, dial, knockback, control. |
 | **[macros & beacons](docs/GDD.md#macros--beacons)** | bundled CPython starts on demand and stays **warm** in two authority domains: new macros are BOUND to Neuron's brokered capabilities, while `# neuron: raw` is the explicit full-Python escape hatch. every macro gets a frozen trigger snapshot, persistent state, macro composition, and beacons; RAW and BOUND never share an interpreter. don't want to write Python? the block builder edits the same source document and preserves module-level code/metadata while you work visually. |
@@ -137,6 +138,10 @@ the windows builds are **not code-signed**. windows SmartScreen may warn on firs
 ```
 gh attestation verify neuron-<version>-windows-x86_64.zip --repo worflor/neuron
 ```
+
+The `open / run` action uses the existing shell helper. A Windows URL example is
+`start "" "https://example.com"`; a bare URL is not a shell command. Shell scripts use that
+same helper, while Python macros alone use the warm Macro Host.
 
 the installer places neuron in `%LOCALAPPDATA%\Programs\Neuron` and adds a Start menu shortcut. the zip stays portable: extract it anywhere writable and run `neuron-app.exe`.
 

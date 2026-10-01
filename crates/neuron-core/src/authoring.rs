@@ -82,8 +82,8 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
     ("macro", "python macro", "macro name", "run & code", true, 4),
     (
         "run",
-        "run a command",
-        "command line",
+        "open / run",
+        "app name · URL · command line",
         "run & code",
         true,
         5,
@@ -163,11 +163,13 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
     (
         "volume",
         "volume",
-        "output | mic  · +4 / -4 / dial",
+        "output | mic | scroll-hover | scroll-anchored · ±4 / mic =60 / dial",
         "audio",
         false,
         5,
     ),
+    ("lighting-layer", "lighting layer", "JSON/TOML operation", "lighting", true, 3),
+    ("undo", "undo", "last reversible change", "editing", false, 3),
     (
         "mute",
         "mute",
@@ -224,7 +226,7 @@ pub fn action_blurb(id: &str) -> &'static str {
         "ghost-paste" => "Type the clipboard as keystrokes",
         "pocket" => "Stash or swap a portable clipboard",
         "macro" => "Run a Python macro",
-        "run" => "Launch a command line",
+        "run" => "Open apps, URLs, or commands",
         "echo" => "Repeat the last action",
         "whiteboard" => "Open a screen annotation canvas",
         "knockback" => "Start the rhythm-duet familiar",
@@ -240,6 +242,8 @@ pub fn action_blurb(id: &str) -> &'static str {
         "system" => "Lock or sleep the PC",
         "obs" => "Control OBS: stream, record, scene",
         "volume" => "Change output volume or mic gain",
+        "lighting-layer" => "Edit the active lighting stack",
+        "undo" => "Restore the last reversible change",
         "mute" => "Mute or unmute output or mic",
         "momentary-mic" => "Push-to-talk or push-to-mute the mic",
         "output-flip" => "Switch the default audio output",
@@ -261,6 +265,8 @@ pub fn build_action(id: &str, param: &str) -> Action {
         // CONSOLIDATED volume: nudge (a ±step) OR the analog dial, for output OR mic — one entry, the
         // submode lives in the param. See build_volume.
         "volume" => build_volume(p),
+        "lighting-layer" => parse_lighting_edit(p).map_or(Action::Noop, |edit| Action::LightingLayer { edit }),
+        "undo" => Action::Undo,
         // CONSOLIDATED mute: output OR mic, toggle/on/off — one entry. (Hold-to-talk lives in its own
         // `momentary-mic` entry.) See build_mute.
         "mute" => build_mute(p),
@@ -575,6 +581,13 @@ fn parse_dir(s: &str) -> Direction {
 fn build_volume(p: &str) -> Action {
     use crate::action::DialTarget;
     let (target_amt, device) = split_device(p);
+    let lower = target_amt.to_ascii_lowercase();
+    if lower.contains("scroll-anchored") || lower.contains("anchored-scroll") {
+        return Action::Dial { target: DialTarget::ScrollAnchored };
+    }
+    if lower.contains("scroll-hover") || lower.contains("hover-scroll") {
+        return Action::Dial { target: DialTarget::ScrollHover };
+    }
     let mic = target_amt
         .split_whitespace()
         .any(|w| w.eq_ignore_ascii_case("mic"));
@@ -615,6 +628,55 @@ fn build_volume(p: &str) -> Action {
                 delta_pct: delta,
             }
         }
+    }
+}
+
+fn parse_lighting_edit(p: &str) -> Option<crate::action::LightingLayerOp> {
+    use crate::action::LightingLayerOp as Edit;
+    if let Some(edit) = serde_json::from_str(p).ok().or_else(|| toml::from_str(p).ok()) {
+        return Some(edit);
+    }
+    let (op, tail) = p.trim().split_once(char::is_whitespace).map_or((p.trim(), ""), |(a, b)| (a, b.trim()));
+    let index = |s: &str| s.parse::<usize>().ok();
+    match op.to_ascii_lowercase().as_str() {
+        "pop" if tail.is_empty() => Some(Edit::Pop),
+        "toggle" | "enable" | "disable" => {
+            let index = index(tail)?;
+            Some(match op.to_ascii_lowercase().as_str() {
+                "toggle" => Edit::Toggle { index }, "enable" => Edit::Enable { index }, _ => Edit::Disable { index },
+            })
+        }
+        "push" => Some(Edit::Push { preset: Some(tail.to_string()), layer: None }).filter(|_| !tail.is_empty()),
+        "replace" => {
+            let (i, preset) = tail.split_once(char::is_whitespace)?;
+            Some(Edit::Replace { index: index(i)?, preset: Some(preset.trim().to_string()), layer: None }).filter(|_| !preset.trim().is_empty())
+        }
+        "move" => {
+            let (from, to) = tail.split_once(char::is_whitespace)?;
+            Some(Edit::Move { from: index(from)?, to: index(to.trim())? })
+        }
+        "region" => {
+            let (i, cells) = tail.split_once(char::is_whitespace).unwrap_or((tail, ""));
+            let cells = if cells.trim().is_empty() || cells.trim().eq_ignore_ascii_case("clear") {
+                Vec::new()
+            } else {
+                cells.split(',').map(|cell| cell.trim().parse::<u32>().ok()).collect::<Option<Vec<_>>>()?
+            };
+            Some(Edit::Region { index: index(i)?, cells })
+        }
+        "params" => {
+            let (i, params) = tail.split_once(char::is_whitespace)?;
+            let params = params.split([',', ' ']).filter(|s| !s.is_empty()).map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                Some((k.to_string(), v.parse::<f32>().ok()?))
+            }).collect::<Option<std::collections::BTreeMap<_, _>>>()?;
+            (!params.is_empty()).then_some(Edit::Params { index: index(i)?, params })
+        }
+        "spectrum" => {
+            let (i, spectrum) = tail.split_once(char::is_whitespace)?;
+            Some(Edit::Spectrum { index: index(i)?, spectrum: parse_structured(spectrum.trim()).ok()? })
+        }
+        _ => None,
     }
 }
 
@@ -737,6 +799,9 @@ pub fn validate_action(id: &str, param: &str) -> Result<(), String> {
         }
         // volume: a STEP needs a non-zero ±number; "dial"/blank (the slide) is always fine.
         "volume" => {
+            if matches!(p.to_ascii_lowercase().as_str(), "scroll-hover" | "hover-scroll" | "scroll-anchored" | "anchored-scroll") {
+                return Ok(());
+            }
             let (target_amt, _) = split_device(p);
             let amt = target_amt
                 .split_whitespace()
@@ -773,6 +838,10 @@ pub fn validate_action(id: &str, param: &str) -> Result<(), String> {
                 }
             }
         }
+        "lighting-layer" => parse_lighting_edit(p)
+            .map(|_| ())
+            .ok_or_else(|| "lighting-layer needs a valid JSON or TOML operation object".into()),
+        "undo" => Ok(()),
         // profile: up/down/blank cycles (always ok); a name must be an existing profile.
         "profile" => {
             let l = p.to_lowercase();
@@ -1060,8 +1129,12 @@ pub fn action_to_palette(a: &Action) -> (&'static str, String) {
             match target {
                 crate::action::DialTarget::MicVolume => "mic dial".to_string(),
                 crate::action::DialTarget::OutputVolume => "dial".to_string(),
+                crate::action::DialTarget::ScrollHover => "scroll-hover".to_string(),
+                crate::action::DialTarget::ScrollAnchored => "scroll-anchored".to_string(),
             },
         ),
+        Action::LightingLayer { edit } => ("lighting-layer", serde_json::to_string(edit).unwrap_or_default()),
+        Action::Undo => ("undo", String::new()),
         // DPI set/cycle → the consolidated `dpi` entry.
         Action::DpiSet { dpi } => ("dpi", dpi.to_string()),
         Action::DpiCycle { dir } => (
@@ -1483,6 +1556,8 @@ pub fn variant_name(a: &Action) -> &'static str {
         Action::Sniper { .. } => "sniper",
         Action::OutputFlip { .. } => "output-flip",
         Action::Dial { .. } => "dial",
+        Action::LightingLayer { .. } => "lighting-layer",
+        Action::Undo => "undo",
         Action::Control => "control",
         Action::Pocket { .. } => "pocket",
         Action::Curtain => "curtain",
@@ -1506,7 +1581,7 @@ pub fn action_examples() -> Vec<(Action, &'static str)> {
     };
     vec![
         (Action::Noop, "do nothing (an unbound placeholder; on the hypershift layer it is the hold key)"),
-        (Action::Run { cmd: "notepad.exe".into() }, "run a shell command line"),
+        (Action::Run { cmd: r#"start "" "https://example.com""#.into() }, "open a URL from the Windows shell"),
         (Action::Key { key: "ctrl+shift+s".into() }, "press a key or chord"),
         (Action::MicMute { device: None, mode: "toggle".into() }, "mic mute: toggle | on | off"),
         (Action::MicGain { device: None, delta_pct: 5.0 }, "nudge mic gain by percentage points"),
@@ -1551,7 +1626,9 @@ pub fn action_examples() -> Vec<(Action, &'static str)> {
         (Action::MomentaryMic { device: None, mode: MomentaryMode::Flip }, "push-to-talk / push-to-mute while held (flip | talk | mute)"),
         (Action::Sniper { dpi: 400 }, "drop to a precision DPI while held (0 = default 400)"),
         (Action::OutputFlip { devices: vec!["headset".into(), "speakers".into()] }, "flip the default audio output between named devices"),
-        (Action::Dial { target: DialTarget::OutputVolume }, "analog slide knob (output-volume | mic-volume)"),
+        (Action::Dial { target: DialTarget::OutputVolume }, "analog slide knob (output-volume | mic-volume | scroll-hover | scroll-anchored)"),
+        (Action::LightingLayer { edit: crate::action::LightingLayerOp::Toggle { index: 1 } }, "edit a validated compositor layer in the current lighting target"),
+        (Action::Undo, "restore the latest reversible session change when it is still current"),
         (Action::Control, "prime the control-center glance"),
         (Action::Pocket { slot: "a".into(), persist: false }, "portable clipboard slot"),
         (Action::Curtain, "panic privacy screen"),
@@ -2340,7 +2417,11 @@ mod tests {
     fn builds_every_palette_action() {
         // every palette id resolves to a non-panicking Action (most non-Noop with a param).
         for (id, ..) in ACTION_PALETTE {
-            let a = build_action(id, "f");
+            let a = if *id == "lighting-layer" {
+                build_action(id, r#"{"op":"toggle","index":1}"#)
+            } else {
+                build_action(id, "f")
+            };
             // only "noop" maps to Noop; everything else is a real action.
             if *id == "noop" {
                 assert_eq!(a, Action::Noop);
@@ -2701,6 +2782,30 @@ mod tests {
             }),
             ("volume", "dial".to_string())
         );
+        for (raw, target) in [
+            ("scroll-hover", DialTarget::ScrollHover),
+            ("scroll-anchored", DialTarget::ScrollAnchored),
+        ] {
+            let action = Action::Dial { target };
+            assert_eq!(build_action("volume", raw), action);
+            assert_eq!(build_action("volume", &action_to_palette(&action).1), action);
+        }
+        let edit = Action::LightingLayer { edit: crate::action::LightingLayerOp::Toggle { index: 1 } };
+        let (id, raw) = action_to_palette(&edit);
+        assert_eq!(id, "lighting-layer");
+        assert_eq!(build_action(id, &raw), edit);
+        assert!(validate_action(id, &raw).is_ok());
+        for spec in [
+            "toggle 1", "enable 0", "disable 2", "push fire", "pop", "replace 0 aurora",
+            "move 2 0", "spectrum 0 {\"stops\":[\"ff0000\"]}", "params 0 speed=1.5", "region 0 clear", "region 1 2,3,4",
+        ] {
+            let built = build_action("lighting-layer", spec);
+            assert_ne!(built, Action::Noop, "{spec}");
+            let (id, printed) = action_to_palette(&built);
+            assert_eq!(build_action(id, &printed), built, "printer round trip for {spec}");
+            assert!(validate_action(id, &printed).is_ok(), "validator for {spec}");
+        }
+        assert_eq!(build_action("undo", ""), Action::Undo);
         assert_eq!(
             build_action("volume", "+4"),
             Action::OutputGain {
@@ -3177,7 +3282,7 @@ mod tests {
             "sequence", "script", "mouse-button", "media", "dpi-cycle", "dpi-set", "scroll-stage-cycle",
             "profile-switch", "profile-cycle", "turbo", "teleport", "whiteboard", "knockback", "glance",
             "summon", "banish", "pin", "kill", "echo", "tether", "ghost-paste", "momentary-mic", "sniper",
-            "output-flip", "dial", "control", "pocket", "curtain", "lock", "sleep", "obs",
+            "output-flip", "dial", "lighting-layer", "undo", "control", "pocket", "curtain", "lock", "sleep", "obs",
         ];
         let examples = action_examples();
         let have: BTreeSet<&str> = examples.iter().map(|(a, _)| variant_name(a)).collect();

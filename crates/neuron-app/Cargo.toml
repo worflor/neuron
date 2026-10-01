@@ -85,6 +85,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Devices_HumanInterfaceDevice", # GUID_DEVINTERFACE_HID — scope the hotplug notification to HID
     # crash recovery:
     "Win32_System_Threading",          # GetCurrentThreadId for flight-event attribution
+    "Win32_System_StationsAndDesktops", # OpenInputDesktop identity check for safe wheel delivery
     "Win32_System_Recovery",           # RegisterApplicationRestart — OS respawns us after a crash
     "Win32_System_Diagnostics_Debug",  # SetUnhandledExceptionFilter — native faults leave a trace
     "Win32_System_Kernel",             # EXCEPTION_POINTERS/CONTEXT for the SEH filter
