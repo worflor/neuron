@@ -1111,10 +1111,7 @@ export component ClipboardTransformEditor inherits VerticalLayout {
     HorizontalLayout {
         spacing: 5px;
         Picker { options: root.operation-labels; index: root.selected-operation; changed(index) => { root.selected-operation = index; } }
-        Button { text: "+ add"; clicked => {
-            if root.selected-operation-id == "regex" { State.save-clipboard-operation(-1, State.clipboard-pattern, State.clipboard-replacement-input); }
-            else { State.append-clipboard-operation(root.selected-operation-id, "", ""); }
-        } }
+        if root.selected-operation-id != "regex" : Button { text: "+ add"; clicked => { State.append-clipboard-operation(root.selected-operation-id, "", ""); } }
         Text { text: "ordered · max 32"; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; horizontal-stretch: 1; }
     }
     for operation[index] in State.clipboard-operations : HorizontalLayout {

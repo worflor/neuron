@@ -1136,12 +1136,13 @@ pub(crate) fn snapshot_for_action() -> Result<(Pocket, u64), &'static str> {
 }
 
 fn skip_clipboard_derivative(id: u32, present: &[u32]) -> Result<bool, ()> {
+    // Metafile-pict blocks contain nested GDI handles, so copying their HGLOBAL bytes cannot carry them.
     match id {
         CF_TEXT => Ok(present.contains(&CF_UNICODETEXT)),
         7 | 16 => Ok(present.contains(&CF_UNICODETEXT) || present.contains(&CF_TEXT)),
         CF_DIB => Ok(present.contains(&CF_DIBV5)),
         2 | 9 if present.contains(&CF_DIB) || present.contains(&CF_DIBV5) => Ok(true),
-        2 | 9 | 14 => Err(()),
+        2 | 3 | 9 | 14 | 0x83 => Err(()),
         _ => Ok(false),
     }
 }
@@ -1499,6 +1500,8 @@ mod tests {
         assert_eq!(skip_clipboard_derivative(CF_DIB, &[CF_DIB, CF_DIBV5]), Ok(true));
         assert_eq!(skip_clipboard_derivative(2, &[2, CF_DIB]), Ok(true));
         assert_eq!(skip_clipboard_derivative(2, &[2]), Err(()));
+        assert_eq!(skip_clipboard_derivative(3, &[3, 14]), Err(()));
+        assert_eq!(skip_clipboard_derivative(0x83, &[0x83]), Err(()));
         assert_eq!(skip_clipboard_derivative(14, &[14]), Err(()));
         assert_eq!(skip_clipboard_derivative(0xC001, &[0xC001]), Ok(false));
     }

@@ -217,7 +217,8 @@ example `[{"op":"trim"},{"op":"uppercase"}]`; supported operations are listed by
 `action list`. `pocket-history` restores a newest-first history index. `screenshot` captures the
 virtual desktop by default, or accepts `window` / `region`; a typed JSON `Screenshot` action may
 also set an explicit PNG `path` and `clipboard` destination. The native screenshot action is
-Windows-only.
+Windows-only. Headless CLI/daemon screen and window captures report their completion to stderr;
+region selection requires the resident app overlay and is refused immediately by the CLI/daemon.
 
 ### config, status, reload
 
