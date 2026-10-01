@@ -127,8 +127,8 @@ pub fn apply_native_audio_action(action: &Action) -> String {
             }
         },
         |id, _, value| {
-            if !crate::safety::input_armed() { return Err("audio action is disarmed".into()); }
             let ctl = VolumeCtl::open(id).ok_or_else(|| "endpoint unavailable".to_owned())?;
+            if !crate::safety::input_armed() { return Err("audio action is disarmed".into()); }
             let ok = match value { AudioValue::Volume(value) => ctl.set_volume(*value), AudioValue::Mute(value) => ctl.set_mute(*value) };
             if ok { Ok(()) } else { Err("endpoint write failed".into()) }
         },
