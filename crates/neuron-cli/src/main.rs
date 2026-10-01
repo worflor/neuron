@@ -1299,7 +1299,7 @@ fn pocket_cmd(args: PocketArgs) -> Result<()> {
         let Some(neuron::livesync::PocketReply::HistoryItem { contents: Some(wire) }) = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::HistoryItem { index }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? else {
             bail!("session history item is unavailable; keep the resident app running and check the newest-first index");
         };
-        let item = wire.clone().decode().map_err(anyhow::Error::msg)?;
+        let item = wire.decode().map_err(anyhow::Error::msg)?;
         return out::emit(&serde_json::json!({"index": index, "contents": pocket_json(&item)}), || {
             println!("history #{index}: {} formats · {} bytes", item.formats.len(), item.formats.iter().map(|f| f.bytes.len()).sum::<usize>());
             if let Some(text) = item.text() { print!("{text}"); if !text.ends_with('\n') { println!(); } }

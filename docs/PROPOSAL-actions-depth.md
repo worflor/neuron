@@ -38,8 +38,8 @@ variable sample text, a capture name and kind (literal, digits, word, text until
 delimiter). Escape fixed text and show the real pattern. Never infer generality from one
 example. Named replacement buttons insert ${name}. Distinguish match, no-match and invalid
 pattern. A raw-pattern mode shares the preview. No WASM, service, AI inference, modal or
-new page. Reopening a complex action must preserve its spec. General chains use the
-existing structured-spec escape hatch rather than a new visual language.
+new page. Reopening a complex action must preserve its spec. Ordered operation rows can
+be edited, moved or removed inline; the existing structured-spec escape hatch remains.
 
 ## Lighting layer
 
