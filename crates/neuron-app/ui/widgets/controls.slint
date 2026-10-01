@@ -1099,11 +1099,9 @@ export component Picker inherits Rectangle {
 export component ClipboardTransformEditor inherits VerticalLayout {
     property <string> sample: "order 7391 shipped";
     property <string> capture-name: "id";
-    property <string> capture-kind: "digits";
     property <string> delimiter: " ";
-    property <string> replacement: "${id}";
-    property <string> raw-pattern: "";
-    property <bool> raw-mode: false;
+    property <[string]> kinds: ["literal", "digits", "word", "until-delimiter"];
+    in-out property <int> selected-kind: 1;
     in-out property <int> selected-operation: 0;
     property <[string]> operation-ids: ["uppercase", "lowercase", "titlecase", "trim", "trim-lines", "lines-reverse", "lines-sort", "lines-unique", "json-pretty", "json-compact", "csv-to-json", "json-to-csv", "base64-encode", "base64-decode", "url-encode", "url-decode", "regex"];
     property <[string]> operation-labels: ["Uppercase", "Lowercase", "Title case", "Trim", "Trim lines", "Reverse lines", "Sort lines", "Unique lines", "JSON pretty", "JSON compact", "CSV → JSON", "JSON → CSV", "Base64 encode", "Base64 decode", "URL encode", "URL decode", "Regex replace"];
@@ -1113,16 +1111,21 @@ export component ClipboardTransformEditor inherits VerticalLayout {
     HorizontalLayout {
         spacing: 5px;
         Picker { options: root.operation-labels; index: root.selected-operation; changed(index) => { root.selected-operation = index; } }
-        Button { text: "+ add"; clicked => { State.append-clipboard-operation(root.selected-operation-id, "", ""); } }
+        Button { text: "+ add"; clicked => {
+            if root.selected-operation-id == "regex" { State.save-clipboard-operation(-1, State.clipboard-pattern, State.clipboard-replacement-input); }
+            else { State.append-clipboard-operation(root.selected-operation-id, "", ""); }
+        } }
         Text { text: "ordered · max 32"; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; horizontal-stretch: 1; }
     }
     for operation[index] in State.clipboard-operations : HorizontalLayout {
         spacing: 4px;
         Text { text: "{index + 1}. {operation}"; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+        if State.clipboard-operation-rows[index].editable : Button { text: State.clipboard-editing-index == index ? "editing" : "edit"; clicked => { State.edit-clipboard-operation(index); } }
         Button { text: "↑"; clicked => { State.move-clipboard-operation(index, -1); } }
         Button { text: "↓"; clicked => { State.move-clipboard-operation(index, 1); } }
         Button { text: "×"; clicked => { State.remove-clipboard-operation(index); } }
     }
+    if root.selected-operation-id == "regex" || State.clipboard-editing-index >= 0 : VerticalLayout {
     HorizontalLayout {
         spacing: 5px;
         Text { text: "sample"; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
@@ -1132,7 +1135,7 @@ export component ClipboardTransformEditor inherits VerticalLayout {
             border-color: sample-input.has-focus ? Theme.accent.with-alpha(0.7) : Theme.line;
             HorizontalLayout { padding-left: 10px; padding-right: 10px;
                 sample-input := TextInput { text <=> root.sample; color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-small; single-line: true;
-                    edited => { State.preview-clipboard-example(root.sample, root.raw-pattern, root.replacement, root.raw-mode); }
+                    edited => { State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); }
                 }
             }
         }
@@ -1141,7 +1144,7 @@ export component ClipboardTransformEditor inherits VerticalLayout {
             State.mark-clipboard-variable(root.sample,
                 min(sample-input.cursor-position-byte-offset, sample-input.anchor-position-byte-offset),
                 max(sample-input.cursor-position-byte-offset, sample-input.anchor-position-byte-offset),
-                root.capture-name, root.capture-kind, root.delimiter, root.replacement, root.raw-pattern, root.raw-mode);
+                root.capture-name, root.kinds[root.selected-kind], root.delimiter, State.clipboard-replacement-input, State.clipboard-pattern-input, State.clipboard-raw-mode);
         } }
         Button { text: "clear"; clicked => { State.clear-clipboard-variables(); } }
     }
@@ -1150,31 +1153,29 @@ export component ClipboardTransformEditor inherits VerticalLayout {
         Text { text: "${variable.name}"; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
         Text { text: variable.kind; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
         if variable.kind == "until-delimiter" : Text { text: "before {variable.delimiter}"; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
-        Button { text: "${variable.name}"; clicked => { root.replacement += "${" + variable.name + "}"; State.preview-clipboard-example(root.sample, root.raw-pattern, root.replacement, root.raw-mode); } }
-        Button { text: "×"; clicked => { State.remove-clipboard-variable(index, root.sample, root.raw-pattern, root.replacement, root.raw-mode); } }
+        Button { text: "${variable.name}"; clicked => { State.clipboard-replacement-input += "${" + variable.name + "}"; State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        Button { text: "×"; clicked => { State.remove-clipboard-variable(index, root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
         Rectangle { height: 1px; horizontal-stretch: 1; background: Theme.line; }
     }
     HorizontalLayout {
         spacing: 4px;
-        for kind in ["literal", "digits", "word", "until-delimiter"] : Button {
-            text: kind; clicked => { root.capture-kind = kind; State.preview-clipboard-example(root.sample, root.raw-pattern, root.replacement, root.raw-mode); }
-        }
-        Field { text <=> root.delimiter; placeholder: "delimiter"; field-width: 74px; }
-        Text { text: "→"; color: Theme.text-faint; vertical-alignment: center; }
-        Field { text <=> root.replacement; placeholder: "${name}"; field-width: 160px; edited(value) => { State.preview-clipboard-example(root.sample, root.raw-pattern, value, root.raw-mode); } }
+        Picker { options: root.kinds; index: root.selected-kind; changed(index) => { root.selected-kind = index; State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        if root.kinds[root.selected-kind] == "until-delimiter" : Field { text <=> root.delimiter; placeholder: "delimiter"; field-width: 74px; }
+        Field { text <=> State.clipboard-replacement-input; placeholder: "${name}"; field-width: 160px; edited(value) => { State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, value, State.clipboard-raw-mode); } }
     }
     HorizontalLayout {
         spacing: 5px;
-        Button { text: root.raw-mode ? "raw" : "sample"; clicked => { root.raw-mode = !root.raw-mode; State.preview-clipboard-example(root.sample, root.raw-pattern, root.replacement, root.raw-mode); } }
-        if root.raw-mode : Field { text <=> root.raw-pattern; placeholder: "Rust regex"; field-width: 260px; edited(value) => { State.preview-clipboard-example(root.sample, value, root.replacement, root.raw-mode); } }
-        Button { text: "preview"; clicked => { State.preview-clipboard-example(root.sample, root.raw-pattern, root.replacement, root.raw-mode); } }
-        Button { text: "add regex"; clicked => { State.append-clipboard-operation("regex", State.clipboard-pattern, root.replacement); } }
+        Button { text: State.clipboard-raw-mode ? "raw" : "sample"; clicked => { State.clipboard-raw-mode = !State.clipboard-raw-mode; State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        if State.clipboard-raw-mode : Field { text <=> State.clipboard-pattern-input; placeholder: "Rust regex"; field-width: 260px; edited(value) => { State.preview-clipboard-example(root.sample, value, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        Button { text: "preview"; clicked => { State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        Button { text: State.clipboard-editing-index >= 0 ? "save regex" : "add regex"; clicked => { State.save-clipboard-operation(State.clipboard-editing-index, State.clipboard-pattern, State.clipboard-replacement-input); } }
         Text { text: State.clipboard-pattern; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
     }
     HorizontalLayout {
         spacing: 6px;
         Text { text: State.clipboard-preview-status; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-small; }
         Text { text: State.clipboard-preview; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; overflow: elide; horizontal-stretch: 1; }
+    }
     }
 }
 

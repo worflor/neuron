@@ -1336,10 +1336,11 @@ fn pocket_cmd(
     // reports success and then destroys the payload. `--keep` stays accepted (it's the app's
     // vocabulary) but the disk mirror is not optional here.
     let _ = keep;
-    println!("{}", neuron::pocket::activate(&slot, true));
+    let status = neuron::pocket::activate(&slot, true);
     // activate() persists on a worker thread; this process exits NOW — flush synchronously or
     // the worker dies mid-write and the stash evaporates (live-verified before this call existed).
-    neuron::pocket::flush_durable_sync();
+    neuron::pocket::flush_durable_sync()?;
+    println!("{status}");
     Ok(())
 }
 
