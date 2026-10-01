@@ -240,6 +240,31 @@ struct PendingStar {
     origins: Vec<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct LocalMotif {
+    cells: &'static [(isize, isize)],
+    orbit: &'static [(isize, isize)],
+}
+
+const BLOCK: &[(isize, isize)] = &[(0, 0), (0, 1), (1, 0), (1, 1)];
+const BLINKER: &[(isize, isize)] = &[(1, 0), (1, 1), (1, 2)];
+const BLINKER_ORBIT: &[(isize, isize)] = &[(0, 1), (1, 0), (1, 1), (1, 2), (2, 1)];
+const BOAT: &[(isize, isize)] = &[(0, 0), (0, 1), (1, 0), (1, 2), (2, 1)];
+const LOCAL_MOTIFS: &[LocalMotif] = &[
+    LocalMotif {
+        cells: BLOCK,
+        orbit: BLOCK,
+    },
+    LocalMotif {
+        cells: BLINKER,
+        orbit: BLINKER_ORBIT,
+    },
+    LocalMotif {
+        cells: BOAT,
+        orbit: BOAT,
+    },
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SceneKind {
     Squall,
@@ -446,7 +471,7 @@ impl LifeSim {
             let moved = self.ghost[i] * amount;
             let target = (i / self.cols) * self.cols + target_col as usize;
             self.ghost_scratch[i] -= moved;
-            self.ghost_scratch[target as usize] += moved;
+            self.ghost_scratch[target] += moved;
         }
         for i in 0..self.ghost.len() {
             self.ghost[i] = (self.ghost[i] + self.ghost_scratch[i]).clamp(0.0, 1.0);
@@ -573,7 +598,6 @@ impl LifeSim {
                     self.ghost[i] = self.ghost[i].max(0.28);
                 }
                 self.feed(i, 0.12);
-                return;
             }
             ContactKind::Backspace => {
                 if self.sim_t - self.prune_at >= 1.5 {
@@ -581,7 +605,6 @@ impl LifeSim {
                     self.prune(i);
                 }
                 self.feed(i, 0.10);
-                return;
             }
             ContactKind::Key => {
                 self.feed(i, if rhythmic { 0.12 } else { 0.10 });
@@ -978,11 +1001,15 @@ impl LifeSim {
         };
         self.occupancy_ema += (occupancy - self.occupancy_ema) * (dt as f32 / 12.0).clamp(0.0, 1.0);
         self.ghost_ema += (ghost_density - self.ghost_ema) * (dt as f32 / 8.0).clamp(0.0, 1.0);
-        if visible_live == 0
-            && self.sim_t >= self.recovery_at
-            && self.visible.iter().filter(|x| **x).count() >= 9
+        let no_recent_input = !self.last_key_at.is_some_and(|at| self.sim_t - at < 3.0);
+        let sparse = self.occupancy_ema < 0.06 && visible_count >= 12;
+        let empty = visible_live == 0 && visible_count >= 9;
+        if self.sim_t >= self.recovery_at
+            && no_recent_input
+            && self.scene.is_none()
+            && (sparse || empty)
         {
-            self.recovery_at = self.sim_t + 1.0;
+            self.recovery_at = self.sim_t + 6.0 + self.rand_immigration() as f64 * 6.0;
             self.seed_local_motif();
         }
         if self.quiet_for > 45.0 && self.sim_t >= self.star_due && self.scene.is_none() {
@@ -1033,28 +1060,70 @@ impl LifeSim {
         if self.rows < 3 || self.cols < 3 {
             return false;
         }
-        let block = &[(0, 0), (0, 1), (1, 0), (1, 1)];
         let seasons = season_weights(self.sim_t);
         let pressure = establishment_pressure(self.density, seasons);
         if self.rand_immigration() > pressure {
             return false;
         }
-        let candidates: Vec<_> = (0..self.rows.saturating_sub(1))
-            .flat_map(|r| (0..self.cols.saturating_sub(1)).map(move |c| (r, c)))
-            .filter(|&(r, c)| {
-                (0..2).all(|dr| {
-                    (0..2).all(|dc| {
-                        let i = (r + dr) * self.cols + c + dc;
+        let mut candidates = Vec::new();
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                for (motif_index, motif) in LOCAL_MOTIFS.iter().enumerate() {
+                    let mut fertile = 0.0;
+                    let admitted = motif.orbit.iter().all(|&(dr, dc)| {
+                        let rr = r as isize + dr;
+                        let cc = c as isize + dc;
+                        if rr < 0 || cc < 0 || rr >= self.rows as isize || cc >= self.cols as isize
+                        {
+                            return false;
+                        }
+                        let i = rr as usize * self.cols + cc as usize;
+                        fertile += self.nutrient[i];
                         self.visible[i] && !self.live[i]
-                    })
-                })
-            })
-            .collect();
+                    });
+                    if !admitted {
+                        continue;
+                    }
+                    let separated = motif.orbit.iter().all(|&(dr, dc)| {
+                        let rr = r as isize + dr;
+                        let cc = c as isize + dc;
+                        (-1..=1).all(|dy| {
+                            (-1..=1).all(|dx| {
+                                let nr = rr + dy;
+                                let nc = cc + dx;
+                                nr < 0
+                                    || nc < 0
+                                    || nr >= self.rows as isize
+                                    || nc >= self.cols as isize
+                                    || !self.live[nr as usize * self.cols + nc as usize]
+                            })
+                        })
+                    });
+                    if separated {
+                        candidates.push((r, c, motif_index, fertile));
+                    }
+                }
+            }
+        }
         if candidates.is_empty() {
             return false;
         }
-        let origin = candidates[(self.rand_immigration() * candidates.len() as f32) as usize];
-        self.seed_cells(origin, block, 1)
+        let fertile: Vec<_> = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, _, _, value))| (*value >= 0.18).then_some(i))
+            .collect();
+        let choices = if fertile.is_empty() {
+            None
+        } else {
+            Some(&fertile)
+        };
+        let count = choices.map_or(candidates.len(), Vec::len);
+        let choice = (self.rand_immigration() * count as f32) as usize;
+        let candidate_index =
+            choices.map_or(choice, |indices| indices[choice.min(indices.len() - 1)]);
+        let (r, c, motif_index, _) = candidates[candidate_index];
+        self.seed_cells((r, c), LOCAL_MOTIFS[motif_index].cells, 1)
     }
 
     fn record_recurrence(&mut self) {
@@ -1076,7 +1145,7 @@ impl LifeSim {
             .collect::<Vec<_>>();
         if self.recurrence.iter().any(|old| old == &bits) && self.sim_t - self.recovery_at > 8.0 {
             self.seed_local_motif();
-            self.recovery_at = self.sim_t + 12.0;
+            self.recovery_at = self.sim_t + 6.0 + self.rand_immigration() as f64 * 6.0;
             if self.sim_t - self.renewal_at > 60.0 && self.scene.is_none() {
                 self.start_renewal(self.visible.iter().filter(|x| **x).count() / 10);
             }
@@ -1127,11 +1196,11 @@ impl LifeSim {
                 (0.94, (0.68 + contact * 0.32).min(1.0))
             } else if alive {
                 let maturity = (self.age[i] as f32 / 30.0).clamp(0.0, 1.0);
-                let emergence = 0.70 + 0.30 * (1.0 - self.birth_envelope[i]);
+                let emergence = 0.80 + 0.20 * (1.0 - self.birth_envelope[i]);
                 (
                     0.48 + 0.38 * maturity,
-                    ((0.43 + 0.27 * maturity + 0.10 * warm + 0.08 * n) * emergence)
-                        .clamp(0.0, 0.88),
+                    ((0.58 + 0.22 * maturity + 0.10 * warm + 0.06 * n) * emergence)
+                        .clamp(0.0, 0.90),
                 )
             } else if ghost > 0.05 {
                 (0.14, (ghost * 0.24).clamp(0.0, 0.22))
@@ -1644,6 +1713,90 @@ mod tests {
     }
 
     #[test]
+    fn local_establishment_varies_viable_catalog_motifs_across_seeds() {
+        let mut counts = [0usize; 3];
+        let mut sampled = 0;
+        for seed in 1..=64 {
+            let mut s = LifeSim::new(12, 22, seed * 17);
+            clear(&mut s);
+            s.density = 3.0;
+            if !s.seed_local_motif() {
+                continue;
+            }
+            sampled += 1;
+            let population = s.live.iter().filter(|alive| **alive).count();
+            let catalog_index = match population {
+                3 => 1,
+                4 => 0,
+                5 => 2,
+                other => panic!("unexpected local motif population {other}"),
+            };
+            counts[catalog_index] += 1;
+            let initial = s.live.clone();
+            if catalog_index == 1 {
+                s.generation();
+                s.generation();
+            } else {
+                s.generation();
+            }
+            assert_eq!(s.live, initial, "local catalog motif must be viable");
+        }
+        assert!(
+            sampled >= 32,
+            "enough seeded trials should pass pressure: {sampled}"
+        );
+        assert!(
+            counts.iter().filter(|count| **count > 0).count() >= 2,
+            "catalog choice should vary: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn thin_region_cannot_admit_only_one_phase_of_a_blinker() {
+        let mut s = board(10, 22);
+        s.set_visible_region(&[5 * 22 + 5, 5 * 22 + 6, 5 * 22 + 7], 10, 22);
+        clear(&mut s);
+        s.density = 3.0;
+        assert!(!s.seed_local_motif());
+        assert!(s.live.iter().all(|alive| !*alive));
+    }
+
+    #[test]
+    fn sparse_establishment_can_add_one_separated_colony_but_respects_typing_and_cooldown() {
+        let mut s = board(10, 22);
+        clear(&mut s);
+        s.density = 3.0;
+        put(&mut s, &[(1, 1), (1, 2), (2, 1), (2, 2)]);
+        s.occupancy_ema = 0.01;
+        s.sim_t = 20.0;
+        s.governor(1.0 / 60.0);
+        let population = s.live.iter().filter(|alive| **alive).count();
+        assert!(
+            population > 4,
+            "a sparse world can establish alongside a refuge"
+        );
+        assert!((26.0..=32.0).contains(&s.recovery_at));
+        let deadline = s.recovery_at;
+        for tick in 1..=300 {
+            s.sim_t = 20.0 + tick as f64 / 60.0;
+            s.governor(1.0 / 60.0);
+        }
+        assert_eq!(s.recovery_at, deadline);
+        assert_eq!(s.live.iter().filter(|alive| **alive).count(), population);
+
+        let mut typed = board(10, 22);
+        clear(&mut typed);
+        typed.density = 3.0;
+        put(&mut typed, &[(1, 1), (1, 2), (2, 1), (2, 2)]);
+        typed.occupancy_ema = 0.01;
+        typed.sim_t = 20.0;
+        typed.last_key_at = Some(19.0);
+        typed.governor(1.0 / 60.0);
+        assert_eq!(typed.live.iter().filter(|alive| **alive).count(), 4);
+        assert_eq!(typed.recovery_at, 0.0);
+    }
+
+    #[test]
     fn enter_admits_a_full_lwss_runway_then_uses_a_glider_on_smaller_boards() {
         let mut large = board(6, 22);
         clear(&mut large);
@@ -1748,7 +1901,7 @@ mod tests {
             .filter(|(i, live)| **live && s.visible[*i])
             .count();
         let visible_area = s.visible.iter().filter(|v| **v).count();
-        s.start_squall(1 * s.cols + 1);
+        s.start_squall(s.cols + 1);
         let scene = s.scene.as_ref().expect("squall starts");
         assert_eq!(scene.mortality_left, (visible_live * 17 / 100).max(1));
         assert_eq!(scene.footprint_left, (visible_area * 23 / 100).max(1));
@@ -1885,7 +2038,7 @@ mod tests {
     #[test]
     fn long_seeded_activity_trace_stays_bounded_and_replays_exactly() {
         let run = || {
-            let mut s = LifeSim::new(6, 22, 0xC0FF_EE);
+            let mut s = LifeSim::new(6, 22, 0x00C0_FFEE);
             s.set_visible_region(&(0..132).filter(|i| i % 22 < 18).collect::<Vec<_>>(), 6, 22);
             s.advance_to(0.0);
             let mut event = 0usize;
