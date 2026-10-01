@@ -410,6 +410,17 @@ export global State {
     // ── Bindings (remap + HyperShift + macros + mic-as-Actions) ──────────
     in-out property <[RuleRow]> rules;
     in-out property <[RuleRow]> hypershift-rules;
+    in-out property <string> rule-query;
+    in-out property <string> hyper-rule-query;
+    in-out property <[int]> rule-indices;
+    in-out property <[int]> hyper-rule-indices;
+    in-out property <int> rule-page: 0;
+    in-out property <int> hyper-rule-page: 0;
+    in-out property <int> rule-matches: 0;
+    in-out property <int> hyper-rule-matches: 0;
+    callback filter-rules(string, bool);
+    callback page-rules(int, bool);
+    callback reset-rule-view(bool);
     // POCKETS — portable clipboards. Each carries its emergent content-sigil + legible summary;
     // rebuilt from neuron-core only when a pocket actually changes (a generation counter).
     in-out property <[PocketCard]> pockets;

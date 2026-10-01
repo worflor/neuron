@@ -1341,6 +1341,7 @@ fn regenerate_source_only(st: &State, doc: &MacroDocument) {
 
 /// Install every callback + initial data. Returns the shared runtime so main/tray can reach it.
 pub fn install(app: &AppWindow) -> SharedRt {
+    crate::binding_list::install(app);
     let shared: SharedRt = Rc::new(RefCell::new(Shared {
         rt: AppRuntime::load(),
         pending_import: None,
@@ -3320,12 +3321,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     return;
                 }
                 let hyper = st.get_editing_rule_hyper();
-                let n = if hyper {
-                    row.max(0) as usize
-                } else {
-                    let total = st.get_rules().row_count() as i32;
-                    let first_editable = total - st.get_editable_count();
-                    (row - first_editable).max(0) as usize
+                let Some(n) = gui_row_index(&st, row, hyper) else {
+                    st.set_status_line(PROVENANCE_ROW_NOTE.into());
+                    return;
                 };
                 let (id, param) = current_action(&st);
                 if let Err(e) = crate::editor::validate_action(&id, &param) {
@@ -3348,10 +3346,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 match crate::editor::edit_gui_rule_in_tier(n, hyper, trigger, action) {
                     Ok(()) => {
                         sh.borrow_mut().rt.bindings = neuron::bindings::Bindings::load();
+                        st.set_editing_rule(-1);
                         refresh_rules(&app, &sh);
                         crate::dispatch::request_reload();
                         CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = None);
-                        st.set_editing_rule(-1);
                         st.set_bind_trigger_ready(false);
                         st.set_bind_trigger_label("—".into());
                         st.set_status_line("binding updated — live now".into());
@@ -8175,6 +8173,18 @@ pub fn refresh_badges(app: &AppWindow, sh: &SharedRt) {
     sync_cast_trigger(&st, sh.borrow().rt.cast.trigger);
 }
 
+fn update_rule_model(existing: ModelRc<RuleRow>, rows: Vec<RuleRow>) -> ModelRc<RuleRow> {
+    if let Some(model) = existing.as_any().downcast_ref::<VecModel<RuleRow>>() {
+        while model.row_count() > rows.len() { model.remove(model.row_count() - 1); }
+        for (i, row) in rows.into_iter().enumerate() {
+            if i == model.row_count() { model.push(row); }
+            else if model.row_data(i) != Some(row.clone()) { model.set_row_data(i, row); }
+        }
+        return existing;
+    }
+    ModelRc::new(VecModel::from(rows))
+}
+
 pub fn refresh_rules(app: &AppWindow, sh: &SharedRt) {
     let (base_views, hyper_views) = sh.borrow().rt.rules();
     // toml/cast-sourced rows are read-only provenance; GUI-authored rows (gui.rules.toml) are the
@@ -8232,12 +8242,14 @@ pub fn refresh_rules(app: &AppWindow, sh: &SharedRt) {
         }
     }
     let st = app.global::<State>();
-    st.set_rules(ModelRc::new(VecModel::from(base)));
-    st.set_hypershift_rules(ModelRc::new(VecModel::from(hyper)));
+    st.set_rules(update_rule_model(st.get_rules(), base));
+    st.set_hypershift_rules(update_rule_model(st.get_hypershift_rules(), hyper));
     st.set_editable_count(editable_base);
     st.set_editable_hyper_count(editable_hyper);
     st.set_hypershift_hold_ready(hold_label.is_some());
     st.set_hypershift_hold_label(hold_label.unwrap_or_else(|| "—".to_string()).into());
+    crate::binding_list::refresh(app, false);
+    crate::binding_list::refresh(app, true);
 }
 
 /// A pocket's emergent sigil as a Slint `Path` commands string, in normalized [-1,1] space (the
