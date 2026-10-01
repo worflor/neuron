@@ -92,9 +92,15 @@ pub fn table(d: &Device) -> Result<Vec<u8>> {
 
 /// Write one button's function on the direct profile and verify it against the `02/8C` read-back.
 pub fn write(d: &Device, button: u8, rec: Record) -> Result<()> {
-    if crate::writes::writes_paused() {
+    write_impl(d, button, rec, false)
+}
+
+fn write_impl(d: &Device, button: u8, rec: Record, safety_stock: bool) -> Result<()> {
+    let is_stock = d.def.buttons.iter().find(|b| b.id == button).is_some_and(|b| rec == Record::stock(b.stock_usage));
+    if crate::writes::writes_paused() && !(safety_stock && is_stock) {
         bail!("writes paused");
     }
+    if safety_stock && !is_stock { bail!("safety restore accepts stock functions only"); }
     let mut args = [0u8; 10];
     args[..3].copy_from_slice(&[DIRECT_PROFILE, button, 0x00]);
     args[3..].copy_from_slice(&rec.0);
@@ -233,24 +239,42 @@ pub fn plan_for(def: &DeviceDef, rules: &[Rule], held: Option<crate::controls::C
 
 /// What each device's firmware holds, as written and verified by [`apply`], and the input-path
 /// questions asked of it. The process has one ([`APPLIED`]); it's a type so it can be tested alone.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DeviceKey {
+    pid: CanonicalPid,
+    instance: String,
+}
+
 #[derive(Default, Debug)]
-pub struct Table(BTreeMap<CanonicalPid, Vec<ButtonPlan>>);
+pub struct Table(BTreeMap<DeviceKey, Vec<ButtonPlan>>);
 
 impl Table {
-    fn managed(&self, pid: CanonicalPid) -> impl Iterator<Item = &ButtonPlan> {
-        self.0.get(&pid).into_iter().flatten().filter(|p| p.role != Role::Stock)
+    fn record_applied_plan(&mut self, key: DeviceKey, plan: &[ButtonPlan], succeeded: &std::collections::BTreeSet<u8>) {
+        let previous = self.0.remove(&key).unwrap_or_default();
+        let mut next = Vec::with_capacity(plan.len());
+        for p in plan {
+            if succeeded.contains(&p.id) {
+                next.push(*p);
+            } else if let Some(old) = previous.iter().find(|old| old.id == p.id) {
+                next.push(*old);
+            }
+        }
+        if !next.is_empty() {
+            self.0.insert(key, next);
+        }
     }
 
     /// Emitted `usage` → the stock usage of the button that emitted it. `drift` is set when a
     /// managed button emitted its own stock key: the device lost its functions, so its table is
     /// dropped (the host performs its binds again) until re-applied.
-    pub fn translate(&mut self, pid: CanonicalPid, usage: u16) -> (u16, bool) {
-        if let Some(p) = self.managed(pid).find(|p| u16::from(p.emits()) == usage) {
+    pub fn translate(&mut self, pid: CanonicalPid, instance: &str, usage: u16) -> (u16, bool) {
+        let key = DeviceKey { pid, instance: instance.to_string() };
+        if let Some(p) = self.0.get(&key).into_iter().flatten().find(|p| p.role != Role::Stock && u16::from(p.emits()) == usage) {
             return (u16::from(p.stock_usage), false);
         }
-        let drift = self.managed(pid).any(|p| u16::from(p.stock_usage) == usage);
+        let drift = self.0.get(&key).into_iter().flatten().any(|p| p.role != Role::Stock && u16::from(p.stock_usage) == usage);
         if drift {
-            self.0.remove(&pid);
+            self.0.remove(&key);
         }
         (usage, drift)
     }
@@ -258,24 +282,34 @@ impl Table {
     /// Does the firmware perform the bind on stock key `usage`?
     #[must_use]
     pub fn performs(&self, pid: CanonicalPid, usage: u16) -> bool {
-        self.managed(pid).any(|p| matches!(p.role, Role::Performed { .. }) && u16::from(p.stock_usage) == usage)
+        let mut units = self.0.iter().filter(|(key, _)| key.pid == pid).peekable();
+        units.peek().is_some() && units.all(|(_, plan)| plan.iter().any(|p| matches!(p.role, Role::Performed { .. }) && u16::from(p.stock_usage) == usage))
     }
 
     /// Is stock key `usage` managed at all (performed or private)?
     #[must_use]
     pub fn covers(&self, pid: CanonicalPid, usage: u16) -> bool {
-        self.managed(pid).any(|p| u16::from(p.stock_usage) == usage)
+        let mut units = self.0.iter().filter(|(key, _)| key.pid == pid).peekable();
+        units.peek().is_some() && units.all(|(_, plan)| plan.iter().any(|p| p.role != Role::Stock && u16::from(p.stock_usage) == usage))
     }
 
     /// The device and stock usage private key `usage` stands for.
     #[must_use]
-    pub fn private_source(&self, usage: u16) -> Option<(CanonicalPid, u8)> {
-        self.0.iter().find_map(|(pid, plan)| {
-            plan.iter().find_map(|p| match p.role {
-                Role::Private { usage: u } if u16::from(u) == usage => Some((*pid, p.stock_usage)),
-                _ => None,
-            })
-        })
+    pub fn private_source(&self, usage: u16) -> Option<(CanonicalPid, String, u8)> {
+        let mut found = None;
+        for (key, plan) in &self.0 {
+            for p in plan {
+                if matches!(p.role, Role::Private { usage: u } if u16::from(u) == usage) {
+                    if found.is_some() { return None; }
+                    found = Some((key.pid, key.instance.clone(), p.stock_usage));
+                }
+            }
+        }
+        found
+    }
+
+    fn forget_instance(&mut self, pid: CanonicalPid, instance: &str) -> bool {
+        self.0.remove(&DeviceKey { pid, instance: instance.to_string() }).is_some()
     }
 
     /// Every assigned private key, `(pid, usage)`.
@@ -283,9 +317,9 @@ impl Table {
     pub fn private_keys(&self) -> Vec<(CanonicalPid, u8)> {
         self.0
             .iter()
-            .flat_map(|(pid, plan)| {
+            .flat_map(|(key, plan)| {
                 plan.iter().filter_map(move |p| match p.role {
-                    Role::Private { usage } => Some((*pid, usage)),
+                    Role::Private { usage } => Some((key.pid, usage)),
                     _ => None,
                 })
             })
@@ -294,6 +328,24 @@ impl Table {
 }
 
 static APPLIED: Mutex<Table> = Mutex::new(Table(BTreeMap::new()));
+static PRIVATE_POOL_QUARANTINED: AtomicBool = AtomicBool::new(false);
+
+/// Suppress every private-pool key while stock restoration is unverified.
+#[must_use]
+pub fn private_pool_quarantined(usage: u16) -> bool {
+    u8::try_from(usage).ok().is_some_and(|u| PRIVATE_POOL.contains(&u))
+        && PRIVATE_POOL_QUARANTINED.load(Ordering::Acquire)
+}
+
+/// Keep private-pool input suppressed until an authoritative stock restore completes.
+pub fn begin_private_pool_quarantine() {
+    PRIVATE_POOL_QUARANTINED.store(true, Ordering::Release);
+}
+
+/// Clear private-pool suppression after every discovered device verifies stock functions.
+pub fn clear_private_pool_quarantine() {
+    PRIVATE_POOL_QUARANTINED.store(false, Ordering::Release);
+}
 
 fn applied() -> std::sync::MutexGuard<'static, Table> {
     APPLIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -306,20 +358,39 @@ static CHANGED: AtomicBool = AtomicBool::new(false);
 static DRIFTED: AtomicBool = AtomicBool::new(false);
 
 /// Bring the device's firmware to `plan`, writing only buttons that differ. Every write is
-/// verified; a button that fails stays out of the applied table (the host keeps handling its bind
-/// the stock way). Returns how many buttons now run a non-stock function.
+/// verified; a failed button keeps its last verified plan. Returns how many requested non-stock
+/// functions verified successfully.
 pub fn apply(d: &Device, plan: &[ButtonPlan]) -> Result<usize> {
-    let pid = CanonicalPid::of(d.def.modes.first().map_or(d.pid, |m| m.product_id));
+    apply_impl(d, plan, false, false)
+}
+
+fn apply_impl(d: &Device, plan: &[ButtonPlan], live_guard: bool, safety_stock: bool) -> Result<usize> {
+    let key = DeviceKey {
+        pid: CanonicalPid::of(d.def.modes.first().map_or(d.pid, |m| m.product_id)),
+        instance: d.dpi_unit.clone(),
+    };
     let mut live = Vec::with_capacity(plan.len());
+    let mut succeeded = std::collections::BTreeSet::new();
     let mut first_err = None;
     for p in plan {
+        let _arm = if live_guard && p.role != Role::Stock {
+            match crate::safety::while_input_armed() {
+                Some(guard) => Some(guard),
+                None => return Err(anyhow::anyhow!("input disarmed")),
+            }
+        } else {
+            None
+        };
         let want = p.record();
         let ok = match read(d, p.id) {
             Ok(have) if have == want || (p.role == Role::Stock && have.as_keyboard() == Some((0, p.stock_usage))) => Ok(()),
-            _ => write(d, p.id, want),
+            _ => write_impl(d, p.id, want, safety_stock),
         };
         match ok {
-            Ok(()) => live.push(*p),
+            Ok(()) => {
+                live.push(*p);
+                succeeded.insert(p.id);
+            }
             Err(e) => {
                 first_err.get_or_insert(e);
             }
@@ -328,32 +399,50 @@ pub fn apply(d: &Device, plan: &[ButtonPlan]) -> Result<usize> {
     let managed = live.iter().filter(|p| p.role != Role::Stock).count();
     {
         let mut t = applied();
-        if t.0.get(&pid) != Some(&live) {
+        let previous = t.0.get(&key).cloned();
+        t.record_applied_plan(key.clone(), plan, &succeeded);
+        if t.0.get(&key) != previous.as_ref() {
             CHANGED.store(true, Ordering::Release);
         }
-        t.0.insert(pid, live);
     }
     match first_err {
+        Some(e) if live_guard => Err(e),
+        Some(e) if plan.iter().all(|p| p.role == Role::Stock) => Err(e),
         Some(e) if managed == 0 && plan.iter().any(|p| p.role != Role::Stock) => Err(e),
         _ => Ok(managed),
     }
 }
 
+/// Apply one live GUI plan. Every managed-button read/write/readback transaction holds the arm
+/// transition lease so a disarm cannot race through an in-flight firmware remap.
+pub fn apply_live(d: &Device, plan: &[ButtonPlan]) -> Result<usize> {
+    apply_impl(d, plan, true, false)
+}
+
 /// Return every button of `d` to its factory function and forget the device's applied table.
 pub fn restore_stock(d: &Device) -> Result<()> {
+    restore_stock_with(d, false)
+}
+
+/// Return every button to stock even while device writes are paused. This exception accepts only
+/// the factory record for each declared button and still requires the device readback to match.
+pub fn restore_stock_safety(d: &Device) -> Result<()> {
+    restore_stock_with(d, true)
+}
+
+fn restore_stock_with(d: &Device, safety_stock: bool) -> Result<()> {
     let stock: Vec<ButtonPlan> = d
         .def
         .buttons
         .iter()
         .map(|b| ButtonPlan { id: b.id, stock_usage: b.stock_usage, role: Role::Stock })
         .collect();
-    apply(d, &stock).map(|_| ())
+    apply_impl(d, &stock, false, safety_stock).map(|_| ())
 }
 
-/// Forget a device's applied table without touching it (it was unplugged; its volatile functions
-/// are already gone).
-pub fn forget(pid: u16) {
-    if applied().0.remove(&CanonicalPid::of(pid)).is_some() {
+/// Forget one physical unit whose HID collection disappeared.
+pub fn forget_instance(pid: u16, instance: &str) {
+    if applied().forget_instance(CanonicalPid::of(pid), instance) {
         CHANGED.store(true, Ordering::Release);
     }
 }
@@ -368,12 +457,10 @@ pub fn take_drift() -> bool {
     DRIFTED.swap(false, Ordering::AcqRel)
 }
 
-/// Ingress translation: a keyboard usage `raw_pid` emitted → the stock usage of the button that
-/// emitted it, so binds and capture see the physical button whatever its firmware function. See
-/// [`Table::translate`] for drift.
+/// Instance-aware ingress translation for same-model physical devices.
 #[must_use]
-pub fn translate(raw_pid: u16, usage: u16) -> u16 {
-    let (usage, drift) = applied().translate(CanonicalPid::of(raw_pid), usage);
+pub fn translate_instance(raw_pid: u16, instance: &str, usage: u16) -> u16 {
+    let (usage, drift) = applied().translate(CanonicalPid::of(raw_pid), instance, usage);
     if drift {
         CHANGED.store(true, Ordering::Release);
         DRIFTED.store(true, Ordering::Release);
@@ -399,7 +486,7 @@ pub fn covers(pid: CanonicalPid, usage: u16) -> bool {
 #[must_use]
 pub fn is_private(raw_pid: u16, usage: u16) -> bool {
     let pid = CanonicalPid::of(raw_pid);
-    applied().private_source(usage).is_some_and(|(p, _)| p == pid)
+    applied().private_source(usage).is_some_and(|(p, _, _)| p == pid)
 }
 
 /// Stock buttons currently held through their private key, per device.
@@ -410,7 +497,7 @@ static PRIVATE_HELD: Mutex<BTreeMap<CanonicalPid, Vec<(u16, u16)>>> = Mutex::new
 /// the device without Raw Input because only that device emits the key; it has to, because a
 /// swallowed keystroke never reaches Raw Input. `false` when `usage` isn't a private key.
 pub fn deliver_private(usage: u16, down: bool) -> bool {
-    let Some((pid, stock)) = applied().private_source(usage) else { return false };
+    let Some((pid, _, stock)) = applied().private_source(usage) else { return false };
     let key = (0x07, u16::from(stock));
     let hits = {
         let mut held = PRIVATE_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -468,6 +555,41 @@ mod tests {
         assert_eq!(Record::stock(0x2E).0, [0x02, 0x01, 0x00, 0x2E, 0, 0, 0]);
         assert_eq!(Record::keyboard(0, 0x0A).0, [0x02, 0x02, 0x00, 0x0A, 0, 0, 0]);
         assert_eq!(Record::stock(0x2E).as_keyboard(), Some((0, 0x2E)));
+    }
+
+    #[test]
+    fn partial_stock_restore_keeps_failed_private_mapping() {
+        let pid = CanonicalPid::of(0x00A7);
+        let key = DeviceKey { pid, instance: "unit-a".into() };
+        let private = ButtonPlan { id: 1, stock_usage: 0x2D, role: Role::Private { usage: 0x73 } };
+        let performed = ButtonPlan { id: 2, stock_usage: 0x2E, role: Role::Performed { mods: 0, usage: 0x0A } };
+        let stock = [
+            ButtonPlan { role: Role::Stock, ..private },
+            ButtonPlan { role: Role::Stock, ..performed },
+        ];
+        let mut table = Table::default();
+        table.0.insert(key.clone(), vec![private, performed]);
+
+        table.record_applied_plan(key, &stock, &std::collections::BTreeSet::from([2]));
+
+        assert_eq!(table.private_source(0x73), Some((pid, "unit-a".into(), 0x2D)));
+        assert!(!table.performs(pid, 0x2E));
+        assert!(table.covers(pid, 0x2D));
+        assert!(!table.covers(pid, 0x2E));
+    }
+
+    #[test]
+    fn partial_live_apply_keeps_failed_private_mapping() {
+        let pid = CanonicalPid::of(0x00A7);
+        let key = DeviceKey { pid, instance: "unit-a".into() };
+        let previous = ButtonPlan { id: 1, stock_usage: 0x2D, role: Role::Private { usage: 0x73 } };
+        let requested = ButtonPlan { role: Role::Performed { mods: 0, usage: 0x0A }, ..previous };
+        let mut table = Table::default();
+        table.0.insert(key.clone(), vec![previous]);
+
+        table.record_applied_plan(key, &[requested], &std::collections::BTreeSet::new());
+
+        assert_eq!(table.private_source(0x73), Some((pid, "unit-a".into(), 0x2D)));
     }
 
     #[test]
@@ -551,23 +673,70 @@ mod tests {
             other => panic!("expected a private key, got {other:?}"),
         };
         let mut t = Table::default();
-        t.0.insert(pid, plan);
+        t.0.insert(DeviceKey { pid, instance: "unit-a".into() }, plan);
 
         // Firmware-performed: the emitted 'g' is the '=' button; the engine must not act on it.
-        assert_eq!(t.translate(pid, 0x0A), (0x2E, false));
+        assert_eq!(t.translate(pid, "unit-a", 0x0A), (0x2E, false));
         assert!(t.performs(pid, 0x2E));
         assert!(t.covers(pid, 0x2E) && t.covers(pid, 0x2D) && !t.covers(pid, 0x1E));
         // Host-performed: the private key names its device and stock button by itself.
-        assert_eq!(t.private_source(u16::from(private)), Some((pid, 0x2D)));
+        assert_eq!(t.private_source(u16::from(private)), Some((pid, "unit-a".into(), 0x2D)));
         assert_eq!(t.private_source(0x0A), None);
         assert_eq!(t.private_keys(), vec![(pid, private)]);
         // Unmanaged keys pass untouched.
-        assert_eq!(t.translate(pid, 0x1E), (0x1E, false));
+        assert_eq!(t.translate(pid, "unit-a", 0x1E), (0x1E, false));
 
         // The '=' button emitting its stock key means the firmware lost its function.
-        assert_eq!(t.translate(pid, 0x2E), (0x2E, true));
+        assert_eq!(t.translate(pid, "unit-a", 0x2E), (0x2E, true));
         assert!(!t.performs(pid, 0x2E), "the host performs its binds again until re-applied");
         assert!(t.private_keys().is_empty());
+    }
+
+    #[test]
+    fn applied_translation_is_scoped_to_the_physical_unit() {
+        let pid = CanonicalPid::of(0x00A7);
+        let plan = plan(
+            &naga(),
+            &[bind(0x2D, Action::Run { cmd: "calc".into() }, None)],
+            None,
+            &mut Default::default(),
+        );
+        let mut t = Table::default();
+        t.0.insert(DeviceKey { pid, instance: "unit-a".into() }, plan);
+        assert_ne!(t.translate(pid, "unit-a", 0x73), (0x73, false));
+        assert_eq!(t.translate(pid, "unit-b", 0x73), (0x73, false));
+    }
+
+    #[test]
+    fn multi_unit_queries_fail_closed_and_forget_only_the_removed_unit() {
+        let pid = CanonicalPid::of(0x00A7);
+        let performed = plan(&naga(), &[bind(0x2E, key("g"), None)], None, &mut Default::default());
+        let mut t = Table::default();
+        t.0.insert(DeviceKey { pid, instance: "unit-a".into() }, performed.clone());
+        t.0.insert(DeviceKey { pid, instance: "unit-b".into() }, performed.clone());
+        assert!(t.performs(pid, 0x2E));
+        assert!(t.covers(pid, 0x2E));
+
+        let stock = plan(&naga(), &[], None, &mut Default::default());
+        t.0.insert(DeviceKey { pid, instance: "unit-b".into() }, stock);
+        assert!(!t.performs(pid, 0x2E));
+        assert!(!t.covers(pid, 0x2E));
+
+        assert!(t.forget_instance(pid, "unit-a"));
+        assert_eq!(t.0.len(), 1);
+        assert!(t.0.contains_key(&DeviceKey { pid, instance: "unit-b".into() }));
+    }
+
+    #[test]
+    fn duplicate_private_usages_are_not_attributed_to_either_unit() {
+        let pid = CanonicalPid::of(0x00A7);
+        let plan = plan(&naga(), &[bind(0x1F, Action::Run { cmd: "calc".into() }, None)], None, &mut Default::default());
+        let private = plan.iter().find_map(|p| match p.role { Role::Private { usage } => Some(usage), _ => None }).unwrap();
+        let mut t = Table::default();
+        for instance in ["unit-a", "unit-b"] {
+            t.0.insert(DeviceKey { pid, instance: instance.into() }, plan.clone());
+        }
+        assert_eq!(t.private_source(u16::from(private)), None);
     }
 
     #[test]

@@ -308,8 +308,6 @@ pub struct LiveRuntime {
     id: u64,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
-    /// Whether this runtime armed real input (so stop can disarm symmetrically).
-    armed: bool,
 }
 
 impl LiveRuntime {
@@ -327,7 +325,21 @@ impl LiveRuntime {
         *LIVE_TX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id, tx));
-        neuron::action::arm_input(armed);
+        neuron::macros::macro_host().set_armed(false);
+        let restore_error = crate::buttonfw::set_stance(armed, neuron::writes::writes_paused()).err();
+        let actual_armed = neuron::action::input_armed();
+        neuron::macros::macro_host().set_armed(actual_armed);
+        if let Some(e) = restore_error.as_deref() {
+            eprintln!("[buttons] startup stock restore failed: {e}");
+        }
+        if let Some(app) = weak.upgrade() {
+            let st = app.global::<State>();
+            st.set_input_armed(actual_armed);
+            st.set_arm_stance(crate::glue::arm_stance(neuron::writes::writes_paused(), actual_armed));
+            if let Some(e) = restore_error {
+                st.set_status_line(format!("input disarmed; button stock restore failed: {e}").into());
+            }
+        }
         // LiveRuntime owns this handle and joins it in stop(), so it routes through the
         // handle-returning primitive.
         let handle =
@@ -342,7 +354,6 @@ impl LiveRuntime {
             id,
             stop,
             handle,
-            armed,
         }
     }
 
@@ -351,7 +362,7 @@ impl LiveRuntime {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
-    /// Signal the worker to stop and join it. Disarms input if this runtime armed it. Idempotent.
+    /// Signal the worker to stop and join it. Disarms input and is idempotent.
     pub fn stop(&mut self) {
         {
             let mut live = LIVE_TX
@@ -369,8 +380,12 @@ impl LiveRuntime {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        if self.armed {
-            neuron::action::arm_input(false);
+        // A normal worker exit restores stock in `run_worker`. Cover only spawn failure or a
+        // teardown that unwound before that footer; repeated `stop`/Drop calls stay idempotent.
+        if neuron::action::input_armed() {
+            if let Err(e) = crate::buttonfw::set_stance(false, neuron::writes::writes_paused()) {
+                eprintln!("[buttons] teardown stock restore failed: {e}");
+            }
         }
         neuron::session_undo::clear();
     }

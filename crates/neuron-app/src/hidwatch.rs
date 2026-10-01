@@ -204,6 +204,7 @@ pub fn start() {
 
     // The OS tells us the instant a device interface arrives; the poll below is only the backstop.
     let wake = spawn_hotplug_notifier();
+    let mut topology = hid_topology_snapshot();
 
     let mon = armed;
     crate::worker::spawn_detached("neuron-hidwatch-mon", move || loop {
@@ -229,6 +230,16 @@ pub fn start() {
                 while rx.try_recv().is_ok() {}
             }
         }
+        if let Some(next) = hid_topology_snapshot() {
+            if topology.as_ref() != Some(&next) {
+                // The notifier already invalidated a signalled change. This comparison is the
+                // backstop for missed notifications and unavailable notifier registration.
+                if !woken {
+                    neuron::hid_haptics::hid_topology_changed();
+                }
+                topology = Some(next);
+            }
+        }
         // Recomputed EVERY pass, never captured once: the pid set is derived from the registry, and
         // the registry can both arrive late (a load that failed at startup) and change (a device
         // that adopts itself at runtime). A snapshot taken in `start` would freeze both out until
@@ -240,6 +251,10 @@ pub fn start() {
         // the pill through its own bridge → `notify_hardware_mute` push.
         arm_new(&mouse_event_pids(), &mon, false);
     });
+}
+
+fn hid_topology_snapshot() -> Option<HashSet<DevicePath>> {
+    neuron::transport::enumerate().ok().map(|infos| infos.into_iter().map(|i| i.path).collect())
 }
 
 /// The Razer DPI-mouse pids whose EVENT collections this module owns, read fresh from the current
@@ -348,6 +363,7 @@ unsafe fn notifier_pump() {
         if msg == WM_DEVICECHANGE
             && (wparam as u32 == DBT_DEVICEARRIVAL || wparam as u32 == DBT_DEVICEREMOVECOMPLETE)
         {
+            neuron::hid_haptics::hid_topology_changed();
             notify_hotplug();
         }
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -639,7 +655,8 @@ fn spawn_reader(
                         }
                         // Its volatile button functions are gone with it; re-apply covers a link
                         // (cable or dongle) that is still connected.
-                        neuron::buttons::forget(pid);
+                        let instance = neuron::transport::path_instance(&path.as_os_str().to_string_lossy());
+                        neuron::buttons::forget_instance(pid, &instance);
                         crate::buttonfw::reapply();
                         return;
                     }

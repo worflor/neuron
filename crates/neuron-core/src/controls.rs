@@ -3564,11 +3564,12 @@ pub(crate) mod win {
                                             // here while the hook takes it; otherwise (mid-capture,
                                             // disarmed) it arrives here and reads as its button.
                                             let raw_pid = u16::from_str_radix(&pid_from_path(&path), 16).unwrap_or(0);
+                                            let instance = crate::transport::path_instance(&path);
                                             let private = key.0 == 0x07
                                                 && crate::buttons::is_private(raw_pid, key.1)
                                                 && crate::intercept::takes_private_keys();
                                             let key = match key {
-                                                (0x07, u) => (0x07, crate::buttons::translate(raw_pid, u)),
+                                                (0x07, u) => (0x07, crate::buttons::translate_instance(raw_pid, &instance, u)),
                                                 other => other,
                                             };
                                             let (_, set) = down_sets.entry(path.clone()).or_insert((super::Stream::Keyboard, Vec::new()));

@@ -10,9 +10,8 @@
 //!
 //! An Xbox-protocol pad's controls arrive through GameInput under `gameinput#vid:pid#…`, but its
 //! motors sit on its XInput-HID shadow, a separate device. The two are linked through the device
-//! tree: the shadow's parent carries the pad's USB serial, and so does the pad's own USB device,
-//! whose vid:pid is the GameInput device's. Two identical pads can't be told apart this way; the
-//! first match wins.
+//! tree: the shadow's parent and the pad's USB child carry the same per-unit ID. GameInput's
+//! device ID is opaque, so identical same-model pads are left unwritten when the join is ambiguous.
 //!
 //! Only a Game Pad collection (Generic Desktop 0x01/0x05) is a target: a joystick or wheel's
 //! Physical Interface Device outputs drive force feedback, not rumble, and are never written.
@@ -138,15 +137,16 @@ impl Motors {
 
 /// Which HID device drives each named device's motors (`None`: none, as of when it was looked
 /// for), so a write doesn't re-walk the device tree.
-type TargetCache = HashMap<String, (Option<crate::transport::DevicePath>, std::time::Instant)>;
+type TargetCache = HashMap<String, (Option<crate::transport::DevicePath>, std::time::Instant, u64)>;
 static TARGETS: std::sync::Mutex<Option<TargetCache>> =
     std::sync::Mutex::new(None);
+static DEVICE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// How long "this device has no motors" is believed before looking again (it may be replugged).
 const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 thread_local! {
     /// This thread's open targets, keyed by the name callers use.
-    static OPEN: RefCell<HashMap<String, Motors>> = RefCell::new(HashMap::new());
+    static OPEN: RefCell<HashMap<String, (u64, Motors)>> = RefCell::new(HashMap::new());
 }
 
 /// Writes to a pad outside the verified XInput-HID shadow class are enabled.
@@ -154,29 +154,48 @@ fn unverified_writes() -> bool {
     std::env::var_os("NEURON_HAPTICS_WRITE").is_some()
 }
 
+/// Invalidate cached joins when GameInput's connected-unit set changes.
+pub(crate) fn gameinput_devices_changed() {
+    hid_topology_changed();
+}
+
+/// Invalidate cached HID joins and open motor handles after a device-topology change.
+pub fn hid_topology_changed() {
+    DEVICE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if let Some(targets) = TARGETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+        targets.clear();
+    }
+}
+
 fn target_for(device: &str) -> Option<crate::transport::DevicePath> {
-    if let Some((p, at)) = TARGETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(device)) {
-        if p.is_some() || at.elapsed() < MISS_TTL {
+    let epoch = DEVICE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    if let Some((p, at, cached_epoch)) = TARGETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(device)) {
+        if *cached_epoch == epoch && (p.is_some() || at.elapsed() < MISS_TTL) {
             return p.clone();
         }
     }
+    let gameinput = gameinput_identity(device);
     let found = crate::transport::enumerate().ok().and_then(|infos| {
-        infos.into_iter().filter(|i| i.output_len > 0 && (i.usage_page, i.usage) == (0x01, 0x05)).find(|i| {
+        let eligible: Vec<_> = infos.into_iter().filter(|i| i.output_len > 0 && (i.usage_page, i.usage) == (0x01, 0x05)).filter(|i| {
             let path = i.path.as_os_str().to_string_lossy();
-            if !path.to_ascii_lowercase().contains("&ig_") && !unverified_writes() {
-                return false;
-            }
-            path.eq_ignore_ascii_case(device)
-                || (device.starts_with("gameinput#")
-                    && gip_link(&path).is_some_and(|(vid, pid)| device.starts_with(&format!("gameinput#{vid:04x}:{pid:04x}#"))))
-        })
+            path.to_ascii_lowercase().contains("&ig_") || unverified_writes()
+        }).collect();
+        if let Some(identity) = gameinput {
+            let linked: Vec<_> = eligible.into_iter().filter_map(|i| gip_link(&i.path.as_os_str().to_string_lossy()).map(|(vid, pid)| (vid, pid, i))).collect();
+            let gameinput_units = crate::gameinput::unit_count(identity.vid, identity.pid);
+            let links: Vec<_> = linked.iter().map(|(vid, pid, _)| (*vid, *pid)).collect();
+            unique_shadow_index(identity.vid, identity.pid, gameinput_units, &links).and_then(|index| linked.into_iter().nth(index).map(|(_, _, i)| i))
+        } else {
+            let matches: Vec<_> = eligible.into_iter().filter(|i| i.path.as_os_str().to_string_lossy().eq_ignore_ascii_case(device)).collect();
+            (matches.len() == 1).then(|| matches.into_iter().next().expect("one matching device"))
+        }
     });
-    let path = found.map(|i| i.path);
+    let path = if DEVICE_EPOCH.load(std::sync::atomic::Ordering::Acquire) == epoch { found.map(|i| i.path) } else { None };
     TARGETS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get_or_insert_with(Default::default)
-        .insert(device.to_string(), (path.clone(), std::time::Instant::now()));
+        .insert(device.to_string(), (path.clone(), std::time::Instant::now(), epoch));
     path
 }
 
@@ -189,15 +208,26 @@ impl Sink for PidRumble {
     fn set(&self, device: &str, r: Rumble) -> bool {
         OPEN.with(|open| {
             let mut open = open.borrow_mut();
+            let epoch = DEVICE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+            if open.get(device).is_some_and(|(opened_epoch, _)| *opened_epoch != epoch) {
+                open.remove(device);
+            }
             if !open.contains_key(device) {
                 let Some(path) = target_for(device) else { return false };
+                if DEVICE_EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch {
+                    return false;
+                }
                 let Some(motors) = Motors::open(&path) else {
                     forget_target(device);
                     return false;
                 };
-                open.insert(device.to_string(), motors);
+                open.insert(device.to_string(), (epoch, motors));
             }
-            let sent = open.get(device).is_some_and(|m| m.send(r));
+            if DEVICE_EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch {
+                open.remove(device);
+                return false;
+            }
+            let sent = open.get(device).is_some_and(|(_, m)| m.send(r));
             if !sent {
                 // Unplugged or re-enumerated: found afresh on the next write.
                 open.remove(device);
@@ -211,26 +241,80 @@ impl Sink for PidRumble {
 /// The target failed to open or write: remember that it has none for now.
 fn forget_target(device: &str) {
     if let Some(m) = TARGETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
-        m.insert(device.to_string(), (None, std::time::Instant::now()));
+        let epoch = DEVICE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        m.insert(device.to_string(), (None, std::time::Instant::now(), epoch));
     }
 }
 
-/// For an XInput-HID shadow ("&IG_" in its path), the vid:pid of the pad it shadows: the USB
-/// device whose instance id ends with the same serial as the shadow's parent.
+#[derive(Debug, PartialEq, Eq)]
+struct GameInputIdentity {
+    vid: u16,
+    pid: u16,
+}
+
+fn gameinput_identity(device: &str) -> Option<GameInputIdentity> {
+    let mut parts = device.split('#');
+    if !parts.next()?.eq_ignore_ascii_case("gameinput") {
+        return None;
+    }
+    let (vid, pid) = parts.next()?.split_once(':')?;
+    let unit_id = parts.next()?;
+    if vid.len() != 4
+        || pid.len() != 4
+        || !vid.bytes().all(|b| b.is_ascii_hexdigit())
+        || !pid.bytes().all(|b| b.is_ascii_hexdigit())
+        || parts.next().is_some()
+        || unit_id.is_empty()
+    {
+        return None;
+    }
+    Some(GameInputIdentity { vid: u16::from_str_radix(vid, 16).ok()?, pid: u16::from_str_radix(pid, 16).ok()? })
+}
+
+/// For an XInput-HID shadow, find the one USB child sharing its parent's per-unit ID.
 fn gip_link(path: &str) -> Option<(u16, u16)> {
     if !path.to_ascii_lowercase().contains("&ig_") {
         return None;
     }
-    let parent = parent_instance(&instance_id(path)?)?;
-    let serial = parent.rsplit('&').next()?.to_ascii_uppercase();
-    present_ids("USB").into_iter().find_map(|id| {
-        let up = id.to_ascii_uppercase();
-        if up.contains("&IG_") || !up.ends_with(&format!("\\{serial}")) {
+    let parent = instance_id(path).and_then(|instance| parent_instance(&instance))?;
+    gip_link_from_ids(&parent, &present_ids("USB"))
+}
+
+/// Match a shadow parent's final unit component to an exact USB child instance ID.
+fn gip_link_from_ids(parent: &str, ids: &[String]) -> Option<(u16, u16)> {
+    let parent_parts: Vec<_> = parent.split('\\').collect();
+    if parent_parts.len() != 3 || !parent_parts[0].eq_ignore_ascii_case("USB") || !parent_parts[1].to_ascii_uppercase().contains("&IG_") {
+        return None;
+    }
+    let unit_id = parent_parts[2].rsplit('&').next()?;
+    if unit_id.is_empty() || !unit_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let matches: Vec<_> = ids.iter().filter_map(|id| {
+        let parts: Vec<_> = id.split('\\').collect();
+        if parts.len() != 3 || !parts[0].eq_ignore_ascii_case("USB") || !parts[2].eq_ignore_ascii_case(unit_id) {
             return None;
         }
-        let hex = |key: &str| up.split(key).nth(1).and_then(|s| u16::from_str_radix(s.get(..4)?, 16).ok());
-        Some((hex("VID_")?, hex("PID_")?))
-    })
+        let hardware = parts[1].to_ascii_uppercase();
+        if hardware.contains("&IG_") {
+            return None;
+        }
+        let field = |key: &str| {
+            hardware.split('&').find_map(|part| part.strip_prefix(key)).filter(|value| value.len() == 4 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                .and_then(|value| u16::from_str_radix(value, 16).ok())
+        };
+        Some((field("VID_")?, field("PID_")?))
+    }).collect();
+    (matches.len() == 1).then(|| matches.into_iter().next().expect("one matching USB child"))
+}
+
+fn unique_shadow_index(vid: u16, pid: u16, gameinput_units: usize, shadows: &[(u16, u16)]) -> Option<usize> {
+    if gameinput_units != 1 {
+        return None;
+    }
+    let mut matches = shadows.iter().enumerate().filter(|(_, shadow)| **shadow == (vid, pid));
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
 }
 
 /// The name a present USB device reports on the bus ("PowerA Xbox Series X Controller"), for a
@@ -316,6 +400,47 @@ fn present_ids(enumerator: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gameinput_identity_uses_vid_pid_and_treats_device_id_as_opaque() {
+        assert_eq!(
+            gameinput_identity("gameinput#24c6:543a#00008bc8152ea60a"),
+            Some(GameInputIdentity { vid: 0x24c6, pid: 0x543a })
+        );
+        assert!(gameinput_identity("gameinput#24c6:543a#").is_none());
+        assert!(gameinput_identity("gameinput#24c6:543a#00008bc8152ea60a#extra").is_none());
+    }
+
+    #[test]
+    fn shadow_parent_links_to_the_exact_usb_child_instance() {
+        let parent = r"USB\VID_045E&PID_02FF&IG_00\00&00&00008BC8152EA60A";
+        let ids = vec![
+            r"USB\VID_24C6&PID_543A\00008BC8152EA60B".to_string(),
+            r"USB\VID_24C6&PID_543A\00008BC8152EA60A".to_string(),
+            r"USB\VID_24C6&PID_543A\prefix00008BC8152EA60A".to_string(),
+        ];
+
+        assert_eq!(gip_link_from_ids(parent, &ids), Some((0x24c6, 0x543a)));
+    }
+
+    #[test]
+    fn ambiguous_usb_children_and_non_shadow_parents_fail_closed() {
+        let parent = r"USB\VID_045E&PID_02FF&IG_00\00&00&00008BC8152EA60A";
+        let duplicate = vec![
+            r"USB\VID_24C6&PID_543A\00008BC8152EA60A".to_string(),
+            r"USB\VID_045E&PID_0B13\00008BC8152EA60A".to_string(),
+        ];
+        assert_eq!(gip_link_from_ids(parent, &duplicate), None);
+        assert_eq!(gip_link_from_ids(r"USB\VID_045E&PID_02FF\00008BC8152EA60A", &duplicate), None);
+    }
+
+    #[test]
+    fn gameinput_shadow_join_requires_one_unit_and_one_matching_shadow() {
+        let shadows = [(0x24c6, 0x543a), (0x24c6, 0x543b)];
+        assert_eq!(unique_shadow_index(0x24c6, 0x543a, 1, &shadows), Some(0));
+        assert_eq!(unique_shadow_index(0x24c6, 0x543a, 2, &shadows), None);
+        assert_eq!(unique_shadow_index(0x24c6, 0x543a, 1, &[(0x24c6, 0x543a), (0x24c6, 0x543a)]), None);
+    }
 
     #[test]
     fn interface_paths_become_instance_ids() {

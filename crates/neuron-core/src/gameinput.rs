@@ -169,6 +169,11 @@ pub fn owns(pid: u16) -> bool {
     devices().iter().any(|p| p.pid == pid)
 }
 
+/// Connected GameInput units with this VID:PID; the HID shadow can only be joined when this is one.
+pub(crate) fn unit_count(vid: u16, pid: u16) -> usize {
+    devices().iter().filter(|p| (p.vid, p.pid) == (vid, pid)).count()
+}
+
 extern "system" fn on_device(_token: u64, _ctx: *mut c_void, device: *mut c_void, _ts: u64, current: u32, _previous: u32) {
     let obj = Obj(device as usize);
     let mut list = devices();
@@ -184,6 +189,7 @@ extern "system" fn on_device(_token: u64, _ctx: *mut c_void, device: *mut c_void
             let (vid, pid, path) = (pad.vid, pad.pid, pad.path.clone());
             list.push(pad);
             drop(list);
+            crate::hid_haptics::gameinput_devices_changed();
             // The device-tree name lookup runs after the list is released: the poll thread waits on it.
             let name = crate::hid_haptics::usb_name(vid, pid);
             crate::badge::learn(crate::registry::CanonicalPid::of(pid), Some(crate::badge::Emblem::Pad), name.as_deref().unwrap_or(""));
@@ -196,6 +202,8 @@ extern "system" fn on_device(_token: u64, _ctx: *mut c_void, device: *mut c_void
             // SAFETY: the list's reference, taken on connect; a poll snapshot holds its own.
             unsafe { pad.obj.release() };
             GONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(pad);
+            drop(list);
+            crate::hid_haptics::gameinput_devices_changed();
         }
         _ => {}
     }
