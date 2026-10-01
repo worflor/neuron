@@ -207,6 +207,21 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "is_false")]
         persist: bool,
     },
+    /// Transform explicitly selected clipboard text through an ordered, bounded operation list.
+    ClipboardTransform {
+        ops: Vec<crate::clipboard_transform::TransformOp>,
+    },
+    /// Restore a snapshot from the newest-first in-session clipboard history.
+    PocketHistory { index: usize },
+    /// Capture the screen, trigger-time foreground window, or an app-provided native region.
+    Screenshot {
+        #[serde(default)]
+        target: crate::screenshot::CaptureTarget,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default = "default_true")]
+        clipboard: bool,
+    },
     /// CURTAIN — a panic privacy screen. **Not** a power action: it never touches DPMS / the monitor
     /// power state. It throws one opaque-black, topmost window across the whole virtual desktop so the
     /// screen content is hidden INSTANTLY and RELIABLY, then the first key/click reveals everything
@@ -782,6 +797,8 @@ fn toggle() -> String {
     "toggle".into()
 }
 
+fn default_true() -> bool { true }
+
 impl Action {
     /// True for actions that only give FEEDBACK — OBS control, a profile switch, output volume
     /// and mute — and never synthesize input or touch the game. The only actions a
@@ -880,6 +897,9 @@ impl Action {
                     format!("pocket [{slot}]{keep}")
                 }
             }
+            Action::ClipboardTransform { ops } => format!("clipboard transform ({} op{})", ops.len(), if ops.len() == 1 { "" } else { "s" }),
+            Action::PocketHistory { index } => format!("clipboard history #{index}"),
+            Action::Screenshot { target, path, clipboard } => format!("screenshot {}{}{}", target.label(), if *clipboard { " · clipboard" } else { "" }, path.as_ref().map_or(String::new(), |p| format!(" · {p}"))),
             Action::Curtain => "curtain".into(),
             Action::Lock => "lock".into(),
             Action::Sleep => "sleep".into(),
@@ -1048,6 +1068,9 @@ impl Action {
             // POCKET: move the clipboard into/out of a named register (host-side, arm-gated — it
             // writes the clipboard). The pocket module owns the full-fidelity snapshot + swap.
             Action::Pocket { slot, persist } => crate::pocket::activate(slot, *persist),
+            Action::ClipboardTransform { ops } => crate::pocket::transform(ops),
+            Action::PocketHistory { index } => crate::pocket::restore_history(*index),
+            Action::Screenshot { target, path, clipboard } => crate::screenshot::request(*target, path.clone(), *clipboard),
             // CURTAIN: a panic privacy screen — an opaque black overlay across every monitor, NOT a
             // monitor power-off. Spawns a worker (never blocks here); first key/click reveals.
             Action::Curtain => crate::curtain::raise(),

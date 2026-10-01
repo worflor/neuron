@@ -198,6 +198,25 @@ device write is verified by read-back.
 `badge list`, `badge set PID [--emblem mouse|keyboard|keypad|pad|stick|headset|mic|dial|device] [--name N]`,
 `badge clear PID`.
 
+### pocket
+
+`pocket NAME` swaps a named slot with the system clipboard, carrying every supported clipboard
+format. `pocket --list` shows metadata only; with the resident app it includes session slots, while
+offline it lists durable slots only. `pocket NAME --inspect` explicitly prints that slot's text
+body when present. `pocket NAME --delete` removes its durable file before reporting success.
+`pocket --history` lists the resident app's newest-first, in-session displaced snapshots without
+their contents; `pocket --history-item INDEX` explicitly prints one item's text, and
+`pocket --clear-history` clears the session list. History commands require the resident app.
+`pocket --sigil FILE.svg` exports the named slot's content sigil. CLI pocket swaps are durable
+because the one-shot process exits after the operation.
+
+Clipboard text actions use `clipboard-transform` with a JSON array of ordered operations, for
+example `[{"op":"trim"},{"op":"uppercase"}]`; supported operations are listed by
+`action list`. `pocket-history` restores a newest-first history index. `screenshot` captures the
+virtual desktop by default, or accepts `window` / `region`; a typed JSON `Screenshot` action may
+also set an explicit PNG `path` and `clipboard` destination. The native screenshot action is
+Windows-only.
+
 ### config, status, reload
 
 `config path`; `config app list|get KEY|set KEY VALUE|unset KEY` for the GUI's `app.toml` (notifications,

@@ -79,6 +79,9 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
         false,
         4,
     ),
+    ("clipboard-transform", "transform clipboard text", "ordered operations · pattern editor", "clipboard", true, 4),
+    ("pocket-history", "restore clipboard history", "newest-first index", "clipboard", true, 4),
+    ("screenshot", "capture a screenshot", "screen · window · region", "clipboard", false, 3),
     ("macro", "python macro", "macro name", "run & code", true, 4),
     (
         "run",
@@ -225,6 +228,9 @@ pub fn action_blurb(id: &str) -> &'static str {
         "keys" => "Type a timed key sequence",
         "ghost-paste" => "Type the clipboard as keystrokes",
         "pocket" => "Stash or swap a portable clipboard",
+        "clipboard-transform" => "Transform clipboard text",
+        "pocket-history" => "Restore a clipboard snapshot",
+        "screenshot" => "Capture screen, window, or region",
         "macro" => "Run a Python macro",
         "run" => "Open apps, URLs, or commands",
         "echo" => "Repeat the last action",
@@ -359,6 +365,22 @@ pub fn build_action(id: &str, param: &str) -> Action {
             let persist = parts.any(|t| matches!(t, "keep" | "persist" | "durable"));
             Action::Pocket { slot, persist }
         }
+        "clipboard-transform" => Action::ClipboardTransform { ops: parse_transform_ops(p).unwrap_or_default() },
+        "pocket-history" => Action::PocketHistory { index: p.parse().unwrap_or(usize::MAX) },
+        "screenshot" => {
+            if p.starts_with('{') {
+                serde_json::from_str::<Action>(p).unwrap_or(Action::Screenshot {
+                    target: crate::screenshot::CaptureTarget::Screen, path: None, clipboard: true,
+                })
+            } else {
+                let target = match p.split_whitespace().next().unwrap_or("").to_ascii_lowercase().as_str() {
+                    "window" => crate::screenshot::CaptureTarget::Window,
+                    "region" => crate::screenshot::CaptureTarget::Region,
+                    _ => crate::screenshot::CaptureTarget::Screen,
+                };
+                Action::Screenshot { target, path: None, clipboard: true }
+            }
+        }
         // "name · wormhole" / just "wormhole" / just "name" / blank. The default (Mark) is the
         // automagical warpstone — one press marks / warps back / releases, zero config. The word
         // "wormhole" anywhere switches to the two-anchor portal (swap A⇄B); the name is optional.
@@ -424,6 +446,10 @@ pub fn build_action(id: &str, param: &str) -> Action {
         },
         _ => Action::Noop,
     }
+}
+
+fn parse_transform_ops(text: &str) -> Result<Vec<crate::clipboard_transform::TransformOp>, String> {
+    serde_json::from_str(text).or_else(|_| toml::from_str(text)).map_err(|error| format!("clipboard-transform: expected an operation array ({error})"))
 }
 
 fn parse_media(s: &str) -> MediaKind {
@@ -766,6 +792,34 @@ pub fn validate_action(id: &str, param: &str) -> Result<(), String> {
         }
         // a key the engine can't resolve to a VK would bind-then-do-nothing; reject it up front.
         "key" => check_key(p),
+        "clipboard-transform" => {
+            let ops = parse_transform_ops(p)?;
+            if ops.is_empty() { return Err("clipboard-transform needs at least one operation".into()); }
+            if ops.len() > crate::clipboard_transform::MAX_OPERATIONS { return Err("clipboard-transform allows at most 32 operations".into()); }
+            for op in &ops {
+                if let crate::clipboard_transform::TransformOp::Regex { pattern, replace } = op {
+                    crate::clipboard_transform::validate_regex(pattern, replace).map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        }
+        "pocket" => crate::pocket::validate_slot_name(p.split('\u{00b7}').next().unwrap_or("").trim()).map_err(str::to_string),
+        "pocket-history" => p.parse::<usize>().map(|_| ()).map_err(|_| "pocket-history needs a non-negative index".into()),
+        "screenshot" => {
+            if p.is_empty() { return Ok(()); }
+            if !p.starts_with('{') {
+                return match p.to_ascii_lowercase().as_str() {
+                    "screen" | "window" | "region" => Ok(()),
+                    _ => Err("screenshot target must be exactly screen, window, or region; use a typed JSON action for file options".into()),
+                };
+            }
+            let action = serde_json::from_str::<Action>(p).map_err(|e| format!("screenshot: {e}"))?;
+            match action {
+                Action::Screenshot { path, clipboard, .. } if clipboard || path.is_some() => Ok(()),
+                Action::Screenshot { .. } => Err("screenshot needs a clipboard or non-empty file path".into()),
+                _ => Err("expected a screenshot action".into()),
+            }
+        }
         "keys" => {
             let steps = parse_keyseq(p);
             if steps
@@ -1155,6 +1209,9 @@ pub fn action_to_palette(a: &Action) -> (&'static str, String) {
                 slot.clone()
             },
         ),
+        Action::ClipboardTransform { ops } => ("clipboard-transform", serde_json::to_string(ops).unwrap_or_default()),
+        Action::PocketHistory { index } => ("pocket-history", index.to_string()),
+        Action::Screenshot { .. } => ("screenshot", serde_json::to_string(a).unwrap_or_default()),
         _ => ("noop", String::new()),
     }
 }
@@ -1560,6 +1617,9 @@ pub fn variant_name(a: &Action) -> &'static str {
         Action::Undo => "undo",
         Action::Control => "control",
         Action::Pocket { .. } => "pocket",
+        Action::ClipboardTransform { .. } => "clipboard-transform",
+        Action::PocketHistory { .. } => "pocket-history",
+        Action::Screenshot { .. } => "screenshot",
         Action::Curtain => "curtain",
         Action::Lock => "lock",
         Action::Sleep => "sleep",
@@ -1631,6 +1691,9 @@ pub fn action_examples() -> Vec<(Action, &'static str)> {
         (Action::Undo, "restore the latest reversible session change when it is still current"),
         (Action::Control, "prime the control-center glance"),
         (Action::Pocket { slot: "a".into(), persist: false }, "portable clipboard slot"),
+        (Action::ClipboardTransform { ops: vec![crate::clipboard_transform::TransformOp::Trim] }, "explicitly transform clipboard text"),
+        (Action::PocketHistory { index: 0 }, "restore the newest clipboard snapshot"),
+        (Action::Screenshot { target: crate::screenshot::CaptureTarget::Screen, path: None, clipboard: true }, "capture the virtual desktop to the clipboard"),
         (Action::Curtain, "panic privacy screen"),
         (Action::Lock, "lock the workstation"),
         (Action::Sleep, "suspend the machine"),
@@ -3282,7 +3345,7 @@ mod tests {
             "sequence", "script", "mouse-button", "media", "dpi-cycle", "dpi-set", "scroll-stage-cycle",
             "profile-switch", "profile-cycle", "turbo", "teleport", "whiteboard", "knockback", "glance",
             "summon", "banish", "pin", "kill", "echo", "tether", "ghost-paste", "momentary-mic", "sniper",
-            "output-flip", "dial", "lighting-layer", "undo", "control", "pocket", "curtain", "lock", "sleep", "obs",
+            "output-flip", "dial", "lighting-layer", "undo", "control", "pocket", "clipboard-transform", "pocket-history", "screenshot", "curtain", "lock", "sleep", "obs",
         ];
         let examples = action_examples();
         let have: BTreeSet<&str> = examples.iter().map(|(a, _)| variant_name(a)).collect();
@@ -3313,6 +3376,27 @@ mod tests {
         assert!(parse_action("bogus").is_err());
         assert!(parse_action("").is_err());
         assert!(parse_action(r#"{"type":"nope"}"#).is_err());
+        assert_eq!(parse_action("screenshot:window").unwrap(), Action::Screenshot { target: crate::screenshot::CaptureTarget::Window, path: None, clipboard: true });
+        assert!(validate_action("screenshot", "screen junk").is_err());
+        assert!(validate_action("pocket", "../unsafe · keep").is_err());
+    }
+
+    #[test]
+    fn clipboard_operation_types_round_trip_through_action_palette() {
+        use crate::clipboard_transform::TransformOp as Op;
+        let ops = vec![
+            Op::Uppercase, Op::Lowercase, Op::Titlecase, Op::Trim, Op::TrimLines,
+            Op::LinesReverse, Op::LinesSort, Op::LinesUnique, Op::JsonPretty, Op::JsonCompact,
+            Op::CsvToJson, Op::JsonToCsv, Op::Base64Encode, Op::Base64Decode, Op::UrlEncode,
+            Op::UrlDecode, Op::Regex { pattern: "(?P<word>\\w+)".into(), replace: "${word}".into() },
+        ];
+        let json = serde_json::to_string(&ops).unwrap();
+        let action = build_action("clipboard-transform", &json);
+        assert_eq!(action, Action::ClipboardTransform { ops: ops.clone() });
+        let (id, parameter) = action_to_palette(&action);
+        assert_eq!(id, "clipboard-transform");
+        assert_eq!(serde_json::from_str::<Vec<Op>>(&parameter).unwrap(), ops);
+        assert!(validate_action(id, &parameter).is_ok());
     }
 
     #[test]

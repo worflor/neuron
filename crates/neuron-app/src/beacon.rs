@@ -1687,6 +1687,9 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
                 )
             }
         }
+        Action::ClipboardTransform { ops } => mk(WedgeGlyph::Ghost, "transform text", Some(format!("{} op{}", ops.len(), if ops.len() == 1 { "" } else { "s" })), Tone::Plain, None),
+        Action::PocketHistory { index } => mk(WedgeGlyph::Ghost, "clipboard history", Some(format!("restore #{index}")), Tone::Plain, None),
+        Action::Screenshot { target, .. } => mk(WedgeGlyph::WindowStack, "screenshot", Some(target.label().into()), Tone::Plain, None),
         Action::Teleport => mk(WedgeGlyph::Teleport, "teleport", None, Tone::Plain, None),
         Action::Whiteboard => mk(WedgeGlyph::Whiteboard, "board", None, Tone::Plain, None),
         Action::Control => mk(WedgeGlyph::Network, "control", None, Tone::Plain, None),

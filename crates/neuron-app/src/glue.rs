@@ -21,7 +21,7 @@ use crate::mic;
 use crate::migrate;
 use crate::runtime::AppRuntime;
 use crate::ui::{
-    AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, DeviceRow, DiagRow, EffectParam,
+    AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, ClipboardVariable, DeviceRow, DiagRow, EffectParam,
     EffectRow, EffectTile, GlyphChip, ImportLine, KnobRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
     PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame,
     SpectrumStop,
@@ -1353,6 +1353,63 @@ fn regenerate_source_only(st: &State, doc: &MacroDocument) {
     st.set_macro_source(source.into());
 }
 
+fn parse_transform_ops(source: &str) -> Option<Vec<neuron::clipboard_transform::TransformOp>> {
+    if source.trim().is_empty() { return Some(Vec::new()); }
+    serde_json::from_str(source).ok().or_else(|| toml::from_str(source).ok())
+}
+
+fn refresh_clipboard_operations(state: &State, ops: &[neuron::clipboard_transform::TransformOp]) {
+    let labels = ops.iter().map(|op| {
+        let encoded = serde_json::to_value(op).ok()?;
+        let label = encoded.get("op")?.as_str()?;
+        Some(match op {
+            neuron::clipboard_transform::TransformOp::Regex { pattern, .. } => format!("regex /{pattern}/"),
+            _ => label.to_string(),
+        })
+    }).flatten().collect::<Vec<_>>();
+    state.set_clipboard_operations(slint::ModelRc::new(slint::VecModel::from(labels.into_iter().map(SharedString::from).collect::<Vec<_>>())));
+}
+
+fn clipboard_selections(state: &State) -> Vec<neuron::clipboard_transform::VariableSelection> {
+    let model = state.get_clipboard_variables();
+    (0..model.row_count()).filter_map(|index| model.row_data(index)).map(|variable| {
+        neuron::clipboard_transform::VariableSelection {
+            start_byte: variable.start_byte.max(0) as usize,
+            end_byte: variable.end_byte.max(0) as usize,
+            name: variable.name.to_string(),
+            kind: variable.kind.to_string(),
+            delimiter: variable.delimiter.to_string(),
+        }
+    }).collect()
+}
+
+fn preview_clipboard_example(state: &State, sample: &str, raw_pattern: &str, replacement: &str, raw_mode: bool) {
+    let pattern = if raw_mode {
+        raw_pattern.to_string()
+    } else {
+        match neuron::clipboard_transform::pattern_from_selections(sample, &clipboard_selections(state)) {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                state.set_clipboard_pattern(String::new().into());
+                state.set_clipboard_preview(String::new().into());
+                state.set_clipboard_preview_status(error.to_string().into());
+                return;
+            }
+        }
+    };
+    state.set_clipboard_pattern(pattern.clone().into());
+    match neuron::clipboard_transform::preview_regex(sample, &pattern, replacement) {
+        Ok((matched, output)) => {
+            state.set_clipboard_preview(output.into());
+            state.set_clipboard_preview_status(if matched { "match" } else { "no match" }.into());
+        }
+        Err(error) => {
+            state.set_clipboard_preview(String::new().into());
+            state.set_clipboard_preview_status(error.to_string().into());
+        }
+    }
+}
+
 /// Install every callback + initial data. Returns the shared runtime so main/tray can reach it.
 pub fn install(app: &AppWindow) -> SharedRt {
     crate::binding_list::install(app);
@@ -1378,6 +1435,185 @@ pub fn install(app: &AppWindow) -> SharedRt {
     }));
     UI_SHARED.with(|s| *s.borrow_mut() = Some(shared.clone()));
     let st = app.global::<State>();
+    neuron::screenshot::install_region_selector(crate::overlay::select_screenshot_region);
+    {
+        let weak = app.as_weak();
+        neuron::screenshot::install_completion_sink(move |message| {
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.global::<State>().set_status_line(message.into());
+                }
+            });
+        });
+    }
+
+    st.on_append_clipboard_operation({
+        let w = app.as_weak();
+        move |operation, pattern, replacement| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            let current = state.get_action_param().to_string();
+            let mut ops: Vec<neuron::clipboard_transform::TransformOp> = if current.trim().is_empty() {
+                Vec::new()
+            } else if let Ok(ops) = serde_json::from_str(&current) {
+                ops
+            } else if let Ok(ops) = toml::from_str(&current) {
+                ops
+            } else {
+                state.set_clipboard_preview_status("operation list must be a JSON/TOML array".into());
+                return;
+            };
+            if ops.len() >= neuron::clipboard_transform::MAX_OPERATIONS {
+                state.set_clipboard_preview_status("operation limit reached (32)".into());
+                return;
+            }
+            let Some(op) = (match operation.as_str() {
+                "uppercase" => Some(neuron::clipboard_transform::TransformOp::Uppercase),
+                "lowercase" => Some(neuron::clipboard_transform::TransformOp::Lowercase),
+                "titlecase" => Some(neuron::clipboard_transform::TransformOp::Titlecase),
+                "trim" => Some(neuron::clipboard_transform::TransformOp::Trim),
+                "trim-lines" => Some(neuron::clipboard_transform::TransformOp::TrimLines),
+                "lines-reverse" => Some(neuron::clipboard_transform::TransformOp::LinesReverse),
+                "lines-sort" => Some(neuron::clipboard_transform::TransformOp::LinesSort),
+                "lines-unique" => Some(neuron::clipboard_transform::TransformOp::LinesUnique),
+                "json-pretty" => Some(neuron::clipboard_transform::TransformOp::JsonPretty),
+                "json-compact" => Some(neuron::clipboard_transform::TransformOp::JsonCompact),
+                "csv-to-json" => Some(neuron::clipboard_transform::TransformOp::CsvToJson),
+                "json-to-csv" => Some(neuron::clipboard_transform::TransformOp::JsonToCsv),
+                "base64-encode" => Some(neuron::clipboard_transform::TransformOp::Base64Encode),
+                "base64-decode" => Some(neuron::clipboard_transform::TransformOp::Base64Decode),
+                "url-encode" => Some(neuron::clipboard_transform::TransformOp::UrlEncode),
+                "url-decode" => Some(neuron::clipboard_transform::TransformOp::UrlDecode),
+                "regex" => Some(neuron::clipboard_transform::TransformOp::Regex { pattern: pattern.to_string(), replace: replacement.to_string() }),
+                _ => None,
+            }) else {
+                state.set_clipboard_preview_status("unknown transform operation".into());
+                return;
+            };
+            if let neuron::clipboard_transform::TransformOp::Regex { pattern, replace } = &op {
+                if let Err(error) = neuron::clipboard_transform::validate_regex(pattern, replace) {
+                    state.set_clipboard_preview_status(error.to_string().into());
+                    return;
+                }
+            }
+            ops.push(op);
+            if let Ok(encoded) = serde_json::to_string(&ops) {
+                state.set_action_param(encoded.into());
+                refresh_clipboard_operations(&state, &ops);
+                state.set_clipboard_preview_status(format!("{} operation(s)", ops.len()).into());
+            }
+        }
+    });
+    st.on_move_clipboard_operation({
+        let w = app.as_weak();
+        move |index, delta| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            let Some(mut ops) = parse_transform_ops(&state.get_action_param()) else { return; };
+            let from = index.max(0) as usize;
+            let to = from as isize + delta as isize;
+            if from >= ops.len() || to < 0 || to >= ops.len() as isize { return; }
+            let op = ops.remove(from);
+            ops.insert(to as usize, op);
+            if let Ok(encoded) = serde_json::to_string(&ops) {
+                state.set_action_param(encoded.into());
+                refresh_clipboard_operations(&state, &ops);
+            }
+        }
+    });
+    st.on_remove_clipboard_operation({
+        let w = app.as_weak();
+        move |index| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            let Some(mut ops) = parse_transform_ops(&state.get_action_param()) else { return; };
+            let index = index.max(0) as usize;
+            if index >= ops.len() { return; }
+            ops.remove(index);
+            if let Ok(encoded) = serde_json::to_string(&ops) {
+                state.set_action_param(encoded.into());
+                refresh_clipboard_operations(&state, &ops);
+            }
+        }
+    });
+    st.on_mark_clipboard_variable({
+        let w = app.as_weak();
+        move |sample, start, end, name, kind, delimiter, replacement, raw_pattern, raw_mode| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            let mut variables = clipboard_selections(&state);
+            variables.push(neuron::clipboard_transform::VariableSelection {
+                start_byte: start.max(0) as usize,
+                end_byte: end.max(0) as usize,
+                name: name.to_string(),
+                kind: kind.to_string(),
+                delimiter: delimiter.to_string(),
+            });
+            variables.sort_by_key(|variable| variable.start_byte);
+            match neuron::clipboard_transform::pattern_from_selections(&sample, &variables) {
+                Ok(_) => {
+                    let model = variables.into_iter().map(|variable| ClipboardVariable {
+                        start_byte: variable.start_byte as i32,
+                        end_byte: variable.end_byte as i32,
+                        name: variable.name.into(),
+                        kind: variable.kind.into(),
+                        delimiter: variable.delimiter.into(),
+                    }).collect::<Vec<_>>();
+                    state.set_clipboard_variables(ModelRc::new(VecModel::from(model)));
+                    preview_clipboard_example(&state, &sample, &raw_pattern, &replacement, raw_mode);
+                }
+                Err(error) => state.set_clipboard_preview_status(error.to_string().into()),
+            }
+        }
+    });
+    st.on_remove_clipboard_variable({
+        let w = app.as_weak();
+        move |index, sample, raw_pattern, replacement, raw_mode| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            let mut variables = clipboard_selections(&state);
+            let index = index.max(0) as usize;
+            if index < variables.len() { variables.remove(index); }
+            state.set_clipboard_variables(ModelRc::new(VecModel::from(variables.iter().map(|variable| ClipboardVariable {
+                start_byte: variable.start_byte as i32, end_byte: variable.end_byte as i32,
+                name: variable.name.clone().into(), kind: variable.kind.clone().into(), delimiter: variable.delimiter.clone().into(),
+            }).collect::<Vec<_>>())));
+            preview_clipboard_example(&state, &sample, &raw_pattern, &replacement, raw_mode);
+        }
+    });
+    st.on_clear_clipboard_variables({
+        let w = app.as_weak();
+        move || {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            state.set_clipboard_variables(ModelRc::new(VecModel::<ClipboardVariable>::default()));
+            state.set_clipboard_preview_status("sample a pattern".into());
+            state.set_clipboard_pattern("".into());
+            state.set_clipboard_preview("".into());
+        }
+    });
+    st.on_preview_clipboard_example({
+        let w = app.as_weak();
+        move |sample, raw_pattern, replacement, raw_mode| {
+            let Some(app) = w.upgrade() else { return; };
+            preview_clipboard_example(&app.global::<State>(), &sample, &raw_pattern, &replacement, raw_mode);
+        }
+    });
+    st.on_forget_pocket({
+        let w = app.as_weak();
+        move |name| {
+            let Some(app) = w.upgrade() else { return; };
+            match neuron::pocket::delete(&name) {
+                Ok(true) => {
+                    refresh_pockets(&app);
+                    app.global::<State>().set_status_line(format!("forgot pocket {}", if name.is_empty() { "(default)" } else { name.as_str() }).into());
+                }
+                Ok(false) => app.global::<State>().set_status_line("pocket already gone".into()),
+                Err(error) => app.global::<State>().set_status_line(format!("pocket not forgotten: {error}").into()),
+            }
+        }
+    });
 
     // the ABOUT nameplate — version (compile-time) + where the config/run dir lives.
     // run_root(), NOT current_dir: the CWD is the user's shell/scheduler directory and no
@@ -5774,7 +6010,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let w = app.as_weak();
         app.global::<State>().on_action_choice_changed(move || {
             if let Some(app) = w.upgrade() {
-                refresh_param_suggestions(&app.global::<State>());
+                let state = app.global::<State>();
+                refresh_param_suggestions(&state);
+                let (id, _) = current_action(&state);
+                if id == "clipboard-transform" {
+                    if let Some(ops) = parse_transform_ops(&state.get_action_param()) {
+                        refresh_clipboard_operations(&state, &ops);
+                    }
+                }
             }
         });
     });

@@ -340,6 +340,14 @@ export struct PocketCard {
     filled: bool,       // holds content right now
 }
 
+export struct ClipboardVariable {
+    start-byte: int,
+    end-byte: int,
+    name: string,
+    kind: string,
+    delimiter: string,
+}
+
 // One imported feature line in the migration wizard preview. `category` groups the preview:
 // "perf" (scalar settings) | "lighting" | "binding" | "note" (not migrated).
 export struct ImportLine {
