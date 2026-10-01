@@ -5162,10 +5162,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 };
                 // Mirror into neuron-core's process-global gate so the LIVE dispatch worker also
                 // freezes its DPI/scroll/profile device writes.
-                neuron::writes::set_writes_paused(paused);
+                let transition_error = crate::buttonfw::set_stance(neuron::action::input_armed(), paused).err();
                 let st = app.global::<State>();
+                let armed = neuron::action::input_armed();
+                neuron::macros::macro_host().set_armed(armed);
                 st.set_writes_paused(paused);
-                st.set_arm_stance(arm_stance(paused, neuron::action::input_armed()));
+                st.set_input_armed(armed);
+                st.set_arm_stance(arm_stance(paused, armed));
                 if stopped_anim {
                     st.set_animating(false);
                     st.set_applied_effect(-1);
@@ -5181,7 +5184,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     reapply_all_boards(&app, &sh);
                 }
                 st.set_status_line(
-                    if stopped_anim {
+                    if let Some(e) = transition_error {
+                        format!("button stock restore failed: {e}")
+                    } else if stopped_anim {
                         "writes PAUSED — animation stopped".to_string()
                     } else {
                         format!("writes {}", if paused { "PAUSED" } else { "armed" })
@@ -5203,7 +5208,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     return;
                 }
                 let armed = !neuron::action::input_armed();
-                neuron::action::arm_input(armed);
+                let restore_error = crate::buttonfw::set_stance(armed, neuron::writes::writes_paused()).err();
+                let armed = neuron::action::input_armed();
                 neuron::macros::macro_host().set_armed(armed); // mirror SAFE/arm into the macro sidecar
                 if armed {
                     crate::worker::spawn_detached("neuron-macro-warm", || {
@@ -5212,14 +5218,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
                 st.set_input_armed(armed);
                 st.set_arm_stance(arm_stance(neuron::writes::writes_paused(), armed));
-                st.set_status_line(
-                    if armed {
-                        "INPUT ARMED — remaps + macros now fire real keystrokes".into()
-                    } else {
-                        "safe-mode — input disarmed (simulate only)".to_string()
-                    }
-                    .into(),
-                );
+                let status = if armed {
+                    "INPUT ARMED — remaps + macros now fire real keystrokes".to_string()
+                } else if let Some(e) = restore_error {
+                    format!("input disarmed; button stock restore failed: {e}")
+                } else {
+                    "safe-mode — input disarmed (simulate only)".to_string()
+                };
+                st.set_status_line(status.into());
             }
         });
     });
@@ -5250,7 +5256,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     }
                     stop
                 };
-                neuron::safety::set_mode(mode);
+                let restore_error = crate::buttonfw::set_stance(armed, paused).err();
+                let armed = neuron::action::input_armed();
                 neuron::macros::macro_host().set_armed(armed);
                 if armed {
                     crate::worker::spawn_detached("neuron-macro-warm", || {
@@ -5264,22 +5271,25 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
                 st.set_writes_paused(paused);
                 st.set_input_armed(armed);
-                st.set_arm_stance(m);
+                st.set_arm_stance(arm_stance(paused, armed));
                 // AUTO-APPLY: crossing paused → armed RESUMES every configured board's stack once (parity
                 // with the writes-pause toggle; the manual apply button is gone). A global stop cleared
                 // them all, so restore them all, not just the selected one. No-op on empty stacks.
                 if was_paused && !paused {
                     reapply_all_boards(&app, &sh);
                 }
-                st.set_status_line(
+                let status = if let Some(e) = restore_error {
+                    format!("button stock restore failed: {e}")
+                } else {
                     match m {
                         1 => "arm → DEVICE (device writes on, input safe)",
                         2 => "arm → INPUT (remaps + macros fire, writes paused)",
                         3 => "arm → LIVE (device writes + input synthesis)",
                         _ => "arm → OBSERVE (read-only: nothing fires)",
                     }
-                    .into(),
-                );
+                    .to_string()
+                };
+                st.set_status_line(status.into());
             }
         });
     });

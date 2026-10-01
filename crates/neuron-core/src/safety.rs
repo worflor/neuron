@@ -9,7 +9,7 @@
 //! Macro Host mirror should route through this module instead of each owning a separate flag.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 static INPUT_ARMED: AtomicBool = AtomicBool::new(false);
 static INPUT_GATE_TRANSITION: Mutex<()> = Mutex::new(());
@@ -76,6 +76,13 @@ pub fn set_input_armed(on: bool) {
 
 pub fn input_armed() -> bool {
     INPUT_ARMED.load(Ordering::SeqCst)
+}
+
+/// Hold the arm transition lock across one live input-authorized device operation.
+/// Disarm waits for the operation to finish; a stale worker cannot start after disarm.
+pub fn while_input_armed() -> Option<MutexGuard<'static, ()>> {
+    let guard = INPUT_GATE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    input_armed().then_some(guard)
 }
 
 pub fn set_writes_paused(paused: bool) {
@@ -223,5 +230,11 @@ mod tests {
     #[should_panic(expected = "unit tests may never arm real input")]
     fn tests_cannot_arm_input() {
         set_input_armed(true);
+    }
+
+    #[test]
+    fn live_operation_lease_refuses_while_disarmed() {
+        assert!(!input_armed());
+        assert!(while_input_armed().is_none());
     }
 }

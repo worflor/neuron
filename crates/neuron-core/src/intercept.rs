@@ -743,6 +743,14 @@ pub fn deactivate() {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn hook_edge(physkey: u16, down: bool, injected: bool) -> bool {
     let state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A failed firmware-button restore can leave one of neuron's private F13..F24 functions
+    // active on the device. Suppress that small pool until every button verifies stock, even
+    // while ordinary input synthesis is disarmed; otherwise the artifact reaches the desktop.
+    if !injected
+        && sys::usage_for_physkey(physkey).is_some_and(crate::buttons::private_pool_quarantined)
+    {
+        return true;
+    }
     // `standing_down` covers PAUSED too: swallowing a key mid-capture is exactly the bug the pause
     // exists to prevent (the user is BINDING this control, not using it).
     if state.disarming || standing_down() || !crate::action::input_armed() {

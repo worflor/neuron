@@ -472,14 +472,8 @@ fn main() {
         );
         app.as_weak()
     };
-    // CONTRACT: set the macro gate's atomic BEFORE `dispatch::LiveRuntime::start` below — a python
-    // macro triggered on the very first frame must already see the correct arm state (no startup
-    // window where a fire could slip through against the intended gate). Not debug_assert-able like
-    // the other two startup-order contracts in this file (`glue::install_ui` before `hidwatch::start`,
-    // `host::start` before `build_window`): `false` is a legitimate armed state, so there's no wrong
-    // value to catch — only a wrong ORDER, which this comment is the guard against.
-    neuron::macros::macro_host().set_armed(armed);
-
+    // LiveRuntime holds both input gates disarmed while it verifies the stock-button baseline, then
+    // mirrors the resulting gate before its worker can dispatch the first trigger.
     let live = dispatch::LiveRuntime::start(weak.clone(), armed);
     resident.borrow_mut().live = Some(live);
 
