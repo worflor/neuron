@@ -6,6 +6,8 @@ labels: enhancement, needs-triage
 assignees: ''
 ---
 
+Rather talk it through? An AI agent can help investigate and draft this from your description. Writing it yourself is just as welcome.
+
 **what you were trying to do**
 
 
