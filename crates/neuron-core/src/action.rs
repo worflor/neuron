@@ -1003,11 +1003,8 @@ impl Action {
             Action::Noop => "noop".into(),
             Action::Run { cmd } => run_cmd(cmd),
             Action::Key { key } => press_key(key),
-            Action::MicMute { device, mode } => mic_mute(device.as_deref(), mode),
-            Action::MicGain { device, delta_pct } => mic_gain(device.as_deref(), *delta_pct),
-            Action::MicGainSet { device, pct } => mic_set(device.as_deref(), *pct),
-            Action::OutputMute { device, mode } => out_mute(device.as_deref(), mode),
-            Action::OutputGain { device, delta_pct } => out_gain(device.as_deref(), *delta_pct),
+            Action::MicMute { .. } | Action::MicGain { .. } | Action::MicGainSet { .. }
+            | Action::OutputMute { .. } | Action::OutputGain { .. } => crate::session_undo::apply_native_audio_action(self),
             Action::Sequence { steps } => run_sequence(steps, ctx),
             // The macro engine's context-aware entry point: the trigger-time `ctx` the engine
             // captured threads all the way INTO the native macro body, so `ctx.app()` /
@@ -1533,117 +1530,6 @@ fn run_cmd(cmd: &str) -> String {
     // interpreter consoles stay hidden on Windows — and so a spawn fired by a keypress does not stall
     // the dispatch pump for the milliseconds `CreateProcess` takes (see `crate::macros::run_shell`).
     crate::macros::run_shell(cmd)
-}
-
-#[cfg(windows)]
-fn mic_gain(device: Option<&str>, delta_pct: f32) -> String {
-    match crate::audio::resolve_capture(device)
-        .and_then(|e| crate::audio::VolumeCtl::open(&e.id).map(|c| (e.name, c)))
-    {
-        Some((name, ctl)) => {
-            let v = ctl.nudge(delta_pct / 100.0);
-            format!("{name} gain -> {}%", (v * 100.0).round() as i32)
-        }
-        None => "no mic".into(),
-    }
-}
-
-#[cfg(windows)]
-fn mic_set(device: Option<&str>, pct: f32) -> String {
-    match crate::audio::resolve_capture(device)
-        .and_then(|e| crate::audio::VolumeCtl::open(&e.id).map(|c| (e.name, c)))
-    {
-        Some((name, ctl)) => {
-            ctl.set_volume(pct / 100.0);
-            format!("{name} gain = {}%", pct.round() as i32)
-        }
-        None => "no mic".into(),
-    }
-}
-
-#[cfg(windows)]
-fn mic_mute(device: Option<&str>, mode: &str) -> String {
-    match crate::audio::resolve_capture(device)
-        .and_then(|e| crate::audio::VolumeCtl::open(&e.id).map(|c| (e.id, e.name, c)))
-    {
-        Some((id, name, ctl)) => {
-            // Write, then — only if the OS state actually CHANGED (`set_mute` reports that; a toggle
-            // always changes) — open the mic-tap self-write window, so the detector doesn't fire
-            // `MicTap`'s bound actions for our OWN write. A no-op write is no transition, so the poll
-            // sees no edge and a window would only shadow a real tap. A real transition's ~1s window
-            // opens well inside the ~400ms cache lag before the poll could sample it, so there is no
-            // race. ONLY the DEFAULT endpoint arms it: `device` may name a SECONDARY mic the detector
-            // never samples — arming for it could shadow a real tap on the default.
-            let (s, changed) = match mode {
-                "on" => (true, ctl.set_mute(true)),
-                "off" => (false, ctl.set_mute(false)),
-                _ => (ctl.toggle_mute(), true),
-            };
-            if changed && crate::audio::is_default_capture_id(&id) {
-                crate::mic_state::note_self_mute_write();
-            }
-            format!("{name} mute -> {}", if s { "ON" } else { "off" })
-        }
-        None => "no mic".into(),
-    }
-}
-
-#[cfg(not(windows))]
-fn mic_gain(_d: Option<&str>, _p: f32) -> String {
-    "mic-gain: windows-only".into()
-}
-
-#[cfg(not(windows))]
-fn mic_set(_d: Option<&str>, _p: f32) -> String {
-    "mic-gain-set: windows-only".into()
-}
-
-#[cfg(not(windows))]
-fn mic_mute(_d: Option<&str>, _m: &str) -> String {
-    "mic-mute: windows-only".into()
-}
-
-#[cfg(windows)]
-fn out_gain(device: Option<&str>, delta_pct: f32) -> String {
-    match crate::audio::resolve_render(device)
-        .and_then(|e| crate::audio::VolumeCtl::open(&e.id).map(|c| (e.name, c)))
-    {
-        Some((name, ctl)) => {
-            let v = ctl.nudge(delta_pct / 100.0);
-            format!("{name} vol -> {}%", (v * 100.0).round() as i32)
-        }
-        None => "no output device".into(),
-    }
-}
-#[cfg(windows)]
-fn out_mute(device: Option<&str>, mode: &str) -> String {
-    match crate::audio::resolve_render(device)
-        .and_then(|e| crate::audio::VolumeCtl::open(&e.id).map(|c| (e.name, c)))
-    {
-        Some((name, ctl)) => {
-            let s = match mode {
-                "on" => {
-                    ctl.set_mute(true);
-                    true
-                }
-                "off" => {
-                    ctl.set_mute(false);
-                    false
-                }
-                _ => ctl.toggle_mute(),
-            };
-            format!("{name} mute -> {}", if s { "ON" } else { "off" })
-        }
-        None => "no output device".into(),
-    }
-}
-#[cfg(not(windows))]
-fn out_gain(_d: Option<&str>, _p: f32) -> String {
-    "out-gain: windows-only".into()
-}
-#[cfg(not(windows))]
-fn out_mute(_d: Option<&str>, _m: &str) -> String {
-    "out-mute: windows-only".into()
 }
 
 /// Map a key name to a Windows virtual-key code. Covers the FULL practical keyboard — letters,

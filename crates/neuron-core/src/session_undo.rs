@@ -52,6 +52,19 @@ pub fn profile_entry(before: String, applied: String) -> Option<Entry> {
     Some(Entry::Profile { before, applied })
 }
 
+/// Build a profile Undo entry only after the apply report confirms no fields were skipped or gated.
+#[must_use]
+pub fn verified_profile_entry(before: String, applied: String, skipped: &[String], gated: &[String]) -> Option<Entry> {
+    if !skipped.is_empty() || !gated.is_empty() { return None; }
+    profile_entry(before, applied)
+}
+
+/// A profile restore is complete only at the prior cursor with no unresolved fields.
+#[must_use]
+pub fn profile_restore_complete(current: &str, before: &str, unresolved: &[String]) -> bool {
+    current == before && unresolved.is_empty()
+}
+
 /// Apply a mic/output gain or mute action through the host's trusted audio seam. `armed` is the
 /// process safety state supplied by a host; tests pass a local value to a fake backend and never
 /// arm the process-wide input gate.
@@ -91,6 +104,63 @@ pub fn apply_audio_action(
     let applied = read(&endpoint.0, flow, kind).map_err(|e| format!("endpoint read-back failed: {e}"))?;
     if !same_value(&applied, &target) { return Err("endpoint read-back mismatch".into()); }
     Ok(AudioActionResult::Changed { id: endpoint.0, flow, name: endpoint.1, before, applied })
+}
+
+/// Apply a native audio Action through trusted endpoint reads and the process arm gate, then
+/// record its verified result for session Undo. This is the shared fallback used by direct and
+/// sequenced Actions, so audio mutations never bypass the receipt path.
+#[cfg(windows)]
+pub fn apply_native_audio_action(action: &Action) -> String {
+    use crate::audio::{self, VolumeCtl};
+    let result = apply_audio_action(
+        action,
+        crate::safety::input_armed(),
+        |flow, name| {
+            let endpoint = match flow { Flow::Capture => audio::resolve_capture(name), Flow::Render => audio::resolve_render(name) };
+            Ok(endpoint.map(|endpoint| (endpoint.id, endpoint.name)))
+        },
+        |id, _, kind| {
+            let ctl = VolumeCtl::open(id).ok_or_else(|| "endpoint unavailable".to_owned())?;
+            match kind {
+                AudioValueKind::Volume => ctl.try_get_volume().map(AudioValue::Volume).ok_or_else(|| "volume read failed".into()),
+                AudioValueKind::Mute => ctl.try_get_mute().map(AudioValue::Mute).ok_or_else(|| "mute read failed".into()),
+            }
+        },
+        |id, _, value| {
+            if !crate::safety::input_armed() { return Err("audio action is disarmed".into()); }
+            let ctl = VolumeCtl::open(id).ok_or_else(|| "endpoint unavailable".to_owned())?;
+            let ok = match value { AudioValue::Volume(value) => ctl.set_volume(*value), AudioValue::Mute(value) => ctl.set_mute(*value) };
+            if ok { Ok(()) } else { Err("endpoint write failed".into()) }
+        },
+    );
+    match result {
+        Ok(AudioActionResult::Unchanged { name }) => format!("{name} unchanged"),
+        Ok(AudioActionResult::Changed { id, flow, name, before, applied }) => {
+            if flow == Flow::Capture
+                && matches!((&before, &applied), (AudioValue::Mute(a), AudioValue::Mute(b)) if a != b)
+                && audio::is_default_capture_id(&id)
+            {
+                crate::mic_state::note_self_mute_write();
+            }
+            push(Entry::Audio { id, flow, before, applied: applied.clone() });
+            match applied {
+                AudioValue::Volume(value) => format!("{name} {} -> {}%", if flow == Flow::Capture { "gain" } else { "vol" }, (value * 100.0).round() as i32),
+                AudioValue::Mute(value) => format!("{name} mute -> {}", if value { "ON" } else { "off" }),
+            }
+        }
+        Err(error) => format!("{}: {error}", action.describe()),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn apply_native_audio_action(action: &Action) -> String {
+    match action {
+        Action::MicGain { .. } | Action::MicGainSet { .. } => "mic audio controls: windows-only".into(),
+        Action::MicMute { .. } => "mic mute: windows-only".into(),
+        Action::OutputGain { .. } => "output audio controls: windows-only".into(),
+        Action::OutputMute { .. } => "output mute: windows-only".into(),
+        _ => "action is not an audio mutation".into(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +206,9 @@ impl Journal {
     pub fn clear(&mut self) { self.entries.clear(); }
 
     pub fn len(&self) -> usize { self.entries.len() }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
 }
 
 fn journal() -> &'static Mutex<Journal> {
@@ -231,6 +304,13 @@ mod tests {
         assert!(profile_entry(String::new(), "game".into()).is_none());
         assert!(profile_entry("desktop".into(), "desktop".into()).is_none());
         assert_eq!(profile_entry("desktop".into(), "game".into()), Some(Entry::Profile { before: "desktop".into(), applied: "game".into() }));
+        assert!(verified_profile_entry("desktop".into(), "game".into(), &["mouse DPI".into()], &[]).is_none());
+        assert!(verified_profile_entry("desktop".into(), "game".into(), &[], &["idle timeout".into()]).is_none());
+        assert!(verified_profile_entry("".into(), "game".into(), &[], &[]).is_none());
+        assert_eq!(verified_profile_entry("desktop".into(), "game".into(), &[], &[]), Some(Entry::Profile { before: "desktop".into(), applied: "game".into() }));
+        assert!(profile_restore_complete("desktop", "desktop", &[]));
+        assert!(!profile_restore_complete("desktop", "desktop", &["DPI".into()]));
+        assert!(!profile_restore_complete("game", "desktop", &[]));
     }
 
     #[test]

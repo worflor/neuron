@@ -3183,10 +3183,10 @@ fn run_intent_recording(devices: &mut DeviceSession<'_>, intent: &neuron::action
         &mut cursor,
         intent,
         neuron::dpi_origin::Cause::UserApplied,
-        |_report| {
+        |report| {
             if record_undo && matches!(intent, neuron::action::Intent::ProfileSwitch(_) | neuron::action::Intent::ProfileCycle(_)) {
                 let applied = daemon_active_profile();
-                if let Some(entry) = neuron::session_undo::profile_entry(before.clone(), applied) {
+                if let Some(entry) = neuron::session_undo::verified_profile_entry(before.clone(), applied, &report.skipped, &report.gated) {
                     neuron::session_undo::push(entry);
                 }
             }
@@ -3241,53 +3241,6 @@ impl IntentRunner for CliIntentRunner<'_, '_> {
         }
     }
 
-    fn run_host_action(&mut self, action: &neuron::action::Action, _ctx: &neuron::macros::context::Context) -> Option<String> {
-        use neuron::action::Action;
-        match action {
-            Action::Undo => Some(undo_latest(self.devices)),
-            Action::MicMute { .. } | Action::MicGain { .. } | Action::MicGainSet { .. }
-            | Action::OutputMute { .. } | Action::OutputGain { .. } => Some(apply_audio_action(action)),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(windows)]
-fn apply_audio_action(action: &neuron::action::Action) -> String {
-    use neuron::audio::{self, Flow, VolumeCtl};
-    use neuron::session_undo::{AudioActionResult, AudioValue, AudioValueKind};
-    let result = neuron::session_undo::apply_audio_action(
-        action,
-        neuron::safety::input_armed(),
-        |flow, name| {
-            let endpoint = match flow { Flow::Capture => audio::resolve_capture(name), Flow::Render => audio::resolve_render(name) };
-            Ok(endpoint.map(|endpoint| (endpoint.id, endpoint.name)))
-        },
-        |id, flow, kind| {
-            let ctl = VolumeCtl::open(id).ok_or_else(|| "endpoint unavailable".to_owned())?;
-            match (flow, kind) {
-                (Flow::Capture | Flow::Render, AudioValueKind::Volume) => ctl.try_get_volume().map(AudioValue::Volume).ok_or_else(|| "volume read failed".into()),
-                (Flow::Capture | Flow::Render, AudioValueKind::Mute) => ctl.try_get_mute().map(AudioValue::Mute).ok_or_else(|| "mute read failed".into()),
-            }
-        },
-        |id, _, value| {
-            if !neuron::safety::input_armed() { return Err("audio action is disarmed".to_owned()); }
-            let ctl = VolumeCtl::open(id).ok_or_else(|| "endpoint unavailable".to_owned())?;
-            let ok = match value { AudioValue::Volume(v) => ctl.set_volume(*v), AudioValue::Mute(v) => ctl.set_mute(*v) };
-            if ok { Ok(()) } else { Err("endpoint write failed".into()) }
-        },
-    );
-    match result {
-        Ok(AudioActionResult::Unchanged { name }) => format!("{name} unchanged"),
-        Ok(AudioActionResult::Changed { id, flow, name, before, applied }) => {
-            neuron::session_undo::push(neuron::session_undo::Entry::Audio { id, flow, before, applied: applied.clone() });
-            match applied {
-                AudioValue::Volume(v) => format!("{name} {} -> {}%", flow.label(), (v * 100.0).round() as i32),
-                AudioValue::Mute(v) => format!("{name} mute -> {}", if v { "ON" } else { "off" }),
-            }
-        }
-        Err(error) => format!("{}: {error}", action.describe()),
-    }
 }
 
 #[cfg(windows)]
@@ -3313,8 +3266,12 @@ fn undo_latest(devices: &mut DeviceSession<'_>) -> String {
             let mut cursor = CliProfileCursor;
             if cursor.active_profile() != *applied { return format!("undo: active profile changed since '{applied}'"); }
             let intent = neuron::action::Intent::ProfileSwitch(before.clone());
-            let restored = neuron::intent::run_shared_intent(devices, &mut cursor, &intent, neuron::dpi_origin::Cause::UserApplied);
-            if cursor.active_profile() == *before && restored.is_some() { Ok(()) } else { Err(restored.unwrap_or_else(|| "undo: profile restore unavailable".into())) }
+            let status = neuron::intent::run_shared_intent(devices, &mut cursor, &intent, neuron::dpi_origin::Cause::UserApplied)
+                .unwrap_or_else(|| "undo: profile restore unavailable".into());
+            let unresolved = neuron::profile::active_missing();
+            if neuron::session_undo::profile_restore_complete(&cursor.active_profile(), before, &unresolved) { Ok(()) }
+            else if !unresolved.is_empty() { Err(format!("undo: profile restore incomplete ({status}); unresolved: {}", unresolved.join(", "))) }
+            else { Err(format!("undo: profile restore failed ({status}); active profile is '{}'", cursor.active_profile())) }
         }
         Entry::Lighting { .. } => Err("undo: lighting restore unavailable in the daemon".into()),
     };
