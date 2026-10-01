@@ -1215,7 +1215,7 @@ export component ActionPicker inherits VerticalLayout {
     property <string> lighting-op: root.lighting-operations[root.lighting-operation-index];
     property <string> lighting-index <=> State.lighting-edit-index;
     property <string> lighting-destination <=> State.lighting-edit-destination;
-    property <int> lighting-layer-index: 0;
+    property <int> lighting-layer-index <=> State.lighting-edit-stack;
     property <int> lighting-preset-index <=> State.lighting-edit-preset;
     spacing: 8px;
     Rectangle {
