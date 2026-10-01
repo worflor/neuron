@@ -1963,6 +1963,37 @@ mod tests {
         assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("12-button"));
     }
 
+    /// The report sequence a Naga V2 Pro sent on 2026-09-30 for a wake and then plate swaps
+    /// (2-button = 1, 12-button = 3, 6-button = 4, each swap preceded by a detach): one card per
+    /// seated plate, named for it.
+    #[test]
+    fn recorded_plate_swaps_card_each_plate_by_name() {
+        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        neuron::confirm::set_sink(Some(tx));
+        settle();
+        let _ = rx.try_iter().count();
+        // the wake burst: scroll, dpi and a detached plate together
+        feed(0x09, 0x03, 0x01);
+        feed(0x02, 0x03, 0x20);
+        plate_report(0);
+        settle();
+        for id in [3u8, 0, 1, 0, 3, 0, 1, 0, 3, 0, 4] {
+            plate_report(id);
+            settle();
+        }
+        let got: Vec<String> = rx
+            .try_iter()
+            .filter(|c| c.kind == neuron::confirm::Kind::SidePlate)
+            .filter_map(|c| match c.shape {
+                neuron::confirm::Shape::Discrete { label } => Some(label),
+                neuron::confirm::Shape::Ranged { .. } => None,
+            })
+            .collect();
+        neuron::confirm::set_sink(None);
+        assert_eq!(got, ["12-button", "2-button", "12-button", "2-button", "12-button", "6-button"]);
+    }
+
     #[test]
     fn settle_window_keeps_only_the_last_plate_value() {
         // a seating bounce: the strap flickers detached↔seated before it settles. Same-kind reports
