@@ -961,18 +961,18 @@ impl Action {
     }
 
     /// Whether running this action actually READS the captured [`Context`] (foreground app / cwd /
-    /// clipboard / selection). Only the macro tiers do: a [`Action::Script`], a [`Action::Sequence`]
-    /// containing one (checked transitively), or a [`Action::Turbo`] wrapping one. Every plain host
-    /// action (`Key`/`MouseButton`/`Media`/`Mic*`/`Output*`/`Run`/intents/`Noop`) ignores `ctx`, so
-    /// `run_ctx(&Context::default())` is identical to `run()` for them.
+    /// clipboard / selection). Scripts, window screenshots, and containers of either use it. Plain
+    /// host actions (`Key`/`MouseButton`/`Media`/`Mic*`/`Output*`/`Run`/intents/`Noop`) ignore `ctx`,
+    /// so `run_ctx(&Context::default())` is identical to `run()` for them.
     ///
     /// The live dispatcher uses this to skip the expensive [`Context::capture`] (a clipboard open +
     /// foreground-window + process-image probe — a full OS round-trip that contends process-wide) on
-    /// the common case where nothing matched needs it. Capture is paid only when a macro will read it.
+    /// the common case where nothing matched needs it. Capture is paid only when an action needs it.
     #[must_use]
     pub fn needs_context(&self) -> bool {
         match self {
             Action::Script { .. } => true,
+            Action::Screenshot { target: crate::screenshot::CaptureTarget::Window, .. } => true,
             Action::Sequence { steps } => steps.iter().any(|s| s.action.needs_context()),
             Action::Turbo { action, .. } => action.needs_context(),
             _ => false,
@@ -980,18 +980,20 @@ impl Action {
     }
 
     /// Execute the action with no captured context (the simple dispatch path). Side-effecting;
-    /// returns a short result line for logging. Equivalent to [`Action::run_ctx`] against an
-    /// empty [`Context`] — kept for callers (the CLI, `bindings.rs`, `cast.rs`) that don't
-    /// snapshot the world before firing.
+    /// returns a short result line for logging. Window screenshots use the foreground window at
+    /// this call; [`Action::run_ctx`] instead requires its retained trigger-time HWND.
     #[must_use]
     pub fn run(&self) -> String {
+        if let Action::Screenshot { target: crate::screenshot::CaptureTarget::Window, path, clipboard } = self {
+            return crate::screenshot::request(crate::screenshot::CaptureTarget::Window, path.clone(), *clipboard);
+        }
         self.run_ctx(&Context::default())
     }
 
     /// Execute the action against a captured [`Context`] — the spine's dispatch path. The context
     /// is the world the action reacts to (foreground app / cwd / clipboard / selection / the
-    /// window to restore). Only the script + sequence tiers consume it today; the simple actions
-    /// ignore it, so `run()` and `run_ctx(&Context::default())` are identical for them.
+    /// window to restore). Scripts, window screenshots, and context-aware sequences consume it;
+    /// simple actions ignore it, so `run()` and `run_ctx(&Context::default())` are identical for them.
     ///
     /// Threading `ctx` here (rather than re-`capture()`ing inside each action) is what makes a
     /// macro see a *consistent* snapshot: every step of a `Sequence`, and a `Script`, reason about
@@ -1067,6 +1069,7 @@ impl Action {
             Action::Pocket { slot, persist } => crate::pocket::activate(slot, *persist),
             Action::ClipboardTransform { ops } => crate::pocket::transform(ops),
             Action::PocketHistory { index } => crate::pocket::restore_history(*index),
+            Action::Screenshot { target: crate::screenshot::CaptureTarget::Window, path, clipboard } => crate::screenshot::request_for_window(crate::screenshot::CaptureTarget::Window, path.clone(), *clipboard, ctx.prev_window().0),
             Action::Screenshot { target, path, clipboard } => crate::screenshot::request(*target, path.clone(), *clipboard),
             // CURTAIN: a panic privacy screen — an opaque black overlay across every monitor, NOT a
             // monitor power-off. Spawns a worker (never blocks here); first key/click reveals.
@@ -2499,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_context_only_true_for_macro_tiers() {
+    fn needs_context_tracks_macros_and_window_screenshots() {
         // Plain host actions never read ctx — the dispatcher can skip the clipboard/window capture.
         assert!(!Action::Noop.needs_context());
         assert!(!Action::Key { key: "f".into() }.needs_context());
@@ -2509,6 +2512,26 @@ mod tests {
             mode: "toggle".into()
         }
         .needs_context());
+        let window_shot = Action::Screenshot {
+            target: crate::screenshot::CaptureTarget::Window,
+            path: None,
+            clipboard: true,
+        };
+        let screen_shot = Action::Screenshot {
+            target: crate::screenshot::CaptureTarget::Screen,
+            path: None,
+            clipboard: true,
+        };
+        assert!(window_shot.needs_context());
+        assert!(!screen_shot.needs_context());
+        let nested_window_shot = Action::Sequence {
+            steps: vec![Step {
+                action: Box::new(window_shot),
+                delay_ms: 0,
+                hold_ms: 0,
+            }],
+        };
+        assert!(nested_window_shot.needs_context());
         // A Script reads ctx; a Sequence/Turbo containing one is transitively true.
         let script = Action::Script {
             script: ScriptRef {

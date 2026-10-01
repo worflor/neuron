@@ -559,6 +559,7 @@ fn refresh_action_editor(state: &State) {
     state.set_lighting_edit_index("0".into());
     state.set_lighting_edit_destination("0".into());
     state.set_lighting_edit_preset(0);
+    state.set_lighting_edit_stack(0);
     if let neuron::action::Action::LightingLayer { edit } = neuron::authoring::build_action(
         &current_action(state).0, &state.get_action_param(),
     ) {
@@ -576,6 +577,9 @@ fn refresh_action_editor(state: &State) {
         state.set_lighting_edit_operation(operation);
         state.set_lighting_edit_index(index.to_string().into());
         state.set_lighting_edit_destination(destination.to_string().into());
+        if let Some(row) = state.get_lighting_layer_choices().iter().position(|choice| choice.index_text == index.to_string()) {
+            state.set_lighting_edit_stack(row as i32);
+        }
         if let Some(preset) = preset {
             if let Some(index) = state.get_lighting_preset_choices().iter().position(|choice| choice.slug == preset) {
                 state.set_lighting_edit_preset(index as i32);
