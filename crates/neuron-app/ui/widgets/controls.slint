@@ -1210,13 +1210,13 @@ export component ActionPicker inherits VerticalLayout {
     in property <bool> enabled: true;
     // the palette drawer is open under the field
     property <bool> open: false;
-    property <[string]> lighting-operations: ["toggle", "enable", "disable", "push", "pop", "replace", "move"];
-    property <int> lighting-operation-index: 0;
+    property <[string]> lighting-operations: ["toggle", "enable", "disable", "push", "pop", "replace", "move", "spec"];
+    property <int> lighting-operation-index <=> State.lighting-edit-operation;
     property <string> lighting-op: root.lighting-operations[root.lighting-operation-index];
-    property <string> lighting-index: "0";
-    property <string> lighting-destination: "0";
+    property <string> lighting-index <=> State.lighting-edit-index;
+    property <string> lighting-destination <=> State.lighting-edit-destination;
     property <int> lighting-layer-index: 0;
-    property <int> lighting-preset-index: 0;
+    property <int> lighting-preset-index <=> State.lighting-edit-preset;
     spacing: 8px;
     Rectangle {
         height: Theme.row-h;
@@ -1441,7 +1441,7 @@ export component ActionPicker inherits VerticalLayout {
                 changed(i) => { root.lighting-preset-index = i; }
             }
         }
-        HorizontalLayout {
+        if root.lighting-op != "spec" : HorizontalLayout {
             alignment: end;
             Rectangle {}
             Button {
