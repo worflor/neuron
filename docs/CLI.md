@@ -34,7 +34,7 @@ are the same typed value the config files hold.
 --trigger mouse:4                     --action key:ctrl+shift+s
 --trigger key:f13@00a8                --action dpi:1600
 --trigger macro:M1                    --action macro:my_macro
---trigger input:0x09/0x04@00a8        --action run:notepad.exe
+--trigger input:0x09/0x04@00a8        --action '{"type":"run","cmd":"start \"\" \"https://example.com\""}'
 --trigger 'label:Left Ctrl'           --action keys:w:180 ~90 a
 --trigger gesture:circle              --action '{"type":"dpi-set","dpi":800}'
 --trigger radial:3                    --action '{type="key", key="F5"}'
@@ -53,6 +53,29 @@ An unknown key gets a suggestion (`'ctrlx' isn't a key. Did you mean ctrl+x?`). 
 at 10 cps and the confirmation says `(10 cps is the default ...)`; `turbo:f · 12` sets it.
 A macro or profile that does not exist yet is an error unless `--allow-missing-refs`, which downgrades it
 to a warning in the reply.
+
+The `open / run` action passes its command line to the existing shell helper. A bare URL is not a
+Windows command; use `start "" "https://example.com"`. An application name such as `notepad.exe`
+also works. `script` with kind `shell` uses the same helper; Python alone uses the warm Macro Host.
+
+Mic gain keeps two distinct contracts: `mic-gain` nudges by percentage points, while
+`mic-gain-set` sets an absolute percentage. The dial targets `output-volume`, `mic-volume`,
+`scroll-hover`, or `scroll-anchored`; scroll targets preserve their selection through round-trips.
+
+```toml
+{ type = "mic-gain", delta_pct = 4.0 }
+{ type = "mic-gain-set", pct = 60.0 }
+{ type = "dial", target = "scroll-anchored" }
+{ type = "lighting-layer", op = "push", preset = "fire" }
+{ type = "undo" }
+```
+
+`lighting-layer` edits the selected compositor stack in the resident app; the headless daemon has
+no compositor target and reports it unavailable. Session Undo records successful audio/profile
+changes in the daemon and app; app lighting edits also record their concrete selected device.
+Automatic app-focus profile switches are not journaled, and the first profile activation from an
+empty cursor has no restorable prior state. Undo refuses if that resource changed afterward and
+keeps the entry for retry. Its session journal clears when the resident session ends.
 
 ## Reference
 

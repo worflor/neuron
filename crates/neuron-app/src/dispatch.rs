@@ -284,6 +284,7 @@ impl LiveRuntime {
         if self.armed {
             neuron::action::arm_input(false);
         }
+        neuron::session_undo::clear();
     }
 }
 
@@ -1390,6 +1391,14 @@ impl IntentRunner for AppIntentRunner<'_, '_> {
     fn run_intent(&mut self, intent: &neuron::action::Intent) -> String {
         run_intent(self.devices, intent)
     }
+
+    fn run_host_action(
+        &mut self,
+        action: &neuron::action::Action,
+        _ctx: &neuron::macros::context::Context,
+    ) -> Option<String> {
+        crate::undo::run_host_action(action)
+    }
 }
 
 /// Carry out a daemon [`Intent`] against live device/profile state — the GUI port of the CLI's
@@ -1398,6 +1407,14 @@ impl IntentRunner for AppIntentRunner<'_, '_> {
 fn run_intent(
     devices: &mut neuron::device::DeviceSession<'_>,
     intent: &neuron::action::Intent,
+) -> String {
+    run_intent_recording(devices, intent, true)
+}
+
+fn run_intent_recording(
+    devices: &mut neuron::device::DeviceSession<'_>,
+    intent: &neuron::action::Intent,
+    record_undo: bool,
 ) -> String {
     use neuron::action::Intent;
     // INSTRUMENT intents are APP-level (no device write) — they route to the weave service and
@@ -1438,6 +1455,15 @@ fn run_intent(
             crate::beacon::prime_dial(*target);
             return "dial primed \u{2014} hold the trigger and slide (up = more)".into();
         }
+        Intent::LightingLayer(edit) => {
+            return match crate::glue::edit_selected_lighting(edit.clone()) {
+                Ok(commit) => {
+                    format!("lighting stack updated on {:04x}", commit.pid)
+                }
+                Err(e) => format!("lighting edit failed: {e}"),
+            };
+        }
+        Intent::Undo => return undo_latest(devices),
         // CONTROL CENTER: prime the system-state glance — the next hold opens it.
         Intent::Control => {
             crate::beacon::request_instrument(6);
@@ -1465,10 +1491,52 @@ fn run_intent(
         },
     )
         .unwrap_or_else(|| "instrument routed".into());
-    if neuron::profile::active() != before {
+    let after = neuron::profile::active();
+    if after != before {
+        if record_undo {
+            crate::undo::record_profile(before, after);
+        }
         request_reload();
     }
     out
+}
+
+fn undo_latest(devices: &mut neuron::device::DeviceSession<'_>) -> String {
+    if !neuron::safety::input_armed() {
+        return "undo is disarmed".into();
+    }
+    let Some(record) = neuron::session_undo::peek() else {
+        return "nothing reversible to undo".into();
+    };
+    let result = match &record.entry {
+        crate::undo::Entry::Audio { .. } => crate::undo::undo_audio(&record.entry),
+        crate::undo::Entry::Profile { before, applied } => {
+            if neuron::profile::active() != *applied {
+                Err(format!("profile changed since it was switched to '{applied}'"))
+            } else {
+                let _ = run_intent_recording(
+                    devices,
+                    &neuron::action::Intent::ProfileSwitch(before.clone()),
+                    false,
+                );
+                if neuron::profile::active() == *before {
+                    Ok(())
+                } else {
+                    Err(format!("could not restore profile '{before}'"))
+                }
+            }
+        }
+        crate::undo::Entry::Lighting { pid, unit, before, applied } => {
+            crate::glue::restore_selected_lighting(*pid, unit, applied, before.clone())
+        }
+    };
+    match result {
+        Ok(()) => {
+            neuron::session_undo::complete(record.id);
+            "undid last reversible change".into()
+        }
+        Err(e) => format!("undo refused: {e}"),
+    }
 }
 
 /// Apply whatever [`neuron::profile::AppRules::resolve`] says this focused app should be on.
@@ -1486,9 +1554,10 @@ fn route_focus_to_profile(ctx: &LiveCtx, app: &str) {
     }) else {
         return;
     };
-    let line = run_intent(
+    let line = run_intent_recording(
         &mut ctx.devices.borrow_mut(),
         &neuron::action::Intent::ProfileSwitch(target),
+        false,
     );
     // The spine reload is `run_intent`'s job (it fires for ANY intent that moves the cursor, so a
     // bound profile key gets it too, not just auto-switch). The profile's LIGHTING is the GUI's

@@ -248,6 +248,13 @@ impl StickAim {
     /// hold before it replaces it.
     pub const TURN: f64 = 0.04;
 
+    /// Forget a physical source that disconnected before the cast resolved.
+    pub fn reset(&mut self) {
+        self.latched = None;
+        self.turning = None;
+        self.engaged = false;
+    }
+
     /// Feed a stick sample (x, y in -1..1, y down) taken at `t` seconds. Returns what the wheel
     /// should show: the live aim while the stick is engaged, else the latched choice (so the wedge
     /// stays lit after the stick is let go), else nothing.

@@ -185,6 +185,13 @@ pub enum Action {
     /// trigger becomes a slide (the eigenmotion stroke turns it: up/right = more, fast = coarse,
     /// slow = fine). Handled by the resident app's weave service.
     Dial { target: DialTarget },
+    /// **App intent** — edit the active composited lighting stack through its existing owner.
+    LightingLayer {
+        #[serde(flatten)]
+        edit: LightingLayerOp,
+    },
+    /// Restore the newest reversible change in this session, if its current value still matches.
+    Undo,
     /// **App intent** — CONTROL CENTER: prime the system-state glance (the next hold opens it).
     /// A glanceable read of "wtf is my internet / am i on ethernet / what's my output" plus a
     /// quick bluetooth toggle seam. Same routing contract as [`Action::Teleport`].
@@ -233,6 +240,51 @@ pub enum Action {
     },
 }
 
+/// A typed edit to the host compositor stack. Layer indexes are bottom-up (zero is the bottom).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum LightingLayerOp {
+    Toggle { index: usize },
+    Enable { index: usize },
+    Disable { index: usize },
+    Push {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preset: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layer: Option<crate::pattern::LayerDef>,
+    },
+    Pop,
+    Replace {
+        index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preset: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layer: Option<crate::pattern::LayerDef>,
+    },
+    Move { from: usize, to: usize },
+    Spectrum { index: usize, spectrum: crate::spectrum::Spectrum },
+    Params { index: usize, params: std::collections::BTreeMap<String, f32> },
+    Region { index: usize, cells: Vec<u32> },
+}
+
+impl LightingLayerOp {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Toggle { index } => format!("toggle layer {index}"),
+            Self::Enable { index } => format!("enable layer {index}"),
+            Self::Disable { index } => format!("disable layer {index}"),
+            Self::Push { preset, layer } => format!("push {}", preset.as_deref().unwrap_or(if layer.is_some() { "custom layer" } else { "?" })),
+            Self::Pop => "pop top layer".into(),
+            Self::Replace { index, preset, layer } => format!("replace layer {index} with {}", preset.as_deref().unwrap_or(if layer.is_some() { "custom layer" } else { "?" })),
+            Self::Move { from, to } => format!("move layer {from} to {to}"),
+            Self::Spectrum { index, .. } => format!("set spectrum on layer {index}"),
+            Self::Params { index, .. } => format!("set params on layer {index}"),
+            Self::Region { index, .. } => format!("set region on layer {index}"),
+        }
+    }
+}
+
 /// What an [`Action::Obs`] does. Each maps to an `obs_*` act verb (see `obs_control`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -275,6 +327,10 @@ pub enum DialTarget {
     OutputVolume,
     /// the mic's capture level
     MicVolume,
+    /// Scroll the pane currently under the pointer while the trigger is held.
+    ScrollHover,
+    /// Scroll the pane under the pointer when the trigger is held, keeping that target for the hold.
+    ScrollAnchored,
 }
 
 impl DialTarget {
@@ -283,12 +339,16 @@ impl DialTarget {
         match self {
             DialTarget::OutputVolume => "volume",
             DialTarget::MicVolume => "mic",
+            DialTarget::ScrollHover => "scroll-hover",
+            DialTarget::ScrollAnchored => "scroll-anchored",
         }
     }
     #[must_use]
     pub fn parse(s: &str) -> DialTarget {
         match s.trim().to_lowercase().as_str() {
             "mic" | "mic-volume" | "mic-vol" => DialTarget::MicVolume,
+            "scroll-hover" | "hover-scroll" => DialTarget::ScrollHover,
+            "scroll-anchored" | "anchored-scroll" => DialTarget::ScrollAnchored,
             _ => DialTarget::OutputVolume,
         }
     }
@@ -625,7 +685,7 @@ impl Direction {
 /// profiles forever instead of advancing next/previous from wherever the user is. The direction is
 /// a *delta on the current cursor*, not an absolute slot. (`DpiSet`/`ProfileSwitch` are absolute and
 /// carry their full target, so they need no current read.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Intent {
     /// Cycle the DPI stage list up/down, **from the current DPI** (see the cycle contract on
     /// [`Intent`]): read current DPI, find its stage, step by [`Direction::step`], apply that stage.
@@ -666,6 +726,10 @@ pub enum Intent {
     Tether(String, TetherMode),
     /// Dial — prime the analog knob (APP-level): what it turns.
     Dial(DialTarget),
+    /// Edit the app-owned compositor stack.
+    LightingLayer(LightingLayerOp),
+    /// Restore the newest still-current reversible session mutation.
+    Undo,
     /// Control center — prime the system-state glance (APP-level, same contract as
     /// [`Intent::Teleport`]).
     Control,
@@ -740,7 +804,7 @@ impl Action {
     pub fn describe(&self) -> String {
         match self {
             Action::Noop => "—".into(),
-            Action::Run { cmd } => format!("run `{cmd}`"),
+            Action::Run { cmd } => format!("open / run `{cmd}`"),
             Action::Key { key } => format!("press [{key}]"),
             Action::MicMute { mode, device } => {
                 format!("mic mute [{mode}]{}", dev(device))
@@ -805,6 +869,8 @@ impl Action {
                 }
             }
             Action::Dial { target } => format!("dial {}", target.label()),
+            Action::LightingLayer { edit } => format!("lighting {}", edit.label()),
+            Action::Undo => "undo last change".into(),
             Action::Control => "control center".into(),
             Action::Pocket { slot, persist } => {
                 let keep = if *persist { " (keep)" } else { "" };
@@ -855,6 +921,8 @@ impl Action {
             Action::Echo => Some(Intent::Echo),
             Action::Tether { slot, mode } => Some(Intent::Tether(slot.clone(), *mode)),
             Action::Dial { target } => Some(Intent::Dial(*target)),
+            Action::LightingLayer { edit } => Some(Intent::LightingLayer(edit.clone())),
+            Action::Undo => Some(Intent::Undo),
             Action::Control => Some(Intent::Control),
             _ => None,
         }
@@ -974,6 +1042,8 @@ impl Action {
             // reversible — an OS setting like the mute toggles, not a device write).
             Action::OutputFlip { devices } => out_flip(devices),
             Action::Dial { target } => format!("intent: dial {} (app)", target.label()),
+            Action::LightingLayer { edit } => format!("intent: lighting {} (app)", edit.label()),
+            Action::Undo => "intent: undo (app)".into(),
             Action::Control => "intent: control center (app)".into(),
             // POCKET: move the clipboard into/out of a named register (host-side, arm-gated — it
             // writes the clipboard). The pocket module owns the full-fidelity snapshot + swap.
@@ -2766,6 +2836,12 @@ cmd = "echo hi""#,
                 name: "game".into(),
             },
             Action::ProfileCycle { dir: Direction::Up },
+            Action::Dial { target: DialTarget::ScrollHover },
+            Action::Dial { target: DialTarget::ScrollAnchored },
+            Action::LightingLayer {
+                edit: LightingLayerOp::Move { from: 2, to: 0 },
+            },
+            Action::Undo,
             Action::Turbo {
                 action: Box::new(Action::MouseButton {
                     button: MouseButtonKind::Left,

@@ -58,6 +58,7 @@ mod runtime;
 mod sound;
 mod strokelab;
 mod surface;
+mod undo;
 mod shutdown;
 mod teleport;
 mod tray;

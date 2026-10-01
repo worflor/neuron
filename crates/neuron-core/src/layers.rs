@@ -371,6 +371,72 @@ pub fn check_stack(stack: &[LayerDef]) -> Vec<Issue> {
         .collect()
 }
 
+/// Apply one semantic action edit to a cloned stack and return the validated replacement.
+/// The caller persists and streams this returned value as one commit.
+pub fn edit_stack(stack: &[LayerDef], edit: &crate::action::LightingLayerOp) -> Result<Vec<LayerDef>, String> {
+    use crate::action::LightingLayerOp as Edit;
+    let mut next = stack.to_vec();
+    let at = |i: usize, n: usize| {
+        if i < n { Ok(i) } else { Err(format!("no layer {i} ({n} layers)")) }
+    };
+    match edit {
+        Edit::Toggle { index } => {
+            let i = at(*index, next.len())?;
+            next[i].enabled = !next[i].enabled;
+        }
+        Edit::Enable { index } | Edit::Disable { index } => {
+            let i = at(*index, next.len())?;
+            next[i].enabled = matches!(edit, Edit::Enable { .. });
+        }
+        Edit::Push { preset, layer } => {
+            next.push(layer_source(preset.as_deref(), layer.as_ref())?);
+        }
+        Edit::Pop => {
+            next.pop().ok_or("cannot pop an empty lighting stack")?;
+        }
+        Edit::Replace { index, preset, layer } => {
+            let i = at(*index, next.len())?;
+            next[i] = layer_source(preset.as_deref(), layer.as_ref())?;
+        }
+        Edit::Move { from, to } => {
+            stack_move(&mut next, *from, *to)?;
+        }
+        Edit::Spectrum { index, spectrum } => {
+            let i = at(*index, next.len())?;
+            next[i].spectrum = spectrum.clone();
+        }
+        Edit::Params { index, params } => {
+            let i = at(*index, next.len())?;
+            for (key, value) in params {
+                if !value.is_finite() {
+                    return Err(format!("knob '{key}' must be finite"));
+                }
+                set_param(&mut next[i], key, &value.to_string())?;
+            }
+        }
+        Edit::Region { index, cells } => {
+            let i = at(*index, next.len())?;
+            next[i].region = cells.clone();
+        }
+    }
+    let issues = check_stack(&next);
+    if let Some(issue) = issues.iter().find(|issue| issue.severity == crate::authoring::Severity::Error) {
+        return Err(issue.message.clone());
+    }
+    Ok(next)
+}
+
+fn layer_source(preset: Option<&str>, layer: Option<&LayerDef>) -> Result<LayerDef, String> {
+    match (preset, layer) {
+        (Some(name), None) if !name.trim().is_empty() => {
+            pattern::preset_layer(name).ok_or_else(|| format!("unknown lighting preset '{name}'"))
+        }
+        (None, Some(layer)) => Ok(layer.clone()),
+        (Some(_), Some(_)) => Err("choose a preset or a layer definition, not both".into()),
+        _ => Err("lighting push/replace needs a preset or layer definition".into()),
+    }
+}
+
 /// Insert `layer` at `at` (default: the top of the stack). Returns its index.
 pub fn stack_add(stack: &mut Vec<LayerDef>, layer: LayerDef, at: Option<usize>) -> Result<usize, String> {
     let i = at.unwrap_or(stack.len());
@@ -474,6 +540,24 @@ mod tests {
         assert!(stack_move(&mut stack, 0, 5).is_err());
         assert_eq!(stack_remove(&mut stack, 0).unwrap(), a);
         assert!(stack_remove(&mut stack, 3).is_err());
+    }
+
+    #[test]
+    fn lighting_action_edits_clone_validate_and_keep_final_indexes() {
+        use crate::action::LightingLayerOp as Edit;
+        let base = vec![pattern::preset_layer("fire").unwrap(), pattern::preset_layer("aurora").unwrap()];
+        let pushed = edit_stack(&base, &Edit::Push { preset: Some("fire".into()), layer: None }).unwrap();
+        assert_eq!(pushed.len(), 3);
+        assert_eq!(base.len(), 2, "the source stack is immutable");
+        let moved = edit_stack(&pushed, &Edit::Move { from: 2, to: 0 }).unwrap();
+        assert_eq!(moved[0], pushed[2], "destination is the final index after removal");
+        let cleared = edit_stack(&moved, &Edit::Region { index: 0, cells: Vec::new() }).unwrap();
+        assert!(cleared[0].region.is_empty());
+        assert!(edit_stack(&base, &Edit::Push { preset: Some("missing".into()), layer: None }).is_err());
+        assert!(edit_stack(&base, &Edit::Pop).is_ok());
+        assert!(edit_stack(&[], &Edit::Pop).is_err());
+        assert!(edit_stack(&base, &Edit::Move { from: 1, to: 2 }).is_err());
+        assert!(edit_stack(&base, &Edit::Params { index: 0, params: [ ("bad".into(), 2.0) ].into() }).is_err());
     }
 
     #[test]
