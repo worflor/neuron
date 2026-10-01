@@ -82,11 +82,24 @@ fn update_grid_model(state: &State, px: Vec<slint::Color>) {
 /// (`hidwatch`'s hardware-mute bridge, off a reader thread) needs to post onto the UI thread without
 /// being threaded through as a parameter down through `hidwatch`/`decode`/`bridge_mic_mute`.
 static UI: std::sync::OnceLock<slint::Weak<AppWindow>> = std::sync::OnceLock::new();
+static UI_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+static LIGHTING_TARGET: std::sync::OnceLock<std::sync::Mutex<Option<(u16, String)>>> = std::sync::OnceLock::new();
 
 /// Install the app's weak handle for [`notify_hardware_mute`] and any future non-UI caller. Call once,
 /// as early as the weak handle exists (main.rs builds it before starting `hidwatch::start()`).
 pub fn install_ui(weak: slint::Weak<AppWindow>) {
     let _ = UI.set(weak);
+    let _ = UI_THREAD.set(std::thread::current().id());
+}
+
+fn lighting_target_snapshot() -> Option<(u16, String)> {
+    LIGHTING_TARGET.get_or_init(|| std::sync::Mutex::new(None))
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+fn publish_lighting_target(target: Option<(u16, String)>) {
+    *LIGHTING_TARGET.get_or_init(|| std::sync::Mutex::new(None))
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner) = target;
 }
 
 /// Has [`install_ui`] run yet? Startup-order contract probe for `hidwatch::start()`'s
@@ -575,7 +588,8 @@ fn refresh_param_suggestions(st: &State) {
             .iter()
             .map(|s| (*s).into())
             .collect(),
-        "dial" => ["volume", "mic"].iter().map(|s| (*s).into()).collect(),
+        "dial" => ["volume", "mic", "scroll-hover", "scroll-anchored"].iter().map(|s| (*s).into()).collect(),
+        "lighting-layer" => ["toggle 0", "enable 0", "disable 0", "push fire", "pop", "replace 0 fire", "move 1 0", "spectrum 0 {\"stops\":[\"ff0000\"]}", "params 0 speed=1.5", "region 0 clear"].iter().map(|s| (*s).into()).collect(),
         // the connected output devices — click to build the cycle set
         "output-flip" => neuron::audio::endpoints(neuron::audio::Flow::Render)
             .into_iter()
@@ -7245,6 +7259,7 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     // idx < 0 is a deliberate "select nothing" (an all-adopting list has no auto-pickable row), so
     // it routes into the same clear branch as an empty list — never clamped up to row 0.
     if n == 0 || idx < 0 {
+        publish_lighting_target(None);
         st.set_selected_device(-1);
         st.set_selected_device_kind("".into());
         st.set_selected_device_name("\u{2014}".into());
@@ -7434,6 +7449,11 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
         // reselect / a post-apply refresh (no async) read clean immediately.
         stamp_feel_baseline(&st);
     }
+    publish_lighting_target(if row.cap_light && !row.adopting {
+        Some((pid, row.id.to_string()))
+    } else {
+        None
+    });
 }
 
 /// Extract a beacon-using macro's question(s) from its Python source — every `neuron.ask("…")` string
@@ -8767,6 +8787,138 @@ pub fn flush_lighting_save() {
             eprintln!("neuron: lighting save failed ({e})");
         }
     }
+}
+
+/// A completed edit to the selected device's compositor stack, with the exact states needed by Undo.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LightingCommit {
+    pub pid: u16,
+    pub unit: String,
+    pub before: Vec<neuron::pattern::LayerDef>,
+    pub after: Vec<neuron::pattern::LayerDef>,
+}
+
+fn on_ui<T: Send + 'static>(work: impl FnOnce(AppWindow) -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    let weak = UI.get().cloned().ok_or("lighting UI is unavailable")?;
+    if UI_THREAD.get().is_some_and(|owner| *owner == std::thread::current().id()) {
+        return work(weak.upgrade().ok_or("lighting UI was closed")?);
+    }
+    let ticket = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let callback_ticket = ticket.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    slint::invoke_from_event_loop(move || {
+        if callback_ticket.compare_exchange(0, 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+            return;
+        }
+        let result = weak.upgrade().ok_or_else(|| "lighting UI was closed".to_string()).and_then(work);
+        callback_ticket.store(3, std::sync::atomic::Ordering::Release);
+        let _ = tx.send(result);
+    }).map_err(|e| {
+        ticket.store(2, std::sync::atomic::Ordering::Release);
+        format!("could not schedule UI action: {e}")
+    })?;
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            if ticket.compare_exchange(0, 2, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
+                Err("UI action expired before it began".into())
+            } else if matches!(ticket.load(std::sync::atomic::Ordering::Acquire), 1 | 3) {
+                rx.recv().map_err(|_| String::from("UI action ended without a result"))?
+            } else {
+                Err("UI action did not complete".into())
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("UI action ended without a result".into()),
+    }
+}
+
+/// Edit the UI-owned selected stack on its owning thread. Success is returned only after the
+/// replacement stack has been persisted and committed to the shared runtime.
+pub fn edit_selected_lighting(
+    edit: neuron::action::LightingLayerOp,
+) -> Result<LightingCommit, String> {
+    if !neuron::safety::input_armed() {
+        return Err("lighting action is disarmed".into());
+    }
+    if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("lighting target is not ready".into());
+    }
+    let target = lighting_target_snapshot().ok_or("no selected lighting target")?;
+    on_ui(move |app| {
+            let shared = UI_SHARED.with(|s| s.borrow().clone()).ok_or_else(|| "lighting target is unavailable".to_string())?;
+            if !neuron::safety::input_armed() { return Err("lighting action is disarmed".into()); }
+            if app.global::<State>().get_writes_paused() {
+                return Err("writes are paused; lighting stack was not changed".into());
+            }
+            if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) { return Err("lighting target is not ready".into()); }
+            let (pid, unit, fps, before) = {
+                let s = shared.borrow();
+                (s.rt.selected_pid, s.rt.selected_unit.clone(), s.rt.light_fps.load(std::sync::atomic::Ordering::Relaxed), s.light_layers.clone())
+            };
+            if (pid, unit.clone()) != target {
+                return Err("selected lighting target changed before the edit".into());
+            }
+            let after = neuron::layers::edit_stack(&before, &edit)?;
+            if before == after {
+                return Err("lighting edit made no change".into());
+            }
+            let mut saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
+            saved.fps = fps;
+            saved.layers = after.clone();
+            crate::prefs::set_device_light(pid, saved)?;
+            {
+                let mut s = shared.borrow_mut();
+                s.light_layers = after.clone();
+                s.selected_layer = s.selected_layer.min(after.len().saturating_sub(1));
+                s.layers_rev = s.layers_rev.wrapping_add(1);
+            }
+            refresh_layers(&app, &shared);
+            let commit = LightingCommit { pid, unit, before, after };
+            crate::undo::record_lighting(commit.clone());
+            Ok(commit)
+    })
+}
+
+pub fn restore_selected_lighting(
+    pid: u16,
+    unit: &str,
+    expected: &[neuron::pattern::LayerDef],
+    replacement: Vec<neuron::pattern::LayerDef>,
+) -> Result<(), String> {
+    if !neuron::safety::input_armed() {
+        return Err("undo is disarmed".into());
+    }
+    let expected = expected.to_vec();
+    let unit = unit.to_string();
+    on_ui(move |app| {
+            let shared = UI_SHARED.with(|s| s.borrow().clone()).ok_or_else(|| "lighting target is unavailable".to_string())?;
+            if !neuron::safety::input_armed() { return Err("undo is disarmed".into()); }
+            if app.global::<State>().get_writes_paused() {
+                return Err("writes are paused".into());
+            }
+            if neuron::layers::check_stack(&replacement).iter().any(|i| i.severity == neuron::authoring::Severity::Error) {
+                return Err("saved lighting state failed validation".into());
+            }
+            let (selected, selected_unit, fps, current) = {
+                let s = shared.borrow();
+                (s.rt.selected_pid, s.rt.selected_unit.clone(), s.rt.light_fps.load(std::sync::atomic::Ordering::Relaxed), s.light_layers.clone())
+            };
+            if selected != pid || selected_unit != unit || current != expected {
+                return Err("selected lighting target changed since the edit".into());
+            }
+            let mut saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
+            saved.fps = fps;
+            saved.layers = replacement.clone();
+            crate::prefs::set_device_light(pid, saved)?;
+            {
+                let mut s = shared.borrow_mut();
+                s.light_layers = replacement;
+                s.selected_layer = s.selected_layer.min(s.light_layers.len().saturating_sub(1));
+                s.layers_rev = s.layers_rev.wrapping_add(1);
+            }
+            refresh_layers(&app, &shared);
+            Ok(())
+    })
 }
 
 /// Load the SELECTED device's saved lighting state into the shared runtime + the UI (the fps atomic,

@@ -696,11 +696,20 @@ mod imp {
 
         #[must_use]
         pub fn get_volume(&self) -> f32 {
+            self.try_get_volume().unwrap_or(0.0)
+        }
+
+        /// Read the volume setting, or `None` when Core Audio cannot provide a value.
+        #[must_use]
+        pub fn try_get_volume(&self) -> Option<f32> {
             unsafe {
                 let vt = vtbl::<IAudioEndpointVolumeVtbl>(self.vol);
                 let mut s = 0f32;
-                let _ = ((*vt).get_master_scalar)(self.vol, &raw mut s);
-                s
+                if ((*vt).get_master_scalar)(self.vol, &raw mut s) < 0 || !s.is_finite() {
+                    None
+                } else {
+                    Some(s.clamp(0.0, 1.0))
+                }
             }
         }
 
@@ -723,7 +732,7 @@ mod imp {
         /// not masquerade as a definite `false`, or a caller could skip a needed write (see
         /// `set_mute`). The public [`get_mute`](Self::get_mute) keeps the historical infallible
         /// `bool` (failure → `false`) for callers that only display it.
-        fn try_get_mute(&self) -> Option<bool> {
+        pub fn try_get_mute(&self) -> Option<bool> {
             unsafe {
                 let vt = vtbl::<IAudioEndpointVolumeVtbl>(self.vol);
                 let mut m = 0i32;
@@ -1421,6 +1430,9 @@ mod stub {
         pub fn get_volume(&self) -> f32 {
             0.0
         }
+        pub fn try_get_volume(&self) -> Option<f32> {
+            None
+        }
         pub fn set_volume(&self, _scalar: f32) -> bool {
             false
         }
@@ -1429,6 +1441,9 @@ mod stub {
         }
         pub fn get_mute(&self) -> bool {
             false
+        }
+        pub fn try_get_mute(&self) -> Option<bool> {
+            None
         }
         pub fn set_mute(&self, _mute: bool) -> bool {
             false

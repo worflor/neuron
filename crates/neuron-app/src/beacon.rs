@@ -59,7 +59,7 @@ pub fn request_instrument(id: u32) {
     INSTRUMENT_REQ.store(id, Ordering::SeqCst);
 }
 
-/// The primed dial's target (0 = output volume, 1 = mic volume), read when instrument 3 lands.
+/// The primed dial's target code, read when instrument 3 lands.
 static DIAL_TARGET: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Prime the analog DIAL for `target` — the next hold of the cast trigger becomes the slide.
@@ -69,6 +69,8 @@ pub fn prime_dial(target: neuron::action::DialTarget) {
         match target {
             DialTarget::OutputVolume => 0,
             DialTarget::MicVolume => 1,
+            DialTarget::ScrollHover => 2,
+            DialTarget::ScrollAnchored => 3,
         },
         Ordering::SeqCst,
     );
@@ -463,6 +465,8 @@ fn live_weave(
     let active = std::cell::Cell::new(u32::MAX);
     // A gamepad stick aiming the radial while the weave trigger is held (see `radial::StickAim`).
     let stick_aim = std::cell::RefCell::new(neuron::radial::StickAim::default());
+    let stick_source = std::cell::RefCell::new(None::<neuron::analog::StickSource>);
+    let stick_source_lost = std::cell::Cell::new(false);
     let stick_epoch = std::time::Instant::now();
     // How many options each wedge fans into, so the knob can mark the second tier's rim.
     let fan_counts: Vec<usize> = match &weave_mode {
@@ -679,14 +683,27 @@ fn live_weave(
         // predicate ticks every few ms whether or not the mouse moves, so a stick-only user aims
         // here; the overlay just draws the stroke it is given. ──
         if active.get() == 0 && matches!(weave_mode, crate::overlay::WeaveMode::Radial { .. }) {
-            if let Some((device, x, y)) = neuron::analog::strongest_stick_on(cast.trigger.pid) {
+            let sample = if let Some(source) = stick_source.borrow().as_ref() {
+                neuron::analog::stick_on_source(cast.trigger.pid, source).map(|(x, y)| (source.clone(), x, y))
+            } else {
+                neuron::analog::strongest_stick_on(cast.trigger.pid)
+            };
+            if let Some((source, x, y)) = sample {
                 // The wheel as a knob under the stick, felt on the pad (see `neuron::knob`).
-                neuron::knob::aim(&device, x, y, cast.sectors, &fan_counts);
+                neuron::knob::aim(&source.path, x, y, cast.sectors, &fan_counts);
                 if let Some((ax, ay)) = stick_aim.borrow_mut().observe(x, y, stick_epoch.elapsed().as_secs_f64()) {
+                    if stick_aim.borrow().engaged() && stick_source.borrow().is_none() {
+                        *stick_source.borrow_mut() = Some(source);
+                    }
                     let r = neuron::radial::StickAim::REACH;
                     weave_aim.set((ax * r, ay * r));
                     overlay.push(vec![(0.0, 0.0), ((ax * r) as f32, (ay * r) as f32)]);
                 }
+            } else if stick_source.borrow().is_some() {
+                *stick_source.borrow_mut() = None;
+                stick_source_lost.set(true);
+                stick_aim.borrow_mut().reset();
+                weave_aim.set((0.0, 0.0));
             }
         }
         // ── THE DIAL: while the wheel is up, scrolling over a sound wedge TURNS it — the
@@ -740,15 +757,16 @@ fn live_weave(
         let c_editor = EDITOR_WEAVE.load(Ordering::SeqCst);
         let c_gen = crate::dispatch::reload_generation() != gen;
         let c_instr = INSTRUMENT_REQ.load(Ordering::SeqCst) != 0; // a try-button yanks the wait
-                                                                  // knockback claimed or released its drum key mid-wait → re-arm with the right slots.
+        // knockback claimed or released its drum key mid-wait → re-arm with the right slots.
         let c_kb = crate::knockback::owned_ctl() != kb_ctl;
+        let c_stick = stick_source_lost.get();
         // a "fire via the spine" rhythm just activated: end the capture AT ONCE (no drawing
         // session) so we inject Trigger::Cast right after — the rhythm IS the whole gesture.
         let c_fire = fire_taps.get().is_some();
-        let fired = verb_fired || c_prompt || c_editor || c_gen || c_instr || c_kb || c_fire;
+        let fired = verb_fired || c_prompt || c_editor || c_gen || c_instr || c_kb || c_stick || c_fire;
         if fired && std::env::var_os("NEURON_PROFILE").is_some() {
             eprintln!(
-                "[CANCEL] verb={verb_fired} prompt={c_prompt} editor={c_editor} gen={c_gen} instr={c_instr} kb={c_kb} (gen now={} loaded={gen})",
+                "[CANCEL] verb={verb_fired} prompt={c_prompt} editor={c_editor} gen={c_gen} instr={c_instr} kb={c_kb} stick={c_stick} (gen now={} loaded={gen})",
                 crate::dispatch::reload_generation()
             );
         }
@@ -852,7 +870,7 @@ fn live_weave(
                 // wheel cycles the system default render endpoint; the slide keeps controlling whatever
                 // device is current. (The mic dial has no device cycle — one capture endpoint.)
                 let ticks = neuron::glyph::take_wheel_ticks();
-                if ticks != 0 && !dial.borrow().is_mic() {
+                if ticks != 0 && dial.borrow().is_output() {
                     let target =
                         crate::dialweave::target_from_code(DIAL_TARGET.load(Ordering::SeqCst));
                     for _ in 0..ticks.unsigned_abs().min(8) {
@@ -988,6 +1006,9 @@ fn live_weave(
             overlay.end();
             return;
         }
+        if active.get() == 3 {
+            dial.borrow_mut().finish();
+        }
         // cancelled (beacon/editor/reload) or ESC — never spin hot.
         neuron::knob::cancel();
         if active.get() != u32::MAX {
@@ -996,6 +1017,9 @@ fn live_weave(
         std::thread::sleep(std::time::Duration::from_millis(40));
         return;
     };
+    if id == 3 {
+        dial.borrow_mut().finish();
+    }
     // A stick that committed to a direction is the stroke: it resolves through the same fan and
     // `resolve` path a mouse flick takes (see `radial::StickAim`). A mouse flick past the deadzone
     // wins unless the stick is still out when the trigger lets go: whichever the hand is on.
@@ -1497,6 +1521,9 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
             audio_view(ac.mic, WedgeGlyph::Mic, "mic")
         }
         Action::Dial { target } => {
+            if matches!(target, DialTarget::ScrollHover | DialTarget::ScrollAnchored) {
+                return mk(WedgeGlyph::Mark, "scroll", Some(target.label().into()), Tone::Plain, None);
+            }
             let mic = matches!(target, DialTarget::MicVolume);
             let g = if mic {
                 WedgeGlyph::Mic
@@ -1716,6 +1743,8 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
             };
             mk(WedgeGlyph::Media, title, detail, tone, None)
         }
+        Action::LightingLayer { edit } => mk(WedgeGlyph::Sun, "lighting", Some(edit.label().into()), Tone::Plain, None),
+        Action::Undo => mk(WedgeGlyph::Flip, "undo", None, Tone::Plain, None),
         Action::Noop => WedgeView::blank(),
     }
 }

@@ -94,6 +94,7 @@ pub mod rhythm;
 pub mod runroot;
 pub mod salvage;
 pub mod safety;
+pub mod session_undo;
 pub mod scene;
 pub mod screen_ambient;
 pub mod sensors;

@@ -31,6 +31,8 @@ use neuron::{
     device::DeviceSession,
     executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRuntime},
 };
+#[cfg(windows)]
+use neuron::intent::ProfileCursor;
 use neuron::{
     backup,
     capability as cap,
@@ -3096,12 +3098,26 @@ fn run_daemon(_reg: &Registry, _seconds: Option<u64>, _safe: bool) {
 /// intent (a clean dry-run line); HERE is where it becomes real device/profile state.
 #[cfg(windows)]
 fn run_intent(devices: &mut DeviceSession<'_>, intent: &neuron::action::Intent) -> String {
+    run_intent_recording(devices, intent, true)
+}
+
+#[cfg(windows)]
+fn run_intent_recording(devices: &mut DeviceSession<'_>, intent: &neuron::action::Intent, record_undo: bool) -> String {
     let mut cursor = CliProfileCursor;
-    neuron::intent::run_shared_intent(
+    let before = cursor.active_profile();
+    neuron::intent::run_shared_intent_observe(
         devices,
         &mut cursor,
         intent,
         neuron::dpi_origin::Cause::UserApplied,
+        |_report| {
+            if record_undo && matches!(intent, neuron::action::Intent::ProfileSwitch(_) | neuron::action::Intent::ProfileCycle(_)) {
+                let applied = daemon_active_profile();
+                if let Some(entry) = neuron::session_undo::profile_entry(before.clone(), applied) {
+                    neuron::session_undo::push(entry);
+                }
+            }
+        },
     )
         .unwrap_or_else(|| "app intent needs the resident app - run neuron-app".into())
 }
@@ -3145,7 +3161,93 @@ struct CliIntentRunner<'a, 'reg> {
 #[cfg(windows)]
 impl IntentRunner for CliIntentRunner<'_, '_> {
     fn run_intent(&mut self, intent: &neuron::action::Intent) -> String {
-        run_intent(self.devices, intent)
+        if matches!(intent, neuron::action::Intent::Undo) {
+            undo_latest(self.devices)
+        } else {
+            run_intent(self.devices, intent)
+        }
+    }
+
+    fn run_host_action(&mut self, action: &neuron::action::Action, _ctx: &neuron::macros::context::Context) -> Option<String> {
+        use neuron::action::Action;
+        match action {
+            Action::Undo => Some(undo_latest(self.devices)),
+            Action::MicMute { .. } | Action::MicGain { .. } | Action::MicGainSet { .. }
+            | Action::OutputMute { .. } | Action::OutputGain { .. } => Some(apply_audio_action(action)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn apply_audio_action(action: &neuron::action::Action) -> String {
+    use neuron::audio::{self, Flow, VolumeCtl};
+    use neuron::session_undo::{AudioActionResult, AudioValue, AudioValueKind};
+    let result = neuron::session_undo::apply_audio_action(
+        action,
+        neuron::safety::input_armed(),
+        |flow, name| {
+            let endpoint = match flow { Flow::Capture => audio::resolve_capture(name), Flow::Render => audio::resolve_render(name) };
+            Ok(endpoint.map(|endpoint| (endpoint.id, endpoint.name)))
+        },
+        |id, flow, kind| {
+            let ctl = VolumeCtl::open(id).ok_or_else(|| "endpoint unavailable".to_owned())?;
+            match (flow, kind) {
+                (Flow::Capture | Flow::Render, AudioValueKind::Volume) => ctl.try_get_volume().map(AudioValue::Volume).ok_or_else(|| "volume read failed".into()),
+                (Flow::Capture | Flow::Render, AudioValueKind::Mute) => ctl.try_get_mute().map(AudioValue::Mute).ok_or_else(|| "mute read failed".into()),
+            }
+        },
+        |id, _, value| {
+            if !neuron::safety::input_armed() { return Err("audio action is disarmed".to_owned()); }
+            let ctl = VolumeCtl::open(id).ok_or_else(|| "endpoint unavailable".to_owned())?;
+            let ok = match value { AudioValue::Volume(v) => ctl.set_volume(*v), AudioValue::Mute(v) => ctl.set_mute(*v) };
+            if ok { Ok(()) } else { Err("endpoint write failed".into()) }
+        },
+    );
+    match result {
+        Ok(AudioActionResult::Unchanged { name }) => format!("{name} unchanged"),
+        Ok(AudioActionResult::Changed { id, flow, name, before, applied }) => {
+            neuron::session_undo::push(neuron::session_undo::Entry::Audio { id, flow, before, applied: applied.clone() });
+            match applied {
+                AudioValue::Volume(v) => format!("{name} {} -> {}%", flow.label(), (v * 100.0).round() as i32),
+                AudioValue::Mute(v) => format!("{name} mute -> {}", if v { "ON" } else { "off" }),
+            }
+        }
+        Err(error) => format!("{}: {error}", action.describe()),
+    }
+}
+
+#[cfg(windows)]
+fn undo_latest(devices: &mut DeviceSession<'_>) -> String {
+    use neuron::session_undo::{AudioValue, Entry};
+    if !neuron::safety::input_armed() { return "undo is disarmed".into(); }
+    let Some(record) = neuron::session_undo::peek() else { return "undo: nothing to restore".into(); };
+    let result = match &record.entry {
+        Entry::Audio { id, flow: _, applied, .. } => {
+            let Some(ctl) = neuron::audio::VolumeCtl::open(id) else { return format!("undo: audio endpoint '{id}' unavailable"); };
+            let read = || match applied {
+                AudioValue::Volume(_) => ctl.try_get_volume().map(AudioValue::Volume).map(neuron::session_undo::State::Audio),
+                AudioValue::Mute(_) => ctl.try_get_mute().map(AudioValue::Mute).map(neuron::session_undo::State::Audio),
+            }.ok_or_else(|| format!("audio endpoint '{id}' read failed"));
+            neuron::session_undo::restore_transaction(&record.entry, read, |state| {
+                if !neuron::safety::input_armed() { return Err("undo is disarmed".into()); }
+                let neuron::session_undo::State::Audio(value) = state else { return Err("undo entry is not audio".into()); };
+                let ok = match value { AudioValue::Volume(v) => ctl.set_volume(*v), AudioValue::Mute(v) => ctl.set_mute(*v) };
+                if ok { Ok(()) } else { Err(format!("audio endpoint '{id}' restore failed")) }
+            }).map_err(|e| format!("undo: audio endpoint '{id}': {e}"))
+        }
+        Entry::Profile { before, applied } => {
+            let mut cursor = CliProfileCursor;
+            if cursor.active_profile() != *applied { return format!("undo: active profile changed since '{applied}'"); }
+            let intent = neuron::action::Intent::ProfileSwitch(before.clone());
+            let restored = neuron::intent::run_shared_intent(devices, &mut cursor, &intent, neuron::dpi_origin::Cause::UserApplied);
+            if cursor.active_profile() == *before && restored.is_some() { Ok(()) } else { Err(restored.unwrap_or_else(|| "undo: profile restore unavailable".into())) }
+        }
+        Entry::Lighting { .. } => Err("undo: lighting restore unavailable in the daemon".into()),
+    };
+    match result {
+        Ok(()) => { neuron::session_undo::complete(record.id); "undo restored the previous state".into() }
+        Err(message) => message,
     }
 }
 
@@ -3173,6 +3275,12 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
     use neuron::controls::{HoldEdges, InputEdge, MIC_TAP};
     use neuron::engine::Trigger;
     use std::cell::RefCell;
+    struct SessionUndoReset;
+    impl Drop for SessionUndoReset {
+        fn drop(&mut self) { neuron::session_undo::clear(); }
+    }
+    neuron::session_undo::clear();
+    let _undo_reset = SessionUndoReset;
 
     let mic = audio::resolve_capture(None);
     let ctl = mic.as_ref().and_then(|e| audio::VolumeCtl::open(&e.id));
@@ -3319,9 +3427,10 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                     .app_rules
                     .switch_target(&app, &neuron::profile::active());
                 if let Some(name) = target {
-                    let line = run_intent(
+                    let line = run_intent_recording(
                         &mut devices.borrow_mut(),
                         &neuron::action::Intent::ProfileSwitch(name),
+                        false,
                     );
                     println!("  {line}");
                     // Only rebuild when the switch actually landed — the cursor is the authority.

@@ -75,11 +75,13 @@ pub fn run_shared_intent_observe(
     cause: crate::dpi_origin::Cause,
     mut on_profile_applied: impl FnMut(&crate::profile::ApplyReport),
 ) -> Option<String> {
-    use Intent::{Teleport, Whiteboard, Knockback, Glance, Summon, Banish, Pin, Kill, Tether, Dial, Control, Echo, DpiSet, DpiCycle, ScrollStageCycle, ProfileSwitch, ProfileCycle};
+    use Intent::{Teleport, Whiteboard, Knockback, Glance, Summon, Banish, Pin, Kill, Tether, Dial, Control, Echo, DpiSet, DpiCycle, ScrollStageCycle, ProfileSwitch, ProfileCycle, LightingLayer, Undo};
 
     match intent {
         Teleport | Whiteboard | Knockback | Glance(_) | Summon(..) | Banish(_) | Pin(_)
         | Kill(_) | Tether(..) | Dial(_) | Control => return None,
+        LightingLayer(_) => return Some("lighting layer unavailable: this runtime has no active lighting compositor".into()),
+        Undo => return Some("undo unavailable: this runtime has no session restore adapter".into()),
         Echo => return Some("echo is handled by the dispatch executor".into()),
         _ => {}
     }
@@ -160,8 +162,8 @@ pub fn run_shared_intent_observe(
                 // the caller's live compositor (the GUI streams it) so we never fight a running stream
                 // for the device here. (Lighting-on-auto-switch in a headless daemon is a follow-up.)
                 let rep = p.apply_with_session(devices, false);
-                on_profile_applied(&rep);
                 cursor.set_active_profile(name);
+                on_profile_applied(&rep);
                 profile::note_apply_report(name, &rep);
                 // The gaming-mode guards are HOST-side policy, not a device write, so applying the
                 // profile does not install them — this does. Without it an auto-switch (or a bound
@@ -189,8 +191,8 @@ pub fn run_shared_intent_observe(
                 Ok(p) => {
                     let prev = cursor.active_profile();
                     let rep = p.apply_with_session(devices, false); // settings only (see ProfileSwitch)
-                    on_profile_applied(&rep);
                     cursor.set_active_profile(&name);
+                    on_profile_applied(&rep);
                     profile::note_apply_report(&name, &rep);
                     crate::hook::set_policy(rep.gaming_mode); // see ProfileSwitch
                     crate::confirm::profile(&name, Some(&prev));
@@ -200,7 +202,7 @@ pub fn run_shared_intent_observe(
             }
         }
         Teleport | Whiteboard | Knockback | Glance(_) | Summon(..) | Banish(_) | Pin(_)
-        | Kill(_) | Echo | Tether(..) | Dial(_) | Control => {
+        | Kill(_) | Echo | Tether(..) | Dial(_) | Control | LightingLayer(_) | Undo => {
             unreachable!("handled before shared write gate")
         }
     })
