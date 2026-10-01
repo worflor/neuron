@@ -209,6 +209,11 @@ gui       neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 
 </details>
 
+Clipboard tools live on the same Trigger → Action path: ordered bounded text transforms,
+full-format pockets, in-session displaced-state history, and screen/window/region screenshots.
+`neuron pocket --help` lists pocket management and history commands; `neuron action list` shows the
+typed action forms.
+
 ## contributing
 
 neuron is one person, one desk, one vendor gone deep. that's the point, but it also means a handful of pieces are wide open, and some are shaped so you can own one cleanly without reading the whole tree.

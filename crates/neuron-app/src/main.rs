@@ -1062,6 +1062,12 @@ fn apply_live_commands(
                 flight::trace("live", "profile apply dropped (no window)", 0);
                 eprintln!("neuron-app: cannot apply '{name}' before the window exists");
             }
+            (Command::PocketRequest { request_id }, _, _) => {
+                if let Err(error) = neuron::livesync::serve_pocket_request(&request_id) {
+                    let _ = error;
+                    flight::trace("live", "pocket request could not be served", 0);
+                }
+            }
         }
     }
 }

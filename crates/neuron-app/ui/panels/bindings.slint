@@ -13,6 +13,7 @@ import { RuleRow, PocketCard, MacroBlock, MacroCard } from "../models.slint";
 // tints it from the weave palette so the type reads at a glance too.
 component PocketCardEl inherits Rectangle {
     in property <PocketCard> p;
+    property <bool> forget-armed: false;
     // pocket content is data, not a signal, so it inks in the weave colour rather than a signal hue;
     // the summary line names the kind.
     property <color> tint: p.kind == "other" ? Theme.text : State.weave-accent-col;
@@ -62,6 +63,19 @@ component PocketCardEl inherits Rectangle {
                 overflow: elide;
                 horizontal-stretch: 1;
             }
+            Rectangle {
+                width: 36px; height: 18px; border-radius: Theme.radius-sm;
+                background: forget-hit.has-hover ? Theme.well : transparent;
+                border-width: Theme.hair; border-color: root.forget-armed ? Theme.danger : Theme.line;
+                Text { text: root.forget-armed ? "sure?" : "×"; color: root.forget-armed ? Theme.danger : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; horizontal-alignment: center; vertical-alignment: center; }
+                forget-hit := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        if root.forget-armed { State.forget-pocket(root.p.name); }
+                        else { root.forget-armed = true; }
+                    }
+                }
+            }
             // a filled dot marks a pocket kept on disk (survives a restart)
             Rectangle {
                 y: 4px;
@@ -81,6 +95,7 @@ component PocketCardEl inherits Rectangle {
             overflow: elide;
         }
     }
+    Timer { interval: Theme.confirm-window; running: root.forget-armed; triggered => { root.forget-armed = false; } }
 }
 
 // One EMERGENT macro card in the WORKSHOP catalog — name, the plain-English summary of what it does

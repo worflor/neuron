@@ -14,7 +14,7 @@
 import {
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
-    PocketCard, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
+    PocketCard, ClipboardVariable, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
     SpectrumStop, SpectrumFrame,
     ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene
 } from "models.slint";
@@ -466,8 +466,21 @@ export global State {
     in-out property <[ActionChoice]> action-choices;  // the Action palette (key / run / mic / dpi / …)
     in-out property <int> action-choice: 0;           // selected action index
     in-out property <string> action-param: "";        // the action's parameter (key name / cmd / delta)
+    in-out property <string> clipboard-pattern: "";
+    in-out property <string> clipboard-preview: "";
+    in-out property <string> clipboard-preview-status: "sample a pattern";
+    in-out property <[string]> clipboard-operations: [];
+    in-out property <[ClipboardVariable]> clipboard-variables: [];
     in-out property <[string]> param-suggestions;     // clickable fills for the param (windows / profiles / macros)
     callback action-choice-changed();                  // the picker moved — recompute suggestions
+    callback append-clipboard-operation(string, string, string); // op, pattern, replacement
+    callback move-clipboard-operation(int, int);
+    callback remove-clipboard-operation(int);
+    callback mark-clipboard-variable(string, int, int, string, string, string, string, string, bool);
+    callback remove-clipboard-variable(int, string, string, string, bool);
+    callback clear-clipboard-variables();
+    callback preview-clipboard-example(string, string, string, bool);
+    callback forget-pocket(string);
     callback capture-action-param();                   // press-to-fill: capture a key/chord/button into the param
     callback record-action-keys();                     // toggle the key-sequence recorder (REC ⇄ STOP)
     in-out property <bool> recording-keys: false;      // a sequence take is rolling

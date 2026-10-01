@@ -456,6 +456,21 @@ enum Cmd {
         /// export this pocket's content-sigil as an SVG to this path (read-only)
         #[arg(long)]
         sigil: Option<String>,
+        /// print the full contents of the named pocket
+        #[arg(long, conflicts_with_all = ["delete", "list", "history", "clear_history", "history_item"])]
+        inspect: bool,
+        /// delete a named pocket
+        #[arg(long, conflicts_with_all = ["inspect", "list", "history", "clear_history", "history_item"])]
+        delete: bool,
+        /// list in-session clipboard history metadata
+        #[arg(long, conflicts_with_all = ["inspect", "delete", "clear_history", "history_item", "sigil"])]
+        history: bool,
+        /// print one full history item by newest-first index
+        #[arg(long, conflicts_with_all = ["inspect", "delete", "list", "history", "clear_history", "sigil"])]
+        history_item: Option<usize>,
+        /// clear in-session clipboard history
+        #[arg(long, conflicts_with_all = ["inspect", "delete", "list", "history", "history_item", "sigil"])]
+        clear_history: bool,
     },
     /// Read raw getters from a device (debug)
     ///
@@ -1207,7 +1222,12 @@ fn run() -> Result<()> {
             list,
             keep,
             sigil,
-        } => pocket_cmd(name, list, keep, sigil)?,
+            inspect,
+            delete,
+            history,
+            history_item,
+            clear_history,
+        } => pocket_cmd(name, list, keep, sigil, inspect, delete, history, history_item, clear_history)?,
         Cmd::Prof {
             action: ProfCmd::Pump,
         } => prof_pump_cmd(),
@@ -1219,7 +1239,10 @@ fn run() -> Result<()> {
 /// content-sigil, or MOVE the clipboard into/out of a named pocket. The move writes the clipboard
 /// (a real mutation), so it arms input for this one-shot — the process exits right after, and the
 /// list/sigil paths stay read-only (no arm).
-fn pocket_cmd(name: Option<String>, list: bool, keep: bool, sigil: Option<String>) -> Result<()> {
+fn pocket_cmd(
+    name: Option<String>, list: bool, keep: bool, sigil: Option<String>, inspect: bool,
+    delete: bool, history: bool, history_item: Option<usize>, clear_history: bool,
+) -> Result<()> {
     let disp = |s: &str| {
         if s.is_empty() {
             "(default)".to_string()
@@ -1227,26 +1250,75 @@ fn pocket_cmd(name: Option<String>, list: bool, keep: bool, sigil: Option<String
             s.to_string()
         }
     };
+    let formats = |ids: &[u32]| ids.iter().map(|id| format!("{id:04x}")).collect::<Vec<_>>().join(",");
     if list {
-        let all = neuron::pocket::views();
-        if all.is_empty() {
-            println!("no pockets yet (move something: neuron pocket <name>)");
-            return Ok(());
-        }
-        for (slot, durable, v) in all {
-            let kept = if durable { " \u{00b7} kept" } else { "" };
-            let extra = if let Some(t) = v.text {
-                format!("  \u{201c}{t}\u{201d}")
-            } else if !v.files.is_empty() {
-                format!("  {}", v.files.join(", "))
-            } else {
-                String::new()
-            };
-            println!("  {:<16} {}{kept}{extra}", disp(&slot), v.summary);
+        let live = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::List, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)?;
+        let (entries, live_view) = match live {
+            Some(neuron::livesync::PocketReply::Pockets { entries }) => (entries, true),
+            Some(_) => bail!("resident app returned an unexpected pocket reply"),
+            None => (neuron::pocket::metadata().into_iter().filter(|(_, durable, _, _)| *durable).map(|(slot, durable, ids, bytes)| neuron::livesync::PocketMetadata { slot, durable, kind: if ids.contains(&13) || ids.contains(&1) { "text" } else if ids.contains(&15) { "files" } else if ids.contains(&8) || ids.contains(&17) { "image" } else { "other" }.into(), formats: ids, bytes }).collect(), false),
+        };
+        if !live_view { println!("offline view · durable pockets only"); }
+        if entries.is_empty() { println!("no pockets yet (move something: neuron pocket <name>)"); return Ok(()); }
+        for entry in entries {
+            let kept = if entry.durable { " · kept" } else { "" };
+            println!("  {:<16} {:<6} [{}] · {} bytes{kept}", disp(&entry.slot), entry.kind, formats(&entry.formats), entry.bytes);
         }
         return Ok(());
     }
+    if history {
+        let Some(neuron::livesync::PocketReply::History { entries }) = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::History, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? else {
+            bail!("session history is available only while the resident app is running");
+        };
+        if entries.is_empty() { println!("clipboard history is empty"); }
+        for entry in entries {
+            println!("  {:<3} {:<6} [{}] · {} bytes", entry.index, entry.kind, formats(&entry.formats), entry.bytes);
+        }
+        return Ok(());
+    }
+    if clear_history {
+        match neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::ClearHistory, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? {
+            Some(neuron::livesync::PocketReply::Cleared) => println!("clipboard history cleared"),
+            None => bail!("session history is available only while the resident app is running"),
+            _ => bail!("resident app returned an unexpected pocket reply"),
+        }
+        return Ok(());
+    }
+    if let Some(index) = history_item {
+        let Some(neuron::livesync::PocketReply::HistoryItem { contents: Some(item) }) = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::HistoryItem { index }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? else {
+            bail!("session history item is unavailable; keep the resident app running and check the newest-first index");
+        };
+        let item = item.decode().map_err(anyhow::Error::msg)?;
+        println!("history #{index}: {} formats · {} bytes", item.formats.len(), item.formats.iter().map(|f| f.bytes.len()).sum::<usize>());
+        if let Some(text) = item.text() { print!("{text}"); if !text.ends_with('\n') { println!(); } }
+        return Ok(());
+    }
     let slot = name.unwrap_or_default();
+    if inspect {
+        neuron::pocket::validate_slot_name(&slot).map_err(anyhow::Error::msg)?;
+        let live = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::Inspect { slot: slot.clone() }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)?;
+        let item = match live {
+            Some(neuron::livesync::PocketReply::Pocket { contents, .. }) => contents.map(|p| p.decode()).transpose().map_err(anyhow::Error::msg)?,
+            Some(_) => bail!("resident app returned an unexpected pocket reply"),
+            None => neuron::pocket::inspect(&slot),
+        };
+        let Some(item) = item else { bail!("pocket {} does not exist", disp(&slot)); };
+        println!("pocket {}: {} formats · {} bytes", disp(&slot), item.formats.len(), item.formats.iter().map(|f| f.bytes.len()).sum::<usize>());
+        if let Some(text) = item.text() { print!("{text}"); if !text.ends_with('\n') { println!(); } }
+        return Ok(());
+    }
+    if delete {
+        let deleted = match neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::Delete { slot: slot.clone() }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? {
+            Some(neuron::livesync::PocketReply::Deleted { removed }) => removed,
+            Some(_) => bail!("resident app returned an unexpected pocket reply"),
+            None => neuron::pocket::delete(&slot).map_err(anyhow::Error::msg)?,
+        };
+        match deleted {
+            true => println!("deleted pocket {}", disp(&slot)),
+            false => println!("pocket {} does not exist", disp(&slot)),
+        }
+        return Ok(());
+    }
     if let Some(out) = sigil {
         let svg = neuron::pocket::sigil_svg_of(&slot, 480.0);
         if svg.is_empty() {
