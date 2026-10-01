@@ -63,7 +63,7 @@ fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "Requires a GUI display and an explicit screenshot destination"]
 fn shot() {
     let Some(out) = env("NEURON_SHOT_OUT") else { return };
     let scene = env("NEURON_SHOT_SCENE").unwrap_or_default();
@@ -399,7 +399,7 @@ fn wedge(
 }
 
 #[test]
-#[ignore]
+#[ignore = "Requires a Windows desktop to capture the radial overlay"]
 #[cfg(windows)]
 fn overlay_radial() {
     use crate::overlay::{SpellOverlay, Tone, WeaveMode, WedgeGlyph as G};
@@ -436,7 +436,7 @@ fn overlay_radial() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "Requires a Windows desktop to capture the glyph overlay"]
 #[cfg(windows)]
 fn overlay_glyph() {
     use crate::overlay::{GlyphHint, SpellOverlay, Tone, WeaveMode, WedgeGlyph as G};
@@ -490,7 +490,7 @@ fn overlay_glyph() {
 /// The notification engine's own scripted run (enter, reflow, coalesce, drain), dumped to
 /// `<run root>/_notif_proof`.
 #[test]
-#[ignore]
+#[ignore = "Requires a Windows desktop to capture notification cards"]
 #[cfg(windows)]
 fn notif_cards() {
     if env("NEURON_SHOT_OUT").is_none() {

@@ -179,6 +179,42 @@ pub enum StackCmd {
     },
 }
 
+#[derive(Subcommand)]
+pub enum EffectCmd {
+    /// Save the current stack as a named user effect
+    Save {
+        /// a name for the effect
+        name: String,
+        /// comma-separated tags
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        #[command(flatten)]
+        target: TargetArgs,
+    },
+    /// Export a user effect as a portable TOML file
+    Export {
+        /// the effect's slug or name
+        slug: String,
+        /// output file path
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Import a user effect from a TOML file
+    Import {
+        /// path to the effect file
+        path: String,
+    },
+    /// Delete a user effect
+    Delete {
+        /// the effect's slug or name
+        slug: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List all user effects
+    List,
+}
+
 fn stack_json(t: &LightTarget, stack: &[LayerDef]) -> Value {
     json!({
         "target": t.label(),
@@ -318,6 +354,79 @@ pub fn stack(cmd: StackCmd) -> Result<()> {
             };
             let n = s.len();
             save_and_echo(&t, &s, format!("replaced with {n} layer(s)"))
+        }
+    }
+}
+
+pub fn effect(cmd: EffectCmd) -> Result<()> {
+    match cmd {
+        EffectCmd::Save { name, tags, target } => {
+            let t = target.target()?;
+            let stack = t.load().map_err(anyhow::Error::msg)?;
+            if stack.is_empty() {
+                bail!("{} has no layers — nothing to save", t.label());
+            }
+            let saved = neuron::user_effects::save(&name, &tags, &stack).map_err(anyhow::Error::msg)?;
+            let slug = saved.slug.clone();
+            live::finish(
+                json!({ "slug": saved.slug, "name": name, "tags": tags, "layers": stack.len(), "replaced": saved.replaced }),
+                if saved.replaced {
+                    format!("replaced '{slug}' with the current stack")
+                } else {
+                    format!("saved '{name}' as {slug}")
+                },
+            );
+            Ok(())
+        }
+        EffectCmd::Export { slug, out } => {
+            let text = neuron::user_effects::export_bundle(&slug).map_err(anyhow::Error::msg)?;
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, text.as_bytes()).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+                    live::finish(json!({ "slug": slug, "path": path }), format!("exported {slug} to {path}"));
+                }
+                None => {
+                    out::emit(&json!({ "slug": slug, "toml": text }), || print!("{text}"))?;
+                }
+            }
+            Ok(())
+        }
+        EffectCmd::Import { path } => {
+            let saved = neuron::user_effects::import_from_file(std::path::Path::new(&path)).map_err(anyhow::Error::msg)?;
+            live::finish(
+                json!({ "slug": saved.slug, "path": path, "replaced": saved.replaced }),
+                if saved.replaced {
+                    format!("imported {slug} from {path} (replaced the one already there)", slug = saved.slug)
+                } else {
+                    format!("imported {slug} from {path}", slug = saved.slug)
+                },
+            );
+            Ok(())
+        }
+        EffectCmd::Delete { slug, yes } => {
+            if !yes {
+                bail!("refusing to delete without --yes");
+            }
+            neuron::user_effects::delete(&slug).map_err(anyhow::Error::msg)?;
+            live::finish(json!({ "slug": slug }), format!("deleted {slug}"));
+            Ok(())
+        }
+        EffectCmd::List => {
+            let effects = neuron::user_effects::list().map_err(anyhow::Error::msg)?;
+            let json = json!({
+                "effects": effects
+                    .iter()
+                    .map(|(slug, name, tags)| json!({ "slug": slug, "name": name, "tags": tags }))
+                    .collect::<Vec<_>>()
+            });
+            out::emit(&json, || {
+                if effects.is_empty() {
+                    println!("no saved effects yet — build a look, then `neuron light saved save \"NAME\"`");
+                }
+                for (slug, name, tags) in &effects {
+                    println!("  {:<20} {:<24} {}", slug, name, tags.join(", "));
+                }
+            })
         }
     }
 }

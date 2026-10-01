@@ -2098,6 +2098,74 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
             });
         }
+        // SAVE the live stack as a USER EFFECT — the same stack `neuron light effect save` persists,
+        // through the same store, so a GUI-built look and a CLI-built one are indistinguishable on disk.
+        // A failure is reported as one: the status line never claims a save that did not land.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_save_user_effect(move |name| {
+                if let Some(app) = w.upgrade() {
+                    let st = app.global::<State>();
+                    let name = name.trim().to_string();
+                    if name.is_empty() {
+                        st.set_status_line("name the effect before saving it".into());
+                        return;
+                    }
+                    let stack = sh.borrow().light_layers.clone();
+                    if stack.is_empty() {
+                        st.set_status_line("nothing to save — pick an effect first".into());
+                        return;
+                    }
+                    // Refuse a stack that wouldn't render, the same gate `neuron light effect save`
+                    // applies — a saved effect is a look you'd want back exactly as it was.
+                    let issues = neuron::layers::check_stack(&stack);
+                    if neuron::authoring::has_errors(&issues) {
+                        st.set_status_line(
+                            issues.iter().map(|i| i.message.as_str()).collect::<Vec<_>>().join("; ").into(),
+                        );
+                        return;
+                    }
+                    match neuron::user_effects::save(&name, &[], &stack) {
+                        Ok(saved) => {
+                            refresh_user_effect_tiles(&app, &sh);
+                            // Re-slugify what actually landed (the name is normalised into a slug), so
+                            // the tile the shelf just grew is the one that reads as selected.
+                            st.set_light_user_effect(saved.slug.clone().into());
+                            st.set_light_effect_name(neuron::user_effects::load(&saved.slug).map_or_else(|_| name.clone(), |e| e.name).into());
+                            st.set_status_line(
+                                if saved.replaced {
+                                    format!("replaced '{name}' ({} layers)", stack.len()).into()
+                                } else {
+                                    format!("saved '{name}' as {} ({} layers)", saved.slug, stack.len()).into()
+                                },
+                            );
+                        }
+                        Err(e) => st.set_status_line(format!("save failed: {e}").into()),
+                    }
+                }
+            });
+        }
+        // DELETE a saved effect by slug. Refuses nothing here: the ✕ is a deliberate act on one tile.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_delete_user_effect(move |slug| {
+                if let Some(app) = w.upgrade() {
+                    let st = app.global::<State>();
+                    match neuron::user_effects::delete(slug.trim()) {
+                        Ok(()) => {
+                            if st.get_light_user_effect() == slug {
+                                st.set_light_user_effect("".into());
+                            }
+                            refresh_user_effect_tiles(&app, &sh);
+                            st.set_status_line(format!("deleted {slug}").into());
+                        }
+                        Err(e) => st.set_status_line(format!("delete failed: {e}").into()),
+                    }
+                }
+            });
+        }
     });
 
     // ── Lighting UNIFIED SURFACE — tile pick · auto-rendered params · stack · brush ──
@@ -2111,6 +2179,35 @@ pub fn install(app: &AppWindow) -> SharedRt {
             app.global::<State>().on_pick_tile(move |slug| {
                 if let Some(app) = w.upgrade() {
                     let slug = slug.to_string();
+                    // A SAVED EFFECT is a whole look, not a re-skin: picking one replaces the ENTIRE
+                    // stack with the layers it was saved with (that's what "the effect I made" means),
+                    // and names the loaded effect so its tile lights. A built-in preset keeps the
+                    // re-skin path below unchanged.
+                    if let Some(effect_slug) = slug.strip_prefix(USER_TILE_PREFIX) {
+                        match neuron::user_effects::load(effect_slug) {
+                            Ok(effect) => {
+                                {
+                                    let mut s = sh.borrow_mut();
+                                    s.light_layers = effect.layers;
+                                    s.selected_layer = s.light_layers.len().saturating_sub(1);
+                                    s.active_frame = 0;
+                                    s.layers_rev += 1;
+                                }
+                                refresh_layers(&app, &sh);
+                                refresh_user_effect_tiles(&app, &sh);
+                                flush_lighting_save();
+                                app.global::<State>().set_light_user_effect(effect_slug.into());
+                                app.global::<State>().set_light_effect_name(effect.name.clone().into());
+                                app.global::<State>()
+                                    .set_status_line(format!("lighting → {}", effect.name).into());
+                            }
+                            Err(e) => app
+                                .global::<State>()
+                                .set_status_line(format!("no saved effect '{effect_slug}': {e}").into()),
+                        }
+                        return;
+                    }
+                    app.global::<State>().set_light_user_effect("".into());
                     // build the layer this PRESET describes (pattern + its params + spectrum) and pour it
                     // into the stack. Vitals is just another preset now — no data-mode fork.
                     let readout = {
@@ -2830,6 +2927,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 if let Some(app) = w.upgrade() {
                     let t = neuron::pattern::render_elapsed();
                     render_light_tiles(&app, &sh, t);
+                    // the YOUR-EFFECTS shelf animates on the same tick and the same clock as the built-in
+                    // shelves, so a saved look is seen MOVING in the catalog exactly as it will on the board.
+                    render_user_effect_tiles(&app, &sh, false);
                 }
             });
         }
@@ -8982,6 +9082,14 @@ fn light_tile_catalog() -> Vec<TileSpec> {
         .collect()
 }
 
+/// The tile-slug prefix that marks a shelf row as a USER-SAVED effect rather than a built-in preset.
+///
+/// A saved effect's slug is derived from the user's own name, so it can collide with a preset slug
+/// ("aurora" is a preset AND a legal name). Namespacing the TILE slug — never the stored effect's own
+/// identity — keeps the two shelves unambiguous at the one place that dispatches on it ([`on_pick_tile`])
+/// without changing anything the store persists. Strip it and the value is the effect's real slug.
+const USER_TILE_PREFIX: &str = "user:";
+
 /// Build the [`neuron::pattern::LayerDef`] a preset slug describes (the look the tile picker applies),
 /// falling back to a benign default for an unknown slug.
 fn preset_layer(slug: &str) -> neuron::pattern::LayerDef {
@@ -9451,6 +9559,125 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
     }
 }
 
+/// Rebuild the YOUR-EFFECTS shelf — one live tile per saved effect, each rendering its OWN saved stack
+/// through the same [`neuron::pattern::Compositor`] the device does, so the thumbnail is the look
+/// itself rather than a stand-in.
+///
+/// Deliberately its OWN pass, not a fourth arm of [`render_light_tiles`]: the built-in catalog is keyed
+/// by `&'static str` preset slugs and its per-slug match arms are exhaustive over those, whereas a
+/// saved effect's slug is derived from the user's own name and its frame comes from a whole stack.
+/// Keeping it separate leaves that hot path untouched.
+///
+/// The per-effect [`neuron::pattern::Compositor`]s are cached across calls by slug, so stateful patterns
+/// (fire, sparkle) animate instead of restarting each tick, and the cache is dropped wholesale when the
+/// grid's shape changes. Rows are written IN PLACE (never a model swap) for the same reason the preset
+/// shelves do it: replacing the model rebuilds every card and drops its hover state.
+fn refresh_user_effect_tiles(app: &AppWindow, sh: &SharedRt) {
+    render_user_effect_tiles(app, sh, true);
+}
+
+fn render_user_effect_tiles(app: &AppWindow, sh: &SharedRt, reload: bool) {
+    let state = app.global::<State>();
+    let (rows, cols) = sh.borrow().rt.grid_dims();
+    if rows == 0 || cols == 0 {
+        state.set_light_user_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
+        return;
+    }
+    struct CachedEffect {
+        slug: String,
+        effect: neuron::user_effects::UserEffect,
+        comp: neuron::pattern::Compositor,
+    }
+    struct Shelf {
+        dims: (u8, u8),
+        checked: Option<std::time::Instant>,
+        entries: Vec<CachedEffect>,
+    }
+    thread_local! {
+        static SHELF: RefCell<Shelf> = const { RefCell::new(Shelf {
+            dims: (0, 0), checked: None, entries: Vec::new(),
+        }) };
+    }
+    // ONE clock for the whole pass, so every user tile is a frame of the same instant (a shelf whose
+    // tiles drift out of step with each other reads as several unrelated clocks).
+    let t = neuron::pattern::render_elapsed();
+    let mut built: Vec<EffectTile> = Vec::new();
+    SHELF.with(|c| {
+        let mut c = c.borrow_mut();
+        let resized = c.dims != (rows, cols);
+        // External CLI edits are picked up without putting filesystem reads on every animation tick.
+        if reload || resized || c.checked.is_none_or(|t| t.elapsed().as_secs() >= 2) {
+            if let Ok(saved) = neuron::user_effects::list() {
+                let mut old = std::mem::take(&mut c.entries);
+                c.entries = saved.into_iter().filter_map(|(slug, _, _)| {
+                    let effect = neuron::user_effects::load(&slug).ok()?;
+                    if !resized {
+                        if let Some(i) = old.iter().position(|e| e.slug == slug && e.effect == effect) {
+                            return Some(old.remove(i));
+                        }
+                    }
+                    let comp = neuron::pattern::Compositor::from_defs(&effect.layers);
+                    Some(CachedEffect { slug, effect, comp })
+                }).collect();
+            }
+            c.dims = (rows, cols);
+            c.checked = Some(std::time::Instant::now());
+        }
+        let _quiet = neuron::capture::suppress_key_reads();
+        for cached in &mut c.entries {
+            let slug = &cached.slug;
+            let effect = &cached.effect;
+            let frame = cached.comp.render(rows, cols, t);
+            built.push(EffectTile {
+                name: effect.name.clone().into(),
+                slug: format!("{USER_TILE_PREFIX}{slug}").into(),
+                kind: "effect".into(),
+                blurb: user_effect_blurb(&layers_blurb(&effect.layers), &effect.tags).into(),
+                source: String::new().into(),
+                swatch: frame_to_preview(&frame, usize::from(rows), usize::from(cols)),
+            });
+        }
+    });
+    let existing = state.get_light_user_tiles();
+    match existing.as_any().downcast_ref::<VecModel<EffectTile>>() {
+        Some(vm) if vm.row_count() == built.len() => {
+            for (i, row) in built.into_iter().enumerate() {
+                vm.set_row_data(i, row);
+            }
+        }
+        _ => state.set_light_user_tiles(ModelRc::new(VecModel::from(built))),
+    }
+}
+
+/// What a saved effect's tile says it is, in plain words: how many layers it stacks, naming the presets
+/// behind them so a multi-layer look reads as recognisable ("heat + comet"). Derived on read from the
+/// saved layers, never a second stored description that could drift from the stack it describes.
+fn layers_blurb(layers: &[neuron::pattern::LayerDef]) -> String {
+    if layers.is_empty() {
+        return "no layers".into();
+    }
+    let names: Vec<&str> = layers
+        .iter()
+        .map(|l| neuron::pattern::slug_for_layer(l).unwrap_or(l.pattern.as_str()))
+        .collect();
+    if names.len() == 1 {
+        format!("1 layer · {}", names[0])
+    } else {
+        format!("{} layers · {}", names.len(), names.join(" + "))
+    }
+}
+
+/// A saved effect's blurb: the stack it holds, then its tags when it has any. An untagged effect reads
+/// as the bare stack description — no empty "·" tail for a fact the author never stated.
+fn user_effect_blurb(stack: &str, tags: &[String]) -> String {
+    let tags: Vec<&str> = tags.iter().map(String::as_str).filter(|t| !t.is_empty()).collect();
+    if tags.is_empty() {
+        stack.to_string()
+    } else {
+        format!("{stack} · {}", tags.join(" "))
+    }
+}
+
 /// Build the `EffectParam` controls for a layer from its PATTERN's declared schema, filling each row's
 /// live value from the layer's param bag. Patterns carry NO colour params (colour is the Spectrum), so
 /// the colour kind never appears — the SPECTRUM editor is the colour authority.
@@ -9777,6 +10004,7 @@ pub fn init_grid(app: &AppWindow, sh: &SharedRt) {
     // seed the tile grid so the live previews appear the moment a lit device is selected (the page's
     // ~90ms timer keeps them animating after that).
     render_light_tiles(app, sh, neuron::pattern::render_elapsed());
+    refresh_user_effect_tiles(app, sh);
     refresh_light_unified(app, sh);
 }
 

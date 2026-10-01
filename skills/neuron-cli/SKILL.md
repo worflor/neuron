@@ -86,6 +86,18 @@ neuron profile new everyday
 neuron profile route default everyday                          # where a non-game app returns
 ```
 
+**Saving a look you built, and sharing it.** A saved effect is a named layer stack in
+`effects/` — the same thing the LIGHTING page's `save effect` button writes, so either one
+can load what the other made.
+
+```powershell
+neuron lighting saved save "Neon Tunnel" --profile game --tags ambient,blue
+neuron lighting saved list
+neuron lighting saved export neon-tunnel --out neon-tunnel.toml   # plain readable TOML
+neuron lighting saved import neon-tunnel.toml                     # someone else's file
+neuron lighting saved delete neon-tunnel --yes
+```
+
 **The cast wheel.**
 
 ```powershell

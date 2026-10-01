@@ -4,7 +4,7 @@
 
 import { Theme, Signal } from "../theme.slint";
 import { ChromaLab } from "chromalab.slint";
-import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Lamp, SheenText } from "../widgets/controls.slint";
+import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, SheenText } from "../widgets/controls.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
 import { EffectTile, EffectParam } from "../models.slint";
@@ -36,7 +36,12 @@ component EffectTileCard inherits Rectangle {
     in property <EffectTile> tile;
     in property <bool> selected;
     in property <bool> dimmed;       // a stub (future) — shown, but visibly not-yet-wired
+    // Saved effects require a second click to delete. The trailing TouchArea owns the corner
+    // so pressing it cannot also load the effect.
+    in property <bool> deletable: false;
+    property <bool> delete-armed: false;
     callback picked();
+    callback delete-requested();
     border-radius: Theme.radius;
     // ACTIVE > hover > rest. The selected tile wears a clear accent ground + line; a hovered tile
     // lifts to the well with a faint ink edge; everything else rests on the bezel plane.
@@ -114,6 +119,21 @@ component EffectTileCard inherits Rectangle {
         mouse-cursor: root.dimmed ? MouseCursor.default : MouseCursor.pointer;
         clicked => { if (!root.dimmed) { root.picked(); } }
     }
+    Timer {
+        interval: 3s;
+        running: root.delete-armed;
+        triggered => { root.delete-armed = false; }
+    }
+    if root.deletable : IconButton {
+        x: parent.width - self.width - 3px;
+        y: 3px;
+        glyph: root.delete-armed ? "?" : "\u{00d7}";
+        danger: root.delete-armed;
+        clicked => {
+            if (root.delete-armed) { root.delete-requested(); }
+            else { root.delete-armed = true; }
+        }
+    }
 }
 
 // One SHELF of the catalog: a quiet header naming the family + what feeds it, then the responsive
@@ -123,6 +143,12 @@ component TileShelf inherits VerticalLayout {
     in property <string> title;
     in property <string> caption;
     in property <[EffectTile]> tiles;
+    // A second selection id this shelf also honours. The built-in shelves leave it empty and light off
+    // `State.light-effect` alone; the YOUR-EFFECTS shelf passes the loaded saved-effect slug, because a
+    // loaded user effect reports `light-effect` as its TOP LAYER's preset — which is a different tile.
+    in property <string> selected-extra: "";
+    in property <bool> deletable: false;
+    callback delete-requested(string);
     spacing: 8px;
     HorizontalLayout {
         spacing: 9px;
@@ -145,13 +171,15 @@ component TileShelf inherits VerticalLayout {
         height: self.nrows * self.th + max(0, self.nrows - 1) * self.gap;
         for t[i] in root.tiles : EffectTileCard {
             tile: t;
-            selected: t.slug == State.light-effect;
+            selected: t.slug == State.light-effect || t.slug == root.selected-extra;
             dimmed: t.kind == "stub";
+            deletable: root.deletable;
             x: mod(i, shelfgrid.cols) * (shelfgrid.cw + shelfgrid.gap);
             y: floor(i / shelfgrid.cols) * (shelfgrid.th + shelfgrid.gap);
             width: shelfgrid.cw;
             height: shelfgrid.th;
             picked => { State.pick-tile(t.slug); }
+            delete-requested => { root.delete-requested(t.slug); }
         }
     }
 }
@@ -675,34 +703,50 @@ export component LightingPanel inherits VerticalLayout {
             alignment: start;
             spacing: 7px;
             // status strip — the device geometry on the left, the honest "what this is" on the right.
+            //
+            // It shares the RENDER's 760px measure and centring, deliberately. At full window width
+            // the name sat at x=0 and its live state at x~1700, so the two halves of one caption were
+            // flung to opposite edges of a wide monitor and the state read as belonging to nothing.
+            // Constrained to the subject's own measure they are one caption over one subject, and the
+            // status is right-aligned against that measure rather than the window.
             HorizontalLayout {
-                SheenText {
-                    value: State.selected-device-name + " · " + State.grid-rows + " × " + State.grid-cols + " led";
-                    live: State.compositing && !State.light-foreign;
-                    ink: Theme.text-faint;
-                    size: Theme.fs-data;
-                    weight: 400;
-                    tracking: 0px;
-                }
-                // the live-truth slot: a visitor painting OUTRANKS the live name (it IS
-                // what's live on the device); suppressed rides beside it as a quiet fact.
-                if State.light-foreign : HorizontalLayout {
-                    spacing: 6px;
-                    VerticalLayout { alignment: center; Lamp {} }
-                    Mono {
+                alignment: center;
+                HorizontalLayout {
+                    width: min(parent.width, 760px);
+                    spacing: 7px;
+                    SheenText {
+                        value: State.selected-device-name + " · " + State.grid-rows + " × " + State.grid-cols + " led";
+                        // LIVE means YOUR stack is streaming to this board. A visitor painting on top
+                        // does NOT switch this off: your lighting keeps compositing underneath (the
+                        // VISITORS blend decides how), which is exactly the state this reports. Gating
+                        // it on `&& !light-foreign` blanked the indicator on precisely the machines
+                        // running a game — i.e. most of the time.
+                        live: State.compositing;
+                        ink: Theme.text-faint;
+                        size: Theme.fs-data;
+                        weight: 400;
+                        tracking: 0px;
+                    }
+                    // the gap that pins the status cluster hard right against the measure above
+                    Rectangle { horizontal-stretch: 1; }
+                    // the live-truth slot: a visitor painting OUTRANKS the live name (it IS what's live
+                    // on the device); suppressed rides beside it as a quiet fact. No lamp — the sheen
+                    // on the name already says "mine is live", so a second dot beside it just repeated
+                    // one fact twice in two visual languages.
+                    if State.light-foreign : Mono {
                         text: (State.light-foreign-app == "" ? "another app" : State.light-foreign-app) + " is painting";
                         color: Theme.accent;
                     }
+                    if State.light-suppressed && !State.light-foreign : Mono {
+                        text: (State.light-foreign-app == "" ? "a visitor" : State.light-foreign-app) + " connected \u{00b7} suppressed \u{00b7} ";
+                        color: Theme.text-faint;
+                    }
+                    if !State.compositing && !State.light-foreign && !State.light-brush-on && State.light-effect != "" : Mono {
+                        text: "preview only"; color: Theme.text-faint;
+                    }
+                    if State.light-brush-on : Mono { text: "brush down · L paint · R erase · drag sweeps"; color: Theme.listen; }
+                    if State.light-place-on : Mono { text: "place mode · drag a rectangle to set this layer's area"; color: Theme.listen; }
                 }
-                if State.light-suppressed && !State.light-foreign : Mono {
-                    text: (State.light-foreign-app == "" ? "a visitor" : State.light-foreign-app) + " connected \u{00b7} suppressed \u{00b7} ";
-                    color: Theme.text-faint;
-                }
-                if !State.compositing && !State.light-foreign && !State.light-brush-on && State.light-effect != "" : Mono {
-                    text: "preview only"; color: Theme.text-faint;
-                }
-                if State.light-brush-on : Mono { text: "brush down · L paint · R erase · drag sweeps"; color: Theme.listen; }
-                if State.light-place-on : Mono { text: "place mode · drag a rectangle to set this layer's area"; color: Theme.listen; }
             }
             // the render itself — capped to a comfortable subject width and centred on the void so it
             // reads as the page's calm subject instead of stretching edge-to-edge into a banner.
@@ -768,6 +812,22 @@ export component LightingPanel inherits VerticalLayout {
                 HorizontalLayout {
                     SectionTitle { text: "CATALOG"; }
                     Rectangle {}
+                    // SAVE — the name cell + the button are ONE gesture, riding the header the user is
+                    // already looking at (never a dialog that hides the page they just built). Disabled
+                    // honestly: no stack, or no name yet.
+                    Field {
+                        field-width: 172px;
+                        placeholder: "name this effect";
+                        text: State.light-effect-name;
+                        edited(t) => { State.light-effect-name = t; }
+                        accepted(t) => { State.light-effect-name = t; State.save-user-effect(t); }
+                    }
+                    Button {
+                        text: "save effect";
+                        primary: true;
+                        enabled: State.light-stack-count > 0 && State.light-effect-name != "";
+                        clicked => { State.save-user-effect(State.light-effect-name); }
+                    }
                     Button { text: "import .ChromaEffects"; clicked => { State.import-light-file(); } }
                 }
                 TileShelf {
@@ -784,6 +844,14 @@ export component LightingPanel inherits VerticalLayout {
                     title: "LIVE DATA";
                     caption: "each one reads a real feed, named on the chip · tiles loop a demo";
                     tiles: State.light-data-tiles;
+                }
+                TileShelf {
+                    title: "YOUR EFFECTS";
+                    caption: "saved by you · click to load, \u{00d7} to delete";
+                    tiles: State.light-user-tiles;
+                    selected-extra: State.light-user-effect;
+                    deletable: true;
+                    delete-requested(slug) => { State.delete-user-effect(slug); }
                 }
             }
 

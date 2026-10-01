@@ -108,6 +108,7 @@ pub mod timing;
 pub mod tone;
 pub mod transport;
 pub mod twin;
+pub mod user_effects;
 pub mod vitals;
 pub mod worker;
 pub mod writes;

@@ -137,7 +137,7 @@ impl Knob {
     pub fn feel(&mut self, x: f64, y: f64, t: f64, sectors: usize, fans: impl Fn(usize) -> bool, cues: &mut Vec<Cue>) -> Rumble {
         let m = x.hypot(y).min(1.0);
         // A sample that isn't a number (a driver glitch) is a stick at rest, never a motor command.
-        if !(m >= ENGAGE) || !t.is_finite() {
+        if !x.is_finite() || !y.is_finite() || m < ENGAGE || !t.is_finite() {
             *self = Knob::default();
             return Rumble::OFF;
         }
@@ -321,7 +321,7 @@ pub fn aim(device: &str, x: f64, y: f64, sectors: usize, fans: &[usize]) {
     } else {
         s.knob = Knob::default();
         s.voices.clear();
-        let old = std::mem::replace(&mut s.device, Some(device.to_string())).filter(|_| s.sent != [0; 4]);
+        let old = s.device.replace(device.to_string()).filter(|_| s.sent != [0; 4]);
         // The new device starts at rest; what was sent belonged to the old one.
         s.sent = [0; 4];
         old
