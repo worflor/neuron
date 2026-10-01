@@ -1213,6 +1213,11 @@ export component ActionPicker inherits VerticalLayout {
     in property <bool> enabled: true;
     // the palette drawer is open under the field
     property <bool> open: false;
+    property <string> lighting-op: "toggle";
+    property <string> lighting-index: "0";
+    property <string> lighting-destination: "0";
+    property <int> lighting-layer-index: 0;
+    property <int> lighting-preset-index: 0;
     spacing: 8px;
     Rectangle {
         height: Theme.row-h;
@@ -1395,6 +1400,74 @@ export component ActionPicker inherits VerticalLayout {
         }
     }
     if root.cur-id == "clipboard-transform" : ClipboardTransformEditor { }
+    if root.cur-id == "lighting-layer" : VerticalLayout {
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 4px;
+            for op in ["toggle", "enable", "disable", "push", "pop", "replace", "move"] : Contact {
+                label: op;
+                active: root.lighting-op == op;
+                clicked => { root.lighting-op = op; }
+            }
+        }
+        if root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable"
+            || root.lighting-op == "replace" || root.lighting-op == "move" : HorizontalLayout {
+            spacing: 6px;
+            Mono { text: "layer 0 = bottom"; }
+            Field { text <=> root.lighting-index; placeholder: "0"; field-width: 76px; }
+            if root.lighting-op == "move" : HorizontalLayout {
+                Mono { text: "to"; }
+                Field { text <=> root.lighting-destination; placeholder: "0"; field-width: 76px; }
+            }
+        }
+        if State.lighting-layer-choices.length > 0
+            && (root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable"
+                || root.lighting-op == "replace" || root.lighting-op == "move") : HorizontalLayout {
+            spacing: 6px;
+            Mono { text: "stack"; }
+            Picker {
+                options: State.lighting-layer-labels;
+                index: min(root.lighting-layer-index, State.lighting-layer-labels.length - 1);
+                changed(i) => {
+                    root.lighting-layer-index = i;
+                    root.lighting-index = State.lighting-layer-choices[i].index-text;
+                }
+            }
+        }
+        if root.lighting-op == "push" || root.lighting-op == "replace" : HorizontalLayout {
+            spacing: 6px;
+            Mono { text: "preset"; }
+            Picker {
+                options: State.lighting-preset-labels;
+                index: root.lighting-preset-index;
+                changed(i) => { root.lighting-preset-index = i; }
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            Rectangle {}
+            Button {
+                text: "use edit";
+                primary: true;
+                enabled: root.lighting-op == "pop"
+                    || ((root.lighting-op == "push" || root.lighting-op == "replace") && State.lighting-preset-choices.length > 0)
+                    || ((root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable" || root.lighting-op == "move") && root.lighting-index != "");
+                clicked => {
+                    if (root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable") {
+                        State.action-param = root.lighting-op + " " + root.lighting-index;
+                    } else if (root.lighting-op == "push") {
+                        State.action-param = "push " + State.lighting-preset-choices[root.lighting-preset-index].slug;
+                    } else if (root.lighting-op == "pop") {
+                        State.action-param = "pop";
+                    } else if (root.lighting-op == "replace") {
+                        State.action-param = "replace " + root.lighting-index + " " + State.lighting-preset-choices[root.lighting-preset-index].slug;
+                    } else if (root.lighting-op == "move") {
+                        State.action-param = "move " + root.lighting-index + " " + root.lighting-destination;
+                    }
+                }
+            }
+        }
+    }
     if root.cur-hint != "" && root.cur-id != "clipboard-transform" : HorizontalLayout {
         spacing: 6px;
         Field {

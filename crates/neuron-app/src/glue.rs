@@ -22,7 +22,7 @@ use crate::migrate;
 use crate::runtime::AppRuntime;
 use crate::ui::{
     AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, ClipboardOperationRow, ClipboardVariable, DeviceRow, DiagRow, EffectParam,
-    EffectRow, EffectTile, GlyphChip, ImportLine, KnobRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
+    EffectRow, EffectTile, GlyphChip, ImportLine, KnobRow, LightingLayerChoice, LightingPresetChoice, MacroBlock, MacroCard, MaterialCard, OrganRow,
     PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame,
     SpectrumStop,
     State, Theme,
@@ -589,7 +589,7 @@ fn refresh_param_suggestions(st: &State) {
             .map(|s| (*s).into())
             .collect(),
         "dial" => ["volume", "mic", "scroll-hover", "scroll-anchored"].iter().map(|s| (*s).into()).collect(),
-        "lighting-layer" => ["toggle 0", "enable 0", "disable 0", "push fire", "pop", "replace 0 fire", "move 1 0", "spectrum 0 {\"stops\":[\"ff0000\"]}", "params 0 speed=1.5", "region 0 clear"].iter().map(|s| (*s).into()).collect(),
+        "lighting-layer" => Vec::new(),
         // the connected output devices — click to build the cycle set
         "output-flip" => neuron::audio::endpoints(neuron::audio::Flow::Render)
             .into_iter()
@@ -9536,12 +9536,24 @@ fn commit_custom_layer(sh: &SharedRt, frame: &[Rgb]) {
 /// what makes lighting AUTO-STREAM: no manual apply. Both side effects are debounced + gated (see
 /// `save_lighting` / `schedule_lighting_apply`), so a knob drag collapses to one disk write + one restream.
 pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
-    let (n, sel) = {
+    let (layers, sel) = {
         let s = sh.borrow();
-        (s.light_layers.len(), s.selected_layer)
+        (s.light_layers.clone(), s.selected_layer)
     };
+    let n = layers.len();
     let st = app.global::<State>();
     st.set_selected_layer(if n == 0 { -1 } else { sel.min(n - 1) as i32 });
+    st.set_lighting_layer_choices(ModelRc::new(VecModel::from(layers.iter().enumerate().map(|(index, _layer)| {
+        LightingLayerChoice { index_text: index.to_string().into() }
+    }).collect::<Vec<_>>())));
+    st.set_lighting_layer_labels(ModelRc::new(VecModel::from(layers.iter().enumerate().map(|(index, layer)| {
+        let name = neuron::pattern::preset_by_slug(&layer.pattern).map_or(layer.pattern.as_str(), |preset| preset.label);
+        format!("{index} · {name}").into()
+    }).collect::<Vec<_>>())));
+    st.set_lighting_preset_choices(ModelRc::new(VecModel::from(neuron::pattern::presets().into_iter().map(|preset| {
+        LightingPresetChoice { slug: preset.slug.into() }
+    }).collect::<Vec<_>>())));
+    st.set_lighting_preset_labels(ModelRc::new(VecModel::from(neuron::pattern::presets().into_iter().map(|preset| preset.label.into()).collect::<Vec<_>>())));
     // the unified page + the spectrum editor are projections of the SAME stack — keep them in lockstep.
     refresh_light_unified(app, sh);
     // It's a no-op until restore has run (LIGHTING_READY) and is never reached from the animate loop —
