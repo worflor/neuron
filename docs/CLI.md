@@ -167,6 +167,9 @@ blend. It lives on a profile (`--profile P`, painted by `profile apply`) or as a
 
 Knobs are checked against the pattern's own schema; an enum knob takes an option name or index. A
 hand-painted per-key frame is a `custom` layer: `--spec '{"pattern":"custom","frame":[[r,g,b],...]}'`.
+The built-in `wildlife` preset (`life` pattern) runs its cellular habitat without live input. Its only
+knobs are `speed` and `density`; key contacts use the resident read-side edge stream where available.
+For example: `neuron lighting stack add --preset wildlife --profile work`.
 The older `lighting run|effect|mirror|keytest|cellsweep|cells` verbs are the hardware bench and unchanged.
 
 ### profile
