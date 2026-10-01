@@ -34,6 +34,16 @@
 
 pub use crate::controls::usage_name;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct KeyObservation {
+    pub sequence: u64,
+    pub at: f64,
+    pub pid: Option<crate::registry::CanonicalPid>,
+    pub page: u16,
+    pub usage: u16,
+    pub down: bool,
+}
+
 /// Mouse virtual-keys (`GetAsyncKeyState` codes): L/R/Middle + the two X-buttons (thumb 1/2).
 /// Used by [`is_mouse_vk`] (the sequence recorder's keyboard-only filter).
 pub const MOUSE_VKS: [i32; 5] = [
@@ -118,6 +128,10 @@ pub fn suppress_key_reads() -> KeyReadGuard {
     KeyReadGuard(())
 }
 
+pub(crate) fn key_reads_suppressed() -> bool {
+    SUPPRESS_KEY_READS.with(std::cell::Cell::get)
+}
+
 /// Read the current pressed state of one virtual-key. Reads only (never injects), so it is safe
 /// regardless of the input-arm gate. Returns `false` immediately (no syscall) while a
 /// [`suppress_key_reads`] guard is active on this thread.
@@ -148,6 +162,113 @@ pub fn key_down(_vk: i32) -> bool {
 /// VK path already works (a consume-once queue would let one consumer steal the press from the other).
 static MACRO_HELD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static KEY_TRANSITIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const KEY_OBSERVATION_CAPACITY: usize = 512;
+struct ObservationRing {
+    events: std::collections::VecDeque<KeyObservation>,
+    sequence: u64,
+    dropped: u64,
+}
+static KEY_OBSERVATIONS: std::sync::OnceLock<std::sync::Mutex<ObservationRing>> =
+    std::sync::OnceLock::new();
+
+fn observation_ring() -> &'static std::sync::Mutex<ObservationRing> {
+    KEY_OBSERVATIONS.get_or_init(|| {
+        std::sync::Mutex::new(ObservationRing {
+            events: std::collections::VecDeque::with_capacity(KEY_OBSERVATION_CAPACITY),
+            sequence: 0,
+            dropped: 0,
+        })
+    })
+}
+
+impl ObservationRing {
+    fn push(
+        &mut self,
+        pid: Option<crate::registry::CanonicalPid>,
+        page: u16,
+        usage: u16,
+        down: bool,
+        at: f64,
+    ) {
+        self.sequence = self.sequence.wrapping_add(1);
+        let event = KeyObservation {
+            sequence: self.sequence,
+            at,
+            pid,
+            page,
+            usage,
+            down,
+        };
+        if self.events.len() == KEY_OBSERVATION_CAPACITY {
+            self.events.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.events.push_back(event);
+    }
+
+    fn read(&self, cursor: &mut u64, suppressed: bool) -> (Vec<KeyObservation>, u64, u64) {
+        if suppressed {
+            *cursor = self.sequence;
+            return (Vec::new(), 0, self.dropped);
+        }
+        let first = self
+            .events
+            .front()
+            .map_or_else(|| self.sequence.saturating_add(1), |e| e.sequence);
+        let missed = first.saturating_sub(cursor.saturating_add(1));
+        if missed > 0 {
+            *cursor = first - 1;
+        }
+        let events: Vec<_> = self
+            .events
+            .iter()
+            .copied()
+            .filter(|e| e.sequence > *cursor)
+            .collect();
+        if let Some(last) = events.last() {
+            *cursor = last.sequence;
+        }
+        (events, missed, self.dropped)
+    }
+}
+
+pub(crate) fn observe_key_edge(
+    pid: Option<crate::registry::CanonicalPid>,
+    page: u16,
+    usage: u16,
+    down: bool,
+) {
+    let mut ring = observation_ring()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = crate::pattern::render_epoch().elapsed().as_secs_f64();
+    ring.push(pid, page, usage, down, at);
+}
+
+/// Attach at the current head so a newly activated pattern never replays old typing.
+pub(crate) fn key_observation_head() -> u64 {
+    observation_ring()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .sequence
+}
+
+pub(crate) fn key_observation_now() -> f64 {
+    crate::pattern::render_epoch().elapsed().as_secs_f64()
+}
+
+/// Read all observations after `cursor`; overflow is reported as the skipped sequence count.
+pub(crate) fn key_observations_since(cursor: &mut u64) -> (Vec<KeyObservation>, u64, u64) {
+    let ring = observation_ring()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ring.read(
+        cursor,
+        crate::capture::SUPPRESS_KEY_READS.with(std::cell::Cell::get),
+    )
+}
+
 
 #[cfg(windows)]
 static KEY_WAKE_EVENTS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
@@ -219,7 +340,15 @@ pub fn note_key_transition() {
 /// Store the live macro-key held mask — called by the macro-key reader on EVERY `0x04` report,
 /// including an all-released report (mask `0`), so RELEASES propagate and the next press re-detects.
 pub fn set_macro_held(mask: u8) {
-    if MACRO_HELD.swap(mask, std::sync::atomic::Ordering::Relaxed) != mask {
+    let old = MACRO_HELD.swap(mask, std::sync::atomic::Ordering::Relaxed);
+    if old != mask {
+        for i in 0..6 {
+            let was_down = old & (1 << i) != 0;
+            let down = mask & (1 << i) != 0;
+            if was_down != down {
+                observe_key_edge(None, 0xFF00, 0x20 + i as u16, down);
+            }
+        }
         note_key_transition();
     }
 }
@@ -286,6 +415,41 @@ fn capture_filtered_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_observation_readers_attach_at_head_are_independent_and_report_overflow() {
+        let mut ring = ObservationRing { events: std::collections::VecDeque::new(), sequence: 0, dropped: 0 };
+        ring.push(None, 0x07, 0x09, true, 0.0);
+        let mut first = ring.sequence;
+        let mut second = ring.sequence;
+        ring.push(None, 0x07, 0x04, true, 1.0);
+        ring.push(None, 0x07, 0x04, false, 1.01);
+        let (a, missed_a, _) = ring.read(&mut first, false);
+        let (b, missed_b, _) = ring.read(&mut second, false);
+        assert_eq!(missed_a, 0);
+        assert_eq!(missed_b, 0);
+        assert_eq!(a, b);
+        assert_eq!(a.iter().map(|e| e.down).collect::<Vec<_>>(), [true, false]);
+        let mut late = 0;
+        for i in 0..KEY_OBSERVATION_CAPACITY + 3 { ring.push(None, 0x07, i as u16, true, 2.0 + i as f64); }
+        let (overflowed, missed, dropped) = ring.read(&mut late, false);
+        assert_eq!(missed, 6);
+        assert_eq!(dropped, 6);
+        assert_eq!(overflowed.len(), KEY_OBSERVATION_CAPACITY);
+        assert!(overflowed.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+    }
+
+    #[test]
+    fn suppressed_observation_reader_does_not_replay_suppressed_events() {
+        let mut ring = ObservationRing { events: std::collections::VecDeque::new(), sequence: 0, dropped: 0 };
+        let mut cursor = ring.sequence;
+        ring.push(None, 0x07, 0x05, true, 1.0);
+        assert!(ring.read(&mut cursor, true).0.is_empty());
+        assert!(ring.read(&mut cursor, false).0.is_empty());
+        ring.push(None, 0x07, 0x06, true, 2.0);
+        assert!(ring.read(&mut cursor, true).0.is_empty());
+        assert!(ring.read(&mut cursor, false).0.is_empty());
+    }
 
     #[test]
     fn mouse_vks_classified() {
