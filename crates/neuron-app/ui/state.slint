@@ -482,6 +482,10 @@ export global State {
     in-out property <[LightingPresetChoice]> lighting-preset-choices;
     in-out property <[string]> lighting-preset-labels;
     in-out property <[string]> lighting-layer-labels;
+    in-out property <int> lighting-edit-operation: 0;
+    in-out property <string> lighting-edit-index: "0";
+    in-out property <string> lighting-edit-destination: "0";
+    in-out property <int> lighting-edit-preset: 0;
     callback action-choice-changed();                  // the picker moved — recompute suggestions
     callback append-clipboard-operation(string, string, string); // op, pattern, replacement
     callback edit-clipboard-operation(int);

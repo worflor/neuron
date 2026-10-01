@@ -555,6 +555,35 @@ fn preset_picker(st: &State, action: &neuron::action::Action) {
 
 fn refresh_action_editor(state: &State) {
     refresh_param_suggestions(state);
+    state.set_lighting_edit_operation(0);
+    state.set_lighting_edit_index("0".into());
+    state.set_lighting_edit_destination("0".into());
+    state.set_lighting_edit_preset(0);
+    if let neuron::action::Action::LightingLayer { edit } = neuron::authoring::build_action(
+        &current_action(state).0, &state.get_action_param(),
+    ) {
+        use neuron::action::LightingLayerOp;
+        let (operation, index, destination, preset) = match edit {
+            LightingLayerOp::Toggle { index } => (0, index, 0, None),
+            LightingLayerOp::Enable { index } => (1, index, 0, None),
+            LightingLayerOp::Disable { index } => (2, index, 0, None),
+            LightingLayerOp::Push { preset: Some(preset), layer: None } => (3, 0, 0, Some(preset)),
+            LightingLayerOp::Pop => (4, 0, 0, None),
+            LightingLayerOp::Replace { index, preset: Some(preset), layer: None } => (5, index, 0, Some(preset)),
+            LightingLayerOp::Move { from, to } => (6, from, to, None),
+            _ => (7, 0, 0, None),
+        };
+        state.set_lighting_edit_operation(operation);
+        state.set_lighting_edit_index(index.to_string().into());
+        state.set_lighting_edit_destination(destination.to_string().into());
+        if let Some(preset) = preset {
+            if let Some(index) = state.get_lighting_preset_choices().iter().position(|choice| choice.slug == preset) {
+                state.set_lighting_edit_preset(index as i32);
+            } else {
+                state.set_lighting_edit_operation(7);
+            }
+        }
+    }
     state.set_clipboard_editing_index(-1);
     state.set_clipboard_pattern_input("".into());
     state.set_clipboard_replacement_input("${id}".into());
