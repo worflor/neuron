@@ -138,7 +138,8 @@ impl Motors {
 
 /// Which HID device drives each named device's motors (`None`: none, as of when it was looked
 /// for), so a write doesn't re-walk the device tree.
-static TARGETS: std::sync::Mutex<Option<HashMap<String, (Option<crate::transport::DevicePath>, std::time::Instant)>>> =
+type TargetCache = HashMap<String, (Option<crate::transport::DevicePath>, std::time::Instant)>;
+static TARGETS: std::sync::Mutex<Option<TargetCache>> =
     std::sync::Mutex::new(None);
 /// How long "this device has no motors" is believed before looking again (it may be replugged).
 const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5);

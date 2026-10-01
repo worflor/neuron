@@ -252,12 +252,20 @@ impl StickAim {
     /// should show: the live aim while the stick is engaged, else the latched choice (so the wedge
     /// stays lit after the stick is let go), else nothing.
     pub fn observe(&mut self, x: f64, y: f64, t: f64) -> Option<(f64, f64)> {
+        if !x.is_finite() || !y.is_finite() || !t.is_finite() {
+            self.engaged = false;
+            self.turning = None;
+            return self.latched;
+        }
+        let (x, y) = (x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0));
         let m = x.hypot(y);
         self.engaged = m >= Self::ENGAGE;
         if m >= Self::LATCH {
             let reversal = self.latched.is_some_and(|(lx, ly)| lx * x + ly * y < 0.0);
             if reversal {
-                let since = self.turning.map_or(t, |(_, t0)| t0);
+                let since = self.turning
+                    .filter(|((tx, ty), t0)| tx * x + ty * y > 0.0 && t >= *t0)
+                    .map_or(t, |(_, t0)| t0);
                 self.turning = Some(((x, y), since));
                 if t - since >= Self::TURN {
                     self.latched = Some((x, y));
@@ -542,6 +550,22 @@ mod tests {
         assert!(a.engaged());
         a.observe(0.0, 0.0, 0.3);
         assert!(!a.engaged());
+    }
+
+    #[test]
+    fn a_wandering_reversal_must_hold_and_invalid_samples_stay_finite() {
+        let mut a = StickAim::default();
+        a.observe(0.0, -1.0, 0.0);
+        a.observe(1.0, 0.1, 0.10);
+        a.observe(-1.0, 0.1, 0.14);
+        assert_eq!(a.latched(), Some((0.0, -1.0)));
+        a.observe(-1.0, 0.1, 0.19);
+        assert_eq!(a.latched(), Some((-1.0, 0.1)));
+        for (x, y, t) in [(f64::NAN, 0.0, 0.2), (0.0, f64::INFINITY, 0.2), (0.0, 0.0, f64::NAN)] {
+            a.observe(x, y, t);
+            assert!(!a.engaged());
+            assert!(a.path(40.0).unwrap().iter().all(|p| p.re.is_finite() && p.im.is_finite()));
+        }
     }
 
     #[test]

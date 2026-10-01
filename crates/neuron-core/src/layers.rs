@@ -147,9 +147,15 @@ pub fn catalog_json() -> serde_json::Value {
             })
         })
         .collect();
+    let user_effects: Vec<_> = crate::user_effects::list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(slug, name, tags)| serde_json::json!({"slug": slug, "name": name, "tags": tags}))
+        .collect();
     serde_json::json!({
         "presets": presets,
         "patterns": patterns,
+        "user_effects": user_effects,
         "blends": ["normal", "add", "screen", "cut"],
         "motions": ["hold", "drift", "cycle", "breathe", "flow"],
     })
@@ -475,6 +481,31 @@ mod tests {
         let c = catalog_json();
         assert_eq!(c["presets"].as_array().unwrap().len(), pattern::presets().len());
         assert_eq!(c["patterns"].as_array().unwrap().len(), pattern::registry().len());
+    }
+
+    /// The catalog's `user_effects` is the ONE place the GUI's YOUR-EFFECTS shelf and
+    /// `neuron light saved list` both read, so a saved look must show up there the moment it lands —
+    /// and a corrupt entry must degrade to "no user effects", never take the whole catalog (and with
+    /// it every preset tile) down.
+    #[test]
+    fn catalog_carries_saved_effects_and_survives_a_bad_one() {
+        let _r = crate::authoring::test_run_root();
+        let layer = build_layer(&LayerMods { preset: Some("aurora".into()), ..LayerMods::default() }).unwrap();
+        crate::user_effects::save("Shelf Test", &["cool".into()], std::slice::from_ref(&layer)).unwrap();
+        let c = catalog_json();
+        let found = c["user_effects"].as_array().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["slug"], "shelf-test");
+        assert_eq!(found[0]["name"], "Shelf Test");
+        assert_eq!(found[0]["tags"][0], "cool");
+
+        std::fs::write(crate::user_effects::effect_path("shelf-test"), "this is not toml =").unwrap();
+        let after = catalog_json();
+        assert!(
+            after["presets"].as_array().unwrap().len() == pattern::presets().len(),
+            "a corrupt saved effect must not take the preset catalog down with it"
+        );
+        assert!(after["user_effects"].as_array().unwrap().is_empty());
     }
 
     #[test]

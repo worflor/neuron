@@ -148,6 +148,11 @@ export global Theme {
     out property <duration> hover-in: 30ms;
     out property <duration> hover-out: 180ms;
     out property <duration> sheen: 340ms;           // the device-glyph sheen band's sweep
+    // How long a live SheenText rests before sweeping again. A sheen that plays ONCE is invisible in
+    // the only state it exists to report — a thing that is simply live, right now, indefinitely — so
+    // the band repeats for as long as it is live. ~7x the sweep itself: mostly dark, a light now and
+    // then, so it stays an accent rather than becoming a permanent distraction.
+    out property <duration> sheen-period: 2400ms;
     // the delete choreography: content fades over fade-out, the row collapses at fade-out-hold —
     // the 20ms stagger is deliberate (the fade must finish before the space closes under it)
     out property <duration> fade-out:      240ms;

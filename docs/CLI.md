@@ -136,6 +136,9 @@ blend. It lives on a profile (`--profile P`, painted by `profile apply`) or as a
 | `lighting stack add (--preset S \| --pattern K \| --spec JSON) [--color RRGGBB] [--gradient A,B,..] [--motion drift:0.5] [--blend add] [--param k=v]... [--region 0,1,2 \| --rect r0,c0,r1,c1 --board 6x22] [--disable] [--at N]` | add a layer |
 | `lighting stack set INDEX ...` | edit in place |
 | `lighting stack rm INDEX`, `mv FROM TO`, `clear --yes`, `replace JSON` | |
+| `lighting saved save NAME [--tags A,B] --profile P` | save a validated layer stack as a reusable effect; reports replacement |
+| `lighting saved list`, `delete SLUG --yes` | list or remove saved effects |
+| `lighting saved export SLUG [--out FILE]`, `import FILE` | share a plain TOML stack; stdout export is TOML, or one JSON document under `--json` |
 | `lighting fps --pid HEX [N]` | stream frame rate 1-30, `0` clears |
 | `lighting apply NAME` | paint a profile now (same as `profile apply`) |
 

@@ -286,6 +286,13 @@ export global State {
     // one deliberate "stop writing" is the global writes-pause gate (the header pill / Settings).
     in-out property <bool> compositing: false;       // the stack is streaming live to the device
     callback import-light-file();                    // pick a .ChromaEffects / .synapse3 → frame or layer
+    // USER EFFECTS — the user's OWN looks, saved out of the live stack. The name rides the CATALOG
+    // header beside the button (one gesture: type, press save), not in a dialog that hides the page.
+    in-out property <string> light-effect-name: ""; // the name being typed for the next save
+    in-out property <string> light-user-effect: ""; // slug of the saved effect now live ("" = none); lights its tile
+    callback save-user-effect(string);               // save the current stack under this name
+    callback delete-user-effect(string);             // delete a saved effect by slug
+    in-out property <[EffectTile]> light-user-tiles; // YOUR-EFFECTS shelf — saved by the user
 
     // ── Lighting UNIFIED SURFACE — the render-first, tile-driven page ─────
     // ONE grid of live-preview tiles (effects AND data modes together); picking one plays it on the

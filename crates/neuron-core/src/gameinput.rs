@@ -280,7 +280,7 @@ fn run() {
         if lib.is_null() {
             return;
         }
-        let Some(create) = GetProcAddress(lib, b"GameInputCreate\0".as_ptr()) else { return };
+        let Some(create) = GetProcAddress(lib, c"GameInputCreate".as_ptr().cast()) else { return };
         let create: extern "system" fn(*mut *mut c_void) -> i32 = std::mem::transmute(create);
         let mut raw: *mut c_void = std::ptr::null_mut();
         if create(&mut raw) < 0 || raw.is_null() {

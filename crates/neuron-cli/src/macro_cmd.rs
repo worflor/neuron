@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use neuron::macros::{self, macro_host, macro_host::macro_host as host};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 
 #[derive(Subcommand)]
 pub enum MacroCmd {
@@ -256,7 +257,7 @@ fn run_once(name: Option<String>, file: Option<String>, arm: bool) -> Result<()>
         }
         (Some(n), None) => {
             let known = macro_host::list_macros();
-            if !known.iter().any(|m| *m == n) {
+            if !known.contains(&n) {
                 match neuron::authoring::nearest(&n, known.iter().map(String::as_str)) {
                     Some(s) => bail!("no macro named '{n}'. Did you mean {s}?"),
                     None => bail!("no macro named '{n}'. Run `neuron macro list` to see them."),
@@ -301,8 +302,7 @@ fn run_once(name: Option<String>, file: Option<String>, arm: bool) -> Result<()>
         let mut msg = format!("macro '{id}' failed: {short}");
         if !out::json() {
             for line in &log {
-                msg.push_str(&format!("
-  | {line}"));
+                let _ = write!(msg, "\n  | {line}");
             }
         }
         bail!(msg);

@@ -550,6 +550,11 @@ enum LightingCmd {
         #[command(subcommand)]
         action: light::StackCmd,
     },
+    /// Your own saved looks: save, export, import, delete, list
+    Saved {
+        #[command(subcommand)]
+        action: light::EffectCmd,
+    },
     /// Paint a profile's lighting now (same as `profile apply NAME`)
     Apply { profile: String },
     /// The stream frame rate (1-30) a device's saved look uses: read, set, or `0` to clear
@@ -980,6 +985,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
 
 /// Exit for a command line clap rejected: help and version as clap prints them, anything else as
 /// plain lines (`{"error": ...}` under `--json`) with exit code 2.
+#[allow(clippy::exit)] // Argument parsing finishes before any runtime resources are acquired.
 fn usage_error(e: &clap::Error) -> ! {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     if !e.use_stderr() {
@@ -1050,11 +1056,9 @@ fn grouped_command() -> clap::Command {
     let width = HELP_GROUPS.iter().flat_map(|(_, names)| names.iter()).map(|n| n.len()).max().unwrap_or(0);
     let mut listing = String::new();
     for (heading, names) in HELP_GROUPS {
-        listing.push_str(&format!("{heading}:
-"));
+        let _ = writeln!(listing, "{heading}:");
         for n in *names {
-            listing.push_str(&format!("  {n:<width$}  {}
-", about(&cmd, n)));
+            let _ = writeln!(listing, "  {n:<width$}  {}", about(&cmd, n));
         }
         listing.push('\n');
     }
@@ -1441,6 +1445,7 @@ fn lighting_cmd(reg: &Registry, action: Option<LightingCmd>) -> Result<()> {
         None => lighting_show(reg),
         Some(LightingCmd::Catalog) => light::catalog(),
         Some(LightingCmd::Stack { action }) => light::stack(action),
+        Some(LightingCmd::Saved { action }) => light::effect(action),
         Some(LightingCmd::Apply { profile }) => profile_apply(reg, &profile),
         Some(LightingCmd::Fps { pid, value }) => light::fps(&pid, value),
         Some(LightingCmd::Run {
@@ -2439,7 +2444,7 @@ fn synapse_mapping_logs(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf>
         .map(|e| e.path())
         .filter(|p| {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            name.contains("Mapping") && name.ends_with(".log")
+            name.contains("Mapping") && p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
         })
         .collect();
     out.sort();
@@ -4189,7 +4194,7 @@ fn adopt_cmd(reg: &Registry, dry_run: bool) -> Result<()> {
 /// The device `info` describes: the one `--pid` names, else the first recognized one. Returns the
 /// device with `(its position, how many are connected)`.
 fn open_for_info(reg: &Registry, pid: Option<&str>) -> Result<(Device, usize, usize)> {
-    let want = pid.map(|p| parse_pid(p)).transpose()?;
+    let want = pid.map(parse_pid).transpose()?;
     let infos = transport::enumerate()?;
     // one entry per driven control pipe, deduplicated by (pid, family) like `list`
     let mut found: Vec<(&neuron::transport::HidDeviceInfo, &DeviceDef)> = Vec::new();
@@ -4226,7 +4231,7 @@ fn info(d: &Device, pos: usize, total: usize) -> Result<()> {
     let mut lines = vec![format!("{} [{}]", d.def.name, d.def.codename), format!("  pid:      {:04x}", d.pid)];
     if total > 1 {
         v["device"] = serde_json::json!({ "index": pos, "of": total });
-        lines[0].push_str(&format!("  ({pos} of {total} devices; --pid to pick)"));
+        let _ = write!(lines[0], "  ({pos} of {total} devices; --pid to pick)");
     }
     if let Ok(fw) = cap::firmware(d) {
         v["firmware"] = fw.clone().into();

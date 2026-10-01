@@ -2445,6 +2445,13 @@ export component TriggerWell inherits Rectangle {
 // SheenText — an invisible moving clip window reveals an accent duplicate of the exact
 // text, so the light lives on the ink rather than washing the row. Used on the device
 // page for connected rows and on the lighting page for the live-on-device name.
+//
+// TWO parts, because one is not enough. The band is the sweep — a light travelling across
+// the glyphs — and the RESTING ink is what makes the component readable at all: a band that
+// plays once and parks off-screen is invisible in the one state it exists to report (a thing
+// that is simply live, right now, indefinitely), and the page opens mid-life far more often
+// than it catches the transition. So `live` brightens the resting ink AND drives a sweep that
+// repeats every `period` for as long as it is live.
 export component SheenText inherits Rectangle {
     in property <string> value;
     in property <bool> live;
@@ -2452,24 +2459,46 @@ export component SheenText inherits Rectangle {
     in property <length> size: Theme.fs-data;
     in property <int> weight: 700;
     in property <length> tracking: Theme.track-1;
+    /// Rest-to-rest interval for the sweep. Ignored while `live` is false (the timer stands down).
+    in property <duration> period: Theme.sheen-period;
     horizontal-stretch: 1;
     height: root.size + 4px;
     background: transparent;
     clip: true;
     property <length> band-width: min(58px, max(24px, root.width * 0.18));
-    property <length> band-x: root.live ? root.width + 8px : -root.band-width - 8px;
+    /// Travelling toward the right edge, or parked just off the left one waiting its turn. The band
+    /// sweeps alternately in each direction; both are the same shimmer, and the alternation is what
+    /// lets one boolean drive an indefinite repeat without a second "returning" state to track.
+    property <bool> sweeping: false;
+    property <length> band-x: root.sweeping ? root.width + 8px : -root.band-width - 8px;
+    /// The resting state carries the MEANING; the sweep is the flourish on top of it. A live name is
+    /// legible bright ink at rest — one tier below the sweep's accent, so the travelling light still
+    /// reads as brighter than the text it crosses rather than accent-on-accent.
+    property <color> rest-ink: root.live ? Theme.text : root.ink;
+
+    // The repeat. Gated on `live` so a resting row costs nothing, and driven off a toggle rather than
+    // the `live` edge so the first sweep lands whether the text was already live when the page opened
+    // or went live a moment ago.
+    Timer {
+        interval: root.period;
+        running: root.live;
+        triggered => { root.sweeping = !root.sweeping; }
+    }
 
     Text {
         width: parent.width;
         height: parent.height;
         text: root.value;
-        color: root.ink;
+        color: root.rest-ink;
         font-size: root.size;
         font-weight: root.weight;
         font-family: Theme.mono;
         letter-spacing: root.tracking;
         vertical-alignment: center;
         overflow: elide;
+        // the resting brightening settles rather than snaps — it is the same light arriving, not a
+        // colour swap, so it must not read as a state change.
+        animate color { duration: Theme.settle; }
     }
     Rectangle {
         x: root.band-x;

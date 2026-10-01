@@ -93,6 +93,7 @@ Thumbs.db
 !/runtime/host/neuron.py
 !/runtime/host/neuron_host.py
 /backups/
+/effects/
 /macros/
 # the app's RUNTIME macro store (seeded default copies + the `.defaults_seeded` marker) — generated on
 # first launch; the SOURCE defaults live in neuron-core/src/macros/defaults/. Committing the marker

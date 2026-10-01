@@ -643,7 +643,7 @@ mod tests {
             let streams = [Stream::Pointer, Stream::Keyboard, Stream::Pad, Stream::Collection(7), Stream::Deferred];
             let pages = [0x09u16, 0x07, neuron::analog::AXIS_POS_PAGE];
             let mut state = ControlCaptureState::default();
-            let mut last: std::collections::HashMap<Option<neuron::registry::CanonicalPid>, Vec<(u16, u16)>> = Default::default();
+            let mut last: std::collections::HashMap<Option<neuron::registry::CanonicalPid>, Vec<(u16, u16)>> = std::collections::HashMap::default();
             for (dev, stream, hits) in events {
                 let pid = Some(neuron::registry::CanonicalPid::of(0x100 + dev));
                 let hits: Vec<(u16, u16)> = hits.into_iter().map(|(p, u)| (pages[usize::from(p)], u + 1)).collect();
@@ -722,7 +722,7 @@ mod tests {
                 },
                 neuron::timing::ago(TWIN_SETTLE),
             )),
-            seen: Default::default(),
+            seen: std::collections::HashMap::default(),
         };
         let control = state.settled().expect("expired candidate commits");
         assert_eq!(

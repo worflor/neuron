@@ -23,7 +23,7 @@ fn main() {
             println!("GameInput.dll not available");
             return;
         }
-        let Some(create) = GetProcAddress(lib, b"GameInputCreate\0".as_ptr()) else {
+        let Some(create) = GetProcAddress(lib, c"GameInputCreate".as_ptr().cast()) else {
             println!("GameInputCreate missing");
             return;
         };
