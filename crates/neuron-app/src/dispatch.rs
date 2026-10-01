@@ -31,10 +31,11 @@
 use crate::ui::{AppWindow, State};
 use neuron::controls::{self, ControlEvent, HoldEdges, InputEdge, MIC_TAP};
 use neuron::engine::Trigger;
-use neuron::executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRuntime};
+use neuron::executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRuntime, WorkerIntent};
 use slint::ComponentHandle;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,6 +57,92 @@ enum LiveCommand {
         persist: bool,
         reply: Sender<Result<ProfileApplyResult, String>>,
     },
+    RunWorkerIntent {
+        runtime_id: u64,
+        intent: neuron::action::Intent,
+        ticket: Arc<AtomicU8>,
+        reply: Sender<String>,
+        _slot: HostIntentSlot,
+    },
+}
+
+const HOST_INTENT_LIMIT: usize = 16;
+const HOST_INTENT_TIMEOUT: Duration = Duration::from_secs(20);
+const TICKET_QUEUED: u8 = 0;
+const TICKET_RUNNING: u8 = 1;
+const TICKET_CANCELLED: u8 = 2;
+const TICKET_COMPLETE: u8 = 3;
+
+fn claim_host_intent(ticket: &AtomicU8) -> bool {
+    ticket.compare_exchange(TICKET_QUEUED, TICKET_RUNNING, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+}
+
+fn cancel_queued_host_intent(ticket: &AtomicU8) -> bool {
+    ticket.compare_exchange(TICKET_QUEUED, TICKET_CANCELLED, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+}
+
+struct HostIntentSlot(Arc<AtomicUsize>);
+
+impl Drop for HostIntentSlot {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
+}
+
+fn host_intent_callback(
+    tx: Sender<LiveCommand>,
+    runtime_id: u64,
+    stop: Arc<AtomicBool>,
+    pending: Arc<AtomicUsize>,
+    status: Arc<Mutex<LiveStatus>>,
+    weak: slint::Weak<AppWindow>,
+) -> WorkerIntent {
+    Arc::new(move |intent| {
+        let fired_at_submit = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fired;
+        let result = if stop.load(Ordering::SeqCst) {
+            "host intent unavailable: runtime stopped".into()
+        } else if pending.fetch_add(1, Ordering::SeqCst) >= HOST_INTENT_LIMIT {
+            pending.fetch_sub(1, Ordering::SeqCst);
+            "host intent unavailable: queue full".into()
+        } else {
+            let slot = HostIntentSlot(pending.clone());
+            let ticket = Arc::new(AtomicU8::new(TICKET_QUEUED));
+            let (reply, rx) = channel();
+            if tx.send(LiveCommand::RunWorkerIntent {
+                runtime_id,
+                intent: intent.clone(),
+                ticket: ticket.clone(),
+                reply,
+                _slot: slot,
+            }).is_err() {
+                "host intent unavailable: runtime stopped".into()
+            } else {
+                neuron::controls::wake_pump();
+                match rx.recv_timeout(HOST_INTENT_TIMEOUT) {
+                    Ok(result) => result,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if cancel_queued_host_intent(&ticket) {
+                            "host intent expired before execution".into()
+                        } else if ticket.load(Ordering::SeqCst) == TICKET_RUNNING || ticket.load(Ordering::SeqCst) == TICKET_COMPLETE {
+                            rx.recv().unwrap_or_else(|_| "host intent failed: runtime stopped".into())
+                        } else {
+                            "host intent unavailable: runtime stopped".into()
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => "host intent failed: runtime stopped".into(),
+                }
+            }
+        };
+        if !stop.load(Ordering::SeqCst) {
+            let mut current = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.fired == fired_at_submit {
+                current.last_trigger = "macro host action".into();
+                current.last_action.clone_from(&result);
+                current.active_profile = neuron::profile::active();
+                drop(current);
+                post_status(&weak, &status);
+            }
+        }
+        result
+    })
 }
 
 static NEXT_LIVE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -236,6 +323,7 @@ impl LiveRuntime {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let (tx, rx) = channel();
+        let worker_tx = tx.clone();
         *LIVE_TX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id, tx));
@@ -243,7 +331,7 @@ impl LiveRuntime {
         // LiveRuntime owns this handle and joins it in stop(), so it routes through the
         // handle-returning primitive.
         let handle =
-            crate::worker::spawn_named("neuron-live-dispatch", move || run_worker(weak, worker_stop, rx))
+            crate::worker::spawn_named("neuron-live-dispatch", move || run_worker(weak, worker_stop, rx, id, worker_tx))
                 .ok();
         if handle.is_none() {
             *LIVE_TX
@@ -334,6 +422,9 @@ struct LiveCtx<'a> {
     sniper: SniperMap,
     turbos: RefCell<TurboRuntime>,
     live_rx: Receiver<LiveCommand>,
+    runtime_id: u64,
+    stop: Arc<AtomicBool>,
+    worker_callback: Option<WorkerIntent>,
     /// Dispatch's OWN previous mic-mute cache sample — the stream it edge-detects on to fire `MicTap`
     /// on a real external toggle. SEPARATE from `glue::mic_tap_baseline` (the pill's shown value): a
     /// fresher source (the launch reconcile unit) can seed the baseline while dispatch's 400ms cache
@@ -385,6 +476,9 @@ impl<'a> LiveCtx<'a> {
             sniper: RefCell::new(std::collections::HashMap::new()),
             turbos: RefCell::new(TurboRuntime::new()),
             live_rx,
+            runtime_id: 0,
+            stop: Arc::new(AtomicBool::new(false)),
+            worker_callback: None,
             last_mute: None,
             switcher: neuron::app_focus::AppFocusSwitch::new(),
             tick: 0,
@@ -511,7 +605,13 @@ fn service_while_halted(
 /// [`neuron::app_focus::AppFocusSwitch`] (foreground polling on Windows, `None` off-Windows). On a
 /// non-Windows host the loop still arms/builds the engine and processes reload/inject/profile
 /// commands on the tick — only hardware input edges are dormant (no source yet).
-fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Receiver<LiveCommand>) {
+fn run_worker(
+    weak: slint::Weak<AppWindow>,
+    stop: Arc<AtomicBool>,
+    live_rx: Receiver<LiveCommand>,
+    runtime_id: u64,
+    live_tx: Sender<LiveCommand>,
+) {
     // Input posture: this is THE thread that turns a device edge into an action, so if the scheduler
     // leaves it waiting behind a fullscreen game's threads, every binding fires late — intermittently,
     // and worst exactly when a game is running. `latency::INJECT_HOP` is what measures whether this
@@ -534,6 +634,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
         devices: Vec::new(),
     });
     let devices = neuron::device::DeviceSession::new(&reg);
+    let pending_intents = Arc::new(AtomicUsize::new(0));
 
     // Status shared with the UI: only post deltas (the loop runs hot, the UI updates on events).
     let status = Arc::new(Mutex::new(LiveStatus::default()));
@@ -542,6 +643,14 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
         s.held_layers = String::new();
     }
     post_status(&weak, &status);
+    let worker_callback = Some(host_intent_callback(
+        live_tx,
+        runtime_id,
+        stop.clone(),
+        pending_intents,
+        status.clone(),
+        weak.clone(),
+    ));
 
     // Every borrow the two `listen_until` closures below need, gathered into ONE `LiveCtx` (see its
     // doc) built ONCE here — outside the immortal loop — so its state SURVIVES a listener reopen
@@ -558,6 +667,9 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
         sniper: RefCell::new(std::collections::HashMap::new()),
         turbos: RefCell::new(TurboRuntime::new()),
         live_rx,
+        runtime_id,
+        stop: stop.clone(),
+        worker_callback,
         last_mute: None,
         switcher: neuron::app_focus::AppFocusSwitch::new(),
         tick: 0,
@@ -736,6 +848,7 @@ fn live_edge(ctx: &mut LiveCtx, ev: &ControlEvent) {
                         &trigger,
                         &ctx.status,
                         &ctx.weak,
+                        ctx.worker_callback.clone(),
                     ) {
                         ctx.turbos.borrow_mut().start(outcome.turbo);
                     }
@@ -846,6 +959,21 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                 }
                 let _ = reply.send(result);
             }
+            LiveCommand::RunWorkerIntent { runtime_id, intent, ticket, reply, .. } => {
+                if runtime_id != ctx.runtime_id || ctx.stop.load(Ordering::SeqCst) {
+                    let _ = cancel_queued_host_intent(&ticket);
+                    let _ = reply.send("host intent unavailable: runtime stopped".into());
+                } else if claim_host_intent(&ticket) {
+                    if ctx.stop.load(Ordering::SeqCst) {
+                        ticket.store(TICKET_CANCELLED, Ordering::SeqCst);
+                        let _ = reply.send("host intent unavailable: runtime stopped".into());
+                    } else {
+                        let result = run_intent_recording(&mut ctx.devices.borrow_mut(), &intent, true);
+                        ticket.store(TICKET_COMPLETE, Ordering::SeqCst);
+                        let _ = reply.send(result);
+                    }
+                }
+            }
         }
     }
     // flight heartbeat: the live loop proves it's alive every tick — a silent organ is
@@ -899,6 +1027,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                 &t,
                 &ctx.status,
                 &ctx.weak,
+                ctx.worker_callback.clone(),
             )
             .is_some()
             {
@@ -936,6 +1065,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
     {
         let mut intents = AppIntentRunner {
             devices: &mut ctx.devices.borrow_mut(),
+            worker_callback: ctx.worker_callback.clone(),
         };
         ctx.turbos
             .borrow_mut()
@@ -1000,6 +1130,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                     &Trigger::MicTap,
                     &ctx.status,
                     &ctx.weak,
+                    ctx.worker_callback.clone(),
                 );
                 let (p, u) = MIC_TAP;
                 // pid: None — this detector watches the OS default-capture mute, so the DEVICE that
@@ -1019,6 +1150,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                     },
                     &ctx.status,
                     &ctx.weak,
+                    ctx.worker_callback.clone(),
                 );
             });
         }
@@ -1051,6 +1183,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                 &Trigger::AppFocus { app },
                 &ctx.status,
                 &ctx.weak,
+                ctx.worker_callback.clone(),
             );
         });
     }
@@ -1360,8 +1493,9 @@ fn fire_trigger(
     trigger: &Trigger,
     status: &Arc<Mutex<LiveStatus>>,
     weak: &slint::Weak<AppWindow>,
+    worker_callback: Option<WorkerIntent>,
 ) -> Option<DispatchOutcome> {
-    let mut intents = AppIntentRunner { devices };
+    let mut intents = AppIntentRunner { devices, worker_callback };
     let outcome = exec.fire(&rt.engine, trigger, &mut intents)?;
     *LAST_ACTION_DESC
         .lock()
@@ -1385,12 +1519,15 @@ fn fire_trigger(
 
 struct AppIntentRunner<'a, 'reg> {
     devices: &'a mut neuron::device::DeviceSession<'reg>,
+    worker_callback: Option<WorkerIntent>,
 }
 
 impl IntentRunner for AppIntentRunner<'_, '_> {
     fn run_intent(&mut self, intent: &neuron::action::Intent) -> String {
         run_intent(self.devices, intent)
     }
+
+    fn worker_callback(&self) -> Option<WorkerIntent> { self.worker_callback.clone() }
 }
 
 /// Carry out a daemon [`Intent`] against live device/profile state — the GUI port of the CLI's
@@ -1705,6 +1842,20 @@ fn post_status(weak: &slint::Weak<AppWindow>, status: &Arc<Mutex<LiveStatus>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_host_intent_cannot_be_claimed_or_mutated_late() {
+        let ticket = AtomicU8::new(TICKET_QUEUED);
+        let mutations = AtomicUsize::new(0);
+        assert!(cancel_queued_host_intent(&ticket));
+        assert!(!claim_host_intent(&ticket));
+        if claim_host_intent(&ticket) { mutations.fetch_add(1, Ordering::SeqCst); }
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+
+        let running = AtomicU8::new(TICKET_QUEUED);
+        assert!(claim_host_intent(&running));
+        assert!(!cancel_queued_host_intent(&running), "a running host intent is allowed to finish");
+    }
 
     // ── the mic-tap detector, END TO END ────────────────────────────────────────────────────────
     //
