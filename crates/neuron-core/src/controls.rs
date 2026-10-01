@@ -1092,11 +1092,14 @@ pub(crate) fn note_held(
     publish_control_observation(pid, stream, &set);
 }
 
+type HeldObservationPrior = Option<(Option<crate::registry::CanonicalPid>, Vec<(u16, u16)>)>;
+type HeldObservationEdge = (Option<crate::registry::CanonicalPid>, u16, u16, bool);
+
 fn held_key_edges(
-    prior: Option<(Option<crate::registry::CanonicalPid>, Vec<(u16, u16)>)>,
+    prior: HeldObservationPrior,
     pid: Option<crate::registry::CanonicalPid>,
     hits: &[(u16, u16)],
-) -> Vec<(Option<crate::registry::CanonicalPid>, u16, u16, bool)> {
+) -> Vec<HeldObservationEdge> {
     let old_pid = prior.as_ref().and_then(|(old_pid, _)| *old_pid);
     let same_device = old_pid == pid;
     let old = prior.as_ref().map_or_else(Vec::new, |(_, previous)| {
