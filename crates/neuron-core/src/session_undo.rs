@@ -73,6 +73,7 @@ pub fn apply_verified_volume_step(
 ) -> Option<f32> {
     if !desired.is_finite() || !(0.0..=1.0).contains(&desired) || !armed() || !set(desired) { return None; }
     let applied = read()?;
+    if !same_value(&AudioValue::Volume(applied), &AudioValue::Volume(desired)) { return None; }
     receipt.verified_applied(applied).then_some(applied)
 }
 
@@ -377,6 +378,8 @@ mod tests {
         assert!(receipt.clone().finish(Some(0.4)).is_none(), "no-op dial movement is not journaled");
         assert!(receipt.clone().finish(Some(0.8)).is_none(), "external mixer changes make the receipt stale");
         assert!(receipt.verified_applied(0.7));
+        assert!(apply_verified_volume_step(&mut receipt, 0.9, || true, |_| true, || Some(0.7)).is_none(),
+            "setter success with mismatched read-back cannot advance the receipt");
         assert_eq!(receipt.clone().finish(None), None, "unreadable final state cannot be claimed");
         assert_eq!(
             receipt.finish(Some(0.7)),

@@ -1210,7 +1210,9 @@ export component ActionPicker inherits VerticalLayout {
     in property <bool> enabled: true;
     // the palette drawer is open under the field
     property <bool> open: false;
-    property <string> lighting-op: "toggle";
+    property <[string]> lighting-operations: ["toggle", "enable", "disable", "push", "pop", "replace", "move"];
+    property <int> lighting-operation-index: 0;
+    property <string> lighting-op: root.lighting-operations[root.lighting-operation-index];
     property <string> lighting-index: "0";
     property <string> lighting-destination: "0";
     property <int> lighting-layer-index: 0;
@@ -1399,23 +1401,22 @@ export component ActionPicker inherits VerticalLayout {
     if root.cur-id == "clipboard-transform" : ClipboardTransformEditor { }
     if root.cur-id == "lighting-layer" : VerticalLayout {
         spacing: 6px;
-        HorizontalLayout {
-            spacing: 4px;
-            for op in ["toggle", "enable", "disable", "push", "pop", "replace", "move"] : Contact {
-                label: op;
-                active: root.lighting-op == op;
-                clicked => { root.lighting-op = op; }
-            }
+        Picker {
+            options: root.lighting-operations;
+            index: root.lighting-operation-index;
+            changed(i) => { root.lighting-operation-index = i; }
         }
         if root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable"
             || root.lighting-op == "replace" || root.lighting-op == "move" : HorizontalLayout {
             spacing: 6px;
-            Mono { text: "layer 0 = bottom"; }
+            Mono { text: "layer"; }
             Field { text <=> root.lighting-index; placeholder: "0"; field-width: 76px; }
-            if root.lighting-op == "move" : HorizontalLayout {
-                Mono { text: "to"; }
-                Field { text <=> root.lighting-destination; placeholder: "0"; field-width: 76px; }
-            }
+            Mono { text: "0 = bottom"; }
+        }
+        if root.lighting-op == "move" : HorizontalLayout {
+            spacing: 6px;
+            Mono { text: "to"; }
+            Field { text <=> root.lighting-destination; placeholder: "0"; field-width: 76px; }
         }
         if State.lighting-layer-choices.length > 0
             && (root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable"

@@ -3382,6 +3382,20 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_mode_is_canonical_and_target_remains_an_alias() {
+        use crate::screenshot::CaptureTarget;
+        let action = Action::Screenshot { target: CaptureTarget::Window, path: Some("shot.png".into()), clipboard: false };
+        assert_eq!(parse_action(r#"{"type":"screenshot","mode":"window","path":"shot.png","clipboard":false}"#).unwrap(), action);
+        assert_eq!(parse_action(r#"{"type":"screenshot","target":"window","path":"shot.png","clipboard":false}"#).unwrap(), action);
+        let encoded = serde_json::to_value(&action).unwrap();
+        assert_eq!(encoded["mode"], "window");
+        assert!(encoded.get("target").is_none());
+        assert_eq!(toml::from_str::<Action>("type = 'screenshot'\nmode = 'region'\n").unwrap(),
+            Action::Screenshot { target: CaptureTarget::Region, path: None, clipboard: true });
+        assert!(parse_action(r#"{"type":"screenshot","mode":"typo"}"#).is_err());
+    }
+
+    #[test]
     fn clipboard_operation_types_round_trip_through_action_palette() {
         use crate::clipboard_transform::TransformOp as Op;
         let ops = vec![
