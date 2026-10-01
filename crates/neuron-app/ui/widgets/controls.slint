@@ -1116,7 +1116,7 @@ export component ClipboardTransformEditor inherits VerticalLayout {
     }
     for operation[index] in State.clipboard-operations : HorizontalLayout {
         spacing: 4px;
-        Text { text: "{index + 1}. {operation}"; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+        Text { text: (index + 1) + ". " + operation; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
         if State.clipboard-operation-rows[index].editable : Button { text: State.clipboard-editing-index == index ? "editing" : "edit"; clicked => { State.edit-clipboard-operation(index); } }
         Button { text: "↑"; clicked => { State.move-clipboard-operation(index, -1); } }
         Button { text: "↓"; clicked => { State.move-clipboard-operation(index, 1); } }
@@ -1147,10 +1147,10 @@ export component ClipboardTransformEditor inherits VerticalLayout {
     }
     for variable[index] in State.clipboard-variables : HorizontalLayout {
         spacing: 4px;
-        Text { text: "${variable.name}"; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
+        Text { text: "${" + variable.name + "}"; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
         Text { text: variable.kind; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
-        if variable.kind == "until-delimiter" : Text { text: "before {variable.delimiter}"; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
-        Button { text: "${variable.name}"; clicked => { State.clipboard-replacement-input += "${" + variable.name + "}"; State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        if variable.kind == "until-delimiter" : Text { text: "before " + variable.delimiter; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
+        Button { text: "${" + variable.name + "}"; clicked => { State.clipboard-replacement-input += "${" + variable.name + "}"; State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
         Button { text: "×"; clicked => { State.remove-clipboard-variable(index, root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
         Rectangle { height: 1px; horizontal-stretch: 1; background: Theme.line; }
     }

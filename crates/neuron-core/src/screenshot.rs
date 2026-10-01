@@ -155,7 +155,7 @@ fn request_inner(target: CaptureTarget, path: Option<String>, clipboard: bool, r
             #[cfg(not(windows))]
             || None,
             #[cfg(windows)]
-            |hwnd| windows::window_rect(hwnd),
+            windows::window_rect,
             #[cfg(not(windows))]
             |_| None,
         )
