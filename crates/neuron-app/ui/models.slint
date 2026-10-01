@@ -382,6 +382,16 @@ export struct ActionChoice {
     tier: int,           // maturity 0=placeholder · 1-4=WIP · 5=done — shown as a small badge
 }
 
+// A current compositor row offered as a convenient index shortcut in the shared ActionPicker.
+export struct LightingLayerChoice {
+    index_text: string,
+}
+
+// Pattern preset metadata for typed LightingLayer push/replace controls.
+export struct LightingPresetChoice {
+    slug: string,
+}
+
 // One flattened ROW of the macro CONSTRUCTOR canvas — the direct-manipulation builder's display
 // model. Slint can't render a recursive tree, so the Rust glue (`flatten_macro` in glue.rs) flattens
 // the working `Vec<MacroNode>` into a flat list that fully describes the UI: real STEPS, branch-arm

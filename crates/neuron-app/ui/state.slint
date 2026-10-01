@@ -16,7 +16,8 @@ import {
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
     SpectrumStop, SpectrumFrame,
-    ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene
+    ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene,
+    LightingLayerChoice, LightingPresetChoice
 } from "models.slint";
 
 export global State {
@@ -477,6 +478,10 @@ export global State {
     in-out property <string> clipboard-replacement-input: "${id}";
     in-out property <bool> clipboard-raw-mode: false;
     in-out property <[string]> param-suggestions;     // clickable fills for the param (windows / profiles / macros)
+    in-out property <[LightingLayerChoice]> lighting-layer-choices;
+    in-out property <[LightingPresetChoice]> lighting-preset-choices;
+    in-out property <[string]> lighting-preset-labels;
+    in-out property <[string]> lighting-layer-labels;
     callback action-choice-changed();                  // the picker moved — recompute suggestions
     callback append-clipboard-operation(string, string, string); // op, pattern, replacement
     callback edit-clipboard-operation(int);
