@@ -66,6 +66,14 @@ use std::time::{Duration, Instant};
 /// ~220ms is comfortably longer than any observed bounce / wake burst yet short enough that a real
 /// change's card still feels immediate.
 const BATCH_SETTLE: Duration = Duration::from_millis(220);
+/// How long a side-plate code must hold before it is believed. The strap codes are contact
+/// patterns (2-button 1, 12-button 3, 6-button 4), so a plate sliding on reads a PARTIAL code
+/// first: a 12-button seated slowly reported 1, the 2-button's code, for longer than
+/// [`BATCH_SETTLE`]. A batch holding a plate waits this long instead.
+#[cfg(not(test))]
+const PLATE_SETTLE: Duration = Duration::from_millis(700);
+#[cfg(test)]
+const PLATE_SETTLE: Duration = Duration::from_millis(260);
 /// The "a human physically couldn't" threshold. A person cannot change two DISTINCT states within this
 /// span — DPI and scroll are separate buttons, and a plate swap is a multi-second physical act — but
 /// the firmware emits its whole wake-announce within a few ms. So a batch holding ≥2 DISTINCT kinds
@@ -1269,8 +1277,10 @@ fn batch_push_at_unit(pid: u16, unit: &str, ev: Push, now: Instant) {
             }
         }
         st.generation += 1;
-        st.generation
+        let wait = if st.batch.plate.is_some() { PLATE_SETTLE } else { BATCH_SETTLE };
+        (st.generation, wait)
     };
+    let (my_gen, wait) = my_gen;
     PENDING_FLUSHES.fetch_add(1, Ordering::SeqCst);
     let unit = unit.to_owned();
     crate::worker::spawn_detached("neuron-hidwatch-batch", move || {
@@ -1283,7 +1293,7 @@ fn batch_push_at_unit(pid: u16, unit: &str, ev: Push, now: Instant) {
             }
         }
         let _done = FlushDone;
-        thread::sleep(BATCH_SETTLE);
+        thread::sleep(wait);
         // Take + decide under the lock so a report landing in the gap can't be lost: if a newer
         // push for THIS pid bumped its generation, a later flush owns the batch — this one bows out.
         let batch = {
@@ -1336,12 +1346,13 @@ fn flush_batch(pid: u16, unit: &str, b: Batch) {
         if let Some((_, v)) = b.scroll {
             neuron::confirm::prime_scroll(pid, v);
         }
-        if let Some((_, id, label)) = b.plate {
+        // A state-announce burst is how we learn the plate on wake/replug WITHOUT carding it, and
+        // the latch still follows: the binds track the hardware however we found out. Except a
+        // burst's "detached": a Naga woken with the 6-button seated announced plate 0, and believing
+        // it dropped that plate's binds until the next swap. A real removal arrives on its own.
+        if let Some((_, id, label)) = b.plate.filter(|(_, id, _)| *id != 0) {
             neuron::confirm::prime_side_plate(pid, u32::from(id), &label);
             crate::glue::post_observation(pid, crate::glue::Observed::Plate(label.clone()));
-            // A state-announce burst is how we learn the plate on wake/replug WITHOUT carding it.
-            // The latch still has to happen: the binds must follow the hardware whether we found
-            // out by watching a swap or by the mouse telling us what it already had.
             latch_plate_layer(id, &label);
         }
     } else {
@@ -1992,6 +2003,45 @@ mod tests {
             .collect();
         neuron::confirm::set_sink(None);
         assert_eq!(got, ["12-button", "2-button", "12-button", "2-button", "12-button", "6-button"]);
+    }
+
+    /// A 12-button plate slid on slowly: one contact first (code 1, the 2-button's), the full
+    /// pattern later. Only the plate that stays is believed.
+    #[test]
+    fn a_partial_contact_while_seating_never_names_the_wrong_plate() {
+        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        neuron::confirm::set_sink(Some(tx));
+        neuron::confirm::prime_side_plate(NAGA_PID, 4, &plate_label(NAGA_PID, 4));
+        settle();
+        let _ = rx.try_iter().count();
+        plate_report(0);
+        plate_report(1);
+        thread::sleep(BATCH_SETTLE + Duration::from_millis(20)); // longer than the old window
+        plate_report(3);
+        settle();
+        let named: Vec<String> = rx
+            .try_iter()
+            .filter(|c| c.kind == neuron::confirm::Kind::SidePlate)
+            .filter_map(|c| match c.shape {
+                neuron::confirm::Shape::Discrete { label } => Some(label),
+                neuron::confirm::Shape::Ranged { .. } => None,
+            })
+            .collect();
+        neuron::confirm::set_sink(None);
+        assert_eq!(named, ["12-button"]);
+    }
+
+    #[test]
+    fn a_wake_burst_claiming_no_plate_keeps_the_seated_one() {
+        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        neuron::confirm::prime_side_plate(NAGA_PID, 4, &plate_label(NAGA_PID, 4));
+        let t0 = Instant::now();
+        batch_push_at(NAGA_PID, Push::Dpi(800), t0);
+        batch_push_at(NAGA_PID, Push::Scroll(3), t0);
+        batch_push_at(NAGA_PID, Push::Plate(0, plate_label(NAGA_PID, 0)), t0);
+        settle();
+        assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("6-button"));
     }
 
     #[test]
