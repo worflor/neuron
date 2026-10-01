@@ -134,20 +134,41 @@ fn capture_failure_with_file(reason: &str, saved_path: Option<&std::path::Path>,
 
 /// Queue a capture on the bounded worker pool. Only one selection/capture may be outstanding.
 pub fn request(target: CaptureTarget, path: Option<String>, clipboard: bool) -> String {
+    request_inner(target, path, clipboard, None)
+}
+
+/// Queue a capture against the trigger-time foreground window retained in [`crate::macros::Context`].
+pub fn request_for_window(target: CaptureTarget, path: Option<String>, clipboard: bool, hwnd: isize) -> String {
+    request_inner(target, path, clipboard, Some(hwnd))
+}
+
+fn request_inner(target: CaptureTarget, path: Option<String>, clipboard: bool, retained_window: Option<isize>) -> String {
     if !crate::action::input_armed() { return "screenshot [disarmed]".into(); }
     if !clipboard && path.is_none() { return "screenshot: choose the clipboard or a PNG path".into(); }
     if let Err(reason) = validate_region_request(target, region_selector_installed()) {
         return format!("screenshot: {reason}");
+    }
+    let window_rect = if target == CaptureTarget::Window {
+        resolve_window_target(retained_window,
+            #[cfg(windows)]
+            || windows::foreground_target().map(|(_, rect)| rect),
+            #[cfg(not(windows))]
+            || None,
+            #[cfg(windows)]
+            |hwnd| windows::window_rect(hwnd),
+            #[cfg(not(windows))]
+            |_| None,
+        )
+    } else { None };
+    #[cfg(windows)]
+    if target == CaptureTarget::Window && retained_window.is_some() && window_rect.is_none() {
+        return "screenshot: trigger-time window is no longer available".into();
     }
     static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     use std::sync::atomic::Ordering;
     if ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return "screenshot: capture already in progress".into();
     }
-    #[cfg(windows)]
-    let window_rect = if target == CaptureTarget::Window { windows::foreground_target().map(|(_, rect)| rect) } else { None };
-    #[cfg(not(windows))]
-    let window_rect = None;
     let queued = crate::worker::spawn_detached("neuron-screenshot", move || {
         struct Reset(&'static std::sync::atomic::AtomicBool);
         impl Drop for Reset { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
@@ -157,6 +178,17 @@ pub fn request(target: CaptureTarget, path: Option<String>, clipboard: bool) -> 
     });
     if queued { "screenshot: capture queued".into() }
     else { ACTIVE.store(false, Ordering::SeqCst); "screenshot: worker is unavailable".into() }
+}
+
+fn resolve_window_target(
+    retained: Option<isize>,
+    current: impl FnOnce() -> Option<Rect>,
+    resolve: impl FnOnce(isize) -> Option<Rect>,
+) -> Option<Rect> {
+    match retained {
+        Some(hwnd) => resolve(hwnd),
+        None => current(),
+    }
 }
 
 fn encode_png(pixels: &Pixels) -> Result<Vec<u8>, String> {
@@ -278,7 +310,7 @@ mod windows {
         SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetSystemMetrics, GetWindowRect, SM_CXVIRTUALSCREEN,
+        GetForegroundWindow, GetSystemMetrics, GetWindowRect, IsWindow, SM_CXVIRTUALSCREEN,
         SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     };
 
@@ -321,6 +353,17 @@ mod windows {
             let mut rect: RECT = std::mem::zeroed();
             if GetWindowRect(hwnd, &raw mut rect) == 0 { return None; }
             Some((hwnd as isize, Rect { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom }))
+        }
+    }
+
+    pub fn window_rect(handle: isize) -> Option<Rect> {
+        // SAFETY: `handle` is the captured HWND; IsWindow validates it before GetWindowRect writes to initialized RECT storage.
+        unsafe {
+            let hwnd = handle as windows_sys::Win32::Foundation::HWND;
+            if hwnd.is_null() || IsWindow(hwnd) == 0 { return None; }
+            let mut rect: RECT = std::mem::zeroed();
+            if GetWindowRect(hwnd, &raw mut rect) == 0 { return None; }
+            Some(Rect { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom })
         }
     }
 
@@ -382,6 +425,15 @@ mod tests {
         assert_eq!(validate_region_request(CaptureTarget::Region, false), Err("region selection requires the resident app"));
         assert_eq!(validate_region_request(CaptureTarget::Screen, false), Ok(()));
         assert_eq!(validate_region_request(CaptureTarget::Region, true), Ok(()));
+    }
+
+    #[test]
+    fn retained_window_never_falls_back_to_a_new_foreground_window() {
+        let mut current_called = false;
+        let rect = resolve_window_target(Some(42), || { current_called = true; Some(Rect { left: 0, top: 0, right: 10, bottom: 10 }) }, |_| None);
+        assert_eq!(rect, None);
+        assert!(!current_called);
+        assert_eq!(resolve_window_target(None, || Some(Rect { left: -10, top: 0, right: 0, bottom: 10 }), |_| None), Some(Rect { left: -10, top: 0, right: 0, bottom: 10 }));
     }
 
     #[test]
