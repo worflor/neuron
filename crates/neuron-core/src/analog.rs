@@ -251,6 +251,13 @@ pub struct Stick {
     pub y: f32,
 }
 
+/// Stable owner of one stick axis pair during a held radial cast.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StickSource {
+    pub path: String,
+    pub axes: (u16, u16),
+}
+
 /// The axis pairs that form sticks when both halves are centred.
 const STICK_PAIRS: [(u16, u16); 3] = [(0x30, 0x31), (0x33, 0x34), (0x32, 0x35)];
 
@@ -366,21 +373,38 @@ pub fn sticks() -> Vec<(String, Stick)> {
         .collect()
 }
 
-/// The most deflected stick right now: the device's path and `(x, y)` with y down. When `pid`
-/// names a device that has sticks (the cast trigger's own pad), only its sticks aim; otherwise
-/// whichever stick on any device the user is pushing. A resting stick is (0, 0).
+/// The most deflected finite stick right now. When `pid` is set, only sticks from that canonical
+/// product can aim; a missing source never falls through to an unrelated pad.
 #[must_use]
-pub fn strongest_stick_on(pid: Option<crate::registry::CanonicalPid>) -> Option<(String, f64, f64)> {
-    let all = sticks();
-    let on = |path: &str| {
-        let own = u16::from_str_radix(&crate::controls::pid_from_path(path), 16).ok().map(crate::registry::CanonicalPid::of);
-        pid.is_some() && own == pid
-    };
-    let scope: Vec<(String, Stick)> = if all.iter().any(|(p, _)| on(p)) { all.into_iter().filter(|(p, _)| on(p)).collect() } else { all };
-    scope
-        .into_iter()
-        .map(|(p, s)| (p, f64::from(s.x), f64::from(s.y)))
-        .max_by(|a, b| a.1.hypot(a.2).total_cmp(&b.1.hypot(b.2)))
+pub fn strongest_stick_on(pid: Option<crate::registry::CanonicalPid>) -> Option<(StickSource, f64, f64)> {
+    strongest(sticks(), pid)
+}
+
+/// Current sample from the physical path already chosen for one active cast.
+#[must_use]
+pub fn stick_on_source(pid: Option<crate::registry::CanonicalPid>, source: &StickSource) -> Option<(f64, f64)> {
+    stick_on_source_from(sticks(), pid, source)
+}
+
+fn stick_on_source_from(items: Vec<(String, Stick)>, pid: Option<crate::registry::CanonicalPid>, source: &StickSource) -> Option<(f64, f64)> {
+    items.into_iter().find(|(path, stick)| path == &source.path && stick.axes == source.axes && owns_pid(path, pid))
+        .and_then(|(_, stick)| (stick.x.is_finite() && stick.y.is_finite()).then_some((f64::from(stick.x), f64::from(stick.y))))
+}
+
+fn owns_pid(path: &str, pid: Option<crate::registry::CanonicalPid>) -> bool {
+    pid.is_none_or(|expected| {
+        u16::from_str_radix(&crate::controls::pid_from_path(path), 16)
+            .ok().map(crate::registry::CanonicalPid::of) == Some(expected)
+    })
+}
+
+fn strongest(items: Vec<(String, Stick)>, pid: Option<crate::registry::CanonicalPid>) -> Option<(StickSource, f64, f64)> {
+    items.into_iter()
+        .filter(|(path, s)| owns_pid(path, pid) && s.x.is_finite() && s.y.is_finite())
+        .map(|(path, stick)| (StickSource { path, axes: stick.axes }, f64::from(stick.x), f64::from(stick.y)))
+        .max_by(|a, b| a.1.hypot(a.2).total_cmp(&b.1.hypot(b.2))
+            .then_with(|| b.0.path.cmp(&a.0.path))
+            .then_with(|| (b.0.axes.0, b.0.axes.1).cmp(&(a.0.axes.0, a.0.axes.1))))
 }
 
 /// A human name for an analog-derived control: the descriptor's own axis name with its direction.
@@ -442,6 +466,38 @@ mod tests {
     const Z: Field = Field { page: 0x01, usage: 0x32, logical_min: 0, logical_max: 1023 };
     const HAT: Field = Field { page: 0x01, usage: 0x39, logical_min: 1, logical_max: 8 };
     const BATTERY: Field = Field { page: 0x06, usage: 0x20, logical_min: 0, logical_max: 255 };
+
+    #[test]
+    fn stick_selection_filters_nonfinite_and_never_falls_back_from_a_pad_pid() {
+        let pid = crate::registry::CanonicalPid::of(0x1234);
+        let stick = |x, y| Stick { axes: (0x0130, 0x0131), x, y };
+        let samples = vec![
+            ("HID#VID_045E&PID_1234#nan".into(), stick(f32::NAN, 1.0)),
+            ("HID#VID_045E&PID_1234#own".into(), stick(0.3, 0.4)),
+            ("HID#VID_045E&PID_9876#other".into(), stick(0.0, 0.9)),
+        ];
+        let picked = strongest(samples.clone(), Some(pid)).unwrap();
+        assert_eq!(picked.0.path, "HID#VID_045E&PID_1234#own");
+        assert_eq!(strongest(samples, None).unwrap().0.path, "HID#VID_045E&PID_9876#other");
+        assert_eq!(strongest(vec![("HID#VID_045E&PID_9876#other".into(), stick(0.0, 1.0))], Some(pid)), None);
+    }
+
+    #[test]
+    fn cast_source_latches_the_chosen_axis_pair_and_does_not_drift_to_another_stick() {
+        let pid = crate::registry::CanonicalPid::of(0x1234);
+        let path = "HID#VID_045E&PID_1234#pad".to_string();
+        let left = Stick { axes: (0x0130, 0x0131), x: 0.0, y: 0.0 };
+        let right = Stick { axes: (0x0133, 0x0134), x: 0.8, y: 0.0 };
+        let source = strongest(vec![(path.clone(), left), (path.clone(), right)], Some(pid)).unwrap().0;
+        assert_eq!(source.axes, (0x0133, 0x0134));
+        let next = vec![
+            (path.clone(), Stick { x: 0.9, y: 0.0, ..left }),
+            (path.clone(), Stick { x: 0.7, y: 0.1, ..right }),
+        ];
+        let (x, y) = stick_on_source_from(next, Some(pid), &source).unwrap();
+        assert!((x - 0.7).abs() < 1e-6 && (y - 0.1).abs() < 1e-6);
+        assert_eq!(stick_on_source_from(vec![(path, left)], Some(pid), &source), None, "missing chosen axis pair is a source loss");
+    }
 
     fn run(d: &mut Device, values: &[(Field, i32)], from: u64, to: u64) -> Vec<(u16, u16)> {
         let mut last = Vec::new();
