@@ -136,6 +136,9 @@ fn capture_failure_with_file(reason: &str, saved_path: Option<&std::path::Path>,
 pub fn request(target: CaptureTarget, path: Option<String>, clipboard: bool) -> String {
     if !crate::action::input_armed() { return "screenshot [disarmed]".into(); }
     if !clipboard && path.is_none() { return "screenshot: choose the clipboard or a PNG path".into(); }
+    if let Err(reason) = validate_region_request(target, region_selector_installed()) {
+        return format!("screenshot: {reason}");
+    }
     static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     use std::sync::atomic::Ordering;
     if ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
@@ -242,6 +245,18 @@ where F: Fn() -> Option<Rect> + Send + Sync + 'static {
 fn select_region() -> Option<Rect> {
     let selector = REGION_SELECTOR.get()?.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
     selector()
+}
+
+fn region_selector_installed() -> bool {
+    REGION_SELECTOR.get().is_some_and(|cell| cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some())
+}
+
+fn validate_region_request(target: CaptureTarget, selector_installed: bool) -> Result<(), &'static str> {
+    if target == CaptureTarget::Region && !selector_installed {
+        Err("region selection requires the resident app")
+    } else {
+        Ok(())
+    }
 }
 
 /// Install the host's nonblocking completion surface for screenshot results.
@@ -360,6 +375,13 @@ mod tests {
     fn rectangles_accept_negative_desktop_coordinates_and_reject_growth() {
         assert_eq!(Rect { left: -1920, top: -200, right: 0, bottom: 880 }.dimensions(), Ok((1920, 1080)));
         assert!(Rect { left: 0, top: 0, right: i32::MAX, bottom: i32::MAX }.dimensions().is_err());
+    }
+
+    #[test]
+    fn headless_region_requests_are_rejected_before_queueing() {
+        assert_eq!(validate_region_request(CaptureTarget::Region, false), Err("region selection requires the resident app"));
+        assert_eq!(validate_region_request(CaptureTarget::Screen, false), Ok(()));
+        assert_eq!(validate_region_request(CaptureTarget::Region, true), Ok(()));
     }
 
     #[test]

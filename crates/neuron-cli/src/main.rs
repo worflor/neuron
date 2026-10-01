@@ -1088,6 +1088,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<()> {
+    neuron::screenshot::install_completion_sink(|message| eprintln!("[screenshot] {message}"));
     // Before ANY config read: carry a build-tree config universe forward (see
     // `runroot::adopt_legacy_run_root`). Both binaries do this because either one can be the first
     // to start after an upgrade, and they share one config universe — whoever gets there first
@@ -1242,6 +1243,17 @@ fn pocket_cmd(args: PocketArgs) -> Result<()> {
         }
     };
     let formats = |ids: &[u32]| ids.iter().map(|id| format!("{id:04x}")).collect::<Vec<_>>().join(",");
+    let pocket_json = |item: &neuron::pocket::Pocket| {
+        use base64::Engine as _;
+        serde_json::json!({
+            "formats": item.formats.iter().map(|format| serde_json::json!({
+                "id": format.id,
+                "bytes": format.bytes.len(),
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(&format.bytes),
+            })).collect::<Vec<_>>(),
+            "text": item.text(),
+        })
+    };
     if list {
         let live = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::List, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)?;
         let (entries, live_view) = match live {
@@ -1249,54 +1261,58 @@ fn pocket_cmd(args: PocketArgs) -> Result<()> {
             Some(_) => bail!("resident app returned an unexpected pocket reply"),
             None => (neuron::pocket::metadata().into_iter().filter(|(_, durable, _, _)| *durable).map(|(slot, durable, ids, bytes)| neuron::livesync::PocketMetadata { slot, durable, kind: if ids.contains(&13) || ids.contains(&1) { "text" } else if ids.contains(&15) { "files" } else if ids.contains(&8) || ids.contains(&17) { "image" } else { "other" }.into(), formats: ids, bytes }).collect(), false),
         };
-        if !live_view { println!("offline view · durable pockets only"); }
-        if entries.is_empty() { println!("no pockets yet (move something: neuron pocket <name>)"); return Ok(()); }
-        for entry in entries {
-            let kept = if entry.durable { " · kept" } else { "" };
-            println!("  {:<16} {:<6} [{}] · {} bytes{kept}", disp(&entry.slot), entry.kind, formats(&entry.formats), entry.bytes);
-        }
-        return Ok(());
+        return out::emit(&serde_json::json!({"offline": !live_view, "entries": entries}), || {
+            if !live_view { println!("offline view · durable pockets only"); }
+            if entries.is_empty() { println!("no pockets yet (move something: neuron pocket <name>)"); }
+            for entry in &entries {
+                let kept = if entry.durable { " · kept" } else { "" };
+                println!("  {:<16} {:<6} [{}] · {} bytes{kept}", disp(&entry.slot), entry.kind, formats(&entry.formats), entry.bytes);
+            }
+        });
     }
     if history {
         let Some(neuron::livesync::PocketReply::History { entries }) = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::History, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? else {
             bail!("session history is available only while the resident app is running");
         };
-        if entries.is_empty() { println!("clipboard history is empty"); }
-        for entry in entries {
-            println!("  {:<3} {:<6} [{}] · {} bytes", entry.index, entry.kind, formats(&entry.formats), entry.bytes);
-        }
-        return Ok(());
+        return out::emit(&serde_json::json!({"entries": entries}), || {
+            if entries.is_empty() { println!("clipboard history is empty"); }
+            for entry in &entries {
+                println!("  {:<3} {:<6} [{}] · {} bytes", entry.index, entry.kind, formats(&entry.formats), entry.bytes);
+            }
+        });
     }
     if clear_history {
         match neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::ClearHistory, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? {
-            Some(neuron::livesync::PocketReply::Cleared) => println!("clipboard history cleared"),
+            Some(neuron::livesync::PocketReply::Cleared) => out::done(serde_json::json!({"cleared": true}), "clipboard history cleared"),
             None => bail!("session history is available only while the resident app is running"),
             _ => bail!("resident app returned an unexpected pocket reply"),
         }
         return Ok(());
     }
     if let Some(index) = history_item {
-        let Some(neuron::livesync::PocketReply::HistoryItem { contents: Some(item) }) = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::HistoryItem { index }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? else {
+        let Some(neuron::livesync::PocketReply::HistoryItem { contents: Some(wire) }) = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::HistoryItem { index }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? else {
             bail!("session history item is unavailable; keep the resident app running and check the newest-first index");
         };
-        let item = item.decode().map_err(anyhow::Error::msg)?;
-        println!("history #{index}: {} formats · {} bytes", item.formats.len(), item.formats.iter().map(|f| f.bytes.len()).sum::<usize>());
-        if let Some(text) = item.text() { print!("{text}"); if !text.ends_with('\n') { println!(); } }
-        return Ok(());
+        let item = wire.clone().decode().map_err(anyhow::Error::msg)?;
+        return out::emit(&serde_json::json!({"index": index, "contents": pocket_json(&item)}), || {
+            println!("history #{index}: {} formats · {} bytes", item.formats.len(), item.formats.iter().map(|f| f.bytes.len()).sum::<usize>());
+            if let Some(text) = item.text() { print!("{text}"); if !text.ends_with('\n') { println!(); } }
+        });
     }
     let slot = name.unwrap_or_default();
     if inspect {
         neuron::pocket::validate_slot_name(&slot).map_err(anyhow::Error::msg)?;
         let live = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::Inspect { slot: slot.clone() }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)?;
-        let item = match live {
-            Some(neuron::livesync::PocketReply::Pocket { contents, .. }) => contents.map(neuron::livesync::WirePocket::decode).transpose().map_err(anyhow::Error::msg)?,
+        let (item, durable) = match live {
+            Some(neuron::livesync::PocketReply::Pocket { contents, durable, .. }) => (contents.map(neuron::livesync::WirePocket::decode).transpose().map_err(anyhow::Error::msg)?, durable),
             Some(_) => bail!("resident app returned an unexpected pocket reply"),
-            None => neuron::pocket::inspect(&slot),
+            None => (neuron::pocket::inspect_bounded(&slot, 16 * 1024 * 1024).map_err(anyhow::Error::msg)?, true),
         };
         let Some(item) = item else { bail!("pocket {} does not exist", disp(&slot)); };
-        println!("pocket {}: {} formats · {} bytes", disp(&slot), item.formats.len(), item.formats.iter().map(|f| f.bytes.len()).sum::<usize>());
-        if let Some(text) = item.text() { print!("{text}"); if !text.ends_with('\n') { println!(); } }
-        return Ok(());
+        return out::emit(&serde_json::json!({"slot": slot, "durable": durable, "contents": pocket_json(&item)}), || {
+            println!("pocket {}: {} formats · {} bytes", disp(&slot), item.formats.len(), item.formats.iter().map(|f| f.bytes.len()).sum::<usize>());
+            if let Some(text) = item.text() { print!("{text}"); if !text.ends_with('\n') { println!(); } }
+        });
     }
     if delete {
         let deleted = match neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::Delete { slot: slot.clone() }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)? {
@@ -1304,9 +1320,10 @@ fn pocket_cmd(args: PocketArgs) -> Result<()> {
             Some(_) => bail!("resident app returned an unexpected pocket reply"),
             None => neuron::pocket::delete(&slot).map_err(anyhow::Error::msg)?,
         };
-        if deleted { println!("deleted pocket {}", disp(&slot)); }
-        else { println!("pocket {} does not exist", disp(&slot)); }
-        return Ok(());
+        return out::emit(&serde_json::json!({"slot": slot, "deleted": deleted}), || {
+            if deleted { println!("deleted pocket {}", disp(&slot)); }
+            else { println!("pocket {} does not exist", disp(&slot)); }
+        });
     }
     if let Some(out) = sigil {
         let svg = neuron::pocket::sigil_svg_of(&slot, 480.0);

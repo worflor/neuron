@@ -145,6 +145,7 @@ mod region_selector {
 
     pub fn select() -> Option<Rect> {
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SW_SHOW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
+        // SAFETY: these scalar metric indexes require no pointers; the returned dimensions are validated below.
         let bounds = unsafe {
             let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -161,22 +162,39 @@ mod region_selector {
         let surface = LayeredSurface::new(&spec)?;
         let hwnd = surface.hwnd();
         ACTIVE.with(|active| *active.borrow_mut() = Some(Selector { surface, bounds, width: width as usize, height: height as usize, start: None, result: None, done: false }));
+        // SAFETY: `hwnd` is the live surface window owned by ACTIVE; these calls may synchronously call wndproc.
+        let ready = unsafe {
+            if SetWindowPos(hwnd, HWND_TOPMOST, bounds.left, bounds.top, width as i32, height as i32, SWP_SHOWWINDOW) == 0 {
+                false
+            } else {
+                ShowWindow(hwnd, SW_SHOW);
+                SetForegroundWindow(hwnd) != 0
+            }
+        };
+        if !ready {
+            drop(ACTIVE.with(|active| active.borrow_mut().take()));
+            return None;
+        }
+        let done = ACTIVE.with(|active| active.borrow().as_ref().is_none_or(|selector| selector.done));
+        if done {
+            drop(ACTIVE.with(|active| active.borrow_mut().take()));
+            return None;
+        }
         ACTIVE.with(|active| {
             let state = active.borrow();
-            let Some(selector) = state.as_ref() else { return; };
-            unsafe {
-                if SetWindowPos(hwnd, HWND_TOPMOST, bounds.left, bounds.top, width as i32, height as i32, SWP_SHOWWINDOW) == 0 { return; }
-                ShowWindow(hwnd, SW_SHOW);
-                SetForegroundWindow(hwnd);
+            if let Some(selector) = state.as_ref() {
+                let initial = bounds;
+                draw(selector, None);
+                selector.surface.present(Some(POINT { x: initial.left, y: initial.top }), SIZE { cx: width as i32, cy: height as i32 }, 255);
             }
-            let initial = bounds;
-            draw(selector, None);
-            selector.surface.present(Some(POINT { x: initial.left, y: initial.top }), SIZE { cx: width as i32, cy: height as i32 }, 255);
         });
+        // SAFETY: all-zero is a valid initial MSG value; GetMessageW fills it on this worker thread.
         let mut message: windows_sys::Win32::UI::WindowsAndMessaging::MSG = unsafe { std::mem::zeroed() };
         loop {
+            // SAFETY: `message` is writable and this thread owns the selector window's message queue.
             let result = unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) };
             if result <= 0 { break; }
+            // SAFETY: GetMessageW initialized this message; DispatchMessageW routes only to live windows.
             unsafe { TranslateMessage(&raw const message); DispatchMessageW(&raw const message); }
             let done = ACTIVE.with(|active| active.borrow().as_ref().is_none_or(|selector| selector.done));
             if done { break; }
@@ -190,6 +208,7 @@ mod region_selector {
 
     fn cursor() -> Option<(i32, i32)> {
         let mut point = POINT { x: 0, y: 0 };
+        // SAFETY: `point` is writable storage for GetCursorPos on this desktop thread.
         if unsafe { GetCursorPos(&raw mut point) } == 0 { None } else { Some((point.x, point.y)) }
     }
 
@@ -197,6 +216,7 @@ mod region_selector {
         let count = selector.width.saturating_mul(selector.height);
         let bits = selector.surface.bits();
         if bits.is_null() || count.checked_mul(4).is_none_or(|bytes| bytes > MAX_CAPTURE_BYTES) { return; }
+        // SAFETY: the live LayeredSurface owns this DIB for `count` pixels, and the cap validates its extent.
         let pixels = unsafe { std::slice::from_raw_parts_mut(bits, count) };
         pixels.fill(0x4000_0000);
         let Some(rect) = selection else { return; };
@@ -214,15 +234,20 @@ mod region_selector {
         }
     }
 
+    // SAFETY: Windows calls this for the live selector HWND on its owning worker thread.
     unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KILLFOCUS, WM_CANCELMODE};
         match message {
             WM_LBUTTONDOWN => {
                 let point = cursor();
-                ACTIVE.with(|active| if let Some(selector) = active.borrow_mut().as_mut() {
+                let selecting = ACTIVE.with(|active| if let Some(selector) = active.borrow_mut().as_mut() {
                     selector.start = point;
+                    true
+                } else { false });
+                if selecting {
+                    // SAFETY: this callback's `hwnd` is the live selector window receiving the button event.
                     unsafe { SetCapture(hwnd); }
-                });
+                }
                 0
             }
             WM_MOUSEMOVE => {
@@ -244,6 +269,7 @@ mod region_selector {
                     }
                     selector.done = true;
                 });
+                // SAFETY: release the current thread's capture after updating selector state.
                 unsafe { ReleaseCapture(); }
                 0
             }
@@ -255,8 +281,15 @@ mod region_selector {
                 ACTIVE.with(|active| if let Some(selector) = active.borrow_mut().as_mut() { selector.done = true; });
                 0
             }
-            WM_DESTROY => { unsafe { PostQuitMessage(0); } 0 }
-            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            WM_DESTROY => {
+                // SAFETY: posts WM_QUIT to this selector worker's message queue.
+                unsafe { PostQuitMessage(0); }
+                0
+            }
+            _ => {
+                // SAFETY: forwards an unhandled message for the live selector HWND to Win32.
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
         }
     }
 }
