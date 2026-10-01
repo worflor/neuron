@@ -37,8 +37,8 @@ not add user controls or a second lighting engine.
 - Read-side observations contain identity, monotonic time and sequence. Attach at
   head, recover explicitly from overflow and keep readers independent. Feed only
   already-computed physical edges; no interception, injection, dispatch change or
-  additional Raw Input registration. The owner authorized implementation of these
-  docs in this session. Polling remains a conservative fallback with honest limits.
+  additional Raw Input registration. Polling remains a conservative fallback with
+  honest limits.
 - Enter owns its event before generic harvest and gust processing. A departure
   is admitted only if its complete motif and a useful visible runway fit; failed
   placement resolves as a local flutter. It never clears a corridor through life.

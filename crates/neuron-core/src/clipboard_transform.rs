@@ -15,7 +15,7 @@ pub const MAX_OPERATIONS: usize = 32;
 pub const MAX_PREVIEW_BYTES: usize = 8192;
 const MAX_REGEX_SIZE: usize = 1024 * 1024;
 
-/// One deterministic clipboard operation. The order in `ClipboardTransform::ops` is significant.
+/// One deterministic clipboard operation. Actions execute these in their stored order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum TransformOp {
@@ -46,12 +46,6 @@ pub struct VariableSelection {
     pub name: String,
     pub kind: String,
     pub delimiter: String,
-}
-
-/// An ordered transform chain stored in an action.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClipboardTransform {
-    pub ops: Vec<TransformOp>,
 }
 
 /// Failure categories the action and inline preview can present independently.
@@ -377,6 +371,9 @@ fn json_to_csv(input: &str) -> Result<String, TransformError> {
     let headers: Vec<String> = rows[0].as_object().ok_or_else(|| TransformError::InvalidText(
         "JSON-to-CSV expects object rows".into(),
     ))?.keys().cloned().collect();
+    if headers.is_empty() {
+        return Err(TransformError::InvalidText("JSON-to-CSV needs at least one field".into()));
+    }
     for row in rows {
         let object = row.as_object().ok_or_else(|| TransformError::InvalidText(
             "JSON-to-CSV expects object rows".into(),
@@ -602,6 +599,7 @@ mod tests {
         let json = apply(csv, &[TransformOp::CsvToJson]).unwrap();
         assert_eq!(apply(&json, &[TransformOp::JsonToCsv]).unwrap(), "n,name\n37,\"Ada, L\"\n");
         assert!(apply("[{\"a\":1},{\"b\":2}]", &[TransformOp::JsonToCsv]).is_err());
+        assert!(apply("[{}]", &[TransformOp::JsonToCsv]).is_err());
     }
 
     #[test]

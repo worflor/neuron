@@ -444,34 +444,7 @@ enum Cmd {
     /// clipboard has content, restores if the pocket does, swaps if both, carrying every format.
     /// `--list` shows what each pocket holds, `--sigil out.svg` exports a pocket's content sigil,
     /// `--keep` makes it survive a restart.
-    Pocket {
-        /// the pocket name (omit = the single default pocket)
-        name: Option<String>,
-        /// show every pocket's current contents (read-only)
-        #[arg(long)]
-        list: bool,
-        /// keep this pocket on disk so it survives a restart
-        #[arg(long)]
-        keep: bool,
-        /// export this pocket's content-sigil as an SVG to this path (read-only)
-        #[arg(long)]
-        sigil: Option<String>,
-        /// print the full contents of the named pocket
-        #[arg(long, conflicts_with_all = ["delete", "list", "history", "clear_history", "history_item"])]
-        inspect: bool,
-        /// delete a named pocket
-        #[arg(long, conflicts_with_all = ["inspect", "list", "history", "clear_history", "history_item"])]
-        delete: bool,
-        /// list in-session clipboard history metadata
-        #[arg(long, conflicts_with_all = ["inspect", "delete", "clear_history", "history_item", "sigil"])]
-        history: bool,
-        /// print one full history item by newest-first index
-        #[arg(long, conflicts_with_all = ["inspect", "delete", "list", "history", "clear_history", "sigil"])]
-        history_item: Option<usize>,
-        /// clear in-session clipboard history
-        #[arg(long, conflicts_with_all = ["inspect", "delete", "list", "history", "history_item", "sigil"])]
-        clear_history: bool,
-    },
+    Pocket(PocketArgs),
     /// Read raw getters from a device (debug)
     ///
     /// Interrogates a device's `razer_report` getter space with raw bytes: `neuron probe 0221
@@ -1217,17 +1190,7 @@ fn run() -> Result<()> {
             id,
             scan,
         } => probe_cmd(&pid, class.as_deref(), id.as_deref(), scan)?,
-        Cmd::Pocket {
-            name,
-            list,
-            keep,
-            sigil,
-            inspect,
-            delete,
-            history,
-            history_item,
-            clear_history,
-        } => pocket_cmd(name, list, keep, sigil, inspect, delete, history, history_item, clear_history)?,
+        Cmd::Pocket(args) => pocket_cmd(args)?,
         Cmd::Prof {
             action: ProfCmd::Pump,
         } => prof_pump_cmd(),
@@ -1235,14 +1198,42 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+#[derive(clap::Args)]
+struct PocketArgs {
+    /// the pocket name (omit = the single default pocket)
+    name: Option<String>,
+    /// show every pocket's current contents (read-only)
+    #[arg(long)]
+    list: bool,
+    /// keep this pocket on disk so it survives a restart
+    #[arg(long)]
+    keep: bool,
+    /// export this pocket's content-sigil as an SVG to this path (read-only)
+    #[arg(long)]
+    sigil: Option<String>,
+    /// print the full contents of the named pocket
+    #[arg(long, conflicts_with_all = ["delete", "list", "history", "clear_history", "history_item"])]
+    inspect: bool,
+    /// delete a named pocket
+    #[arg(long, conflicts_with_all = ["inspect", "list", "history", "clear_history", "history_item"])]
+    delete: bool,
+    /// list in-session clipboard history metadata
+    #[arg(long, conflicts_with_all = ["inspect", "delete", "clear_history", "history_item", "sigil"])]
+    history: bool,
+    /// print one full history item by newest-first index
+    #[arg(long, conflicts_with_all = ["inspect", "delete", "list", "history", "clear_history", "sigil"])]
+    history_item: Option<usize>,
+    /// clear in-session clipboard history
+    #[arg(long, conflicts_with_all = ["inspect", "delete", "list", "history", "history_item", "sigil"])]
+    clear_history: bool,
+}
+
 /// Portable clipboards from the CLI: list every pocket's contents, export a pocket's emergent
 /// content-sigil, or MOVE the clipboard into/out of a named pocket. The move writes the clipboard
 /// (a real mutation), so it arms input for this one-shot — the process exits right after, and the
 /// list/sigil paths stay read-only (no arm).
-fn pocket_cmd(
-    name: Option<String>, list: bool, keep: bool, sigil: Option<String>, inspect: bool,
-    delete: bool, history: bool, history_item: Option<usize>, clear_history: bool,
-) -> Result<()> {
+fn pocket_cmd(args: PocketArgs) -> Result<()> {
+    let PocketArgs { name, list, keep, sigil, inspect, delete, history, history_item, clear_history } = args;
     let disp = |s: &str| {
         if s.is_empty() {
             "(default)".to_string()
@@ -1298,7 +1289,7 @@ fn pocket_cmd(
         neuron::pocket::validate_slot_name(&slot).map_err(anyhow::Error::msg)?;
         let live = neuron::livesync::request_pockets(&neuron::livesync::PocketRequest::Inspect { slot: slot.clone() }, std::time::Duration::from_secs(5)).map_err(anyhow::Error::msg)?;
         let item = match live {
-            Some(neuron::livesync::PocketReply::Pocket { contents, .. }) => contents.map(|p| p.decode()).transpose().map_err(anyhow::Error::msg)?,
+            Some(neuron::livesync::PocketReply::Pocket { contents, .. }) => contents.map(neuron::livesync::WirePocket::decode).transpose().map_err(anyhow::Error::msg)?,
             Some(_) => bail!("resident app returned an unexpected pocket reply"),
             None => neuron::pocket::inspect(&slot),
         };
@@ -1313,10 +1304,8 @@ fn pocket_cmd(
             Some(_) => bail!("resident app returned an unexpected pocket reply"),
             None => neuron::pocket::delete(&slot).map_err(anyhow::Error::msg)?,
         };
-        match deleted {
-            true => println!("deleted pocket {}", disp(&slot)),
-            false => println!("pocket {} does not exist", disp(&slot)),
-        }
+        if deleted { println!("deleted pocket {}", disp(&slot)); }
+        else { println!("pocket {} does not exist", disp(&slot)); }
         return Ok(());
     }
     if let Some(out) = sigil {

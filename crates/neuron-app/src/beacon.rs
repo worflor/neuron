@@ -1746,7 +1746,7 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
             };
             mk(WedgeGlyph::Media, title, detail, tone, None)
         }
-        Action::LightingLayer { edit } => mk(WedgeGlyph::Sun, "lighting", Some(edit.label().into()), Tone::Plain, None),
+        Action::LightingLayer { edit } => mk(WedgeGlyph::Sun, "lighting", Some(edit.label()), Tone::Plain, None),
         Action::Undo => mk(WedgeGlyph::Flip, "undo", None, Tone::Plain, None),
         Action::Noop => WedgeView::blank(),
     }

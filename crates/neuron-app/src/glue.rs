@@ -589,7 +589,6 @@ fn refresh_param_suggestions(st: &State) {
             .map(|s| (*s).into())
             .collect(),
         "dial" => ["volume", "mic", "scroll-hover", "scroll-anchored"].iter().map(|s| (*s).into()).collect(),
-        "lighting-layer" => Vec::new(),
         // the connected output devices — click to build the cycle set
         "output-flip" => neuron::audio::endpoints(neuron::audio::Flow::Render)
             .into_iter()
@@ -1617,7 +1616,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let editing = state.get_clipboard_editing_index();
             if editing >= 0 {
                 let editing = editing as usize;
-                state.set_clipboard_editing_index(if editing == index { -1 } else if editing > index { (editing - 1) as i32 } else { editing as i32 });
+                state.set_clipboard_editing_index(match editing.cmp(&index) {
+                    std::cmp::Ordering::Equal => -1,
+                    std::cmp::Ordering::Greater => (editing - 1) as i32,
+                    std::cmp::Ordering::Less => editing as i32,
+                });
             }
             if let Ok(encoded) = serde_json::to_string(&ops) {
                 state.set_action_param(encoded.into());
@@ -9204,11 +9207,11 @@ pub fn edit_selected_lighting(
             }
             let mut saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
             saved.fps = fps;
-            saved.layers = after.clone();
+            saved.layers.clone_from(&after);
             crate::prefs::set_device_light(pid, saved)?;
             {
                 let mut s = shared.borrow_mut();
-                s.light_layers = after.clone();
+                s.light_layers.clone_from(&after);
                 s.selected_layer = s.selected_layer.min(after.len().saturating_sub(1));
                 s.layers_rev = s.layers_rev.wrapping_add(1);
             }
@@ -9248,7 +9251,7 @@ pub fn restore_selected_lighting(
             }
             let mut saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
             saved.fps = fps;
-            saved.layers = replacement.clone();
+            saved.layers.clone_from(&replacement);
             crate::prefs::set_device_light(pid, saved)?;
             {
                 let mut s = shared.borrow_mut();
