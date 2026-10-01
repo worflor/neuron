@@ -1391,14 +1391,6 @@ impl IntentRunner for AppIntentRunner<'_, '_> {
     fn run_intent(&mut self, intent: &neuron::action::Intent) -> String {
         run_intent(self.devices, intent)
     }
-
-    fn run_host_action(
-        &mut self,
-        action: &neuron::action::Action,
-        _ctx: &neuron::macros::context::Context,
-    ) -> Option<String> {
-        crate::undo::run_host_action(action)
-    }
 }
 
 /// Carry out a daemon [`Intent`] against live device/profile state — the GUI port of the CLI's
@@ -1479,12 +1471,14 @@ fn run_intent_recording(
     // and the new profile's dark. Keyed on the CURSOR actually moving, so a failed switch (a target
     // that no longer loads) costs nothing.
     let before = neuron::profile::active();
+    let mut apply_issues = None;
     let out = neuron::intent::run_shared_intent_observe(
         devices,
         &mut cursor,
         intent,
         neuron::dpi_origin::Cause::UserApplied,
         |report| {
+            apply_issues = Some((report.skipped.clone(), report.gated.clone()));
             if report.dpi_applied {
                 note_profile_applied();
             }
@@ -1494,7 +1488,9 @@ fn run_intent_recording(
     let after = neuron::profile::active();
     if after != before {
         if record_undo {
-            crate::undo::record_profile(before, after);
+            if let Some((skipped, gated)) = apply_issues {
+                crate::undo::record_profile(before, after, &skipped, &gated);
+            }
         }
         request_reload();
     }
@@ -1514,15 +1510,18 @@ fn undo_latest(devices: &mut neuron::device::DeviceSession<'_>) -> String {
             if neuron::profile::active() != *applied {
                 Err(format!("profile changed since it was switched to '{applied}'"))
             } else {
-                let _ = run_intent_recording(
+                let status = run_intent_recording(
                     devices,
                     &neuron::action::Intent::ProfileSwitch(before.clone()),
                     false,
                 );
-                if neuron::profile::active() == *before {
+                let unresolved = neuron::profile::active_missing();
+                if neuron::session_undo::profile_restore_complete(&neuron::profile::active(), before, &unresolved) {
                     Ok(())
+                } else if !unresolved.is_empty() {
+                    Err(format!("profile restore incomplete ({status}); unresolved: {}", unresolved.join(", ")))
                 } else {
-                    Err(format!("could not restore profile '{before}'"))
+                    Err(format!("profile restore failed ({status}); active profile is '{}'", neuron::profile::active()))
                 }
             }
         }

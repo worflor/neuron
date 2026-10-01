@@ -72,7 +72,9 @@ Mic gain keeps two distinct contracts: `mic-gain` nudges by percentage points, w
 
 `lighting-layer` edits the selected compositor stack in the resident app; the headless daemon has
 no compositor target and reports it unavailable. Session Undo records successful audio/profile
-changes in the daemon and app; app lighting edits also record their concrete selected device.
+changes in the daemon and app; app lighting edits also record their concrete selected device. A
+profile Undo reapplies the previous named profile after a complete apply report; it is not a
+byte-for-byte snapshot of hardware.
 Automatic app-focus profile switches are not journaled, and the first profile activation from an
 empty cursor has no restorable prior state. Undo refuses if that resource changed afterward and
 keeps the entry for retry. Its session journal clears when the resident session ends.
