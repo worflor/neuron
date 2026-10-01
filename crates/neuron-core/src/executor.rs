@@ -12,10 +12,18 @@ use crate::action::{Action, Intent};
 use crate::engine::{Engine, Trigger};
 use crate::macros::context::Context;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Host bridge for Undo and lighting intents invoked from macro workers only.
+///
+/// Direct and Turbo actions run on the live executor thread and must use [`IntentRunner::run_intent`].
+pub type WorkerIntent = Arc<dyn Fn(&Intent) -> String + Send + Sync>;
 
 pub trait IntentRunner {
     fn run_intent(&mut self, intent: &Intent) -> String;
+
+    fn worker_callback(&self) -> Option<WorkerIntent> { None }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -188,9 +196,9 @@ impl DispatchExecutor {
         if let Some(intent) = action.intent() {
             intents.run_intent(&intent)
         } else if let Some((_cps, inner)) = action.turbo() {
-            inner.run_ctx(&ctx)
+            run_live_action(inner, &ctx, intents)
         } else {
-            action.run_ctx(&ctx)
+            action.run_ctx_with_worker(&ctx, intents.worker_callback().as_ref())
         }
     }
 
@@ -212,10 +220,10 @@ impl DispatchExecutor {
         if let Some(intent) = action.intent() {
             intents.run_intent(&intent)
         } else if let Some((cps, inner)) = action.turbo() {
-            let r = inner.run_ctx(ctx);
+            let r = run_live_action(inner, ctx, intents);
             format!("turbo {cps}cps (single press): {r}")
         } else {
-            action.run_ctx(ctx)
+            action.run_ctx_with_worker(ctx, intents.worker_callback().as_ref())
         }
     }
 
@@ -226,6 +234,16 @@ impl DispatchExecutor {
         let result = self.run_action(&action, ctx, intents);
         format!("echo -> {result}")
     }
+}
+
+fn run_live_action(action: &Action, ctx: &Context, intents: &mut impl IntentRunner) -> String {
+    if let Some(intent) = action.intent() {
+        return intents.run_intent(&intent);
+    }
+    if let Some((_, inner)) = action.turbo() {
+        return run_live_action(inner, ctx, intents);
+    }
+    action.run_ctx_with_worker(ctx, intents.worker_callback().as_ref())
 }
 
 #[cfg(test)]
@@ -253,6 +271,35 @@ mod tests {
             self.count += 1;
             format!("intent {}", self.count)
         }
+    }
+
+    struct DirectIntents {
+        calls: Vec<Intent>,
+    }
+
+    impl IntentRunner for DirectIntents {
+        fn run_intent(&mut self, intent: &Intent) -> String {
+            self.calls.push(intent.clone());
+            "direct host intent".into()
+        }
+
+        fn worker_callback(&self) -> Option<WorkerIntent> {
+            Some(Arc::new(|_| panic!("a top-level Turbo must not queue to its own live thread")))
+        }
+    }
+
+    #[test]
+    fn top_level_turbo_host_intents_use_the_live_runner_without_worker_queueing() {
+        let mut exec = DispatchExecutor::new();
+        let mut intents = DirectIntents { calls: Vec::new() };
+        let undo = Action::Turbo { action: Box::new(Action::Undo), cps: 5 };
+        assert!(exec.run_action(&undo, &Context::default(), &mut intents).contains("direct host intent"));
+        let lighting = Action::Turbo {
+            action: Box::new(Action::LightingLayer { edit: crate::action::LightingLayerOp::Pop }),
+            cps: 5,
+        };
+        assert!(exec.run_repeated_action(&lighting, &mut intents).contains("direct host intent"));
+        assert_eq!(intents.calls, [Intent::Undo, Intent::LightingLayer(crate::action::LightingLayerOp::Pop)]);
     }
 
     #[test]

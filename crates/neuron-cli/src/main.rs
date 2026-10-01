@@ -26,6 +26,12 @@ use profile_cmd::ProfileCmd;
 use spec::BindCmd;
 use std::fmt::Write as _;
 #[cfg(windows)]
+use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(windows)]
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TryRecvError};
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
 use neuron::{
     audio,
     device::DeviceSession,
@@ -3233,8 +3239,45 @@ fn set_daemon_active_profile(name: &str) {
 /// the single dispatch entry the run-daemon uses for buttons, the mic tap, gestures, radial flicks
 /// and app focus alike — the "one dispatcher" made live.
 #[cfg(windows)]
+struct CliWorkerIntent {
+    intent: neuron::action::Intent,
+    ticket: Arc<AtomicU8>,
+    reply: std::sync::mpsc::Sender<String>,
+}
+
+#[cfg(windows)]
+fn cli_worker_callback(tx: SyncSender<CliWorkerIntent>) -> neuron::executor::WorkerIntent {
+    Arc::new(move |intent| {
+        let ticket = Arc::new(AtomicU8::new(0));
+        let (reply, rx) = std::sync::mpsc::channel();
+        let request = CliWorkerIntent { intent: intent.clone(), ticket: ticket.clone(), reply };
+        if tx.try_send(request).is_err() {
+            return "host intent unavailable: daemon queue full".into();
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(result) => { eprintln!("  {result}"); result }
+            Err(RecvTimeoutError::Timeout) => {
+                if ticket.compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    let message = "host intent expired before execution";
+                    eprintln!("  {message}");
+                    message.into()
+                } else if ticket.load(Ordering::SeqCst) == 1 || ticket.load(Ordering::SeqCst) == 3 {
+                    let result = rx.recv().unwrap_or_else(|_| "host intent failed: daemon stopped".into());
+                    eprintln!("  {result}");
+                    result
+                } else {
+                    "host intent failed: daemon stopped".into()
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => "host intent failed: daemon stopped".into(),
+        }
+    })
+}
+
+#[cfg(windows)]
 struct CliIntentRunner<'a, 'reg> {
     devices: &'a mut DeviceSession<'reg>,
+    worker_callback: neuron::executor::WorkerIntent,
 }
 
 #[cfg(windows)]
@@ -3245,6 +3288,10 @@ impl IntentRunner for CliIntentRunner<'_, '_> {
         } else {
             run_intent(self.devices, intent)
         }
+    }
+
+    fn worker_callback(&self) -> Option<neuron::executor::WorkerIntent> {
+        Some(self.worker_callback.clone())
     }
 
 }
@@ -3293,8 +3340,9 @@ fn fire_trigger(
     exec: &mut DispatchExecutor,
     rt: &mut neuron::controls::Runtime,
     trigger: &neuron::engine::Trigger,
+    worker_callback: neuron::executor::WorkerIntent,
 ) -> Option<DispatchOutcome> {
-    let mut intents = CliIntentRunner { devices };
+    let mut intents = CliIntentRunner { devices, worker_callback };
     let outcome = exec.fire(&rt.engine, trigger, &mut intents)?;
     rt.note_fired(trigger);
     println!("  {}: {}", outcome.trigger, outcome.action);
@@ -3311,6 +3359,8 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
     use neuron::controls::{HoldEdges, InputEdge, MIC_TAP};
     use neuron::engine::Trigger;
     use std::cell::RefCell;
+    let (host_tx, host_rx) = sync_channel(16);
+    let worker_callback = cli_worker_callback(host_tx);
     struct SessionUndoReset;
     impl Drop for SessionUndoReset {
         fn drop(&mut self) { neuron::session_undo::clear(); }
@@ -3373,6 +3423,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                             &mut exec.borrow_mut(),
                             &mut rt.borrow_mut(),
                             &trigger,
+                            worker_callback.clone(),
                         ) {
                             turbos.borrow_mut().start(outcome.turbo);
                         }
@@ -3386,6 +3437,17 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
         },
         || {
             tick += 1;
+            loop {
+                let request = match host_rx.try_recv() {
+                    Ok(request) => request,
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                };
+                if request.ticket.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    let result = run_intent(&mut devices.borrow_mut(), &request.intent);
+                    request.ticket.store(3, Ordering::SeqCst);
+                    let _ = request.reply.send(result);
+                }
+            }
             // Re-reconcile the gaming-mode hook periodically (cheap; only (de)installs on a policy
             // change) so a profile applied mid-session — e.g. via the AppFocus->ProfileSwitch intent
             // — (de)activates Alt+Tab/Win/Alt+F4 suppression on this very (message-pumping) thread.
@@ -3406,6 +3468,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
             {
                 let mut intents = CliIntentRunner {
                     devices: &mut devices.borrow_mut(),
+                    worker_callback: worker_callback.clone(),
                 };
                 turbos
                     .borrow_mut()
@@ -3429,6 +3492,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                         &mut exec.borrow_mut(),
                         &mut rt.borrow_mut(),
                         &Trigger::MicTap,
+                        worker_callback.clone(),
                     );
                     let (p, u) = MIC_TAP;
                     // pid: None — the CLI detector watches the OS default-capture mute, so the
@@ -3444,6 +3508,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                             usage: u,
                             pid: None,
                         },
+                        worker_callback.clone(),
                     );
                 }
             }
@@ -3479,6 +3544,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                     &mut exec.borrow_mut(),
                     &mut rt.borrow_mut(),
                     &Trigger::AppFocus { app },
+                    worker_callback.clone(),
                 );
             }
         },

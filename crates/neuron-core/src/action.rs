@@ -1001,13 +1001,29 @@ impl Action {
     /// the original window after a sub-second in-game macro.
     #[must_use]
     pub fn run_ctx(&self, ctx: &Context) -> String {
+        self.run_ctx_with_worker(ctx, None)
+    }
+
+    /// Execute with the embedding host's bounded bridge for worker-owned daemon intents.
+    pub fn run_ctx_with_worker(
+        &self,
+        ctx: &Context,
+        worker: Option<&crate::executor::WorkerIntent>,
+    ) -> String {
+        if let Some(worker) = worker {
+            match self {
+                Action::Undo => return worker(&Intent::Undo),
+                Action::LightingLayer { edit } => return worker(&Intent::LightingLayer(edit.clone())),
+                _ => {}
+            }
+        }
         match self {
             Action::Noop => "noop".into(),
             Action::Run { cmd } => run_cmd(cmd),
             Action::Key { key } => press_key(key),
             Action::MicMute { .. } | Action::MicGain { .. } | Action::MicGainSet { .. }
             | Action::OutputMute { .. } | Action::OutputGain { .. } => crate::session_undo::apply_native_audio_action(self),
-            Action::Sequence { steps } => run_sequence(steps, ctx),
+            Action::Sequence { steps } => run_sequence(steps, ctx, worker.cloned()),
             // The macro engine's context-aware entry point: the trigger-time `ctx` the engine
             // captured threads all the way INTO the native macro body, so `ctx.app()` /
             // `ctx.cwd()` / `ctx.prev_window()` inside the macro are the world as it was when the
@@ -1031,7 +1047,7 @@ impl Action {
             }
             // A one-shot turbo press: fire the inner action ONCE (the daemon drives the held
             // autofire loop via `turbo()`; a context-free run() is the single-press fallback).
-            Action::Turbo { action, .. } => action.run_ctx(ctx),
+            Action::Turbo { action, .. } => action.run_ctx_with_worker(ctx, worker),
             Action::Teleport => "intent: teleport (app)".into(),
             Action::Whiteboard => "intent: whiteboard (app)".into(),
             Action::Knockback => "intent: knockback (app)".into(),
@@ -1141,7 +1157,11 @@ impl ScriptKind {
 ///
 /// The `ctx` threads through to nested actions (a `Sequence` can contain a context-aware
 /// `Script` step) so the whole macro reasons about one consistent snapshot of the world.
-fn run_sequence(steps: &[Step], ctx: &Context) -> String {
+fn run_sequence(
+    steps: &[Step],
+    ctx: &Context,
+    worker: Option<crate::executor::WorkerIntent>,
+) -> String {
     // A macro can sleep (held keys, inter-step delays), so it must not run on the live dispatch
     // thread the way a synchronous walk would — that would stall every other binding for the
     // macro's whole duration. Returns at once with a "running" line; the work happens off-thread.
@@ -1151,6 +1171,7 @@ fn run_sequence(steps: &[Step], ctx: &Context) -> String {
     // before the macro's first keystroke could go out — the largest controllable cost in the whole
     // press→output path. See `crate::macros::runner`.
     let n = steps.len();
+    let host_intents_required = steps.iter().any(|step| needs_worker_intent(&step.action));
     let plural = if n == 1 { "" } else { "s" };
     let owned_steps = steps.to_vec();
     let owned_ctx = ctx.clone();
@@ -1158,6 +1179,7 @@ fn run_sequence(steps: &[Step], ctx: &Context) -> String {
     // records `press_to_output` against the real press — otherwise the headline number would stop
     // at "we handed the macro to a worker", which is not what the user feels.
     let origin = crate::latency::origin();
+    let worker_pool = worker.clone();
     // Scoped tightly to the HANDOFF. If the guard covered the whole `match`, the no-pool fallback's
     // inline run would record the macro's entire duration as "spawn cost" and poison the stage that
     // exists to measure the handoff.
@@ -1165,7 +1187,7 @@ fn run_sequence(steps: &[Step], ctx: &Context) -> String {
         let _t = crate::latency::start(&crate::latency::MACRO_SPAWN);
         crate::macros::runner::submit(move || {
             crate::latency::adopt(origin);
-            run_sequence_sync(&owned_steps, &owned_ctx);
+            run_sequence_sync(&owned_steps, &owned_ctx, worker_pool);
         })
     };
     match submitted {
@@ -1181,15 +1203,27 @@ fn run_sequence(steps: &[Step], ctx: &Context) -> String {
         crate::macros::runner::Submitted::NoPool => {
             let steps2 = steps.to_vec();
             let ctx2 = ctx.clone();
+            let worker2 = worker.clone();
             if crate::worker::spawn_detached("neuron-macro", move || {
                 crate::latency::adopt(origin);
-                run_sequence_sync(&steps2, &ctx2);
+                run_sequence_sync(&steps2, &ctx2, worker2);
             }) {
                 format!("running macro ({n} step{plural})")
+            } else if host_intents_required {
+                format!("macro skipped ({n} step{plural}) — host intent worker unavailable")
             } else {
-                run_sequence_sync(steps, ctx)
+                run_sequence_sync(steps, ctx, worker)
             }
         }
+    }
+}
+
+fn needs_worker_intent(action: &Action) -> bool {
+    match action {
+        Action::Undo | Action::LightingLayer { .. } => true,
+        Action::Sequence { steps } => steps.iter().any(|step| needs_worker_intent(&step.action)),
+        Action::Turbo { action, .. } => needs_worker_intent(action),
+        _ => false,
     }
 }
 
@@ -1202,7 +1236,11 @@ fn run_sequence(steps: &[Step], ctx: &Context) -> String {
 /// waits, then releases — so "hold W 200ms" walks for 200ms and "hold right-click 500ms" drags. Other
 /// actions fire-and-forget, and `hold_ms` then just pads the timeline. Each hold/pause is capped so a
 /// fat-fingered value can't make a stray macro worker linger for minutes.
-fn run_sequence_sync(steps: &[Step], ctx: &Context) -> String {
+fn run_sequence_sync(
+    steps: &[Step],
+    ctx: &Context,
+    worker: Option<crate::executor::WorkerIntent>,
+) -> String {
     use std::time::Duration;
     // A single step shouldn't sleep longer than this — it's off the dispatch thread now, but a
     // runaway value (`delay_ms: 600000`) still shouldn't strand a worker for ten minutes.
@@ -1219,11 +1257,11 @@ fn run_sequence_sync(steps: &[Step], ctx: &Context) -> String {
             }
             // A nested Sequence runs INLINE (synchronous) so the parent's ordering holds.
             (Action::Sequence { steps: inner }, _) => {
-                run_sequence_sync(inner, ctx);
+                run_sequence_sync(inner, ctx, worker.clone());
             }
             // Everything else: fire the action, then (if hold_ms set on a non-holdable) pad the line.
             (action, h) => {
-                let _ = action.run_ctx(ctx);
+                let _ = action.run_ctx_with_worker(ctx, worker.as_ref());
                 if h > 0 {
                     crate::timing::sleep_precise(Duration::from_millis(u64::from(h)));
                 }
@@ -2685,7 +2723,7 @@ cmd = "echo hi""#,
             },
         ];
         assert_eq!(
-            run_sequence_sync(&steps, &Context::default()),
+            run_sequence_sync(&steps, &Context::default(), None),
             "ran macro (3 steps)"
         );
     }
@@ -2707,9 +2745,33 @@ cmd = "echo hi""#,
             hold_ms: 0,
         }];
         assert_eq!(
-            run_sequence_sync(&outer_steps, &Context::default()),
+            run_sequence_sync(&outer_steps, &Context::default(), None),
             "ran macro (1 step)"
         );
+    }
+
+    #[test]
+    fn nested_sequences_route_undo_and_lighting_through_host_callback_in_order() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        let worker: crate::executor::WorkerIntent = Arc::new(move |intent| {
+            sink.lock().unwrap().push(format!("{intent:?}"));
+            "host committed".into()
+        });
+        let steps = vec![
+            Step { action: Box::new(Action::Sequence { steps: vec![
+                Step { action: Box::new(Action::LightingLayer { edit: LightingLayerOp::Toggle { index: 2 } }), delay_ms: 0, hold_ms: 0 },
+                Step { action: Box::new(Action::Undo), delay_ms: 0, hold_ms: 0 },
+                Step { action: Box::new(Action::LightingLayer { edit: LightingLayerOp::Pop }), delay_ms: 0, hold_ms: 0 },
+            ] }), delay_ms: 0, hold_ms: 0 },
+        ];
+        assert_eq!(run_sequence_sync(&steps, &Context::default(), Some(worker)), "ran macro (1 step)");
+        assert_eq!(*calls.lock().unwrap(), [
+            "LightingLayer(Toggle { index: 2 })",
+            "Undo",
+            "LightingLayer(Pop)",
+        ]);
     }
 
     #[test]
