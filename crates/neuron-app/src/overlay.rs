@@ -109,6 +109,158 @@ pub enum Tone {
     Plain,
 }
 
+/// Run the region selector on the screenshot worker, never from Slint's event loop.
+pub fn select_screenshot_region() -> Option<neuron::screenshot::Rect> {
+    #[cfg(windows)]
+    { region_selector::select() }
+    #[cfg(not(windows))]
+    { None }
+}
+
+#[cfg(windows)]
+mod region_selector {
+    use crate::surface::{LayeredSurface, SurfaceSpec};
+    use neuron::screenshot::{Rect, MAX_CAPTURE_BYTES};
+    use std::cell::RefCell;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW, PostQuitMessage,
+        SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST,
+        SWP_SHOWWINDOW, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
+
+    struct Selector {
+        surface: LayeredSurface,
+        bounds: Rect,
+        width: usize,
+        height: usize,
+        start: Option<(i32, i32)>,
+        result: Option<Rect>,
+        done: bool,
+    }
+
+    thread_local! { static ACTIVE: RefCell<Option<Selector>> = const { RefCell::new(None) }; }
+
+    pub fn select() -> Option<Rect> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SW_SHOW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
+        let bounds = unsafe {
+            let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if width <= 0 || height <= 0 { return None; }
+            Rect { left, top, right: left.saturating_add(width), bottom: top.saturating_add(height) }
+        };
+        let (width, height) = bounds.dimensions().ok()?;
+        let bytes = usize::try_from(width).ok()?.checked_mul(usize::try_from(height).ok()?)?.checked_mul(4)?;
+        if bytes > MAX_CAPTURE_BYTES { return None; }
+        let mut spec = SurfaceSpec::new("NeuronScreenshotRegion", WS_EX_TOPMOST | WS_EX_TOOLWINDOW, width as i32, height as i32);
+        spec.wndproc = Some(wndproc);
+        let surface = LayeredSurface::new(&spec)?;
+        let hwnd = surface.hwnd();
+        ACTIVE.with(|active| *active.borrow_mut() = Some(Selector { surface, bounds, width: width as usize, height: height as usize, start: None, result: None, done: false }));
+        ACTIVE.with(|active| {
+            let state = active.borrow();
+            let Some(selector) = state.as_ref() else { return; };
+            unsafe {
+                if SetWindowPos(hwnd, HWND_TOPMOST, bounds.left, bounds.top, width as i32, height as i32, SWP_SHOWWINDOW) == 0 { return; }
+                ShowWindow(hwnd, SW_SHOW);
+                SetForegroundWindow(hwnd);
+            }
+            let initial = bounds;
+            draw(selector, None);
+            selector.surface.present(Some(POINT { x: initial.left, y: initial.top }), SIZE { cx: width as i32, cy: height as i32 }, 255);
+        });
+        let mut message: windows_sys::Win32::UI::WindowsAndMessaging::MSG = unsafe { std::mem::zeroed() };
+        loop {
+            let result = unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) };
+            if result <= 0 { break; }
+            unsafe { TranslateMessage(&raw const message); DispatchMessageW(&raw const message); }
+            let done = ACTIVE.with(|active| active.borrow().as_ref().is_none_or(|selector| selector.done));
+            if done { break; }
+        }
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let selector = active.take()?;
+            Some(selector.result)
+        }).flatten()
+    }
+
+    fn cursor() -> Option<(i32, i32)> {
+        let mut point = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&raw mut point) } == 0 { None } else { Some((point.x, point.y)) }
+    }
+
+    fn draw(selector: &Selector, selection: Option<Rect>) {
+        let count = selector.width.saturating_mul(selector.height);
+        let bits = selector.surface.bits();
+        if bits.is_null() || count.checked_mul(4).is_none_or(|bytes| bytes > MAX_CAPTURE_BYTES) { return; }
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits, count) };
+        pixels.fill(0x4000_0000);
+        let Some(rect) = selection else { return; };
+        let left = (rect.left - selector.bounds.left).clamp(0, selector.width as i32 - 1) as usize;
+        let right = (rect.right - 1 - selector.bounds.left).clamp(0, selector.width as i32 - 1) as usize;
+        let top = (rect.top - selector.bounds.top).clamp(0, selector.height as i32 - 1) as usize;
+        let bottom = (rect.bottom - 1 - selector.bounds.top).clamp(0, selector.height as i32 - 1) as usize;
+        for x in left..=right {
+            pixels[top * selector.width + x] = 0xFF50DCFF;
+            pixels[bottom * selector.width + x] = 0xFF50DCFF;
+        }
+        for y in top..=bottom {
+            pixels[y * selector.width + left] = 0xFF50DCFF;
+            pixels[y * selector.width + right] = 0xFF50DCFF;
+        }
+    }
+
+    unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KILLFOCUS, WM_CANCELMODE};
+        match message {
+            WM_LBUTTONDOWN => {
+                let point = cursor();
+                ACTIVE.with(|active| if let Some(selector) = active.borrow_mut().as_mut() {
+                    selector.start = point;
+                    unsafe { SetCapture(hwnd); }
+                });
+                0
+            }
+            WM_MOUSEMOVE => {
+                ACTIVE.with(|active| if let Some(selector) = active.borrow().as_ref() {
+                    if let (Some((x0, y0)), Some((x1, y1))) = (selector.start, cursor()) {
+                        let selection = Rect { left: x0.min(x1), top: y0.min(y1), right: x0.max(x1), bottom: y0.max(y1) };
+                        draw(selector, Some(selection));
+                        selector.surface.present(None, SIZE { cx: selector.width as i32, cy: selector.height as i32 }, 255);
+                    }
+                });
+                0
+            }
+            WM_LBUTTONUP => {
+                let point = cursor();
+                ACTIVE.with(|active| if let Some(selector) = active.borrow_mut().as_mut() {
+                    if let (Some((x0, y0)), Some((x1, y1))) = (selector.start, point) {
+                        let rect = Rect { left: x0.min(x1), top: y0.min(y1), right: x0.max(x1), bottom: y0.max(y1) };
+                        if rect.dimensions().is_ok() { selector.result = Some(rect); }
+                    }
+                    selector.done = true;
+                });
+                unsafe { ReleaseCapture(); }
+                0
+            }
+            WM_KEYDOWN if wparam as u32 == u32::from(VK_ESCAPE) => {
+                ACTIVE.with(|active| if let Some(selector) = active.borrow_mut().as_mut() { selector.done = true; });
+                0
+            }
+            WM_KILLFOCUS | WM_CANCELMODE => {
+                ACTIVE.with(|active| if let Some(selector) = active.borrow_mut().as_mut() { selector.done = true; });
+                0
+            }
+            WM_DESTROY => { unsafe { PostQuitMessage(0); } 0 }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+}
+
 /// The archetype a wedge draws — a small procedural vector icon (no fonts). Chosen by the bound
 /// Action so identity is recognizable at a glance without reading the title.
 #[derive(Clone, Copy, Debug, PartialEq)]

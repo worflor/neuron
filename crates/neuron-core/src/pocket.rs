@@ -33,10 +33,11 @@
 //! disarmed mode it touches nothing and reports `[disarmed]`. Reading to render a preview is always
 //! safe and never gated.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use serde::{Deserialize, Serialize};
 
 // Standard clipboard format ids (stable Win32 constants; spelled out so this file needs no extra
 // windows-sys feature imports for the platform-neutral view logic).
@@ -48,14 +49,14 @@ const CF_DIBV5: u32 = 17;
 
 /// One clipboard format's raw bytes, captured verbatim. `id` is the Win32 clipboard-format id
 /// (a standard `CF_*` constant, or a registered format id `>= 0xC000`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipFormat {
     pub id: u32,
     pub bytes: Vec<u8>,
 }
 
 /// Everything currently held — the full multi-format clipboard snapshot, or empty.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pocket {
     pub formats: Vec<ClipFormat>,
 }
@@ -68,6 +69,10 @@ impl Pocket {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.formats.is_empty()
+    }
+    /// Full Unicode text body when this snapshot carries `CF_UNICODETEXT`.
+    pub fn text(&self) -> Option<String> {
+        self.get(CF_UNICODETEXT).and_then(|bytes| utf16_text(bytes).ok())
     }
     fn get(&self, id: u32) -> Option<&[u8]> {
         self.formats
@@ -308,6 +313,7 @@ impl PocketView {
 struct Slot {
     pocket: Pocket,
     durable: bool,
+    revision: u64,
 }
 
 static SLOTS: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
@@ -316,10 +322,193 @@ fn slots() -> &'static Mutex<HashMap<String, Slot>> {
     SLOTS.get_or_init(|| Mutex::new(load_all()))
 }
 
+fn next_slot_revision() -> u64 { SLOT_REVISION.fetch_add(1, Ordering::Relaxed) }
+
 /// Bumped on every successful move. The GUI watches this so it rebuilds its pocket representation
 /// (which re-hashes payloads to draw sigils) ONLY when something actually changed — never per-frame.
 static GEN: AtomicU64 = AtomicU64::new(0);
+static SLOT_REVISION: AtomicU64 = AtomicU64::new(1);
+static PERSIST_NONCE: AtomicU64 = AtomicU64::new(1);
 static FAKE_MOVE_AUTHORIZED: AtomicBool = AtomicBool::new(false);
+static HISTORY: OnceLock<Mutex<VecDeque<Pocket>>> = OnceLock::new();
+const HISTORY_ITEMS: usize = 20;
+const HISTORY_BYTES: usize = 16 * 1024 * 1024;
+
+fn history() -> &'static Mutex<VecDeque<Pocket>> {
+    HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn pocket_size(pocket: &Pocket) -> usize {
+    pocket.formats.iter().fold(0usize, |sum, format| sum.saturating_add(format.bytes.len()))
+}
+
+fn remember_history(pocket: &Pocket) {
+    let mut items = history().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    push_history(&mut items, pocket);
+}
+
+fn push_history(items: &mut VecDeque<Pocket>, pocket: &Pocket) {
+    if pocket.is_empty() || pocket_size(pocket) > HISTORY_BYTES { return; }
+    if items.front() == Some(pocket) {
+        return;
+    }
+    items.push_front(pocket.clone());
+    while items.len() > HISTORY_ITEMS || items.iter().map(pocket_size).fold(0usize, usize::saturating_add) > HISTORY_BYTES {
+        items.pop_back();
+    }
+}
+
+/// Session history metadata, newest first. Payload bytes stay private until [`history_item`] is
+/// called explicitly.
+pub fn history_views() -> Vec<(usize, PocketView, usize)> {
+    history().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter().enumerate().map(|(index, pocket)| (index, pocket.view(), pocket_size(pocket))).collect()
+}
+
+/// Content-free session history metadata for explicit CLI listing.
+pub fn history_metadata() -> Vec<(usize, Vec<u32>, usize)> {
+    history().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter().enumerate().map(|(index, pocket)| {
+            (index, pocket.formats.iter().map(|format| format.id).collect(), pocket_size(pocket))
+        }).collect()
+}
+
+/// Content-free metadata for named pockets, including only format IDs and total size.
+pub fn metadata() -> Vec<(String, bool, Vec<u32>, usize)> {
+    let entries = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut out: Vec<_> = entries.iter().map(|(name, slot)| (
+        name.clone(), slot.durable, slot.pocket.formats.iter().map(|format| format.id).collect(), pocket_size(&slot.pocket),
+    )).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Return one explicitly requested history payload.
+pub fn history_item(index: usize) -> Option<Pocket> {
+    history().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(index).cloned()
+}
+
+/// Clear in-memory clipboard history for this process.
+pub fn clear_history() {
+    history().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+}
+
+/// Pocket slot names are data identifiers, never path fragments.
+pub fn validate_slot_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() { return Ok(()); }
+    if name.len() > 64 || name == "." || name == ".." { return Err("pocket name must be 1–64 safe characters"); }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("pocket names use letters, digits, hyphen, and underscore");
+    }
+    let upper = name.to_ascii_uppercase();
+    let reserved_numbered = |prefix: &str| upper.strip_prefix(prefix).is_some_and(|n| {
+        n.len() == 1 && n.as_bytes()[0].is_ascii_digit() && n.as_bytes()[0] != b'0'
+    });
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || reserved_numbered("COM") || reserved_numbered("LPT")
+    {
+        return Err("pocket name is reserved by Windows");
+    }
+    Ok(())
+}
+
+/// Delete a pocket after its durable file has been removed successfully.
+pub fn delete(slot: &str) -> Result<bool, String> {
+    validate_slot_name(slot).map_err(str::to_string)?;
+    let mut entries = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(existing) = entries.get(slot) else { return Ok(false); };
+    if existing.durable {
+        match std::fs::remove_file(disk_path(slot)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not remove durable pocket: {error}")),
+        }
+    }
+    entries.remove(slot);
+    GEN.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// Explicitly retrieve a named pocket's full snapshot for CLI inspection.
+pub fn inspect(slot: &str) -> Option<Pocket> {
+    slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(slot).map(|entry| entry.pocket.clone())
+}
+
+/// Inspect only when the full payload fits the caller's explicit output budget.
+pub fn inspect_bounded(slot: &str, limit: usize) -> Result<Option<Pocket>, String> {
+    let entries = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = entries.get(slot) else { return Ok(None); };
+    let size = pocket_size(&entry.pocket);
+    if size > limit { return Err(format!("explicit pocket inspection is limited to {} MiB", limit / (1024 * 1024))); }
+    Ok(Some(entry.pocket.clone()))
+}
+
+/// Restore a full-fidelity clipboard snapshot from session history without consuming or reordering it.
+pub fn restore_history(index: usize) -> String {
+    let Some(snapshot) = history_item(index) else { return format!("clipboard history #{index}: no entry"); };
+    if !crate::action::input_armed() && !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst) {
+        return "clipboard history [disarmed]".into();
+    }
+    let (state, sequence) = read_clip_snapshot();
+    let original = match state {
+        ClipState::Empty => Pocket::empty(),
+        ClipState::Carryable(pocket) => pocket,
+        ClipState::Busy => return "clipboard history: clipboard is busy; nothing changed".into(),
+        ClipState::Uncarryable => return "clipboard history: current clipboard format cannot be preserved".into(),
+    };
+    match set_clipboard_if_sequence(&snapshot, sequence, &original) {
+        Ok(()) => {},
+        Err(ClipboardWriteError::Changed) => return "clipboard history: clipboard changed; nothing restored".into(),
+        Err(ClipboardWriteError::Busy) => return "clipboard history: clipboard is busy; nothing changed".into(),
+        Err(ClipboardWriteError::WriteFailed) => return "clipboard history: write failed; original preserved".into(),
+        Err(ClipboardWriteError::RollbackFailed) => return "clipboard history: write and rollback failed; contents may be incomplete".into(),
+    }
+    format!("clipboard history #{index} restored ({})", snapshot.view().summary)
+}
+
+/// Transform CF_UNICODETEXT and replace the clipboard only after the entire result is ready and
+/// the original clipboard sequence still matches. Rich source formats become explicit plain text.
+pub fn transform(ops: &[crate::clipboard_transform::TransformOp]) -> String {
+    #[cfg(not(windows))]
+    if fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() {
+        return "clipboard transform: clipboard access is unsupported on this platform".into();
+    }
+    let (state, sequence) = read_clip_snapshot();
+    let original = match state {
+        ClipState::Empty => return "clipboard transform: clipboard is empty".into(),
+        ClipState::Busy => return "clipboard transform: clipboard is busy".into(),
+        ClipState::Uncarryable => return "clipboard transform: clipboard format cannot be read".into(),
+        ClipState::Carryable(pocket) => pocket,
+    };
+    let Some(bytes) = original.get(CF_UNICODETEXT) else {
+        return "clipboard transform: clipboard has no Unicode text".into();
+    };
+    let input = match utf16_text(bytes) {
+        Ok(text) => text,
+        Err(()) => return "clipboard transform: clipboard text is invalid UTF-16".into(),
+    };
+    let output = match crate::clipboard_transform::apply(&input, ops) {
+        Ok(output) => output,
+        Err(error) => return format!("clipboard transform: {error}"),
+    };
+    if output == input {
+        return "clipboard transform: unchanged".into();
+    }
+    if !crate::action::input_armed() && !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst) {
+        return "clipboard transform [disarmed]".into();
+    }
+    let replacement = text_pocket(&output);
+    match set_clipboard_if_sequence(&replacement, sequence, &original) {
+        Ok(()) => {
+            remember_history(&original);
+            format!("clipboard transformed ({} chars)", output.chars().count())
+        }
+        Err(ClipboardWriteError::Changed) => "clipboard transform: clipboard changed; nothing replaced".into(),
+        Err(ClipboardWriteError::Busy) => "clipboard transform: clipboard is busy; nothing replaced".into(),
+        Err(ClipboardWriteError::WriteFailed) => "clipboard transform: write failed; original restored".into(),
+        Err(ClipboardWriteError::RollbackFailed) => "clipboard transform: write and rollback failed; contents may be incomplete".into(),
+    }
+}
 
 /// The change counter — increments each time a pocket's contents move. See [`GEN`].
 pub fn generation() -> u64 {
@@ -330,13 +519,15 @@ pub fn generation() -> u64 {
 /// the truth table). `persist` marks the slot durable (mirrored to disk, survives a restart).
 /// Returns a short status line describing what moved. The only entry point the `Action` layer uses.
 pub fn activate(slot: &str, persist: bool) -> String {
+    if let Err(error) = validate_slot_name(slot) { return format!("pocket: {error}"); }
     let tag = if slot.is_empty() {
         String::new()
     } else {
         format!(" {slot}")
     };
 
-    let (live, live_empty) = match read_clip_state() {
+    let (clip_state, sequence) = read_clip_snapshot();
+    let (live, live_empty) = match clip_state {
         // The clipboard holds something we can't snapshot (a handle-only format with no DIB/HGLOBAL
         // twin). Moving would either lose it (on a stash) or clobber it (on a restore), so we refuse
         // and change nothing — the same "never destroy what you didn't ask to" rule the device
@@ -344,6 +535,7 @@ pub fn activate(slot: &str, persist: bool) -> String {
         ClipState::Uncarryable => {
             return format!("pocket{tag}: clipboard holds content i can't carry \u{2014} left it");
         }
+        ClipState::Busy => return format!("pocket{tag}: clipboard is busy \u{2014} nothing moved"),
         ClipState::Empty => (Pocket::empty(), true),
         ClipState::Carryable(p) => (p, false),
     };
@@ -370,25 +562,38 @@ pub fn activate(slot: &str, persist: bool) -> String {
     // FAILURE-SAFETY ORDER (load-bearing — see the lock comment above): write the clipboard FIRST,
     // borrowing the slot in place, and swap ONLY once that write reports success — so BOTH failure
     // shapes leave the slot untouched with the user's payload intact: a panic inside
-    // set_clipboard (unwinds before the swap), and the ordinary fallible path (a foreign process
-    // holding the clipboard → `false` → honest "nothing moved", never a silently-consumed pocket).
+    // sequence-checked clipboard transaction (unwinds before the swap), and the ordinary fallible
+    // path (a foreign process holding the clipboard → honest "nothing moved").
     let new_pocket = live; // what was on the clipboard now rests in the pocket
-    if !set_clipboard(&entry.pocket) {
-        // what was pocketed COULD NOT reach the clipboard — moving it out anyway would destroy
-        // it (the old clipboard content still sits on the clipboard AND would land in the slot).
-        return format!("pocket{tag}: clipboard is held by another app \u{2014} nothing moved");
+    let changed = entry.pocket != new_pocket;
+    let becoming_durable = persist && !entry.durable;
+    if pocket_size(&new_pocket) > MAX_POCKET_BYTES {
+        return format!("pocket{tag}: payload exceeds 128 MiB; nothing moved");
     }
-    let to_clipboard = std::mem::replace(&mut entry.pocket, new_pocket);
+    if !changed && !becoming_durable { return format!("pocket{tag}: clipboard and pocket already match"); }
+    if changed {
+        match set_clipboard_if_sequence(&entry.pocket, sequence, &new_pocket) {
+            Ok(()) => {},
+            Err(ClipboardWriteError::Changed) => return format!("pocket{tag}: clipboard changed; nothing moved"),
+            Err(ClipboardWriteError::Busy) => return format!("pocket{tag}: clipboard is held by another app \u{2014} nothing moved"),
+            Err(ClipboardWriteError::WriteFailed) => return format!("pocket{tag}: write failed; prior contents restored"),
+            Err(ClipboardWriteError::RollbackFailed) => return format!("pocket{tag}: write and rollback failed; contents may be incomplete"),
+        }
+    }
+    if changed { remember_history(&new_pocket); }
+    let to_clipboard = if changed { std::mem::replace(&mut entry.pocket, new_pocket) } else { entry.pocket.clone() };
 
     entry.durable |= persist;
+    entry.revision = next_slot_revision();
     let durable = entry.durable;
     if durable {
         // Persist OFF the dispatch path: a multi-MB image pocket shouldn't block the live tick on a
         // synchronous file write. Snapshot under the lock, write on a worker.
         let slot = slot.to_string();
         let snapshot = entry.pocket.clone();
+        let revision = entry.revision;
         crate::worker::spawn_detached("neuron-pocket-persist", move || {
-            let _ = write_disk(&slot, &snapshot);
+            let _ = persist_if_current(&slot, revision, &snapshot);
         });
     }
     GEN.fetch_add(1, Ordering::Relaxed); // a real move happened — let the GUI repaint
@@ -573,17 +778,17 @@ fn dib_dims(b: &[u8]) -> Option<(u32, u32)> {
 /// worker mid-write and the user's payload with it. A one-shot caller (the CLI) runs this before
 /// returning. Idempotent full re-mirror: full slots written, emptied slots' files removed.
 pub fn flush_durable_sync() {
-    let snapshot: Vec<(String, Pocket)> = {
+    let snapshot: Vec<(String, Pocket, u64)> = {
         let g = slots()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.iter()
             .filter(|(_, s)| s.durable)
-            .map(|(k, s)| (k.clone(), s.pocket.clone()))
+            .map(|(k, s)| (k.clone(), s.pocket.clone(), s.revision))
             .collect()
     };
-    for (slot, p) in snapshot {
-        let _ = write_disk(&slot, &p);
+    for (slot, p, revision) in snapshot {
+        let _ = persist_if_current(&slot, revision, &p);
     }
 }
 
@@ -591,6 +796,7 @@ pub fn flush_durable_sync() {
 
 const MAGIC: &[u8; 4] = b"NPKT";
 const VERSION: u8 = 1;
+const MAX_POCKET_BYTES: usize = 128 * 1024 * 1024;
 
 /// `runtime/pockets/` in the run root — where durable pockets are mirrored.
 fn disk_dir() -> PathBuf {
@@ -617,13 +823,8 @@ fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(b);
 }
 
-fn write_disk(slot: &str, p: &Pocket) -> std::io::Result<()> {
-    let path = disk_path(slot);
-    if p.is_empty() {
-        // An emptied durable pocket leaves no file behind.
-        let _ = std::fs::remove_file(&path);
-        return Ok(());
-    }
+fn encode_disk(slot: &str, p: &Pocket) -> std::io::Result<Vec<u8>> {
+    if pocket_size(p) > MAX_POCKET_BYTES { return Err(std::io::Error::other("durable pocket exceeds 128 MiB")); }
     let mut buf = Vec::new();
     buf.extend_from_slice(MAGIC);
     buf.push(VERSION);
@@ -633,8 +834,74 @@ fn write_disk(slot: &str, p: &Pocket) -> std::io::Result<()> {
         buf.extend_from_slice(&f.id.to_le_bytes());
         put_bytes(&mut buf, &f.bytes);
     }
+    Ok(buf)
+}
+
+fn stage_disk(slot: &str, p: &Pocket) -> std::io::Result<Option<PathBuf>> {
+    if p.is_empty() { return Ok(None); }
+    let buf = encode_disk(slot, p)?;
     std::fs::create_dir_all(disk_dir())?;
-    std::fs::write(path, buf)
+    let nonce = PERSIST_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp = disk_dir().join(format!("{:016x}-{}-{nonce}.tmp", fnv1a(slot), std::process::id()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+    use std::io::Write;
+    if let Err(error) = file.write_all(&buf).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(Some(temp))
+}
+
+fn persist_if_current(slot: &str, revision: u64, pocket: &Pocket) -> std::io::Result<()> {
+    let temp = stage_disk(slot, pocket)?;
+    commit_staged_if_current(slot, revision, pocket, temp)
+}
+
+fn commit_staged_if_current(slot: &str, revision: u64, pocket: &Pocket, temp: Option<PathBuf>) -> std::io::Result<()> {
+    let current = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !current.get(slot).is_some_and(|entry| entry.durable && entry.revision == revision && entry.pocket == *pocket) {
+        if let Some(temp) = temp { let _ = std::fs::remove_file(temp); }
+        return Ok(());
+    }
+    let target = disk_path(slot);
+    if let Some(temp) = temp {
+        let result = replace_file(&temp, &target);
+        if result.is_err() { let _ = std::fs::remove_file(temp); }
+        result
+    }
+    else {
+        match std::fs::remove_file(target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_file(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers and live through the call.
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::MoveFileExW(source.as_ptr(), target.as_ptr(), 0x1 | 0x8) };
+    if ok != 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+fn read_disk_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    const LIMIT: u64 = MAX_POCKET_BYTES as u64 + 64 * 1024;
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > LIMIT { return Err(std::io::Error::other("durable pocket exceeds 128 MiB")); }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT { return Err(std::io::Error::other("durable pocket exceeds 128 MiB")); }
+    Ok(bytes)
 }
 
 fn take_bytes<'a>(b: &mut &'a [u8]) -> Option<&'a [u8]> {
@@ -657,21 +924,28 @@ fn parse_disk(mut b: &[u8]) -> Option<(String, Pocket)> {
     }
     b = &b[5..];
     let name = String::from_utf8_lossy(take_bytes(&mut b)?).into_owned();
+    validate_slot_name(&name).ok()?;
     if b.len() < 4 {
         return None;
     }
     let count = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
     b = &b[4..];
+    if count > b.len() / 8 { return None; }
     let mut formats = Vec::with_capacity(count);
+    let mut used = 0usize;
     for _ in 0..count {
         if b.len() < 4 {
             return None;
         }
         let id = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         b = &b[4..];
-        let bytes = take_bytes(&mut b)?.to_vec();
+        let data = take_bytes(&mut b)?;
+        used = used.checked_add(data.len())?;
+        if used > MAX_POCKET_BYTES { return None; }
+        let bytes = data.to_vec();
         formats.push(ClipFormat { id, bytes });
     }
+    if !b.is_empty() { return None; }
     Some((name, Pocket { formats }))
 }
 
@@ -684,13 +958,14 @@ fn load_all() -> HashMap<String, Slot> {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("pocket") {
             continue;
         }
-        if let Ok(bytes) = std::fs::read(entry.path()) {
+        if let Ok(bytes) = read_disk_bounded(&entry.path()) {
             if let Some((name, pocket)) = parse_disk(&bytes) {
                 map.insert(
                     name,
                     Slot {
                         pocket,
                         durable: true,
+                        revision: next_slot_revision(),
                     },
                 );
             }
@@ -703,6 +978,7 @@ fn load_all() -> HashMap<String, Slot> {
 
 enum ClipState {
     Empty,
+    Busy,
     /// Clipboard has content, but none of it is in a form we can snapshot (handle-only formats).
     Uncarryable,
     Carryable(Pocket),
@@ -720,6 +996,7 @@ enum ClipState {
 /// What the in-memory test clipboard holds (mirrors [`ClipState`] but owns its payload).
 enum FakeClip {
     Empty,
+    Busy,
     Uncarryable,
     Carryable(Pocket),
     /// Reads succeed (the payload is visible) but every WRITE is refused — the real-world race
@@ -730,23 +1007,33 @@ enum FakeClip {
 }
 
 static FAKE_CLIP: OnceLock<Mutex<Option<FakeClip>>> = OnceLock::new();
+static FAKE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn fake_clip() -> &'static Mutex<Option<FakeClip>> {
     FAKE_CLIP.get_or_init(|| Mutex::new(None))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardWriteError { Changed, Busy, WriteFailed, RollbackFailed }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImpWriteError { Changed, Busy, WriteFailed, RollbackFailed }
+
+fn read_clip_snapshot() -> (ClipState, u64) {
+    if let Some(fake) = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+        let state = match fake {
+            FakeClip::Empty => ClipState::Empty,
+            FakeClip::Busy => ClipState::Busy,
+            FakeClip::Uncarryable => ClipState::Uncarryable,
+            FakeClip::Carryable(p) | FakeClip::Refuses(p) => ClipState::Carryable(p.clone()),
+        };
+        return (state, FAKE_SEQUENCE.load(Ordering::SeqCst));
+    }
+    imp::read_clip_snapshot()
+}
+
 /// Read the clipboard state — the in-memory test clipboard if one is installed, else the OS.
 fn read_clip_state() -> ClipState {
-    if let Some(fake) = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
-        return match fake {
-            FakeClip::Empty => ClipState::Empty,
-            FakeClip::Uncarryable => ClipState::Uncarryable,
-            FakeClip::Carryable(p) => ClipState::Carryable(p.clone()),
-            // reads see the content normally — only the WRITE half is refused.
-            FakeClip::Refuses(p) => ClipState::Carryable(p.clone()),
-        };
-    }
-    imp::read_clip_state()
+    read_clip_snapshot().0
 }
 
 /// Write the clipboard — the in-memory test clipboard if installed, else the OS.
@@ -755,7 +1042,7 @@ fn read_clip_state() -> ClipState {
 pub(crate) fn macro_clipboard_get() -> Option<String> {
     match read_clip_state() {
         ClipState::Carryable(p) => p.get(CF_UNICODETEXT).map(utf16_to_string),
-        ClipState::Empty | ClipState::Uncarryable => None,
+        ClipState::Empty | ClipState::Busy | ClipState::Uncarryable => None,
     }
 }
 
@@ -765,44 +1052,96 @@ pub(crate) fn macro_clipboard_set(text: &str) -> bool {
     }
     let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
     bytes.extend_from_slice(&[0, 0]);
-    set_clipboard(&Pocket {
+    let (state, sequence) = read_clip_snapshot();
+    let previous = match state {
+        ClipState::Carryable(pocket) => pocket,
+        ClipState::Empty => Pocket::empty(),
+        ClipState::Busy | ClipState::Uncarryable => return false,
+    };
+    let replacement = Pocket {
         formats: vec![ClipFormat {
             id: CF_UNICODETEXT,
             bytes,
         }],
+    };
+    if replacement == previous { return true; }
+    if set_clipboard_if_sequence(&replacement, sequence, &previous).is_ok() {
+        remember_history(&previous);
+        true
+    } else { false }
+}
+
+fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket) -> Result<(), ClipboardWriteError> {
+    let mut g = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(fake) = g.as_ref() {
+        if FAKE_SEQUENCE.load(Ordering::SeqCst) != expected { return Err(ClipboardWriteError::Changed); }
+        if matches!(fake, FakeClip::Refuses(_) | FakeClip::Busy) { return Err(ClipboardWriteError::Busy); }
+        *g = Some(if p.is_empty() { FakeClip::Empty } else { FakeClip::Carryable(p.clone()) });
+        FAKE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        return Ok(());
+    }
+    drop(g);
+    if !crate::action::input_armed() { return Err(ClipboardWriteError::Busy); }
+    imp::set_clipboard_if_sequence(p, expected, rollback).map_err(|error| match error {
+        ImpWriteError::Changed => ClipboardWriteError::Changed,
+        ImpWriteError::Busy => ClipboardWriteError::Busy,
+        ImpWriteError::WriteFailed => ClipboardWriteError::WriteFailed,
+        ImpWriteError::RollbackFailed => ClipboardWriteError::RollbackFailed,
     })
 }
 
-fn set_clipboard(p: &Pocket) -> bool {
-    let mut g = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    match g.as_ref() {
-        // the write-refusing state stays exactly as installed — like a foreign process that
-        // still holds the clipboard open when our write arrives.
-        Some(FakeClip::Refuses(_)) => return false,
-        Some(_) => {
-            *g = Some(if p.is_empty() {
-                FakeClip::Empty
-            } else {
-                FakeClip::Carryable(p.clone())
-            });
-            return true;
-        }
-        None => {}
+/// Replace the clipboard only if its system sequence still equals the captured version.
+pub(crate) fn replace_at_sequence(replacement: &Pocket, original: &Pocket, sequence: u64) -> Result<(), &'static str> {
+    if pocket_size(replacement) > MAX_POCKET_BYTES || pocket_size(original) > MAX_POCKET_BYTES { return Err("payload exceeds 128 MiB"); }
+    if !crate::action::input_armed() && !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst) { return Err("disarmed"); }
+    let changed = replacement != original;
+    match set_clipboard_if_sequence(replacement, sequence, original) {
+        Ok(()) => { if changed { remember_history(original); } Ok(()) }
+        Err(ClipboardWriteError::Changed) => Err("changed"),
+        Err(ClipboardWriteError::Busy) => Err("busy"),
+        Err(ClipboardWriteError::WriteFailed) => Err("write-failed"),
+        Err(ClipboardWriteError::RollbackFailed) => Err("rollback-failed"),
     }
-    drop(g);
-    // A fake move authorization must never fall through to the real clipboard if a test
-    // uninstalls its fake between the gate check and this write.
-    if !crate::action::input_armed() {
-        return false;
+}
+
+pub(crate) fn snapshot_for_action() -> Result<(Pocket, u64), &'static str> {
+    match read_clip_snapshot() {
+        (ClipState::Busy, _) => Err("busy"),
+        (ClipState::Uncarryable, _) => Err("unsupported"),
+        (ClipState::Empty, sequence) => Ok((Pocket::empty(), sequence)),
+        (ClipState::Carryable(pocket), sequence) => Ok((pocket, sequence)),
     }
-    imp::set_clipboard(p)
+}
+
+fn skip_clipboard_derivative(id: u32, present: &[u32]) -> Result<bool, ()> {
+    match id {
+        CF_TEXT => Ok(present.contains(&CF_UNICODETEXT)),
+        7 | 16 => Ok(present.contains(&CF_UNICODETEXT) || present.contains(&CF_TEXT)),
+        CF_DIB => Ok(present.contains(&CF_DIBV5)),
+        2 | 9 if present.contains(&CF_DIB) || present.contains(&CF_DIBV5) => Ok(true),
+        2 | 9 | 14 => Err(()),
+        _ => Ok(false),
+    }
+}
+
+fn text_pocket(text: &str) -> Pocket {
+    let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.extend_from_slice(&[0, 0]);
+    Pocket { formats: vec![ClipFormat { id: CF_UNICODETEXT, bytes }] }
+}
+
+fn utf16_text(bytes: &[u8]) -> Result<String, ()> {
+    if bytes.len() % 2 != 0 { return Err(()); }
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+    let end = units.iter().position(|unit| *unit == 0).unwrap_or(units.len());
+    String::from_utf16(&units[..end]).map_err(|_| ())
 }
 
 /// TEST SEAM — drive [`activate`] against an in-memory clipboard so the move path is provable
 /// non-destructively (it never touches the real OS clipboard). OFF in production unless installed.
 #[doc(hidden)]
 pub mod testclip {
-    use super::{fake_clip, load_all, slots, ClipFormat, FakeClip, Pocket, Slot, FAKE_MOVE_AUTHORIZED, Ordering};
+    use super::{fake_clip, load_all, next_slot_revision, slots, ClipFormat, FakeClip, Pocket, Slot, FAKE_MOVE_AUTHORIZED, FAKE_SEQUENCE, Ordering};
 
     const CF_UNICODETEXT: u32 = 13;
 
@@ -826,10 +1165,12 @@ pub mod testclip {
     /// Install an EMPTY in-memory clipboard (routes `activate()` away from the OS).
     pub fn install_empty() {
         *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FakeClip::Empty);
+        FAKE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     }
     /// Install an in-memory clipboard holding `s` as text.
     pub fn install_text(s: &str) {
         *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FakeClip::Carryable(text_pocket(s)));
+        FAKE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     }
     /// Install an in-memory clipboard holding an arbitrary multi-format payload.
     pub fn install_pocket(p: Pocket) {
@@ -838,6 +1179,7 @@ pub mod testclip {
         } else {
             FakeClip::Carryable(p)
         });
+        FAKE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     }
     /// Install an in-memory clipboard that READS as holding `s` but REFUSES every write — the
     /// foreign-holder race (`OpenClipboard` fails at write time). For pinning `activate`'s
@@ -845,10 +1187,17 @@ pub mod testclip {
     pub fn install_refusing_text(s: &str) {
         *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(FakeClip::Refuses(text_pocket(s)));
+        FAKE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    }
+    /// Install a fake clipboard that models another process holding it open.
+    pub fn install_busy() {
+        *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FakeClip::Busy);
+        FAKE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     }
     /// Install an in-memory clipboard whose content can't be carried (handle-only, no twin).
     pub fn install_uncarryable() {
         *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FakeClip::Uncarryable);
+        FAKE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     }
     /// What currently sits on the in-memory clipboard (None if empty / uncarryable / not installed).
     pub fn current() -> Option<Pocket> {
@@ -861,6 +1210,7 @@ pub mod testclip {
     pub fn uninstall() {
         FAKE_MOVE_AUTHORIZED.store(false, Ordering::SeqCst);
         *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        FAKE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     }
     /// Authorize pocket moves only against the installed in-memory clipboard.
     pub fn authorize_moves(on: bool) {
@@ -875,7 +1225,7 @@ pub mod testclip {
         slots()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(slot.to_string(), Slot { pocket, durable });
+            .insert(slot.to_string(), Slot { pocket, durable, revision: next_slot_revision() });
     }
     /// Re-read the durable pockets from disk into the store (re-runs `load_all`, for tests that
     /// write `.pocket` files directly and then want them loaded).
@@ -886,12 +1236,13 @@ pub mod testclip {
 
 #[cfg(windows)]
 mod imp {
-    use super::{ClipFormat, ClipState, Pocket};
+    use super::{ClipFormat, ClipState, ImpWriteError, Pocket, MAX_POCKET_BYTES};
+    use windows_sys::Win32::Foundation::HGLOBAL;
     use std::ptr;
     use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, OpenClipboard,
-        SetClipboardData,
+        CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+        GetClipboardSequenceNumber, OpenClipboard, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
         GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -900,9 +1251,11 @@ mod imp {
     /// Open the clipboard, RETRYING briefly — another process (a clipboard manager, RDP, a browser)
     /// can hold it for a few ms, and a one-shot failure would make us needlessly refuse the move (or
     /// fail a restore). Caller must `CloseClipboard` on success.
-    unsafe fn open_clipboard_retry() -> bool {
+    unsafe fn open_clipboard_retry(owner: windows_sys::Win32::Foundation::HWND) -> bool {
         for _ in 0..10 {
-            if OpenClipboard(ptr::null_mut()) != 0 {
+            // SAFETY: read callers pass null by contract; every writer supplies its live owner HWND.
+            // SAFETY: the caller supplies null only for reads or a live thread-owned HWND for writes.
+            if OpenClipboard(owner) != 0 {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -912,27 +1265,17 @@ mod imp {
 
     /// Read the whole clipboard WITHOUT changing it. Distinguishes truly empty from "has content we
     /// can't carry" so the caller can refuse rather than lose data.
-    pub fn read_clip_state() -> ClipState {
-        // OS-auto-synthesized derivatives: when the canonical source is on the clipboard, Windows can
-        // regenerate these on demand. Snapshotting them and re-publishing them as REAL entries on a
-        // restore would SUPPRESS that synthesis (EmptyClipboard kills auto-synthesis) and can subtly
-        // change what a consuming app sees — so we skip a derivative whenever its source is present
-        // and let the OS re-derive it. (Handle-only twins like CF_BITMAP/CF_PALETTE are already
-        // dropped by `snapshot_one`.)
-        const CF_TEXT: u32 = 1;
-        const CF_OEMTEXT: u32 = 7;
-        const CF_UNICODETEXT: u32 = 13;
-        const CF_LOCALE: u32 = 16;
-        const CF_DIB: u32 = 8;
-        const CF_DIBV5: u32 = 17;
+    pub fn read_clip_snapshot() -> (ClipState, u64) {
         // Serialize this process's clipboard window against every other clipboard user — see
         // `crate::clipboard` for why there is exactly one process-wide lock.
         let _guard = crate::clipboard::clipboard_guard();
+        // SAFETY: this thread owns the process clipboard lock, keeps the OS clipboard open while
+        // enumerating and copying its formats, then closes it before returning.
         unsafe {
-            if !open_clipboard_retry() {
+            if !open_clipboard_retry(ptr::null_mut()) {
                 // Couldn't open it even after retrying — treat as uncarryable so we never clobber a
                 // clipboard we couldn't inspect.
-                return ClipState::Uncarryable;
+                return (ClipState::Busy, 0);
             }
             // Pass 1: enumerate which formats are present (we need the whole set to decide skips).
             let mut order = Vec::new();
@@ -942,113 +1285,137 @@ mod imp {
                 fmt = EnumClipboardFormats(fmt);
             }
             let saw_any = !order.is_empty();
-            let present = |id: u32| order.contains(&id);
-            let skip = |id: u32| -> bool {
-                match id {
-                    CF_TEXT => present(CF_UNICODETEXT),
-                    CF_OEMTEXT | CF_LOCALE => present(CF_UNICODETEXT) || present(CF_TEXT),
-                    CF_DIB => present(CF_DIBV5),
-                    _ => false,
-                }
-            };
             // Pass 2: snapshot only the formats we keep, in clipboard order.
             let mut formats = Vec::new();
+            let mut used = 0usize;
+            let mut oversized = false;
             for &id in &order {
-                if skip(id) {
-                    continue;
+                match super::skip_clipboard_derivative(id, &order) {
+                    Ok(true) => continue,
+                    Err(()) => { oversized = true; break; }
+                    Ok(false) => {}
                 }
-                if let Some(bytes) = snapshot_one(id) {
-                    formats.push(ClipFormat { id, bytes });
+                let remaining = MAX_POCKET_BYTES.saturating_sub(used);
+                match snapshot_one(id, remaining) {
+                    Ok(Some(bytes)) => { used = used.saturating_add(bytes.len()); formats.push(ClipFormat { id, bytes }); },
+                    Ok(None) => {},
+                    Err(()) => { oversized = true; break; }
                 }
             }
+            let sequence = GetClipboardSequenceNumber() as u64;
             CloseClipboard();
-            if !saw_any {
+            let state = if !saw_any {
                 ClipState::Empty
-            } else if formats.is_empty() {
+            } else if oversized || formats.is_empty() {
                 ClipState::Uncarryable
             } else {
                 ClipState::Carryable(Pocket { formats })
-            }
+            };
+            (state, sequence)
         }
     }
 
-    /// Copy one format's bytes out of its global memory block. Returns None for handle-only formats
-    /// (`CF_BITMAP` / `CF_PALETTE` / metafiles) that aren't `GlobalLock`-able.
-    unsafe fn snapshot_one(fmt: u32) -> Option<Vec<u8>> {
-        // A handful of PREDEFINED clipboard formats hand back a GDI/handle object, NOT an HGLOBAL
-        // movable-memory block: CF_BITMAP -> HBITMAP, CF_PALETTE -> HPALETTE, CF_ENHMETAFILE ->
-        // HENHMETAFILE. `GlobalLock`/`GlobalSize`/`GlobalUnlock` assume the handle IS a moveable
-        // global-memory block (they read/write an internal lock-count in memory addressed via the
-        // handle) — calling them on a GDI handle is undefined behavior: it can silently corrupt
-        // whatever the handle's bit pattern happens to address, which surfaces later as
-        // STATUS_HEAP_CORRUPTION rather than an immediate access violation. Root-caused via a live
-        // clipboard holding Bitmap+PNG: `GetClipboardData(CF_BITMAP)` returns an HBITMAP, and
-        // GlobalLock/GlobalUnlock on it reproducibly corrupted the heap (confirmed by excluding
-        // just CF_BITMAP here and watching 50/50 runs go clean). So: skip every known handle-only
-        // predefined format before ever calling GlobalLock on it. (CF_METAFILEPICT IS a real
-        // HGLOBAL — to a small METAFILEPICT struct — so it's left to the normal path below.)
-        const CF_BITMAP: u32 = 2;
-        const CF_PALETTE: u32 = 9;
-        const CF_ENHMETAFILE: u32 = 14;
-        if matches!(fmt, CF_BITMAP | CF_PALETTE | CF_ENHMETAFILE) {
-            return None;
-        }
+    /// Copy one enumerated clipboard format or refuse the entire snapshot if it cannot be read.
+    unsafe fn snapshot_one(fmt: u32, remaining: usize) -> Result<Option<Vec<u8>>, ()> {
+        // SAFETY: OpenClipboard is held by the caller; this handle remains clipboard-owned.
         let h = GetClipboardData(fmt); // owned by the clipboard — do NOT free.
         if h.is_null() {
-            return None;
+            return Err(());
         }
+        // SAFETY: the format classifier excluded known GDI handle formats; clipboard-owned HGLOBAL remains valid while open.
         let p = GlobalLock(h);
         if p.is_null() {
-            return None;
+            return Err(());
         }
         let size = GlobalSize(h);
+        if size == 0 || size > remaining { GlobalUnlock(h); return Err(()); }
+        // SAFETY: GlobalSize bounds the locked block and `p` is its live address.
         let bytes = std::slice::from_raw_parts(p as *const u8, size).to_vec();
         GlobalUnlock(h);
-        Some(bytes)
+        Ok(Some(bytes))
     }
 
-    /// Replace the clipboard with exactly these formats (empties it first). An empty `Pocket` just
-    /// clears the clipboard.
-    pub fn set_clipboard(p: &Pocket) -> bool {
-        // Serialize this process's clipboard window against every other clipboard user — see
-        // `crate::clipboard` for why there is exactly one process-wide lock.
+    /// Compare the clipboard sequence inside the open transaction immediately before replacing it.
+    pub fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket) -> Result<(), ImpWriteError> {
         let _guard = crate::clipboard::clipboard_guard();
+        let Some(mut output) = prepare(p) else { return Err(ImpWriteError::WriteFailed); };
+        let Some(mut backup) = prepare(rollback) else { return Err(ImpWriteError::WriteFailed); };
+        // SAFETY: output and rollback buffers are prepared before opening; owner remains live until
+        // CloseClipboard, and sequence comparison occurs in the same open transaction.
         unsafe {
-            if !open_clipboard_retry() {
-                return false;
+            let Some(owner) = crate::clipboard::ClipboardOwner::new() else { return Err(ImpWriteError::WriteFailed); };
+            if !open_clipboard_retry(owner.hwnd()) { return Err(ImpWriteError::Busy); }
+            if GetClipboardSequenceNumber() as u64 != expected {
+                CloseClipboard();
+                return Err(ImpWriteError::Changed);
             }
-            EmptyClipboard();
-            for f in &p.formats {
-                let h = GlobalAlloc(GMEM_MOVEABLE, f.bytes.len());
-                if h.is_null() {
-                    continue;
-                }
-                let dst = GlobalLock(h);
-                if dst.is_null() {
-                    GlobalFree(h);
-                    continue;
-                }
-                std::ptr::copy_nonoverlapping(f.bytes.as_ptr(), dst.cast::<u8>(), f.bytes.len());
-                GlobalUnlock(h);
-                // On success the system OWNS the block; on failure we must free it.
-                if SetClipboardData(f.id, h).is_null() {
-                    GlobalFree(h);
-                }
+            if EmptyClipboard() == 0 {
+                CloseClipboard();
+                return Err(ImpWriteError::WriteFailed);
             }
+            let installed = install(&mut output);
+            let rolled_back = installed || (EmptyClipboard() != 0 && install(&mut backup));
             CloseClipboard();
-            true
+            if installed { Ok(()) }
+            else if rolled_back { Err(ImpWriteError::WriteFailed) }
+            else { Err(ImpWriteError::RollbackFailed) }
         }
+    }
+
+    struct Prepared(Vec<(u32, HGLOBAL)>);
+
+    impl Drop for Prepared {
+        fn drop(&mut self) {
+            for (_, handle) in &self.0 {
+                if !handle.is_null() {
+                    // SAFETY: a non-null handle is still locally owned because successful installs
+                    // null it immediately after the OS takes ownership.
+                    unsafe { GlobalFree(*handle); }
+                }
+            }
+        }
+    }
+
+    fn prepare(pocket: &Pocket) -> Option<Prepared> {
+        let mut prepared = Prepared(Vec::with_capacity(pocket.formats.len()));
+        // SAFETY: each allocation is checked, locks are paired with unlocks, and the copy length
+        // is exactly the allocated byte count.
+        unsafe {
+            for format in &pocket.formats {
+                let handle = GlobalAlloc(GMEM_MOVEABLE, format.bytes.len());
+                if handle.is_null() { return None; }
+                let dst = GlobalLock(handle);
+                if dst.is_null() {
+                    GlobalFree(handle);
+                    return None;
+                }
+                std::ptr::copy_nonoverlapping(format.bytes.as_ptr(), dst.cast::<u8>(), format.bytes.len());
+                GlobalUnlock(handle);
+                prepared.0.push((format.id, handle));
+            }
+        }
+        Some(prepared)
+    }
+
+    unsafe fn install(prepared: &mut Prepared) -> bool {
+        for (id, handle) in &mut prepared.0 {
+            // SAFETY: each handle was allocated before the clipboard transaction; on success the
+            // system owns it, so it is nulled before Prepared can be dropped.
+            if SetClipboardData(*id, *handle).is_null() { return false; }
+            *handle = std::ptr::null_mut();
+        }
+        true
     }
 }
 
 #[cfg(not(windows))]
 mod imp {
     use super::{ClipState, Pocket};
-    pub fn read_clip_state() -> ClipState {
-        ClipState::Empty
+    pub fn read_clip_snapshot() -> (ClipState, u64) {
+        (ClipState::Empty, 0)
     }
-    pub fn set_clipboard(_p: &Pocket) -> bool {
-        false
+    pub fn set_clipboard_if_sequence(_p: &Pocket, _expected: u64, _rollback: &Pocket) -> Result<(), super::ImpWriteError> {
+        Err(super::ImpWriteError::Busy)
     }
 }
 
@@ -1069,6 +1436,60 @@ mod tests {
                 bytes: utf16le(s),
             }],
         }
+    }
+
+    #[test]
+    fn history_is_bounded_deduped_and_content_free_metadata_is_explicit() {
+        let mut history = VecDeque::new();
+        let first = text_pocket("first");
+        push_history(&mut history, &first);
+        push_history(&mut history, &first);
+        assert_eq!(history.len(), 1, "consecutive duplicate snapshots are collapsed");
+        for i in 0..HISTORY_ITEMS + 4 { push_history(&mut history, &text_pocket(&format!("{i}"))); }
+        assert_eq!(history.len(), HISTORY_ITEMS);
+        assert_eq!(history.front().and_then(Pocket::text).as_deref(), Some("23"));
+        let too_large = Pocket { formats: vec![ClipFormat { id: 0xC001, bytes: vec![0; HISTORY_BYTES + 1] }] };
+        push_history(&mut history, &too_large);
+        assert_eq!(history.len(), HISTORY_ITEMS);
+    }
+
+    #[test]
+    fn pocket_names_reject_windows_devices_and_path_fragments() {
+        for name in ["CON", "nul", "COM1", "lpt9", "..", "a/b", "a\\b"] {
+            assert!(validate_slot_name(name).is_err(), "accepted {name:?}");
+        }
+        assert!(validate_slot_name("notes-2").is_ok());
+        assert!(validate_slot_name("").is_ok());
+    }
+
+    #[test]
+    fn clipboard_format_classifier_skips_only_known_regenerated_derivatives() {
+        assert_eq!(skip_clipboard_derivative(CF_TEXT, &[CF_TEXT, CF_UNICODETEXT]), Ok(true));
+        assert_eq!(skip_clipboard_derivative(CF_DIB, &[CF_DIB, CF_DIBV5]), Ok(true));
+        assert_eq!(skip_clipboard_derivative(2, &[2, CF_DIB]), Ok(true));
+        assert_eq!(skip_clipboard_derivative(2, &[2]), Err(()));
+        assert_eq!(skip_clipboard_derivative(14, &[14]), Err(()));
+        assert_eq!(skip_clipboard_derivative(0xC001, &[0xC001]), Ok(false));
+    }
+
+    #[test]
+    fn delayed_persistence_cannot_overwrite_newer_data_or_resurrect_deleted_slots() {
+        let _r = crate::authoring::test_run_root();
+        let slot = format!("race-{}-{}", std::process::id(), next_slot_revision());
+        let old = text_pocket("old snapshot");
+        testclip::seed_slot(&slot, old.clone(), true);
+        let old_revision = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner)[&slot].revision;
+        let staged = stage_disk(&slot, &old).unwrap().unwrap();
+
+        let newer = text_pocket("newer snapshot");
+        testclip::seed_slot(&slot, newer.clone(), true);
+        let new_revision = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner)[&slot].revision;
+        persist_if_current(&slot, new_revision, &newer).unwrap();
+        assert_eq!(parse_disk(&read_disk_bounded(&disk_path(&slot)).unwrap()).unwrap().1, newer);
+
+        assert!(delete(&slot).unwrap());
+        commit_staged_if_current(&slot, old_revision, &old, Some(staged)).unwrap();
+        assert!(!disk_path(&slot).exists(), "an old writer must not recreate a deleted durable slot");
     }
 
     #[test]
@@ -1259,7 +1680,7 @@ mod tests {
 
         let reader_a = std::thread::spawn(|| {
             for _ in 0..ITERS {
-                let _ = imp::read_clip_state();
+                let _ = read_clip_state();
             }
         });
         let reader_b = std::thread::spawn(|| {

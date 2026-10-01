@@ -30,3 +30,35 @@ static CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn clipboard_guard() -> std::sync::MutexGuard<'static, ()> {
     CLIPBOARD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// A valid owner HWND for clipboard writes. Windows rejects `SetClipboardData` when the
+/// clipboard was opened with a null owner; this short-lived hidden system-class window belongs
+/// to the calling thread and lives until the clipboard is closed.
+#[cfg(windows)]
+pub(crate) struct ClipboardOwner(windows_sys::Win32::Foundation::HWND);
+
+#[cfg(windows)]
+impl ClipboardOwner {
+    pub(crate) fn new() -> Option<Self> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW;
+        const STATIC: &[u16] = &[b'S' as u16, b'T' as u16, b'A' as u16, b'T' as u16, b'I' as u16, b'C' as u16, 0];
+        // SAFETY: STATIC is NUL-terminated, the parent is the documented HWND_MESSAGE sentinel,
+        // and all other pointers are null because the built-in STATIC class needs no parameters.
+        let hwnd = unsafe {
+            CreateWindowExW(0, STATIC.as_ptr(), STATIC.as_ptr(), 0, 0, 0, 0, 0,
+                -3isize as _, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null())
+        };
+        (!hwnd.is_null()).then_some(Self(hwnd))
+    }
+
+    pub(crate) fn hwnd(&self) -> windows_sys::Win32::Foundation::HWND { self.0 }
+}
+
+#[cfg(windows)]
+impl Drop for ClipboardOwner {
+    fn drop(&mut self) {
+        // SAFETY: this HWND is created by `new`, remains valid through CloseClipboard, and is
+        // destroyed exactly once on the same calling thread.
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.0); }
+    }
+}
