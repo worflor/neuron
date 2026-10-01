@@ -61,6 +61,10 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+base64 = "0.22"
+csv = "1.3"
+regex = "1.11"
+png = "0.17"
 
 # The Woflo Labs Engram trajectory codec, included under its own terms — the rhythm
 # familiar's brain in KNOCKBACK: every exchange is an Engram block; the twin's knockback is
