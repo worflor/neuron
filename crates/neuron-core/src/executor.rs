@@ -16,11 +16,6 @@ use std::time::{Duration, Instant};
 
 pub trait IntentRunner {
     fn run_intent(&mut self, intent: &Intent) -> String;
-
-    /// Embedding runtimes may provide typed receipts around reversible host actions.
-    fn run_host_action(&mut self, _action: &Action, _ctx: &Context) -> Option<String> {
-        None
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -193,9 +188,9 @@ impl DispatchExecutor {
         if let Some(intent) = action.intent() {
             intents.run_intent(&intent)
         } else if let Some((_cps, inner)) = action.turbo() {
-            intents.run_host_action(inner, &ctx).unwrap_or_else(|| inner.run_ctx(&ctx))
+            inner.run_ctx(&ctx)
         } else {
-            intents.run_host_action(action, &ctx).unwrap_or_else(|| action.run_ctx(&ctx))
+            action.run_ctx(&ctx)
         }
     }
 
@@ -217,10 +212,10 @@ impl DispatchExecutor {
         if let Some(intent) = action.intent() {
             intents.run_intent(&intent)
         } else if let Some((cps, inner)) = action.turbo() {
-            let r = intents.run_host_action(inner, ctx).unwrap_or_else(|| inner.run_ctx(ctx));
+            let r = inner.run_ctx(ctx);
             format!("turbo {cps}cps (single press): {r}")
         } else {
-            intents.run_host_action(action, ctx).unwrap_or_else(|| action.run_ctx(ctx))
+            action.run_ctx(ctx)
         }
     }
 
