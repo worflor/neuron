@@ -29,12 +29,15 @@
 
 use crate::effects::{Blend, Param, ParamKind};
 use crate::lighting::Rgb;
-use crate::spectrum::{self, Motion, Palette, Spectrum, Stop};
+use crate::spectrum::{self, Ease, Loop, Motion, Palette, Spectrum, Stop, Frame};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
 use std::sync::OnceLock;
 use std::time::Instant;
+
+mod life;
+use life::Life;
 
 // ─────────────────────────────────────── Field & Pattern ─────────────────────────────────
 
@@ -220,6 +223,9 @@ pub trait Pattern: Send {
     /// from the layer's region ([`Bounds::from_region`]) and calls this once per tick before [`field`]
     /// (`Pattern::field`), so a bounds-aware pattern always sees its current rect.
     fn set_bounds(&mut self, _b: Bounds) {}
+
+    /// Receive the exact row-major layer mask when a pattern's dynamics use its true footprint.
+    fn set_visible_region(&mut self, _region: &[u32], _rows: u8, _cols: u8) {}
 
     /// Emit this tick's field for a `rows`×`cols` matrix at elapsed time `t` (seconds).
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field;
@@ -630,6 +636,16 @@ static REGISTRY: &[PatternDef] = &[
         },
         has_spectrum: true,
         readout: true,
+    },
+    PatternDef {
+        key: "life",
+        label: "Life",
+        make: || Box::new(Life::default()),
+        params: || vec![speed_param(), density_param()],
+        default_spectrum: life_spectrum,
+        tile: TileMeta { live_input: false },
+        has_spectrum: true,
+        readout: false,
     },
 ];
 
@@ -2925,6 +2941,23 @@ impl Pattern for SignalLight {
 // Each is a fn so the registry table stays `const` (Spectrum allocates). Presets ([`presets`]) override
 // these with their own spectra.
 
+fn life_spectrum() -> Spectrum {
+    let palettes = [
+        [Rgb::new(12, 45, 34), Rgb::new(67, 190, 116), Rgb::new(206, 229, 128)],
+        [Rgb::new(16, 53, 79), Rgb::new(32, 178, 172), Rgb::new(203, 231, 171)],
+        [Rgb::new(78, 37, 28), Rgb::new(209, 105, 44), Rgb::new(233, 194, 96)],
+        [Rgb::new(21, 34, 72), Rgb::new(89, 151, 207), Rgb::new(223, 238, 248)],
+    ];
+    let frames = palettes.into_iter().map(|colors| {
+        let mut frame = Frame::new(Palette::new(vec![Stop::new(colors[0], 0.0), Stop::new(colors[1], 0.5), Stop::new(colors[2], 1.0)], Motion::Hold));
+        frame.hold = 13.0;
+        frame.fade = 3.0;
+        frame.ease = Ease::Smooth;
+        frame
+    }).collect();
+    Spectrum::sequence(frames, Loop::Loop)
+}
+
 /// Fire's ember→white incandescent ramp (the colour `Heat`'s `u = heat` samples).
 fn fire_spectrum() -> Spectrum {
     Spectrum::from_palette(Palette::new(
@@ -3021,7 +3054,7 @@ impl Preset {
     pub fn group(&self) -> &'static str {
         if pattern_is_readout(self.pattern) || matches!(self.pattern, "meter" | "screen") {
             "data"
-        } else if pattern_def(self.pattern).is_some_and(|d| d.tile.live_input) {
+        } else if self.source == "keys" || pattern_def(self.pattern).is_some_and(|d| d.tile.live_input) {
             "input"
         } else {
             "effect"
@@ -3098,6 +3131,8 @@ pub fn presets() -> Vec<Preset> {
             blurb: "wears the colour a Chroma game is painting, effects and all", source: "game" },
         Preset { slug: "signal", label: "Signal", pattern: "signal", params: pp_none, spectrum: sp_pulse,
             blurb: "a light your macros drive: neuron.signal(n, v)", source: "macros" },
+        Preset { slug: "wildlife", label: "Wildlife", pattern: "life", params: pp_none, spectrum: life_spectrum,
+            blurb: "a seasonal cellular habitat shaped by your typing", source: "keys" },
     ]
 }
 
@@ -3247,6 +3282,7 @@ impl Compositor {
             // region mask below still gives the exact-shape transparency; this only sizes the drawing.
             let bbox = Bounds::from_region(&layer.region, rows, cols);
             layer.pattern.set_bounds(bbox);
+            layer.pattern.set_visible_region(&layer.region, rows, cols);
             let field = layer.pattern.field(rows, cols, t);
             if field.len() != n {
                 continue; // a misbehaving pattern can't corrupt the stack
@@ -3708,7 +3744,7 @@ mod tests {
         for k in ["vitals", "onair", "miclight", "modeheld", "gamelight", "signal"] {
             assert!(keys.contains(&k), "registry is missing the '{k}' readout");
         }
-        assert_eq!(keys.len(), 20, "the thirteen shapes + the custom frame layer + the six readouts");
+        assert_eq!(keys.len(), 21, "the registered patterns including custom frame and readouts");
     }
 
     // ── presets are pure, valid data (the tile grid) ────────────────────────────────────────────
@@ -3777,6 +3813,7 @@ mod tests {
             ("modeheld", "data"),
             ("gamelight", "data"),
             ("signal", "data"),
+            ("wildlife", "input"),
         ];
         let ps = presets();
         assert_eq!(

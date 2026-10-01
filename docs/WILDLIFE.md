@@ -1,9 +1,9 @@
 > **kind:** feature design + implementation brief — the Wildlife lighting pattern
 > (`life`).
 >
-> **status:** DESIGNED, NOT IMPLEMENTED. Nothing described here exists in the tree.
-> This document is the spec the implementation must satisfy and the tests must
-> protect. Do not read it as a description of current behaviour.
+> **status:** IMPLEMENTED in `neuron-core`, the pattern registry, preset catalog and CLI docs.
+> The automated software checks pass. The visual result remains unverified on real
+> hardware; this brief records the intended behavior and test contract, not a hardware grade.
 >
 > **provenance:** drafted with LLM assistance (October 2026), then red-teamed
 > against the live sources and independently probed (Life mathematics, input

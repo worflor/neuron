@@ -847,6 +847,13 @@ pub fn vk_to_control(vk: i32) -> Option<(u16, u16)> {
         v @ 0x31..=0x39 => (0x07, (v - 0x31) as u16 + 0x1E), // '1'..'9'
         v @ 0x41..=0x5A => (0x07, (v - 0x41) as u16 + 0x04), // 'A'..'Z'
         v @ 0x70..=0x7B => (0x07, (v - 0x70) as u16 + 0x3A), // F1..F12
+        0x60 => (0x07, 0x62),                               // Numpad 0
+        v @ 0x61..=0x69 => (0x07, (v - 0x61) as u16 + 0x59), // Numpad 1..9
+        0x6A => (0x07, 0x55),                               // Numpad multiply
+        0x6B => (0x07, 0x57),                               // Numpad add
+        0x6D => (0x07, 0x56),                               // Numpad subtract
+        0x6E => (0x07, 0x63),                               // Numpad decimal
+        0x6F => (0x07, 0x54),                               // Numpad divide
         0x08 => (0x07, 0x2A),                                // Backspace
         0x09 => (0x07, 0x2B),                                // Tab
         0x0D => (0x07, 0x28),                                // Enter
@@ -904,6 +911,13 @@ pub fn control_to_vk(page: u16, usage: u16) -> Option<i32> {
             u @ 0x1E..=0x26 => i32::from(u - 0x1E) + 0x31,
             u @ 0x04..=0x1D => i32::from(u - 0x04) + 0x41,
             u @ 0x3A..=0x45 => i32::from(u - 0x3A) + 0x70,
+            u @ 0x59..=0x61 => i32::from(u - 0x58) + 0x60,
+            0x62 => 0x60,
+            0x63 => 0x6E,
+            0x54 => 0x6F,
+            0x55 => 0x6A,
+            0x56 => 0x6D,
+            0x57 => 0x6B,
             0x2A => 0x08,
             0x2B => 0x09,
             0x28 => 0x0D,
@@ -1039,6 +1053,12 @@ pub(crate) fn note_held(
     let mut set = hits.to_vec();
     normalize_hits(&mut set);
     let mut g = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if stream == Stream::Keyboard || stream == Stream::RawInput {
+        let prior = g.iter().find(|(s, _, _)| s == source).map(|(_, prior_pid, prior_hits)| (*prior_pid, prior_hits.clone()));
+        for (edge_pid, page, usage, down) in held_key_edges(prior, pid, &set) {
+            crate::capture::observe_key_edge(edge_pid, page, usage, down);
+        }
+    }
     let mut changed = false;
     match g.iter_mut().position(|(s, _, _)| s == source) {
         Some(i) if set.is_empty() => {
@@ -1070,6 +1090,47 @@ pub(crate) fn note_held(
         crate::capture::note_key_transition();
     }
     publish_control_observation(pid, stream, &set);
+}
+
+fn held_key_edges(
+    prior: Option<(Option<crate::registry::CanonicalPid>, Vec<(u16, u16)>)>,
+    pid: Option<crate::registry::CanonicalPid>,
+    hits: &[(u16, u16)],
+) -> Vec<(Option<crate::registry::CanonicalPid>, u16, u16, bool)> {
+    let old_pid = prior.as_ref().and_then(|(old_pid, _)| *old_pid);
+    let same_device = old_pid == pid;
+    let old = prior.as_ref().map_or_else(Vec::new, |(_, previous)| {
+        if same_device { previous.iter().copied().filter(|(page, _)| *page == 0x07).collect() } else { Vec::new() }
+    });
+    let new: Vec<_> = hits.iter().copied().filter(|(page, _)| *page == 0x07).collect();
+    let mut edges = Vec::new();
+    if let Some((previous_pid, previous)) = prior {
+        for &(page, usage) in previous.iter().filter(|(page, _)| *page == 0x07) {
+            if !same_device || !new.contains(&(page, usage)) {
+                edges.push((previous_pid, page, usage, false));
+            }
+        }
+    }
+    for &(page, usage) in &new {
+        if !old.contains(&(page, usage)) { edges.push((pid, page, usage, true)); }
+    }
+    edges
+}
+
+#[cfg(test)]
+mod held_observation_tests {
+    use super::held_key_edges;
+
+    #[test]
+    fn held_set_differences_emit_only_keyboard_downs_releases_and_device_replacements() {
+        let pid_a = Some(crate::registry::CanonicalPid::of(0x7A71));
+        let pid_b = Some(crate::registry::CanonicalPid::of(0x7A72));
+        let first = held_key_edges(None, pid_a, &[(0x07, 0x04), (0x09, 1)]);
+        assert_eq!(first, [(pid_a, 0x07, 0x04, true)]);
+        assert!(held_key_edges(Some((pid_a, vec![(0x07, 0x04)])), pid_a, &[(0x07, 0x04)]).is_empty());
+        assert_eq!(held_key_edges(Some((pid_a, vec![(0x07, 0x04)])), pid_a, &[]), [(pid_a, 0x07, 0x04, false)]);
+        assert_eq!(held_key_edges(Some((pid_a, vec![(0x07, 0x04)])), pid_b, &[(0x07, 0x05)]), [(pid_a, 0x07, 0x04, false), (pid_b, 0x07, 0x05, true)]);
+    }
 }
 
 /// The canonical source identity for a device path — the one transformation between "the pid this
