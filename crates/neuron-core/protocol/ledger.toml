@@ -1820,12 +1820,13 @@ dialect = "razer"
 kind = "get"
 class = 0x02
 id = 0x84
-layout = "-> [count 0x1E, button ids ...]; thumb grid 0x40..0x4B"
+layout = "-> [count 0x1E, button ids ...]; twelve-button bank 0x40..0x4B, six-button bank 0x50..0x55"
 meaning = "Physical button-id table (30 entries); `neuron button read --all` walks it."
 devices = ["00a8"]
 grade = "live"
 evidence = [
   { kind = "live", date = "2026-07-22", what = "30-entry table; side buttons 0x40..0x4B" },
+  { kind = "live", date = "2026-10-02", what = "Naga 00a8 (dongle): table contains both 0x40..0x4B and 0x50..0x55 simultaneously. Read-only button read --all; six-button bank omitted from the curated definition before this observation." },
 ]
 
 [[fact]]
@@ -1840,6 +1841,7 @@ devices = ["00a7", "00a8"]
 grade = "live"
 evidence = [
   { kind = "live", date = "2026-09-29", what = "Naga 00a7 (cable), 12-button plate: [00, 4B, 00, 02, 02, 00, 0A, 00, 00, 00] accepted, 02/8C read it back, and the physical '=' thumb key typed 'g' (firmware emission, no host hook); the neighbouring key stayed stock. Survived a side-plate swap. Restored with the original record [00 4B 00 02 01 00 2E ...], read back exact." },
+  { kind = "live", date = "2026-10-02", what = "Naga 00a8 (dongle), profile 0: resident planner wrote six-button ids 0x50..0x55 and verified each through 02/8C. Independent button read --all returned [02,02,00,usage,00,00,00] for H/F24/F23/LeftShift/W/H; ids 0x40..0x45 returned the same records. Hardware read-back verified; physical key emission was not sampled." },
   { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L60-L64", what = "Naga V2 Pro set/get ids, size 0x0A, profile 0 direct" },
   { kind = "source", src = "naga-companion", at = "docs/superpowers/specs/2026-06-21-naga-button-remap-design.md#L4-L5", what = "spike run 2026-07-11 PASS: grid ids 0x40..0x4B, volatile profile-0 writes apply instantly" },
   { kind = "source", src = "naga-web-setup", at = "apps/naga-configurator/naga-webhid.js#L458-L487", what = "Naga V2 Pro write, profile 1, read-back verified" },
@@ -1864,6 +1866,7 @@ devices = ["00a8"]
 grade = "live"
 evidence = [
   { kind = "live", date = "2026-09-29", what = "Naga 00a8, profiles 0 and 1: [p, 40, 00] -> [p, 40, 00, 02, 01, 00, 1e]; 0x41 -> usage 1f; 0x4B -> usage 2e. Keyboard category, the stock digits the thumb grid physically emits." },
+  { kind = "live", date = "2026-10-02", what = "Naga 00a8 (dongle), direct profile 0: 0x50..0x55 each read [02,01,00,usage,00,00,00], usages 0x1E..0x23 (1..6). At the same time 0x40..0x45 already held H/F24/F23/Shift/W/Ctrl from the resident planner. Separate banks explain unchanged six-plate keys despite successful twelve-bank read-back." },
   { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L153-L179", what = "Naga V2 Pro read" },
   { kind = "source", src = "naga-web-setup", at = "apps/naga-configurator/naga-webhid.js#L493-L505", what = "Naga V2 Pro read" },
   { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L191-L203", what = "V3 Pro/35K reply offset differs" },
