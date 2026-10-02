@@ -1,14 +1,12 @@
 ---
 name: neuron-lazy-update
-description: Install, update, restore a portable update, or uninstall neuron (the no-account Razer control app with a Windows app and CLI release; Linux builds from source), drive its `neuron` CLI safely, and answer questions about it. Use when a user asks to install or update neuron, check which version they have, change a device setting through the CLI, fix a neuron problem, or asks how neuron works. A bundled script handles release updates and reports plain status lines.
+description: Operate, maintain, troubleshoot, and explain Neuron. Use for general Neuron questions, status and version checks, installation, updates, rollback, removal, and investigating problems with the app, CLI, devices, or configuration.
 ---
 
-# neuron: install and update
+# Using and maintaining Neuron
 
-This skill covers installation, updates, CLI use, and common questions.
-
-You don't need to be clever here. Follow the steps, read the status lines the script prints, and
-stop when it tells you to.
+Start with the user's goal and the installed build. Use the references below
+for the relevant commands, release workflow, and product evidence.
 
 ## Pick the right file
 
@@ -18,20 +16,22 @@ stop when it tells you to.
 | change a setting, read a device, or run any `neuron` command | [cli.md](cli.md) |
 | know how something works, or whether it's supported | [answers.md](answers.md) |
 | says something didn't work, or asks why something is the way it is | [issues.md](issues.md) |
+| author or revise a Python macro, beacon, or action-specific macro | [neuron-macros](../neuron-macros/SKILL.md) |
+| author bindings, cast, lighting, profiles, or a complete CLI setup | [neuron-cli](../neuron-cli/SKILL.md) |
 
 Read only the file you need.
 
 ## The loop
 
-Every task in this skill runs the same loop. Don't skip steps.
+For questions, inspect the relevant evidence and answer. For changes:
 
 1. **Check.** Look before touching anything: run the read-only step (`-Action check`, or a
    read-only CLI command).
 2. **Report.** Tell the user what you found in one or two plain sentences, including any `FLAG:`
    lines.
-3. **Confirm.** Say exactly what you're about to do and get a yes. Updating closes neuron, and
-   device commands change hardware.
-4. **Act.** Run the one step you confirmed.
+3. **Establish scope.** Match the operation to the user's request. If the change needs additional
+   authorization, explain the specific effect and ask. Updating closes Neuron; device writes change hardware.
+4. **Act.** Run the authorized operation.
 5. **Verify.** Read the result back: the script's final `RESULT:` line, or re-read the setting
    you changed.
 6. **Report.** Say what happened, including anything that didn't go to plan.
@@ -39,9 +39,7 @@ Every task in this skill runs the same loop. Don't skip steps.
 If step 5 doesn't match what you expected, stop and tell the user. Don't try a different command
 to force it.
 
-## Hard rules
-
-These are not judgement calls.
+## Operating constraints
 
 1. **`RESULT: blocked`, or any `FLAG` marked `(STOP)`, means stop.** Show the user the lines. Never
    work around a checksum or attestation failure, and never retry with different flags to get past
@@ -52,12 +50,12 @@ These are not judgement calls.
 3. **Never do these unless the user asks for that exact thing:** arm input, use `--persist`, run
    `neuron-app.exe --purge-synapse`, pass `-AllowDowngrade`, run a macro file, or file an issue.
    Filing is an offer you make once. Only file after the user has approved the exact text.
-4. **Don't invent commands or flags.** If you're unsure, run `neuron.exe <command> --help` and use
-   what it says.
-5. **When you're unsure, ask the user.** A wrong guess here changes someone's hardware or setup.
+4. **Use the installed command interface.** Read `neuron <command> --help` for exact commands and flags.
+5. **Resolve uncertainty before changing the setup.** Inspect commands and read-only state first;
+   ask the user for missing intent or information that affects the operation.
 
 ## Reporting what you notice
 
 Tell the user about anything odd, even if the task succeeded: a `FLAG` line, a command that printed
 a warning, a device missing from `neuron list`, a version that didn't change. One sentence each is
-enough. Noticing is part of the job.
+enough.

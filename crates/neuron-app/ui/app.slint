@@ -656,6 +656,7 @@ export component AppWindow inherits Window {
                             // of just an empty popup.
                             if g.id == State.guide-active-id && g.tabs.length > 0 : activetab := VerticalLayout {
                                 spacing: 18px;
+                                padding-bottom: g.tabs.length > 1 ? 36px : 0px;
                                 // the tab this guide is showing, clamped in case a stale index ever
                                 // outlives its guide (guide-toggle already resets it to 0 on open).
                                 property <int> tab-idx: clamp(State.guide-active-tab, 0, g.tabs.length - 1);

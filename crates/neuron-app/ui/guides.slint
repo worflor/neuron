@@ -66,7 +66,7 @@ export global GuideContent {
                             blocks: [
                                 { code: false, text: "A macro is a Python function. It runs every time you press the control you bind it to." },
                                 { code: true, text: "def macro(ctx):\n    neuron.type_text(\"on my way!\")" },
-                                { code: false, text: "Paste it, bind it on this page, press the key. The Workshop tests disarmed: you see everything a macro would do, but nothing actually types or clicks. You can't break anything while you learn." },
+                                { code: false, text: "Paste it, bind it on this page, press the key. Workshop tests mock Neuron helpers: nothing types or clicks. Direct Python effects in RAW macros still run." },
                             ],
                         },
                         {
@@ -80,8 +80,8 @@ export global GuideContent {
                         {
                             head: "Your third macro: hit an API",
                             blocks: [
-                                { code: false, text: "The runtime is full CPython with the whole stdlib: urllib, sockets, json, subprocess. Any API you can reach, a keypress can hit." },
-                                { code: true, text: "def macro(ctx):\n    import urllib.request\n    r = urllib.request.urlopen(\n        \"https://wttr.in/?format=%t\")\n    neuron.notify(r.read().decode())" },
+                                { code: false, text: "BOUND is the default. Direct HTTP, files, or subprocesses need a RAW macro: add # neuron: raw in the leading comment header. These effects also run in Workshop tests." },
+                                { code: true, text: "# neuron: raw\ndef macro(ctx):\n    import urllib.request\n    with urllib.request.urlopen(\n        \"https://wttr.in/?format=%t\",\n        timeout=10) as r:\n        neuron.notify(r.read().decode())" },
                                 { code: false, text: "The weather, on a mouse button. Swap the URL for your CI, your home server, a webhook: notify() puts the answer on screen without stealing focus." },
                             ],
                         },
@@ -138,7 +138,7 @@ export global GuideContent {
                             head: "No code, or no limits",
                             blocks: [
                                 { code: false, text: "Every macro is also a drag-and-drop block tree, for whenever you'd rather skip Python entirely, and it converts back to code without losing anything." },
-                                { code: false, text: "Underneath, it's real CPython running in its own process: import anything, open files and sockets, call Win32 through ctypes, spawn threads, even loop forever as a watcher (a busy macro only ever blocks its own queue). No pip in the bundled runtime: point NEURON_PYTHON at your own interpreter, or sys.path.append a folder. A crash only takes down the sidecar, which respawns; your input never stutters. The helpers respect SAFE mode; raw ctypes is your own rope." },
+                                { code: false, text: "RAW macros run ordinary CPython in a separate process: files, sockets, native libraries, and watchers. No pip in the bundled runtime: point NEURON_PYTHON at your own interpreter. Neuron helpers respect SAFE mode; direct RAW effects do not. Use timeouts for external calls." },
                             ],
                         },
                     ],
@@ -178,7 +178,32 @@ export global GuideContent {
                             head: "POST to a webhook, with a body",
                             blocks: [
                                 { code: false, text: "The weather example a tab over only reads. Sending is the same urllib, just with a body and a Request object standing in for a bare URL. Add a Content-Type header too if the endpoint you're hitting is picky about it." },
-                                { code: true, text: "def macro(ctx):\n    import urllib.request as u, json\n    data = json.dumps({\"ok\": 1}).encode()\n    url = \"https://your-webhook-url\"\n    u.urlopen(u.Request(url, data=data))" },
+                                { code: true, text: "# neuron: raw\ndef macro(ctx):\n    import urllib.request as u, json\n    data = json.dumps({\"ok\": 1}).encode()\n    url = \"https://your-webhook-url\"\n    with u.urlopen(u.Request(url, data=data),\n                   timeout=10) as r:\n        r.read()" },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    label: "IN ACTIONS",
+                    sections: [
+                        {
+                            head: "Macros for use in actions",
+                            blocks: [
+                                { code: false, text: "Clipboard Transform sends the text at that step as ctx.clipboard. Your macro returns the replacement text." },
+                                { code: true, text: "def macro(ctx):\n    text = ctx.clipboard or \"\"\n    return \" \".join(text.split())" },
+                                { code: false, text: "Save in Workshop, then choose Clipboard Transform → Python macro → your macro → + add macro. Native steps can run before or after it; one macro per chain." },
+                            ],
+                        },
+                        {
+                            head: "Return the result",
+                            blocks: [
+                                { code: false, text: "Return a string, even \"\". Printing or typing text isn't a result. An error or non-text return keeps the clipboard unchanged. Copying something else while it runs discards the result." },
+                            ],
+                        },
+                        {
+                            head: "Use your own model",
+                            blocks: [
+                                { code: false, text: "For an LLM, decision model, or HTTP call, add # neuron: raw to the file's leading comments. Send ctx.clipboard, set a request timeout, and return the response text. Direct RAW calls also run in Workshop tests." },
                             ],
                         },
                     ],
