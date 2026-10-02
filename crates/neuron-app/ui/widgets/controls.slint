@@ -1103,16 +1103,23 @@ export component ClipboardTransformEditor inherits VerticalLayout {
     property <[string]> kinds: ["literal", "digits", "word", "until-delimiter"];
     in-out property <int> selected-kind: 1;
     in-out property <int> selected-operation: 0;
-    property <[string]> operation-ids: ["uppercase", "lowercase", "titlecase", "trim", "trim-lines", "lines-reverse", "lines-sort", "lines-unique", "json-pretty", "json-compact", "csv-to-json", "json-to-csv", "base64-encode", "base64-decode", "url-encode", "url-decode", "regex"];
-    property <[string]> operation-labels: ["Uppercase", "Lowercase", "Title case", "Trim", "Trim lines", "Reverse lines", "Sort lines", "Unique lines", "JSON pretty", "JSON compact", "CSV → JSON", "JSON → CSV", "Base64 encode", "Base64 decode", "URL encode", "URL decode", "Regex replace"];
+    property <[string]> operation-ids: ["uppercase", "lowercase", "titlecase", "trim", "trim-lines", "lines-reverse", "lines-sort", "lines-unique", "json-pretty", "json-compact", "csv-to-json", "json-to-csv", "base64-encode", "base64-decode", "url-encode", "url-decode", "regex", "macro"];
+    property <[string]> operation-labels: ["Uppercase", "Lowercase", "Title case", "Trim", "Trim lines", "Reverse lines", "Sort lines", "Unique lines", "JSON pretty", "JSON compact", "CSV → JSON", "JSON → CSV", "Base64 encode", "Base64 decode", "URL encode", "URL decode", "Regex replace", "Python macro"];
     property <string> selected-operation-id: root.operation-ids[root.selected-operation];
     spacing: 5px;
 
     HorizontalLayout {
         spacing: 5px;
         Picker { options: root.operation-labels; index: root.selected-operation; changed(index) => { root.selected-operation = index; } }
-        if root.selected-operation-id != "regex" : Button { text: "+ add"; clicked => { State.append-clipboard-operation(root.selected-operation-id, "", ""); } }
+        if root.selected-operation-id != "regex" && root.selected-operation-id != "macro" : Button { text: "+ add"; clicked => { State.append-clipboard-operation(root.selected-operation-id, "", ""); } }
+        if root.selected-operation-id == "macro" : Button { text: "+ add macro"; enabled: State.clipboard-macros.length > 0; clicked => { State.append-clipboard-operation("macro", State.clipboard-macros[State.clipboard-macro-index], ""); } }
         Text { text: "ordered · max 32"; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; horizontal-stretch: 1; }
+    }
+    if root.selected-operation-id == "macro" : HorizontalLayout {
+        spacing: 5px;
+        if State.clipboard-macros.length > 0 : Picker { options: State.clipboard-macros; index: State.clipboard-macro-index; changed(index) => { State.clipboard-macro-index = index; } }
+        if State.clipboard-macros.length == 0 : Text { text: "no saved macros"; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
+        Text { text: "ctx.clipboard → return text"; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
     }
     for operation[index] in State.clipboard-operations : HorizontalLayout {
         spacing: 4px;

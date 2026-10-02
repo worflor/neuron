@@ -213,8 +213,11 @@ their contents; `pocket --history-item INDEX` explicitly prints one item's text,
 because the one-shot process exits after the operation.
 
 Clipboard text actions use `clipboard-transform` with a JSON array of ordered operations, for
-example `[{"op":"trim"},{"op":"uppercase"}]`; supported operations are listed by
-`action list`. `pocket-history` restores a newest-first history index. `screenshot` captures the
+example `[{"op":"trim"},{"op":"uppercase"}]`; a stored Python macro can join the same chain,
+for example `[{"op":"macro","id":"rewrite"}]`. It receives the current intermediate text as
+`ctx.clipboard` and must return a Python `str` (an empty string is allowed). One macro operation is
+allowed per transform; macro-backed transforms run asynchronously and require input to be armed.
+Supported operations are listed by `action list`. `pocket-history` restores a newest-first history index. `screenshot` captures the
 virtual desktop by default, or accepts `window` / `region`; a typed JSON `Screenshot` action may
 also set an explicit PNG `path` and `clipboard` destination. The native screenshot action is
 Windows-only. Headless CLI/daemon screen and window captures report their completion to stderr;

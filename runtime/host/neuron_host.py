@@ -748,18 +748,26 @@ _EPHEMERAL_MAX = 4
 _ephemeral_slots = threading.BoundedSemaphore(_EPHEMERAL_MAX)
 
 
-def _fire_callable(mid, fn, ctx, opts, mock=False, authorized=False, arm_generation=0):
+def _fire_callable(mid, fn, ctx, opts, mock=False, authorized=False, arm_generation=0, contract=None):
     _nh._set_ctx(ctx)
     _nh._set_mid(mid)
     _nh._set_options(opts)
     _nh._set_mock(mock)   # set FRESH every fire so a real fire never inherits a prior test's mock
     _nh._set_authority(authorized, arm_generation)
+    if contract == "clipboard-text-v1" and not authorized and not mock:
+        return False, None, "clipboard transform [disarmed]"
     cap = io.StringIO()
     _stdout_mux._local.target = cap
     try:
         rv = fn(_nh._get_ctx())
         out = cap.getvalue()
         tail = out[-4096:] if out else None
+        if contract == "clipboard-text-v1":
+            if type(rv) is not str:
+                return False, None, "clipboard transform macro must return a string"
+            if len(rv.encode("utf-8")) > 1024 * 1024:
+                return False, None, "clipboard transform output exceeds 1048576 bytes"
+            return True, rv, tail
         return True, (str(rv) if rv is not None else None), tail
     except BaseException:
         return False, None, traceback.format_exc()
@@ -767,7 +775,7 @@ def _fire_callable(mid, fn, ctx, opts, mock=False, authorized=False, arm_generat
         _stdout_mux._local.target = None
 
 
-def _fire(mid, generation, ctx, opts, mock=False, authorized=False, arm_generation=0):
+def _fire(mid, generation, ctx, opts, mock=False, authorized=False, arm_generation=0, contract=None):
     fn = _macros.get(mid)
     if fn is None:
         return False, None, _errors.get(mid, "macro '%s' not registered" % mid)
@@ -777,7 +785,7 @@ def _fire(mid, generation, ctx, opts, mock=False, authorized=False, arm_generati
             "macro '%s' fire was queued for generation %s; active generation is %s"
             % (mid, generation, active)
         )
-    return _fire_callable(mid, fn, ctx, opts, mock, authorized, arm_generation)
+    return _fire_callable(mid, fn, ctx, opts, mock, authorized, arm_generation, contract)
 
 
 def _fire_worker(mid, q):
@@ -796,9 +804,11 @@ def _fire_worker(mid, q):
                     bool(msg.get("mock")),
                     bool(msg.get("authorized")),
                     int(msg.get("arm_generation") or 0),
+                    msg.get("contract"),
                 )
                 _send({"t": "result", "rid": msg.get("rid"), "ok": ok,
-                       "value": val, "error": (None if ok else log), "log": (log if ok else None)})
+                       "value": val, "value_type": type(val).__name__ if ok else None,
+                       "error": (None if ok else log), "log": (log if ok else None)})
             finally:
                 _fire_slots.release()
     finally:

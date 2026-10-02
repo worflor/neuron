@@ -36,6 +36,7 @@ pub enum TransformOp {
     UrlEncode,
     UrlDecode,
     Regex { pattern: String, replace: String },
+    Macro { id: String },
 }
 
 /// One named byte range selected in an example string for deterministic regex generation.
@@ -56,6 +57,7 @@ pub enum TransformError {
     OutputTooLarge,
     InvalidText(String),
     InvalidOperation(String),
+    Macro(String),
 }
 
 impl std::fmt::Display for TransformError {
@@ -64,7 +66,7 @@ impl std::fmt::Display for TransformError {
             Self::TooManyOperations => write!(f, "at most {MAX_OPERATIONS} operations are allowed"),
             Self::InputTooLarge => write!(f, "clipboard text exceeds {MAX_TEXT_BYTES} bytes"),
             Self::OutputTooLarge => write!(f, "transform output exceeds {MAX_TEXT_BYTES} bytes"),
-            Self::InvalidText(message) | Self::InvalidOperation(message) => f.write_str(message),
+            Self::InvalidText(message) | Self::InvalidOperation(message) | Self::Macro(message) => f.write_str(message),
         }
     }
 }
@@ -73,20 +75,47 @@ impl std::error::Error for TransformError {}
 
 /// Apply every operation in memory, returning a complete plain-text result or one failure.
 pub fn apply(input: &str, ops: &[TransformOp]) -> Result<String, TransformError> {
+    apply_with(input, ops, |_, _| Err(TransformError::InvalidOperation("macro transforms require the macro host".into())))
+}
+
+/// Apply ordered transforms, delegating the one optional macro operation to a caller.
+pub fn apply_with(
+    input: &str,
+    ops: &[TransformOp],
+    mut run_macro: impl FnMut(&str, &str) -> Result<String, TransformError>,
+) -> Result<String, TransformError> {
     if input.len() > MAX_TEXT_BYTES {
         return Err(TransformError::InputTooLarge);
     }
-    if ops.len() > MAX_OPERATIONS {
-        return Err(TransformError::TooManyOperations);
-    }
+    validate_ops(ops)?;
     let mut current = input.to_owned();
     for op in ops {
-        current = apply_one(&current, op)?;
+        current = match op {
+            TransformOp::Macro { id } => run_macro(id, &current)?,
+            _ => apply_one(&current, op)?,
+        };
         if current.len() > MAX_TEXT_BYTES {
             return Err(TransformError::OutputTooLarge);
         }
     }
     Ok(current)
+}
+
+/// Validate operation count, macro count, and macro identifiers before clipboard access.
+pub fn validate_ops(ops: &[TransformOp]) -> Result<(), TransformError> {
+    if ops.len() > MAX_OPERATIONS { return Err(TransformError::TooManyOperations); }
+    let mut macros = 0;
+    for op in ops {
+        if let TransformOp::Macro { id } = op {
+            macros += 1;
+            crate::macros::macro_host::validate_macro_id(id)
+                .map_err(TransformError::InvalidOperation)?;
+        }
+    }
+    if macros > 1 {
+        return Err(TransformError::InvalidOperation("at most one macro operation is allowed".into()));
+    }
+    Ok(())
 }
 
 pub fn validate_regex(pattern: &str, replace: &str) -> Result<(), TransformError> {
@@ -236,6 +265,7 @@ fn apply_one(input: &str, op: &TransformOp) -> Result<String, TransformError> {
         TransformOp::UrlEncode => url_encode(input),
         TransformOp::UrlDecode => url_decode(input),
         TransformOp::Regex { pattern, replace } => regex_replace(input, pattern, replace),
+        TransformOp::Macro { .. } => Err(TransformError::InvalidOperation("macro transforms require the macro host".into())),
     }
 }
 
@@ -621,6 +651,34 @@ mod tests {
         assert_eq!(apply("a".repeat(MAX_TEXT_BYTES + 1).as_str(), &[]), Err(TransformError::InputTooLarge));
         let expand = TransformOp::Regex { pattern: "(.)".into(), replace: "${1}${1}".into() };
         assert_eq!(apply(&"a".repeat(MAX_TEXT_BYTES), &[expand]), Err(TransformError::OutputTooLarge));
+    }
+
+    #[test]
+    fn macro_operation_runs_in_order_and_is_limited() {
+        let ops = [
+            TransformOp::Uppercase,
+            TransformOp::Macro { id: "rewrite".into() },
+            TransformOp::Trim,
+        ];
+        let output = apply_with(" hi ", &ops, |id, text| {
+            assert_eq!(id, "rewrite");
+            assert_eq!(text, " HI ");
+            Ok(format!("{text}!"))
+        }).unwrap();
+        assert_eq!(output, "HI !");
+        assert!(apply("x", &[TransformOp::Macro { id: "rewrite".into() }]).is_err());
+        assert!(validate_ops(&[
+            TransformOp::Macro { id: "one".into() },
+            TransformOp::Macro { id: "two".into() },
+        ]).is_err());
+        assert!(validate_ops(&[TransformOp::Macro { id: "../bad".into() }]).is_err());
+    }
+
+    #[test]
+    fn macro_errors_and_oversize_results_fail_closed() {
+        let op = [TransformOp::Macro { id: "rewrite".into() }];
+        assert_eq!(apply_with("x", &op, |_, _| Err(TransformError::Macro("failed".into()))), Err(TransformError::Macro("failed".into())));
+        assert_eq!(apply_with("x", &op, |_, _| Ok("x".repeat(MAX_TEXT_BYTES + 1))), Err(TransformError::OutputTooLarge));
     }
 
     #[test]

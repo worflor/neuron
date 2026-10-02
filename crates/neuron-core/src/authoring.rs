@@ -795,10 +795,15 @@ pub fn validate_action(id: &str, param: &str) -> Result<(), String> {
         "clipboard-transform" => {
             let ops = parse_transform_ops(p)?;
             if ops.is_empty() { return Err("clipboard-transform needs at least one operation".into()); }
-            if ops.len() > crate::clipboard_transform::MAX_OPERATIONS { return Err("clipboard-transform allows at most 32 operations".into()); }
+            crate::clipboard_transform::validate_ops(&ops).map_err(|e| e.to_string())?;
             for op in &ops {
                 if let crate::clipboard_transform::TransformOp::Regex { pattern, replace } = op {
                     crate::clipboard_transform::validate_regex(pattern, replace).map_err(|e| e.to_string())?;
+                }
+                if let crate::clipboard_transform::TransformOp::Macro { id } = op {
+                    if !crate::macros::macro_host::list_macros().iter().any(|name| name == id) {
+                        return Err(format!("no macro '{id}' — save + register it first (MACRO · PYTHON)"));
+                    }
                 }
             }
             Ok(())
@@ -3411,6 +3416,30 @@ mod tests {
         assert_eq!(id, "clipboard-transform");
         assert_eq!(serde_json::from_str::<Vec<Op>>(&parameter).unwrap(), ops);
         assert!(validate_action(id, &parameter).is_ok());
+    }
+
+    #[test]
+    fn clipboard_macro_operation_requires_a_registered_macro_and_round_trips() {
+        let _env = crate::runroot::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("neuron_clipboard_macro_authoring_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _pin = crate::runroot::RunDirPin::to(&dir);
+        crate::macros::macro_host::write_macro_file("rewrite", "def macro(ctx):\n    return ctx.clipboard\n").unwrap();
+        let ops = vec![
+            crate::clipboard_transform::TransformOp::Trim,
+            crate::clipboard_transform::TransformOp::Macro { id: "rewrite".into() },
+        ];
+        let json = serde_json::to_string(&ops).unwrap();
+        assert!(validate_action("clipboard-transform", &json).is_ok());
+        let action = build_action("clipboard-transform", &json);
+        assert_eq!(action, Action::ClipboardTransform { ops: ops.clone() });
+        let (_, parameter) = action_to_palette(&action);
+        assert_eq!(serde_json::from_str::<Vec<crate::clipboard_transform::TransformOp>>(&parameter).unwrap(), ops);
+        let missing = serde_json::json!([{"op":"macro","id":"missing"}]).to_string();
+        assert!(validate_action("clipboard-transform", &missing).unwrap_err().contains("no macro"));
+        drop(_pin);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

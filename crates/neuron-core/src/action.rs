@@ -972,6 +972,7 @@ impl Action {
     pub fn needs_context(&self) -> bool {
         match self {
             Action::Script { .. } => true,
+            Action::ClipboardTransform { ops } => ops.iter().any(|op| matches!(op, crate::clipboard_transform::TransformOp::Macro { .. })),
             Action::Screenshot { target: crate::screenshot::CaptureTarget::Window, .. } => true,
             Action::Sequence { steps } => steps.iter().any(|s| s.action.needs_context()),
             Action::Turbo { action, .. } => action.needs_context(),
@@ -1083,7 +1084,7 @@ impl Action {
             // POCKET: move the clipboard into/out of a named register (host-side, arm-gated — it
             // writes the clipboard). The pocket module owns the full-fidelity snapshot + swap.
             Action::Pocket { slot, persist } => crate::pocket::activate(slot, *persist),
-            Action::ClipboardTransform { ops } => crate::pocket::transform(ops),
+            Action::ClipboardTransform { ops } => crate::pocket::transform_ctx(ops, ctx),
             Action::PocketHistory { index } => crate::pocket::restore_history(*index),
             Action::Screenshot { target: crate::screenshot::CaptureTarget::Window, path, clipboard } => crate::screenshot::request_for_window(crate::screenshot::CaptureTarget::Window, path.clone(), *clipboard, ctx.prev_window().0),
             Action::Screenshot { target, path, clipboard } => crate::screenshot::request(*target, path.clone(), *clipboard),
@@ -2545,6 +2546,8 @@ mod tests {
         assert!(!Action::Noop.needs_context());
         assert!(!Action::Key { key: "f".into() }.needs_context());
         assert!(!Action::DpiSet { dpi: 800 }.needs_context());
+        assert!(!Action::ClipboardTransform { ops: vec![crate::clipboard_transform::TransformOp::Trim] }.needs_context());
+        assert!(Action::ClipboardTransform { ops: vec![crate::clipboard_transform::TransformOp::Macro { id: "m".into() }] }.needs_context());
         assert!(!Action::MicMute {
             device: None,
             mode: "toggle".into()

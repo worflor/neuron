@@ -181,7 +181,7 @@ because a resolved weave is just another `Trigger`, it dispatches through the sa
 - **knockback**: a rhythm familiar. you drum on the cast trigger while idle or in queue, and a spectral twin knocks your rhythm back with a small flourish for you to finish. there's no difficulty: you play, and the twin adapts to your rhythm.
 - **control**: a quick wheel of system state. which network you're on (ethernet/wifi + SSID + whether you're actually online), your current output device, and a bluetooth toggle, all from instant win32 reads.
 
-and since every one of these is just an `Action`, the palette is full of plainer ones you can hang off *any* trigger, weave or not: autofire/turbo, media keys, lock, sleep, **echo** ("do that again", replay the last action), **ghost-paste** (the clipboard typed as real keystrokes, so it lands in game chats and RDP), a portable **pocket** clipboard that carries every format and can persist to disk, and **curtain**, a panic privacy overlay across every monitor.
+and since every one of these is just an `Action`, the palette is full of plainer ones you can hang off *any* trigger, weave or not: autofire/turbo, media keys, lock, sleep, **echo** ("do that again", replay the last action), **ghost-paste** (the clipboard typed as real keystrokes, so it lands in game chats and RDP), **clipboard transform** (ordered text operations, including one stored Python macro), a portable **pocket** clipboard that carries every format and can persist to disk, and **curtain**, a panic privacy overlay across every monitor.
 
 new input is the whole reason for building an engine instead of a settings panel.
 
