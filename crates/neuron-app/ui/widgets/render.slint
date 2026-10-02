@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-import { Theme } from "../theme.slint";
-import { Pill } from "controls.slint";
+import { Theme, Signal } from "../theme.slint";
+import { Lamp, Mono } from "controls.slint";
 
 // DEVICE RENDER — the auto-generated picture of the peripheral itself, LEDs live.
 //
@@ -24,6 +24,10 @@ export component DeviceRender inherits Rectangle {
     in property <int> cols;
     in property <[color]> px;          // row-major live frame (the one source of light)
     in property <string> kind;         // registry icon hint: "keyboard" | "mouse" | other
+    in property <string> device-name;
+    in property <string> device-detail;
+    in property <string> stream-status;
+    in property <Signal> stream-signal: Signal.idle;
     in property <bool> editable: false; // PAINT mode — pointer paints cells
     callback paint(int);
     callback erase(int);
@@ -44,8 +48,7 @@ export component DeviceRender inherits Rectangle {
 
     background: transparent;
 
-    // ── keyboard / generic chassis + lattice ─────────────────────────────
-    if !root.zone-mode : Rectangle {
+    case := Rectangle {
         // bezel — the instrument's body. Stroke only; the void shows through.
         x: parent.width * 4%;
         y: parent.height * 4%;
@@ -56,12 +59,42 @@ export component DeviceRender inherits Rectangle {
         border-color: Theme.line;
         background: Theme.bg-2;
 
+        HorizontalLayout {
+            x: 22px; y: 10px;
+            width: parent.width - 44px; height: 18px;
+            spacing: 16px;
+            Mono {
+                text: root.device-name;
+                horizontal-stretch: 1;
+                color: Theme.text-mid; font-size: Theme.fs-small;
+                font-weight: 600; letter-spacing: Theme.track-1; overflow: elide;
+            }
+            Mono {
+                text: root.device-detail;
+                horizontal-stretch: 0;
+                color: Theme.text-faint; font-size: Theme.fs-small;
+            }
+            if root.stream-status != "" : HorizontalLayout {
+                spacing: 6px;
+                horizontal-stretch: 0;
+                Lamp {
+                    signal: root.stream-signal;
+                    lit: root.stream-signal != Signal.idle;
+                }
+                Mono {
+                    text: root.stream-status;
+                    color: root.stream-signal == Signal.idle ? Theme.text-dim : Theme.hue(root.stream-signal);
+                    font-size: Theme.fs-small;
+                }
+            }
+        }
+
         // a faint inner field line — where the keys live
-        field := Rectangle {
+        if !root.zone-mode : field := Rectangle {
             x: 12px;
-            y: 12px;
+            y: 36px;
             width: parent.width - 24px;
-            height: parent.height - 24px;
+            height: parent.height - 48px;
             border-radius: Theme.radius-case-inner;
             border-width: Theme.hair;
             border-color: Theme.line-soft;
@@ -189,81 +222,80 @@ export component DeviceRender inherits Rectangle {
                 }
             }
         }
-    }
-
-    // ── mouse chassis + zone pads (≤4 LEDs — zones, not a lattice) ───────
-    if root.zone-mode : Rectangle {
-        body := Rectangle {
-            // the mouse body — a tall capsule, centered
-            width: min(parent.width * 38%, parent.height * 64%);
-            height: parent.height * 86%;
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            border-radius: self.width / 2.2;
-            border-width: Theme.hair;
-            border-color: Theme.line;
-            background: Theme.bg-2;
-
-            // button split line (upper third) + wheel slot — silhouette cues, ink only
-            Rectangle {
-                x: parent.width / 2;
-                y: parent.height * 4%;
-                width: Theme.hair;
-                height: parent.height * 24%;
-                background: Theme.line;
-            }
-
-            // zone pads — one per LED, placed where mouse zones actually live
-            // (0 = scroll wheel, 1 = logo, 2/3 = side strips). Colour = the live frame.
-            // bloom twins first (light sits UNDER the pad, not as a wash over it)…
-            for p[i] in root.px : Rectangle {
-                property <length> pw: body.width * 26%;
-                width: self.pw + 10px;
-                height: (i == 0 ? body.height * 12% : self.pw) + 10px;
-                x: (i == 2 ? body.width * 12% : i == 3 ? body.width * 62% : (body.width - self.pw) / 2) - 5px;
-                y: (i == 0 ? body.height * 10%
-                    : i == 1 ? body.height * 52%
-                    : body.height * 36%) - 5px;
-                border-radius: self.width / 2;
-                background: p.with-alpha(Theme.bloom);
-            }
-            // …then the pads themselves
-            for p[i] in root.px : Rectangle {
-                property <length> pw: body.width * 26%;
-                width: self.pw;
-                height: i == 0 ? body.height * 12% : self.pw;
-                x: (i == 2 ? body.width * 12% : i == 3 ? body.width * 62% : (body.width - self.width) / 2);
-                y: i == 0 ? body.height * 10%
-                    : i == 1 ? body.height * 52%
-                    : body.height * 36%;
-                border-radius: i == 0 ? 4px : self.width / 2;
-                background: p;
+        // ── mouse chassis + zone pads (≤4 LEDs — zones, not a lattice) ───────
+        if root.zone-mode : Rectangle {
+            x: 12px; y: 36px;
+            width: parent.width - 24px; height: parent.height - 48px;
+            body := Rectangle {
+                // the mouse body — a tall capsule, centered
+                width: min(parent.width * 38%, parent.height * 64%);
+                height: parent.height * 86%;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                border-radius: self.width / 2.2;
                 border-width: Theme.hair;
-                border-color: zta.has-hover && root.editable ? Theme.text-faint : Theme.line-soft;
-                zta := TouchArea {
-                    enabled: root.editable;
-                    mouse-cursor: root.editable ? MouseCursor.crosshair : MouseCursor.default;
-                    pointer-event(ev) => {
-                        if (ev.kind == PointerEventKind.down) {
-                            if (ev.button == PointerEventButton.right) { root.erase(i); }
-                            else if (ev.button == PointerEventButton.left) { root.paint(i); }
+                border-color: Theme.line;
+                background: Theme.bg-2;
+
+                // button split line (upper third) + wheel slot — silhouette cues, ink only
+                Rectangle {
+                    x: parent.width / 2;
+                    y: parent.height * 4%;
+                    width: Theme.hair;
+                    height: parent.height * 24%;
+                    background: Theme.line;
+                }
+
+                // zone pads — one per LED, placed where mouse zones actually live
+                // (0 = scroll wheel, 1 = logo, 2/3 = side strips). Colour = the live frame.
+                // bloom twins first (light sits UNDER the pad, not as a wash over it)…
+                for p[i] in root.px : Rectangle {
+                    property <length> pw: body.width * 26%;
+                    width: self.pw + 10px;
+                    height: (i == 0 ? body.height * 12% : self.pw) + 10px;
+                    x: (i == 2 ? body.width * 12% : i == 3 ? body.width * 62% : (body.width - self.pw) / 2) - 5px;
+                    y: (i == 0 ? body.height * 10%
+                        : i == 1 ? body.height * 52%
+                        : body.height * 36%) - 5px;
+                    border-radius: self.width / 2;
+                    background: p.with-alpha(Theme.bloom);
+                }
+                // …then the pads themselves
+                for p[i] in root.px : Rectangle {
+                    property <length> pw: body.width * 26%;
+                    width: self.pw;
+                    height: i == 0 ? body.height * 12% : self.pw;
+                    x: (i == 2 ? body.width * 12% : i == 3 ? body.width * 62% : (body.width - self.width) / 2);
+                    y: i == 0 ? body.height * 10%
+                        : i == 1 ? body.height * 52%
+                        : body.height * 36%;
+                    border-radius: i == 0 ? 4px : self.width / 2;
+                    background: p;
+                    border-width: Theme.hair;
+                    border-color: zta.has-hover && root.editable ? Theme.text-faint : Theme.line-soft;
+                    zta := TouchArea {
+                        enabled: root.editable;
+                        mouse-cursor: root.editable ? MouseCursor.crosshair : MouseCursor.default;
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down) {
+                                if (ev.button == PointerEventButton.right) { root.erase(i); }
+                                else if (ev.button == PointerEventButton.left) { root.paint(i); }
+                            }
                         }
                     }
                 }
             }
-        }
-        // honesty note: zone positions are approximate (the registry knows counts, not microns).
-        // Plain faint text, deliberately NOT a Pill — dressed as a chip it rendered as a wide
-        // bordered strip floating under the device with no owner, the loudest element on an
-        // otherwise-dark canvas. An aside should whisper: caption weight, corner-anchored, no box.
-        Text {
-            text: "zones approximate";
-            color: Theme.text-faint;
-            font-size: Theme.fs-small;
-            font-family: Theme.mono;
-            letter-spacing: Theme.track-2;
-            x: parent.width - self.width - 8px;
-            y: parent.height - self.height - 6px;
+            // The registry supplies zone counts, not physical positions.
+            Text {
+                text: "zones approximate";
+                color: Theme.text-faint;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                letter-spacing: Theme.track-2;
+                x: parent.width - self.width - 8px;
+                y: parent.height - self.height - 6px;
+            }
         }
     }
+    @children
 }
