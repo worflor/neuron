@@ -1221,6 +1221,8 @@ impl LifeSim {
             }
             let warm = self.sun(i);
             let n = self.nutrient[i].clamp(0.0, 1.0);
+            // Habitat light follows the existing sunlight and soil without keeping cells alive.
+            let habitat = 0.065 + 0.020 * warm + 0.025 * n;
             let contact = self.contact[i];
             let alive = self.live[i];
             let ghost = self.ghost[i]
@@ -1238,11 +1240,10 @@ impl LifeSim {
                 )
             } else if ghost > 0.05 {
                 (0.14, (ghost * 0.24).clamp(0.0, 0.22))
-            } else if n > 0.045 {
-                (0.08, (n * 0.07).clamp(0.0, 0.07))
             } else {
-                (0.0, 0.0)
+                (0.08, habitat)
             };
+            intensity = intensity.max(habitat);
             if contact <= 0.045 {
                 if let Some(scene) = &self.scene {
                     if matches!(scene.kind, SceneKind::Star | SceneKind::Squall) {
@@ -2229,7 +2230,8 @@ mod tests {
         let energy = |c: crate::lighting::Rgb| u16::from(c.r) + u16::from(c.g) + u16::from(c.b);
         assert!(energy(low[2]) > energy(low[3]));
         assert!(energy(low[3]) > energy(low[1]));
-        assert_eq!(low[0], crate::lighting::Rgb::BLACK);
+        assert!(energy(low[3]) > energy(low[0]));
+        assert!(energy(low[0]) > 0);
     }
 
     #[test]
@@ -2322,6 +2324,36 @@ mod tests {
         assert!(observation_cell(0x07, 0xFFFF).is_none());
         assert!(observation_cell(0x09, 1).is_none());
         assert!(observation_cell(0xFF00, 0x20).is_some());
+    }
+
+    #[test]
+    fn empty_habitat_stays_visible_through_seasons_without_changing_ecology() {
+        let mut s = board(6, 22);
+        s.set_visible_region(&[0, 1, 22, 23], 6, 22);
+        clear(&mut s);
+        s.nutrient.fill(0.0);
+        let spectrum = super::super::life_spectrum();
+        for ghost in [0.0, 0.06] {
+            s.ghost.fill(ghost);
+            for quarter in 0..=256 {
+                let t = quarter as f64 / 4.0;
+                s.sim_t = t;
+                s.biological_t = t;
+                let before = s.clone();
+                let cells = s.render_cells(t);
+                assert_eq!(s, before, "ambient rendering must not feed the simulation");
+                let pixels = Field::Scalar(cells.clone()).render(&spectrum, t as f32);
+                for (i, pixel) in pixels.iter().enumerate() {
+                    if s.visible[i] {
+                        assert_ne!(pixel.scale_f(0.16), crate::lighting::Rgb::BLACK,
+                            "empty habitat vanished at t={t}, cell={i}, ghost={ghost}");
+                        assert!(cells[i].intensity < 0.23, "ambient must stay below living structure");
+                    } else {
+                        assert_eq!(*pixel, crate::lighting::Rgb::BLACK);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

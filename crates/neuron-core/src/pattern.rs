@@ -1154,6 +1154,17 @@ fn scan_key_presses(
     r: usize,
     c: usize,
     count_unmapped: bool,
+    on_press: impl FnMut(usize, usize),
+) -> u32 {
+    scan_key_contacts(prev, &mut [], r, c, count_unmapped, on_press)
+}
+
+fn scan_key_contacts(
+    prev: &mut [bool],
+    held_cells: &mut [bool],
+    r: usize,
+    c: usize,
+    count_unmapped: bool,
     mut on_press: impl FnMut(usize, usize),
 ) -> u32 {
     let mut presses = 0u32;
@@ -1165,14 +1176,19 @@ fn scan_key_presses(
             continue;
         }
         let down = crate::capture::key_down(vk as i32);
-        if down && !*was_down {
-            presses += 1;
-            if let Some((ry, cx)) = cell {
-                let (ry, cx) = (ry as usize, cx as usize);
-                if ry < r && cx < c {
+        if let Some((ry, cx)) = cell {
+            let (ry, cx) = (ry as usize, cx as usize);
+            if ry < r && cx < c {
+                if down && !held_cells.is_empty() {
+                    held_cells[ry * c + cx] = true;
+                }
+                if down && !*was_down {
+                    presses += 1;
                     on_press(ry, cx);
                 }
             }
+        } else if down && !*was_down {
+            presses += 1;
         }
         *was_down = down;
     }
@@ -1185,11 +1201,14 @@ fn scan_key_presses(
             break;
         }
         let down = crate::capture::macro_key_down(i);
-        if down && !prev[slot] {
-            presses += 1;
-            if let Some((ry, cx)) = crate::lighting::razer_key_cell(crate::lighting::MACRO_KEY_NAMES[i]) {
-                let (ry, cx) = (ry as usize, cx as usize);
-                if ry < r && cx < c {
+        if let Some((ry, cx)) = crate::lighting::razer_key_cell(crate::lighting::MACRO_KEY_NAMES[i]) {
+            let (ry, cx) = (ry as usize, cx as usize);
+            if ry < r && cx < c {
+                if down && !held_cells.is_empty() {
+                    held_cells[ry * c + cx] = true;
+                }
+                if down && !prev[slot] {
+                    presses += 1;
                     on_press(ry, cx);
                 }
             }
@@ -1228,13 +1247,13 @@ pub struct Heat {
     density: f32,
     last_t: f32,
     step_acc: f32,
+    weather_t: f32,
 }
 
 impl Heat {
     /// Advance the heat field one simulation step: re-seed the flickering bottom row, then propagate
-    /// upward with density-scaled cooling. Re-rolling the flicker each step makes the step COUNT the
-    /// flicker/propagation rate — which is how `speed` is honoured.
-    fn step(&mut self, r: usize, c: usize) {
+    /// upward with density-scaled cooling and lateral wind advection.
+    fn step(&mut self, r: usize, c: usize, weather_t: f32) {
         let bottom = (r - 1) * c;
         for x in 0..c {
             self.heat[bottom + x] = 0.90 + xorshift(&mut self.rng) * 0.10;
@@ -1242,12 +1261,20 @@ impl Heat {
         // DENSITY scales how much heat survives the climb: higher → less cooling → a taller, fuller flame.
         let dens = self.density.clamp(0.25, 3.0);
         let cool_scale = (1.0 / dens).clamp(0.4, 2.0);
+        let eta = value_noise(weather_t, 0.0, 73.1) * 2.0 - 1.0;
+        let w_gust = eta.signum() * eta.abs().powf(2.0);
         for y in 0..r - 1 {
+            let h_y = if r > 1 { ((r - 1 - y) as f32 / (r - 1) as f32).powf(1.2) } else { 0.0 };
             for x in 0..c {
+                let w_col = value_noise(x as f32 * 0.15, weather_t * 2.0, 19.3) * 0.2 - 0.1;
+                let beta = ((w_gust + w_col) * h_y * 0.45).clamp(-0.45, 0.45);
                 let below = (y + 1) * c + x;
                 let bl = (y + 1) * c + (x + c - 1) % c;
                 let br = (y + 1) * c + (x + 1) % c;
-                let avg = (self.heat[below] * 2.0 + self.heat[bl] + self.heat[br]) / 4.0;
+                let w_below = 0.50;
+                let w_bl = 0.25 + 0.50 * beta;
+                let w_br = 0.25 - 0.50 * beta;
+                let avg = self.heat[below] * w_below + self.heat[bl] * w_bl + self.heat[br] * w_br;
                 let cool = (0.14 + xorshift(&mut self.rng) * 0.10) * cool_scale;
                 self.heat[y * c + x] = (avg - cool).max(0.0);
             }
@@ -1283,12 +1310,13 @@ impl Pattern for Heat {
         let dt = (t - self.last_t).max(0.0);
         self.last_t = t;
         let spd = self.speed.clamp(0.1, 6.0);
+        self.weather_t += dt * 0.05 * spd.sqrt();
         self.step_acc += dt * BASE_STEPS_PER_SEC * spd;
         let mut steps = if dt > 0.0 { self.step_acc.floor() as u32 } else { 1 };
         self.step_acc -= self.step_acc.floor();
         steps = steps.min(8);
         for _ in 0..steps {
-            self.step(r, c);
+            self.step(r, c, self.weather_t);
         }
         // emit (u = heat, intensity = per-column flicker). The flicker DEPTH ramps with heat (steady
         // embers, dancing tips), so the white-hot licks flare and gutter while the base stays a calm bed.
@@ -1843,15 +1871,26 @@ fn draw_comet(inten: &mut [f32], ucoord: &mut [f32], b: &CometBody, r: usize, c:
 /// is the spectrum (default a soft white); each cell emits `u = 0` (one solid colour) and `intensity =
 /// its twinkle level`. `density` populates the sky, `speed` how briskly stars cycle, `fade` the twinkle
 /// length. Deterministic PRNG (no `rand`). The hard-won Starlight, re-expressed.
+#[derive(Clone, Copy, Default)]
+struct StarCell {
+    active: bool,
+    age_s: f32,
+    duration_s: f32,
+    peak: f32,
+    shimmer_freq: f32,
+    shimmer_phase: f32,
+}
+
 #[derive(Default)]
 pub struct Sparkle {
-    level: Vec<f32>,
+    stars: Vec<StarCell>,
     dims: (u8, u8),
     rng: u32,
     speed: f32,
     density: f32,
     fade: f32,
     acc: f32,
+    last_t: f32,
 }
 
 impl Pattern for Sparkle {
@@ -1861,31 +1900,80 @@ impl Pattern for Sparkle {
         self.fade = p.f32("fade", 1.0);
     }
 
-    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
         let (r, c) = (rows as usize, cols as usize);
         let n = r * c;
         if self.dims != (rows, cols) {
-            self.level = vec![0.0; n];
+            self.stars = vec![StarCell::default(); n];
             self.rng = 0x1357_2468;
             self.dims = (rows, cols);
             self.acc = 0.0;
+            self.last_t = t;
         }
         if n == 0 {
             return Field::Scalar(Vec::new());
         }
-        // spawn ~ (3% of cells) × speed × density new stars per frame, accumulating the fraction.
-        self.acc += n as f32 * 0.03 * self.speed.max(0.1) * self.density.clamp(0.1, 4.0);
+        let dt = (t - self.last_t).clamp(0.0, 0.25);
+        self.last_t = t;
+
+        let spd = self.speed.clamp(0.1, 6.0);
+        let dens = self.density.clamp(0.1, 4.0);
+        let f_fade = self.fade.clamp(0.1, 4.0);
+
+        self.acc += dt * n as f32 * 0.08 * spd * dens;
         while self.acc >= 1.0 {
             self.acc -= 1.0;
-            let i = (xorshift(&mut self.rng) * n as f32) as usize % n;
-            self.level[i] = 0.85 + xorshift(&mut self.rng) * 0.15;
+            let start = (xorshift(&mut self.rng) * n as f32) as usize % n;
+            let mut found = None;
+            for offset in 0..n {
+                let idx = (start + offset) % n;
+                if !self.stars[idx].active {
+                    found = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = found {
+                let base_dur = 1.8 / (spd * f_fade.sqrt());
+                let dur = base_dur * (0.8 + 0.4 * xorshift(&mut self.rng));
+                let peak = 0.75 + 0.25 * xorshift(&mut self.rng);
+                let shimmer_freq = 4.0 + 5.0 * xorshift(&mut self.rng);
+                let shimmer_phase = xorshift(&mut self.rng) * TAU;
+                self.stars[idx] = StarCell {
+                    active: true,
+                    age_s: 0.0,
+                    duration_s: dur,
+                    peak,
+                    shimmer_freq,
+                    shimmer_phase,
+                };
+            }
         }
-        // fade every cell toward dark — FADE is the twinkle length (higher → faster decay → crisper sparks).
-        let decay = 0.04 * self.speed.max(0.1) * self.fade.clamp(0.1, 4.0);
-        for l in &mut self.level {
-            *l = (*l - decay).max(0.0);
+
+        let mut cells = Vec::with_capacity(n);
+        for star in &mut self.stars {
+            if !star.active {
+                cells.push(Cell::new(0.0, 0.0));
+                continue;
+            }
+            star.age_s += dt;
+            if star.age_s >= star.duration_s {
+                star.active = false;
+                cells.push(Cell::new(0.0, 0.0));
+                continue;
+            }
+            let sigma = star.age_s / star.duration_s;
+            const SIGMA_PEAK: f32 = 0.25;
+            let env = if sigma <= SIGMA_PEAK {
+                let u = sigma / SIGMA_PEAK;
+                u * u * (3.0 - 2.0 * u)
+            } else {
+                let v = (sigma - SIGMA_PEAK) / (1.0 - SIGMA_PEAK);
+                (1.0 - v).powf(1.8)
+            };
+            let shimmer = 1.0 - 0.08 * (star.age_s * star.shimmer_freq + star.shimmer_phase).sin();
+            let intensity = (star.peak * env * shimmer).clamp(0.0, 1.0);
+            cells.push(Cell::new(0.0, intensity));
         }
-        let cells = self.level.iter().map(|&l| Cell::new(0.0, l)).collect();
         Field::Scalar(cells)
     }
 }
@@ -1900,10 +1988,16 @@ impl Pattern for Sparkle {
 #[derive(Default)]
 pub struct Ignite {
     level: Vec<f32>,
+    contact_age: Vec<f32>,
+    is_fresh_strike: Vec<bool>,
+    held_cells: Vec<bool>,
     prev: Vec<bool>,
     dims: (u8, u8),
     fade: f32,
     glow: bool,
+    last_t: f32,
+    last_key_scan_t: f32,
+    last_key_generation: Option<u64>,
 }
 
 impl Pattern for Ignite {
@@ -1912,37 +2006,76 @@ impl Pattern for Ignite {
         self.glow = p.bool("glow", false);
     }
 
-    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
         let (r, c) = (rows as usize, cols as usize);
         let n = r * c;
         if self.dims != (rows, cols) {
             self.level = vec![0.0; n];
+            self.contact_age = vec![0.0; n];
+            self.is_fresh_strike = vec![false; n];
+            self.held_cells = vec![false; n];
             self.prev = vec![false; KEY_SCAN_SLOTS];
             self.dims = (rows, cols);
+            self.last_t = t;
+            self.last_key_scan_t = t;
+            self.last_key_generation = None;
         }
         if n == 0 {
             return Field::Scalar(Vec::new());
         }
-        let glow = self.glow;
-        let level = &mut self.level;
-        scan_key_presses(&mut self.prev, r, c, false, |ry, cx| {
-            let cell = ry * c + cx;
-            level[cell] = 1.0;
-            if glow {
-                for (dy, dx) in [(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
-                    let ny = ry as isize + dy;
-                    let nx = cx as isize + dx;
-                    if ny >= 0 && ny < r as isize && nx >= 0 && nx < c as isize {
-                        let ni = ny as usize * c + nx as usize;
-                        level[ni] = level[ni].max(0.55);
+        let dt = (t - self.last_t).max(0.0);
+        self.last_t = t;
+
+        let generation = crate::capture::key_transition_generation();
+        if key_scan_due(
+            crate::controls::held_registry_live(),
+            self.last_key_generation,
+            generation,
+            t - self.last_key_scan_t,
+        ) {
+            self.last_key_generation = Some(generation);
+            self.last_key_scan_t = t;
+            self.held_cells.fill(false);
+            let glow = self.glow;
+            let level = &mut self.level;
+            let is_fresh_strike = &mut self.is_fresh_strike;
+            let contact_age = &mut self.contact_age;
+            scan_key_contacts(&mut self.prev, &mut self.held_cells, r, c, false, |ry, cx| {
+                let cell = ry * c + cx;
+                level[cell] = 1.0;
+                contact_age[cell] = 0.0;
+                is_fresh_strike[cell] = true;
+                if glow {
+                    for (dy, dx) in [(0isize, 1isize), (0, -1), (1, 0), (-1, 0)] {
+                        let ny = ry as isize + dy;
+                        let nx = cx as isize + dx;
+                        if ny >= 0 && ny < r as isize && nx >= 0 && nx < c as isize {
+                            let ni = ny as usize * c + nx as usize;
+                            level[ni] = level[ni].max(0.55);
+                        }
                     }
                 }
+            });
+        }
+
+        const TAU_ATTACK: f32 = 0.030;
+        const SUSTAIN: f32 = 0.55;
+        let decay_step = 3.6 * self.fade.clamp(0.1, 4.0) * dt;
+
+        for i in 0..n {
+            if self.held_cells[i] {
+                if self.is_fresh_strike[i] {
+                    self.is_fresh_strike[i] = false;
+                } else {
+                    self.contact_age[i] += dt;
+                    let settle = (-self.contact_age[i] / TAU_ATTACK).exp();
+                    self.level[i] = SUSTAIN + (1.0 - SUSTAIN) * settle;
+                }
+            } else {
+                self.is_fresh_strike[i] = false;
+                self.contact_age[i] = 0.0;
+                self.level[i] = (self.level[i] - decay_step).max(0.0);
             }
-        });
-        // fade — FADE is the trail length (higher → faster decay → a snappier glow).
-        let decay = 0.06 * self.fade.clamp(0.1, 4.0);
-        for l in &mut self.level {
-            *l = (*l - decay).max(0.0);
         }
         let cells = self.level.iter().map(|&l| Cell::new(0.0, l)).collect();
         Field::Scalar(cells)
@@ -1969,10 +2102,18 @@ struct RippleWave {
 #[derive(Default)]
 pub struct Ring {
     waves: Vec<RippleWave>,
+    spawns: Vec<(usize, usize)>,
+    contact_level: Vec<f32>,
+    contact_age: Vec<f32>,
+    is_fresh_strike: Vec<bool>,
+    held_cells: Vec<bool>,
     prev: Vec<bool>,
     dims: (u8, u8),
     speed: f32,
     fade: f32,
+    last_t: f32,
+    last_key_scan_t: f32,
+    last_key_generation: Option<u64>,
 }
 
 impl Ring {
@@ -2004,17 +2145,72 @@ impl Pattern for Ring {
         let n = r * c;
         if self.dims != (rows, cols) {
             self.waves.clear();
+            self.waves.reserve_exact(8);
+            self.spawns = Vec::with_capacity(n);
+            self.contact_level = vec![0.0; n];
+            self.contact_age = vec![0.0; n];
+            self.is_fresh_strike = vec![false; n];
+            self.held_cells = vec![false; n];
             self.prev = vec![false; KEY_SCAN_SLOTS];
             self.dims = (rows, cols);
+            self.last_t = t;
+            self.last_key_scan_t = t;
+            self.last_key_generation = None;
         }
         if n == 0 {
             return Field::Scalar(Vec::new());
         }
-        let mut spawns: Vec<(usize, usize)> = Vec::new();
-        scan_key_presses(&mut self.prev, r, c, false, |ry, cx| spawns.push((ry, cx)));
-        for (ry, cx) in spawns {
-            self.spawn(ry as f32, cx as f32, t);
+        let dt = (t - self.last_t).max(0.0);
+        self.last_t = t;
+
+        let generation = crate::capture::key_transition_generation();
+        if key_scan_due(
+            crate::controls::held_registry_live(),
+            self.last_key_generation,
+            generation,
+            t - self.last_key_scan_t,
+        ) {
+            self.last_key_generation = Some(generation);
+            self.last_key_scan_t = t;
+            self.held_cells.fill(false);
+            self.spawns.clear();
+            let spawns = &mut self.spawns;
+            let contact_level = &mut self.contact_level;
+            let contact_age = &mut self.contact_age;
+            let is_fresh_strike = &mut self.is_fresh_strike;
+            scan_key_contacts(&mut self.prev, &mut self.held_cells, r, c, false, |ry, cx| {
+                spawns.push((ry, cx));
+                let cell = ry * c + cx;
+                contact_level[cell] = 1.0;
+                contact_age[cell] = 0.0;
+                is_fresh_strike[cell] = true;
+            });
+            for i in 0..self.spawns.len() {
+                let (ry, cx) = self.spawns[i];
+                self.spawn(ry as f32, cx as f32, t);
+            }
         }
+
+        const TAU_ATTACK: f32 = 0.030;
+        const SUSTAIN: f32 = 0.55;
+        let decay_step = 3.6 * self.fade.clamp(0.1, 4.0) * dt;
+
+        for i in 0..n {
+            if self.held_cells[i] {
+                if self.is_fresh_strike[i] {
+                    self.is_fresh_strike[i] = false;
+                } else {
+                    self.contact_age[i] += dt;
+                    let settle = (-self.contact_age[i] / TAU_ATTACK).exp();
+                    self.contact_level[i] = SUSTAIN + (1.0 - SUSTAIN) * settle;
+                }
+            } else {
+                self.is_fresh_strike[i] = false;
+                self.contact_age[i] = 0.0;
+                self.contact_level[i] = (self.contact_level[i] - decay_step).max(0.0);
+            }
+        }
+
         // expansion + fade tunables. `speed` is the ring's outward velocity (cells/sec); `fade` the
         // lifetime (higher → shorter rings). RING_WIDTH is the Gaussian band half-width (thickness).
         const BASE_SPEED: f32 = 7.0;
@@ -2023,13 +2219,21 @@ impl Pattern for Ring {
         let speed = self.speed.clamp(0.1, 6.0);
         let life = BASE_LIFETIME / self.fade.clamp(0.25, 4.0);
         self.waves.retain(|w| t >= w.t0 && (t - w.t0) <= life);
+
         let mut cells = vec![Cell::new(0.0, 0.0); n];
         if self.waves.is_empty() {
+            for i in 0..n {
+                cells[i] = Cell::new(0.0, self.contact_level[i]);
+            }
             return Field::Scalar(cells);
         }
+
         for y in 0..r {
             for x in 0..c {
-                let mut env = 0.0f32;
+                let idx = y * c + x;
+                let contact = self.contact_level[idx];
+                let mut base = 0.0f32;
+                let mut sum = 0.0f32;
                 for w in &self.waves {
                     let age = t - w.t0;
                     let radius = age * BASE_SPEED * speed;
@@ -2039,9 +2243,18 @@ impl Pattern for Ring {
                     let band_arg = (d - radius) / RING_WIDTH;
                     let band = (-(band_arg * band_arg)).exp();
                     let envelope = (1.0 - age / life).clamp(0.0, 1.0);
-                    env = env.max(band * envelope);
+                    let val = (band * envelope).clamp(0.0, 1.0);
+                    base = base.max(val);
+                    sum += val;
                 }
-                cells[y * c + x] = Cell::new(0.0, env.clamp(0.0, 1.0));
+                let excess = (sum - base).max(0.0);
+                let wave_intensity = if excess > 0.0 {
+                    base + (1.0 - base) * (1.0 - (-1.5 * excess).exp())
+                } else {
+                    base
+                };
+                let intensity = wave_intensity.max(contact);
+                cells[idx] = Cell::new(0.0, intensity.clamp(0.0, 1.0));
             }
         }
         Field::Scalar(cells)
@@ -2123,6 +2336,8 @@ impl Pattern for Flow {
 pub struct Thermal {
     heat: Vec<f32>,
     scratch: Vec<f32>,
+    held_cells: Vec<bool>,
+    pending: Vec<(usize, usize)>,
     prev: Vec<bool>,
     rate: f32,
     dims: (u8, u8),
@@ -2145,10 +2360,13 @@ impl Pattern for Thermal {
         if self.dims != (rows, cols) {
             self.heat = vec![0.0; n];
             self.scratch = vec![0.0; n];
+            self.held_cells = vec![false; n];
+            self.pending = Vec::with_capacity(KEY_SCAN_SLOTS);
             self.prev = vec![false; KEY_SCAN_SLOTS];
             self.rate = 0.0;
             self.dims = (rows, cols);
             self.last_t = t;
+            self.last_key_scan_t = t;
             self.last_key_generation = None;
         }
         if n == 0 {
@@ -2163,7 +2381,7 @@ impl Pattern for Thermal {
         cool_field(&mut self.heat, fade, dt);
         diffuse_field(&mut self.heat, &mut self.scratch, r, c, dt);
         // detect fresh key-downs: count ALL of them (the typing RATE) and record each pressed key's cell.
-        let mut pending: Vec<(usize, usize)> = Vec::new();
+        self.pending.clear();
         let generation = crate::capture::key_transition_generation();
         let presses = if key_scan_due(
             crate::controls::held_registry_live(),
@@ -2173,7 +2391,9 @@ impl Pattern for Thermal {
         ) {
             self.last_key_generation = Some(generation);
             self.last_key_scan_t = t;
-            scan_key_presses(&mut self.prev, r, c, true, |ry, cx| pending.push((ry, cx)))
+            self.held_cells.fill(false);
+            let pending = &mut self.pending;
+            scan_key_contacts(&mut self.prev, &mut self.held_cells, r, c, true, |ry, cx| pending.push((ry, cx)))
         } else {
             0
         };
@@ -2181,8 +2401,17 @@ impl Pattern for Thermal {
         // white-hot, slow → dim embers — speed → INTENSITY, not coverage).
         self.rate = step_rate(self.rate, presses, dt, fade);
         let peak = deposit_peak(self.rate, sens);
-        for (ry, cx) in pending {
+        for &(ry, cx) in &self.pending {
             deposit_heat(&mut self.heat, ry, cx, r, c, peak);
+        }
+        // (3) CONTACT HEAT: a held key gently maintains ember warmth at the contact source target.
+        let t_source = 0.32 * sens;
+        let approach = 1.0 - (-4.0 * dt).exp();
+        for i in 0..n {
+            if self.held_cells[i] {
+                let diff = (t_source - self.heat[i]).max(0.0);
+                self.heat[i] += diff * approach;
+            }
         }
         // emit (u = temperature clamped to the ramp, intensity = breath × heat-haze shimmer). A fresh
         // flare (temp > 1) clamps u to the spectrum's hot/white end.
@@ -4703,5 +4932,207 @@ mod tests {
         assert_eq!(region_from_rect(2, 4, 99, 99, 4, 6), vec![2 * 6 + 4, 2 * 6 + 5, 3 * 6 + 4, 3 * 6 + 5]);
         // a degenerate board → empty, no panic.
         assert!(region_from_rect(0, 0, 0, 0, 0, 0).is_empty());
+    }
+
+    // ── Lighting Physics Upgrades (Touch Physics, Starlight, Fire, Ripple) ────────────────────────
+
+    #[test]
+    fn ignite_touch_physics_strike_contact_release_contracts() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::capture::set_macro_held(0);
+        let mut ignite = Ignite::default();
+        ignite.configure(&Params::defaults_for("ignite"));
+
+        // Initialize state at t = 0
+        let _ = ignite.field(6, 22, 0.0);
+
+        // M1 is at (row 1, col 0)
+        let cell = 1 * 22 + 0;
+
+        // (1) Fresh strike guarantee: press M1
+        crate::capture::set_macro_held(1 << 0);
+
+        // Render at 6 Hz (dt = 0.167s)
+        let f = scalar(ignite.field(6, 22, 0.167));
+        assert_eq!(f[cell].intensity, 1.0, "fresh strike emits 1.0 on Frame 0 even at low FPS");
+
+        // (2) Held sustain: subsequent frames while held settle toward 0.55 and hold it
+        let mut f_held = f;
+        for i in 2..10 {
+            f_held = scalar(ignite.field(6, 22, 0.167 + i as f32 * 0.05));
+            assert!(f_held[cell].intensity >= 0.55, "held cell never drops below sustain while held");
+        }
+        assert!((f_held[cell].intensity - 0.55).abs() < 0.01, "settles cleanly at sustain 0.55");
+
+        // (3) Release decay: when released, decays linearly
+        crate::capture::set_macro_held(0);
+        let f_released = scalar(ignite.field(6, 22, 0.80));
+        assert!(f_released[cell].intensity < 0.55, "releasing key triggers decay");
+        let f_dead = scalar(ignite.field(6, 22, 1.50));
+        assert_eq!(f_dead[cell].intensity, 0.0, "released key decays fully to zero");
+
+        crate::capture::set_macro_held(0);
+    }
+
+    #[test]
+    fn thermal_hold_source_step_invariance_and_ceiling() {
+        // (1) Zero heat added when T >= T_source
+        let sens = 1.0f32;
+        let t_source = 0.32 * sens;
+        let hot_temp = 0.85f32;
+        let diff_hot = (t_source - hot_temp).max(0.0);
+        assert_eq!(diff_hot, 0.0, "hold source contributes zero heat when T >= T_source");
+
+        // (2) Hold-source step invariance: exponential approach produces equivalent results across
+        // 6 Hz vs 60 Hz over the same elapsed duration (e.g. 1 step at 6 Hz vs 10 steps at 60 Hz)
+        let total_time = 0.1666667f32; // ~1/6th of a second
+        let t_start = 0.10f32;
+
+        // 1 big step (6 Hz)
+        let a_big = 1.0 - (-4.0 * total_time).exp();
+        let t_6hz = t_start + (t_source - t_start).max(0.0) * a_big;
+
+        // 10 small steps (60 Hz)
+        let mut t_60hz = t_start;
+        let dt_small = total_time / 10.0;
+        let a_small = 1.0 - (-4.0 * dt_small).exp();
+        for _ in 0..10 {
+            t_60hz += (t_source - t_60hz).max(0.0) * a_small;
+        }
+
+        assert!(
+            (t_6hz - t_60hz).abs() < 1e-5,
+            "hold source integration is mathematically step-size invariant ({t_6hz} vs {t_60hz})"
+        );
+    }
+
+    #[test]
+    fn sparkle_starlight_properties_and_lifetimes() {
+        // (1) Duration Invariant: doubling speed exactly halves base duration
+        let spd1 = 1.0f32;
+        let spd2 = 2.0f32;
+        let fade = 1.0f32;
+        let dur1 = 1.8 / (spd1 * fade.sqrt());
+        let dur2 = 1.8 / (spd2 * fade.sqrt());
+        assert_eq!(dur1, dur2 * 2.0, "doubling speed exactly halves base duration");
+
+        // (2) Accrual Invariant: doubling speed exactly doubles births accrued over equal wall time
+        let n = 132f32;
+        let dt = 1.0f32;
+        let dens = 1.0f32;
+        let births1 = dt * n * 0.08 * spd1 * dens;
+        let births2 = dt * n * 0.08 * spd2 * dens;
+        assert_eq!(births2, births1 * 2.0, "doubling speed exactly doubles accrued births");
+
+        // (3) Range bounds: intensity strictly remains in [0.0, 1.0]
+        let mut s = Sparkle::default();
+        s.configure(&Params::defaults_for("sparkle"));
+        for i in 0..50 {
+            let f = scalar(s.field(6, 22, i as f32 * 0.05));
+            assert!(f.iter().all(|c| (0.0..=1.0).contains(&c.intensity)), "sparkle intensity within [0, 1]");
+        }
+
+        // (4) Long-Run Population Stability: in deterministic simulation over 60s, mean active
+        // population remains stable within +-15% across speed sweeps (speed=1.0 vs speed=2.0)
+        let sim_active_avg = |spd: f32| -> f32 {
+            let mut s = Sparkle::default();
+            let mut p = Params::default();
+            p.set("speed", spd);
+            s.configure(&p);
+            let mut total_active = 0usize;
+            let steps = 600; // 60 seconds at 10 Hz
+            for i in 0..steps {
+                let f = scalar(s.field(6, 22, i as f32 * 0.1));
+                total_active += f.iter().filter(|c| c.intensity > 0.01).count();
+            }
+            total_active as f32 / steps as f32
+        };
+        let avg1 = sim_active_avg(1.0);
+        let avg2 = sim_active_avg(2.0);
+        let diff = (avg1 - avg2).abs() / avg1.max(1.0);
+        assert!(diff < 0.15, "long-run star population is stable across speed sweep (avg1: {avg1}, avg2: {avg2}, diff: {diff})");
+    }
+
+    #[test]
+    fn fire_weather_advection_kernel_and_invariance() {
+        // (1) Weights sum to 1.0 identically for any lateral bias beta in [-0.45, 0.45]
+        for beta_int in -45..=45 {
+            let beta = beta_int as f32 / 100.0;
+            let w_below = 0.50f32;
+            let w_bl = 0.25 + 0.50 * beta;
+            let w_br = 0.25 - 0.50 * beta;
+            let sum = w_below + w_bl + w_br;
+            assert!((sum - 1.0).abs() < 1e-6, "kernel weights must sum to 1.0 for beta {beta}");
+        }
+
+        // (2) When beta = 0.0, the stencil reproduces baseline Heat propagation identically
+        let below = 0.8f32;
+        let bl = 0.6f32;
+        let br = 0.4f32;
+        let base_avg = (below * 2.0 + bl + br) / 4.0;
+        let beta_zero_avg = below * 0.50 + bl * 0.25 + br * 0.25;
+        assert!((base_avg - beta_zero_avg).abs() < 1e-6, "zero wind matches baseline Heat identically");
+    }
+
+    #[test]
+    fn ring_ripple_single_wave_numerical_identity_and_overlap_gain() {
+        // (1) Solitary wave is 100% numerically identical to baseline Ring
+        let val = 0.72f32;
+        let base = val;
+        let sum = val;
+        let excess = (sum - base).max(0.0);
+        assert_eq!(excess, 0.0);
+        let single_intensity = if excess > 0.0 {
+            base + (1.0 - base) * (1.0 - (-1.5 * excess).exp())
+        } else {
+            base
+        };
+        assert_eq!(single_intensity, val, "single wave is 100% identical to baseline Ring");
+
+        // (2) Crossing waves gain constructive overlap without clipping or color shift
+        let val1 = 0.60f32;
+        let val2 = 0.50f32;
+        let base = val1.max(val2);
+        let sum = val1 + val2;
+        let excess = sum - base; // 0.50
+        assert!(excess > 0.0);
+        let overlap_intensity = base + (1.0 - base) * (1.0 - (-1.5 * excess).exp());
+        assert!(overlap_intensity > base, "crossing waves produce constructive overlap gain");
+        assert!(overlap_intensity <= 1.0, "overlap gain never exceeds 1.0");
+
+        // (3) Spectrum contract: u coordinate is strictly 0.0
+        let mut ring = Ring::default();
+        ring.configure(&Params::defaults_for("ring"));
+        ring.spawn(3.0, 10.0, 0.0);
+        ring.spawn(3.0, 12.0, 0.0);
+        let f = scalar(ring.field(6, 22, 0.2));
+        assert!(f.iter().all(|c| c.u == 0.0), "Ripple emits u=0.0 unconditionally");
+    }
+
+    #[test]
+    fn ring_ripple_contact_hold_and_release() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::capture::set_macro_held(0);
+        let mut ring = Ring::default();
+        ring.configure(&Params::defaults_for("ring"));
+        let _ = ring.field(6, 22, 0.0);
+
+        let cell = 1 * 22 + 0;
+        crate::capture::set_macro_held(1 << 0);
+        let f = scalar(ring.field(6, 22, 0.10));
+        assert_eq!(f[cell].intensity, 1.0, "fresh strike emits peak 1.0");
+        assert_eq!(ring.waves.len(), 1, "wave spawned on strike");
+
+        // advance time past wave lifetime (BASE_LIFETIME = 2.2s) while still holding key
+        let f_held = scalar(ring.field(6, 22, 3.0));
+        assert!(ring.waves.is_empty(), "wave has dissipated past lifetime");
+        assert!((f_held[cell].intensity - 0.55).abs() < 0.01, "held key maintains contact glow at 0.55");
+
+        crate::capture::set_macro_held(0);
+        let f_released = scalar(ring.field(6, 22, 3.15));
+        assert!(f_released[cell].intensity < 0.55, "releasing key triggers decay");
+        let f_dead = scalar(ring.field(6, 22, 4.0));
+        assert_eq!(f_dead[cell].intensity, 0.0, "released key decays fully to zero");
+        crate::capture::set_macro_held(0);
     }
 }
