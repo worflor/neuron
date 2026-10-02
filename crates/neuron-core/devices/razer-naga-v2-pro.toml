@@ -305,3 +305,24 @@ stock_usage = 0x2D
 [[buttons]]
 id = 0x4B
 stock_usage = 0x2E
+
+# The six-button plate has its own function bank, even though its stock keys overlap the
+# twelve-button plate's first six. Table and stock records read live via 02/84 and 02/8C, 2026-10-02.
+[[buttons]]
+id = 0x50
+stock_usage = 0x1E
+[[buttons]]
+id = 0x51
+stock_usage = 0x1F
+[[buttons]]
+id = 0x52
+stock_usage = 0x20
+[[buttons]]
+id = 0x53
+stock_usage = 0x21
+[[buttons]]
+id = 0x54
+stock_usage = 0x22
+[[buttons]]
+id = 0x55
+stock_usage = 0x23

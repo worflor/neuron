@@ -15,6 +15,8 @@
 //! A bind is always stored against the button's STOCK usage (what it emits from the factory), so
 //! the engine, the rule files and capture never see a remapped key. Capture restores the stock
 //! table while it listens.
+//! Separate plate banks sharing a stock control receive the same function; plate-scoped rules
+//! select that function, while base binds work before the first plate announcement.
 //!
 //! Writes go to the volatile direct profile (0): nothing touches onboard flash, and the device
 //! forgets them on replug or power loss, so the app re-applies on connect and wake.
@@ -37,7 +39,7 @@ const BUTTON_FN_SIZE: u8 = 0x0A;
 const DIRECT_PROFILE: u8 = 0x00;
 const CATEGORY_KEYBOARD: u8 = 0x02;
 
-/// Keys handed out one per button for host-performed binds: F13..F24, allocated from F24 down
+/// Keys handed out one per stock control for host-performed binds: F13..F24, allocated from F24 down
 /// because macro pads and hotkey tools favour F13 upward. Unique across every device at once.
 const PRIVATE_POOL: std::ops::RangeInclusive<u8> = 0x68..=0x73;
 
@@ -205,6 +207,9 @@ pub fn plan_for(def: &DeviceDef, rules: &[Rule], held: Option<crate::controls::C
         taken.insert(usage);
         Some(usage)
     };
+    // Mutually exclusive side plates can expose the same stock control through separate banks.
+    // Both banks must emit the same private key so startup needs no guessed plate identity.
+    let mut private_by_stock = BTreeMap::new();
     def.buttons
         .iter()
         .map(|&ButtonSpec { id, stock_usage }| {
@@ -229,7 +234,14 @@ pub fn plan_for(def: &DeviceDef, rules: &[Rule], held: Option<crate::controls::C
                 };
                 match firmware {
                     Some((mods, usage)) => Role::Performed { mods, usage },
-                    None => next_private().map_or(Role::Stock, |usage| Role::Private { usage }),
+                    None => {
+                        let private = private_by_stock.get(&stock_usage).copied().or_else(|| {
+                            let usage = next_private()?;
+                            private_by_stock.insert(stock_usage, usage);
+                            Some(usage)
+                        });
+                        private.map_or(Role::Stock, |usage| Role::Private { usage })
+                    }
                 }
             };
             ButtonPlan { id, stock_usage, role }
@@ -300,8 +312,9 @@ impl Table {
         for (key, plan) in &self.0 {
             for p in plan {
                 if matches!(p.role, Role::Private { usage: u } if u16::from(u) == usage) {
-                    if found.is_some() { return None; }
-                    found = Some((key.pid, key.instance.clone(), p.stock_usage));
+                    let source = (key.pid, key.instance.clone(), p.stock_usage);
+                    if found.as_ref().is_some_and(|old| *old != source) { return None; }
+                    found = Some(source);
                 }
             }
         }
@@ -323,6 +336,8 @@ impl Table {
                     _ => None,
                 })
             })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 }
@@ -634,8 +649,75 @@ mod tests {
         };
         let first = privates(&plan(&def, &rules, None, &mut taken));
         let second = privates(&plan(&def, &rules, None, &mut taken));
-        assert_eq!(first, vec![0x73, 0x72], "F24 first");
+        assert_eq!(first, vec![0x73, 0x72, 0x73, 0x72], "both plate banks share each stock control's key, F24 first");
+        assert_eq!(taken.len(), 4, "two logical controls per device consume four private keys");
         assert!(second.iter().all(|u| !first.contains(u)), "{first:?} vs {second:?}");
+    }
+
+    #[test]
+    fn six_button_bank_uses_saved_stock_binds_without_a_plate_announcement() {
+        let pid = CanonicalPid::of(0x00A7);
+        let rules = [bind(0x1E, key("h"), None), bind(0x1F, Action::MouseButton { button: crate::action::MouseButtonKind::Middle }, None)];
+        let mut taken = Default::default();
+        let plan = plan_for(&naga(), &rules, None, Plate::Seated(None), &mut taken);
+        let role = |id| plan.iter().find(|p| p.id == id).unwrap().role;
+        assert_eq!(role(0x50), Role::Performed { mods: 0, usage: 0x0B });
+        assert_eq!(role(0x50), role(0x40));
+        assert_eq!(role(0x51), Role::Private { usage: 0x73 });
+        assert_eq!(role(0x51), role(0x41));
+        assert_eq!(taken.len(), 1, "aliased banks must not exhaust the private pool");
+        let stock = plan_for(&naga(), &[], None, Plate::Seated(None), &mut Default::default());
+        for (id, usage) in (0x50..=0x55).zip(0x1E..=0x23) {
+            let p = stock.iter().find(|p| p.id == id).unwrap();
+            assert_eq!(p.record(), Record::stock(usage));
+        }
+        let mut table = Table::default();
+        table.0.insert(DeviceKey { pid, instance: "unit-a".into() }, plan);
+        assert_eq!(table.private_source(0x73), Some((pid, "unit-a".into(), 0x1F)));
+        assert_eq!(table.private_keys(), vec![(pid, 0x73)]);
+        assert_eq!(table.translate(pid, "unit-a", 0x73), (0x1F, false));
+        assert_eq!(table.translate(pid, "unit-a", 0x0B), (0x1E, false));
+    }
+
+    #[test]
+    fn six_button_bank_tracks_plate_scoped_overrides() {
+        let rules = [
+            bind(0x1E, key("h"), Some("plate:6-button")),
+            bind(0x1E, key("g"), Some("plate:12-button")),
+        ];
+        for (plate, expected) in [
+            (Some("plate:6-button"), Role::Performed { mods: 0, usage: 0x0B }),
+            (Some("plate:12-button"), Role::Performed { mods: 0, usage: 0x0A }),
+            (None, Role::Stock),
+        ] {
+            let plan = plan_for(&naga(), &rules, None, Plate::Seated(plate), &mut Default::default());
+            for id in [0x40, 0x50] {
+                assert_eq!(plan.iter().find(|p| p.id == id).unwrap().role, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn all_naga_host_binds_fit_the_private_pool_across_both_banks() {
+        let rules: Vec<_> = (0x1E..=0x27).chain([0x2D, 0x2E])
+            .map(|usage| bind(usage, Action::MouseButton { button: crate::action::MouseButtonKind::Middle }, None))
+            .collect();
+        let mut taken = Default::default();
+        let plan = plan_for(&naga(), &rules, None, Plate::Seated(None), &mut taken);
+        assert_eq!(plan.len(), 18);
+        assert!(plan.iter().all(|p| matches!(p.role, Role::Private { .. })));
+        assert_eq!(taken.len(), 12);
+    }
+
+    #[test]
+    fn private_aliases_cannot_name_different_controls_on_one_unit() {
+        let pid = CanonicalPid::of(0x00A7);
+        let mut table = Table::default();
+        table.0.insert(DeviceKey { pid, instance: "unit-a".into() }, vec![
+            ButtonPlan { id: 0x40, stock_usage: 0x1E, role: Role::Private { usage: 0x73 } },
+            ButtonPlan { id: 0x51, stock_usage: 0x1F, role: Role::Private { usage: 0x73 } },
+        ]);
+        assert_eq!(table.private_source(0x73), None);
     }
 
     #[test]
