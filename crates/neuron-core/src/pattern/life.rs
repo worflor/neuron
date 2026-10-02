@@ -214,6 +214,7 @@ pub(super) struct LifeSim {
     pending_star: Option<PendingStar>,
     star_due: f64,
     recovery_at: f64,
+    empty_for: f64,
     renewal_at: f64,
     recurrence: VecDeque<Vec<u64>>,
     recurrence_at: f64,
@@ -250,6 +251,11 @@ const BLOCK: &[(isize, isize)] = &[(0, 0), (0, 1), (1, 0), (1, 1)];
 const BLINKER: &[(isize, isize)] = &[(1, 0), (1, 1), (1, 2)];
 const BLINKER_ORBIT: &[(isize, isize)] = &[(0, 1), (1, 0), (1, 1), (1, 2), (2, 1)];
 const BOAT: &[(isize, isize)] = &[(0, 0), (0, 1), (1, 0), (1, 2), (2, 1)];
+const TOAD: &[(isize, isize)] = &[(1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (2, 2)];
+const TOAD_ORBIT: &[(isize, isize)] = &[
+    (0, 2), (1, 0), (1, 1), (1, 2), (1, 3),
+    (2, 0), (2, 1), (2, 2), (2, 3), (3, 1),
+];
 const LOCAL_MOTIFS: &[LocalMotif] = &[
     LocalMotif {
         cells: BLOCK,
@@ -262,6 +268,10 @@ const LOCAL_MOTIFS: &[LocalMotif] = &[
     LocalMotif {
         cells: BOAT,
         orbit: BOAT,
+    },
+    LocalMotif {
+        cells: TOAD,
+        orbit: TOAD_ORBIT,
     },
 ];
 
@@ -315,6 +325,7 @@ impl LifeSim {
             pending_star: None,
             star_due: 160.0,
             recovery_at: 0.0,
+            empty_for: 0.0,
             renewal_at: 0.0,
             recurrence: VecDeque::new(),
             recurrence_at: 0.0,
@@ -391,6 +402,9 @@ impl LifeSim {
                 self.squall_charge = 0.0;
                 self.scene = None;
                 self.pending_star = None;
+                self.empty_for = 0.0;
+                self.recurrence.clear();
+                self.recurrence_at = t;
                 return;
             }
         }
@@ -534,7 +548,6 @@ impl LifeSim {
         }
         std::mem::swap(&mut self.live, &mut self.next);
         self.next.fill(false);
-        self.biological_t += 1.0 / 3.0;
         if seasons[3] > 0.0 && self.rand_weather() < 0.0008 * seasons[3] {
             self.winter_seed();
         }
@@ -1003,16 +1016,24 @@ impl LifeSim {
         self.ghost_ema += (ghost_density - self.ghost_ema) * (dt as f32 / 8.0).clamp(0.0, 1.0);
         let no_recent_input = !self.last_key_at.is_some_and(|at| self.sim_t - at < 3.0);
         let sparse = self.occupancy_ema < 0.06 && visible_count >= 12;
-        let empty = visible_live == 0 && visible_count >= 9;
-        if self.sim_t >= self.recovery_at
-            && no_recent_input
-            && self.scene.is_none()
-            && (sparse || empty)
-        {
-            self.recovery_at = self.sim_t + 6.0 + self.rand_immigration() as f64 * 6.0;
-            self.seed_local_motif();
+        let star_ready = self.quiet_for > 45.0 && self.sim_t >= self.star_due && self.scene.is_none();
+        let eligible = no_recent_input && self.scene.is_none()
+            && self.pending_star.is_none() && !star_ready;
+        if visible_live == 0 && visible_count >= 4 && eligible {
+            self.empty_for += dt;
+        } else {
+            self.empty_for = 0.0;
         }
-        if self.quiet_for > 45.0 && self.sim_t >= self.star_due && self.scene.is_none() {
+        let recovering = self.empty_for >= 1.25;
+        // Extinction bypasses sparse immigration's probability and cooldown, after a quiet pause.
+        if eligible && (recovering || (sparse && self.sim_t >= self.recovery_at)) {
+            self.recovery_at = self.sim_t
+                + (6.0 + self.rand_immigration() as f64 * 6.0) / f64::from(self.speed);
+            if self.seed_local_motif(recovering) || recovering {
+                self.empty_for = 0.0;
+            }
+        }
+        if star_ready {
             if let Some(i) = self.visible.iter().position(|v| *v) {
                 let y = (i / self.cols) as f32;
                 self.scene = Some(Scene {
@@ -1051,18 +1072,19 @@ impl LifeSim {
             && congested
             && self.quiet_for > 8.0
             && self.scene.is_none()
+            && self.pending_star.is_none()
         {
             self.start_renewal(visible_live);
         }
     }
 
-    fn seed_local_motif(&mut self) -> bool {
+    fn seed_local_motif(&mut self, recovering: bool) -> bool {
         if self.rows < 3 || self.cols < 3 {
             return false;
         }
         let seasons = season_weights(self.sim_t);
         let pressure = establishment_pressure(self.density, seasons);
-        if self.rand_immigration() > pressure {
+        if !recovering && self.rand_immigration() > pressure {
             return false;
         }
         let mut candidates = Vec::new();
@@ -1108,21 +1130,24 @@ impl LifeSim {
         if candidates.is_empty() {
             return false;
         }
-        let fertile: Vec<_> = candidates
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (_, _, _, value))| (*value >= 0.18).then_some(i))
-            .collect();
-        let choices = if fertile.is_empty() {
-            None
-        } else {
-            Some(&fertile)
-        };
-        let count = choices.map_or(candidates.len(), Vec::len);
-        let choice = (self.rand_immigration() * count as f32) as usize;
-        let candidate_index =
-            choices.map_or(choice, |indices| indices[choice.min(indices.len() - 1)]);
-        let (r, c, motif_index, _) = candidates[candidate_index];
+        let prefer_fertile = candidates.iter().any(|candidate| candidate.3 >= 0.18);
+        let mut viable = [false; LOCAL_MOTIFS.len()];
+        for candidate in &candidates {
+            if !prefer_fertile || candidate.3 >= 0.18 {
+                viable[candidate.2] = true;
+            }
+        }
+        // Choose the species before its site so small footprints do not crowd out larger motifs.
+        let motif_choice =
+            (self.rand_immigration() * viable.iter().filter(|x| **x).count() as f32) as usize;
+        let motif_index = viable.iter().enumerate().filter(|(_, v)| **v)
+            .nth(motif_choice).map(|(i, _)| i).expect("at least one viable motif");
+        let mut sites = candidates.iter().filter(|candidate| {
+            candidate.2 == motif_index && (!prefer_fertile || candidate.3 >= 0.18)
+        });
+        let site_choice = (self.rand_immigration() * sites.clone().count() as f32) as usize;
+        let &(r, c, motif_index, _) = sites.nth(site_choice)
+            .expect("viable motif has an admitted site");
         self.seed_cells((r, c), LOCAL_MOTIFS[motif_index].cells, 1)
     }
 
@@ -1143,11 +1168,20 @@ impl LifeSim {
                 })
             })
             .collect::<Vec<_>>();
-        if self.recurrence.iter().any(|old| old == &bits) && self.sim_t - self.recovery_at > 8.0 {
-            self.seed_local_motif();
-            self.recovery_at = self.sim_t + 6.0 + self.rand_immigration() as f64 * 6.0;
-            if self.sim_t - self.renewal_at > 60.0 && self.scene.is_none() {
-                self.start_renewal(self.visible.iter().filter(|x| **x).count() / 10);
+        let visible_live = (0..self.live.len())
+            .filter(|&i| self.visible[i] && self.live[i]).count();
+        if visible_live > 0
+            && self.quiet_for > 8.0
+            && self.scene.is_none()
+            && self.pending_star.is_none()
+            && self.recurrence.iter().any(|old| old == &bits)
+            && self.sim_t - self.recovery_at > 8.0
+        {
+            self.seed_local_motif(false);
+            self.recovery_at = self.sim_t
+                + (6.0 + self.rand_immigration() as f64 * 6.0) / f64::from(self.speed);
+            if self.sim_t - self.renewal_at > 60.0 {
+                self.start_renewal(visible_live);
             }
         }
         self.recurrence.push_back(bits);
@@ -1670,6 +1704,22 @@ mod tests {
         assert_eq!(same.live, first.live);
         assert_eq!(same.age, first.age);
         assert_eq!(same.nutrient, first.nutrient);
+
+        let idle = |fps: u32| {
+            let mut s = board(6, 22);
+            s.advance_to(0.0);
+            for frame in 1..=fps * 192 {
+                s.advance_to(frame as f64 / f64::from(fps));
+            }
+            s
+        };
+        let baseline = idle(60);
+        for fps in [6, 15, 30] {
+            let mut other = idle(fps);
+            assert!((other.tick_accum - baseline.tick_accum).abs() < 1e-8);
+            other.tick_accum = baseline.tick_accum;
+            assert_eq!(other, baseline, "idle ecology must not depend on render cadence");
+        }
     }
 
     #[test]
@@ -1714,13 +1764,13 @@ mod tests {
 
     #[test]
     fn local_establishment_varies_viable_catalog_motifs_across_seeds() {
-        let mut counts = [0usize; 3];
+        let mut counts = [0usize; LOCAL_MOTIFS.len()];
         let mut sampled = 0;
         for seed in 1..=64 {
             let mut s = LifeSim::new(12, 22, seed * 17);
             clear(&mut s);
             s.density = 3.0;
-            if !s.seed_local_motif() {
+            if !s.seed_local_motif(false) {
                 continue;
             }
             sampled += 1;
@@ -1729,11 +1779,12 @@ mod tests {
                 3 => 1,
                 4 => 0,
                 5 => 2,
+                6 => 3,
                 other => panic!("unexpected local motif population {other}"),
             };
             counts[catalog_index] += 1;
             let initial = s.live.clone();
-            if catalog_index == 1 {
+            if catalog_index == 1 || catalog_index == 3 {
                 s.generation();
                 s.generation();
             } else {
@@ -1746,7 +1797,7 @@ mod tests {
             "enough seeded trials should pass pressure: {sampled}"
         );
         assert!(
-            counts.iter().filter(|count| **count > 0).count() >= 2,
+            counts.iter().all(|count| *count > 0),
             "catalog choice should vary: {counts:?}"
         );
     }
@@ -1757,8 +1808,154 @@ mod tests {
         s.set_visible_region(&[5 * 22 + 5, 5 * 22 + 6, 5 * 22 + 7], 10, 22);
         clear(&mut s);
         s.density = 3.0;
-        assert!(!s.seed_local_motif());
+        assert!(!s.seed_local_motif(true));
         assert!(s.live.iter().all(|alive| !*alive));
+    }
+
+    #[test]
+    fn local_catalog_orbits_cover_every_phase_without_extra_cells() {
+        for motif in LOCAL_MOTIFS {
+            let mut phase = vec![false; 25];
+            for &(r, c) in motif.cells {
+                phase[r as usize * 5 + c as usize] = true;
+            }
+            let first = phase.clone();
+            let mut orbit = phase.clone();
+            for _ in 0..2 {
+                phase = conway_step(&phase, 5, 5);
+                for (seen, live) in orbit.iter_mut().zip(&phase) {
+                    *seen |= *live;
+                }
+            }
+            assert_eq!(phase, first, "local species must settle or repeat within two generations");
+            let expected = motif.orbit.iter().map(|&(r, c)| r as usize * 5 + c as usize)
+                .collect::<std::collections::HashSet<_>>();
+            let actual = orbit.iter().enumerate().filter_map(|(i, v)| v.then_some(i))
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn extinction_recovers_in_winter_despite_density_and_sparse_cooldown() {
+        for seed in 1..=16 {
+            let mut s = LifeSim::new(6, 22, seed);
+            clear(&mut s);
+            s.density = 0.25;
+            s.recovery_at = 1000.0;
+            for tick in 1..=74 {
+                s.sim_t = 60.0 + tick as f64 * DT;
+                s.governor(DT);
+                assert!(s.live.iter().all(|live| !*live));
+            }
+            for tick in 75..=77 {
+                s.sim_t = 60.0 + tick as f64 * DT;
+                s.governor(DT);
+            }
+            assert!(s.live.iter().any(|live| *live), "winter recovery failed for seed {seed}");
+            assert_eq!(s.empty_for, 0.0);
+        }
+        let mut typed = board(6, 22);
+        clear(&mut typed);
+        for tick in 1..=120 {
+            typed.sim_t = tick as f64 * DT;
+            typed.last_key_at = Some(typed.sim_t);
+            typed.governor(DT);
+        }
+        assert!(typed.live.iter().all(|live| !*live));
+        assert_eq!(typed.empty_for, 0.0);
+    }
+
+    #[test]
+    fn repeat_interventions_wait_for_quiet_and_do_not_renew_an_empty_board() {
+        for empty in [false, true] {
+            let mut s = board(6, 22);
+            if empty {
+                clear(&mut s);
+                s.quiet_for = 80.0;
+            }
+            s.sim_t = 64.0;
+            s.record_recurrence();
+            let before = s.live.clone();
+            s.sim_t = 72.0;
+            s.record_recurrence();
+            assert!(s.scene.is_none());
+            assert_eq!(s.live, before);
+            assert_eq!(s.recovery_at, 0.0);
+        }
+        let mut wake = board(6, 22);
+        wake.quiet_for = 80.0;
+        wake.pending_star = Some(PendingStar { due: 74.0, origins: vec![0] });
+        wake.sim_t = 64.0;
+        wake.record_recurrence();
+        wake.sim_t = 72.0;
+        let before = wake.live.clone();
+        wake.record_recurrence();
+        assert!(wake.scene.is_none());
+        assert_eq!(wake.live, before);
+        assert_eq!(wake.recovery_at, 0.0);
+    }
+
+    #[test]
+    fn a_ready_star_defers_extinction_recovery_on_its_first_tick() {
+        let mut s = board(6, 22);
+        clear(&mut s);
+        s.sim_t = 160.0;
+        s.quiet_for = 80.0;
+        s.empty_for = 1.24;
+        s.recovery_at = 1000.0;
+        s.governor(DT);
+        assert_eq!(s.scene.as_ref().map(|scene| scene.kind), Some(SceneKind::Star));
+        assert!(s.live.iter().all(|live| !*live));
+        assert_eq!(s.empty_for, 0.0);
+        assert_eq!(s.recovery_at, 1000.0);
+    }
+
+    #[test]
+    fn idle_clock_and_recovery_follow_speed_without_moving_the_seasons() {
+        for speed in [0.25, 1.0, 4.0] {
+            let mut s = board(6, 22);
+            s.speed = speed;
+            s.advance_to(0.0);
+            for tick in 1..=600 {
+                s.advance_to(tick as f64 * DT);
+            }
+            assert!((s.biological_t - 10.0 * f64::from(speed)).abs() < 1e-8);
+            assert!((s.sim_t - 10.0).abs() < 1e-8);
+            clear(&mut s);
+            s.sim_t = 20.0;
+            s.recovery_at = 0.0;
+            s.occupancy_ema = 0.0;
+            s.governor(DT);
+            let delay = (s.recovery_at - s.sim_t) * f64::from(speed);
+            assert!((6.0..=12.0).contains(&delay));
+        }
+    }
+
+    #[test]
+    fn idle_keyboard_trace_avoids_prolonged_extinction_across_speed_and_density() {
+        let region = crate::lighting::razer_keyboard_keys().iter()
+            .filter_map(|key| crate::lighting::razer_key_cell(key))
+            .map(|(r, c)| u32::from(r) * 22 + u32::from(c)).collect::<Vec<_>>();
+        for speed in [0.25, 1.0, 4.0] {
+            for density in [0.25, 1.0, 3.0] {
+                let mut s = LifeSim::new(6, 22, 0x4C49_4645 ^ (6 << 8) ^ 22);
+                s.speed = speed;
+                s.density = density;
+                s.set_visible_region(&region, 6, 22);
+                s.advance_to(0.0);
+                let mut empty_for = 0.0;
+                for frame in 1..=14_400 {
+                    s.advance_to(frame as f64 * DT);
+                    if s.live.iter().zip(&s.visible).any(|(live, visible)| *live && *visible) {
+                        empty_for = 0.0;
+                    } else {
+                        empty_for += DT;
+                    }
+                    assert!(empty_for < 7.0, "idle extinction: speed={speed}, density={density}");
+                }
+            }
+        }
     }
 
     #[test]

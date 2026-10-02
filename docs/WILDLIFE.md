@@ -48,6 +48,22 @@ not add user controls or a second lighting engine.
 - Keep speed/density as the only parameters. Speed affects biology and ambient
   motion, never the shared 64 s calendar or physical-input thresholds. Density
   affects establishment pressure rather than immediate touch visibility.
+- Idle establishment chooses among viable blocks, blinkers, boats and toads,
+  then chooses a site, favouring fertile ground. Each oscillator's complete
+  two-phase footprint must fit the visible region. Choosing species before sites
+  prevents smaller footprints dominating merely because they fit more places.
+- Sparse immigration retains seasonal probability and a 6–12 biological-second
+  cooldown. Visible extinction instead receives a viable-motif attempt after
+  1.25 eligible quiet seconds, bypassing that probability and cooldown. Recent
+  input, an active scene or a pending star wake defers recovery; a region with no
+  complete admitted motif cannot be promised a colony. Failed admission retries
+  after another quiet pause. Winter stays sparse without waiting on repeated
+  unsuccessful immigration rolls.
+- Recurrence interventions require visible life and at least eight seconds of
+  quiet. Empty boards use extinction recovery, and delayed star wakes retain
+  their own space. A clock rebase clears stale recurrence history. The ambient
+  biological clock advances once per simulation tick, independently of generation
+  boundaries.
 - Tests include canonical independent B3/S23 fixtures, identical-time idempotence,
   cadence equivalence, mask/tiny-grid behaviour, event eligibility, quantized RGB
   contrast and several long seeded traces. A green suite still does not grade the
