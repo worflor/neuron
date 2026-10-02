@@ -2451,8 +2451,9 @@ pub fn clear_gestures() -> Result<usize, String> {
 /// the crate's env lock. Dropping it restores the root and removes the dir.
 #[cfg(test)]
 pub(crate) struct TestRoot {
-    _lock: std::sync::MutexGuard<'static, ()>,
+    // Restore the process-wide override before releasing its lock.
     _pin: crate::runroot::RunDirPin,
+    _lock: std::sync::MutexGuard<'static, ()>,
     dir: std::path::PathBuf,
 }
 
