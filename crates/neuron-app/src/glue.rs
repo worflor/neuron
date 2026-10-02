@@ -554,6 +554,7 @@ fn preset_picker(st: &State, action: &neuron::action::Action) {
 }
 
 fn refresh_action_editor(state: &State) {
+    refresh_clipboard_macro_choices(state);
     refresh_param_suggestions(state);
     state.set_lighting_edit_operation(0);
     state.set_lighting_edit_index("0".into());
@@ -600,6 +601,13 @@ fn refresh_action_editor(state: &State) {
         parse_transform_ops(&state.get_action_param()).unwrap_or_default()
     } else { Vec::new() };
     refresh_clipboard_operations(state, &ops);
+}
+
+fn refresh_clipboard_macro_choices(state: &State) {
+    let names = neuron::macros::macro_host::list_macros();
+    let index = state.get_clipboard_macro_index().clamp(0, names.len().saturating_sub(1) as i32);
+    state.set_clipboard_macro_index(index);
+    state.set_clipboard_macros(ModelRc::new(VecModel::from(names.into_iter().map(Into::into).collect::<Vec<_>>())));
 }
 
 /// SUGGESTION CHIPS for the param field — live, clickable fills, by what the chosen action
@@ -1413,6 +1421,7 @@ fn refresh_clipboard_operations(state: &State, ops: &[neuron::clipboard_transfor
         Some(ClipboardOperationRow {
             label: match op {
                 neuron::clipboard_transform::TransformOp::Regex { pattern, .. } => format!("regex /{pattern}/").into(),
+                neuron::clipboard_transform::TransformOp::Macro { id } => format!("macro · {id}").into(),
                 _ => label.to_string().into(),
             },
             editable: matches!(op, neuron::clipboard_transform::TransformOp::Regex { .. }),
@@ -1510,6 +1519,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
             });
         });
     }
+    {
+        let weak = app.as_weak();
+        neuron::pocket::install_transform_completion_sink(move |message| {
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.global::<State>().set_status_line(message.into());
+                }
+            });
+        });
+    }
 
     st.on_append_clipboard_operation({
         let w = app.as_weak();
@@ -1553,6 +1573,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 "url-encode" => Some(neuron::clipboard_transform::TransformOp::UrlEncode),
                 "url-decode" => Some(neuron::clipboard_transform::TransformOp::UrlDecode),
                 "regex" => Some(neuron::clipboard_transform::TransformOp::Regex { pattern: pattern.to_string(), replace: replacement.to_string() }),
+                "macro" => Some(neuron::clipboard_transform::TransformOp::Macro { id: pattern.to_string() }),
                 _ => None,
             }) else {
                 state.set_clipboard_preview_status("unknown transform operation".into());
@@ -1565,6 +1586,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
             }
             ops.push(op);
+            if let Err(error) = neuron::clipboard_transform::validate_ops(&ops) {
+                ops.pop();
+                state.set_clipboard_preview_status(error.to_string().into());
+                return;
+            }
             if let Ok(encoded) = serde_json::to_string(&ops) {
                 state.set_action_param(encoded.into());
                 refresh_clipboard_operations(&state, &ops);
@@ -8010,6 +8036,7 @@ static MACRO_CATALOG_BUILDING: std::sync::atomic::AtomicBool =
 /// sidecar (blocks up to `FIRE_BUDGET`), so it runs OFF the UI thread and posts the finished model back.
 pub(crate) fn refresh_macro_catalog(app: &AppWindow) {
     use std::sync::atomic::Ordering;
+    refresh_clipboard_macro_choices(&app.global::<State>());
     let macros = neuron::macros::macro_host::scan_macro_dir();
     if macros.is_empty() {
         let st = app.global::<State>();

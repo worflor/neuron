@@ -470,25 +470,101 @@ pub fn restore_history(index: usize) -> String {
 /// Transform CF_UNICODETEXT and replace the clipboard only after the entire result is ready and
 /// the original clipboard sequence still matches. Rich source formats become explicit plain text.
 pub fn transform(ops: &[crate::clipboard_transform::TransformOp]) -> String {
+    transform_snapshot_compute_commit(ops, None)
+}
+
+/// Run a macro-backed transform away from the live input listener.
+pub fn transform_ctx(ops: &[crate::clipboard_transform::TransformOp], ctx: &crate::macros::context::Context) -> String {
+    let has_macro = ops.iter().any(|op| matches!(op, crate::clipboard_transform::TransformOp::Macro { .. }));
+    if !has_macro { return transform(ops); }
+    if let Err(error) = crate::clipboard_transform::validate_ops(ops) {
+        return format!("clipboard transform: {error}");
+    }
+    if !crate::action::input_armed() { return "clipboard transform [disarmed]".into(); }
+    let snapshot = match capture_transform_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(message) => return message,
+    };
+    if TRANSFORM_ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return "clipboard transform skipped: another macro transform is running".into();
+    }
+    let owned_ops = ops.to_vec();
+    let owned_ctx = ctx.clone();
+    let worker_started = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_started_in_work = worker_started.clone();
+    let worker_started_in_done = worker_started;
+    let spawned = crate::worker::spawn_notify(
+        "neuron-clipboard-transform",
+        move || {
+            worker_started_in_work.store(true, Ordering::SeqCst);
+            transform_snapshot_compute_commit_from_snapshot(&owned_ops, Some(&owned_ctx), snapshot)
+        },
+        move |result| {
+            TRANSFORM_ACTIVE.store(false, Ordering::SeqCst);
+            let message = result.unwrap_or_else(|| {
+                if worker_started_in_done.load(Ordering::SeqCst) { "clipboard transform failed: worker panicked".into() }
+                else { "clipboard transform skipped: worker unavailable".into() }
+            });
+            publish_transform_completion(message);
+        },
+    );
+    if spawned { "clipboard transform queued".into() }
+    else { "clipboard transform skipped: worker unavailable".into() }
+}
+
+fn transform_snapshot_compute_commit(
+    ops: &[crate::clipboard_transform::TransformOp],
+    ctx: Option<&crate::macros::context::Context>,
+) -> String {
+    if let Err(error) = crate::clipboard_transform::validate_ops(ops) {
+        return format!("clipboard transform: {error}");
+    }
+    match capture_transform_snapshot() {
+        Ok(snapshot) => transform_snapshot_compute_commit_from_snapshot(ops, ctx, snapshot),
+        Err(message) => message,
+    }
+}
+
+fn capture_transform_snapshot() -> Result<(Pocket, String, u64), String> {
     #[cfg(not(windows))]
     if fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() {
-        return "clipboard transform: clipboard access is unsupported on this platform".into();
+        return Err("clipboard transform: clipboard access is unsupported on this platform".into());
     }
     let (state, sequence) = read_clip_snapshot();
     let original = match state {
-        ClipState::Empty => return "clipboard transform: clipboard is empty".into(),
-        ClipState::Busy => return "clipboard transform: clipboard is busy".into(),
-        ClipState::Uncarryable => return "clipboard transform: clipboard format cannot be read".into(),
+        ClipState::Empty => return Err("clipboard transform: clipboard is empty".into()),
+        ClipState::Busy => return Err("clipboard transform: clipboard is busy".into()),
+        ClipState::Uncarryable => return Err("clipboard transform: clipboard format cannot be read".into()),
         ClipState::Carryable(pocket) => pocket,
     };
     let Some(bytes) = original.get(CF_UNICODETEXT) else {
-        return "clipboard transform: clipboard has no Unicode text".into();
+        return Err("clipboard transform: clipboard has no Unicode text".into());
     };
     let input = match utf16_text(bytes) {
         Ok(text) => text,
-        Err(()) => return "clipboard transform: clipboard text is invalid UTF-16".into(),
+        Err(()) => return Err("clipboard transform: clipboard text is invalid UTF-16".into()),
     };
-    let output = match crate::clipboard_transform::apply(&input, ops) {
+    if input.len() > crate::clipboard_transform::MAX_TEXT_BYTES {
+        return Err(format!("clipboard transform: {}", crate::clipboard_transform::TransformError::InputTooLarge));
+    }
+    Ok((original, input, sequence))
+}
+
+fn transform_snapshot_compute_commit_from_snapshot(
+    ops: &[crate::clipboard_transform::TransformOp],
+    ctx: Option<&crate::macros::context::Context>,
+    (original, input, sequence): (Pocket, String, u64),
+) -> String {
+    if ops.iter().any(|op| matches!(op, crate::clipboard_transform::TransformOp::Macro { .. }))
+        && !crate::action::input_armed() {
+        return "clipboard transform [disarmed]".into();
+    }
+    let output = match crate::clipboard_transform::apply_with(&input, ops, |id, text| {
+        if !crate::action::input_armed() { return Err(crate::clipboard_transform::TransformError::Macro("clipboard transform [disarmed]".into())); }
+        let Some(ctx) = ctx else { return Err(crate::clipboard_transform::TransformError::Macro("macro transforms require the action context".into())); };
+        crate::macros::macro_host::macro_host().transform_text(id, ctx, text)
+            .map_err(crate::clipboard_transform::TransformError::Macro)
+    }) {
         Ok(output) => output,
         Err(error) => return format!("clipboard transform: {error}"),
     };
@@ -799,8 +875,20 @@ pub fn flush_durable_sync() -> std::io::Result<()> {
     Ok(())
 }
 
-type PersistFailureSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
-static PERSIST_FAILURE_SINK: std::sync::OnceLock<std::sync::Mutex<Option<PersistFailureSink>>> = std::sync::OnceLock::new();
+type StatusSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+static PERSIST_FAILURE_SINK: std::sync::OnceLock<std::sync::Mutex<Option<StatusSink>>> = std::sync::OnceLock::new();
+static TRANSFORM_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TRANSFORM_COMPLETION_SINK: OnceLock<Mutex<Option<StatusSink>>> = OnceLock::new();
+
+/// Install the host's nonblocking completion surface for macro-backed clipboard transforms.
+pub fn install_transform_completion_sink<F>(sink: F)
+where F: Fn(String) + Send + Sync + 'static {
+    *TRANSFORM_COMPLETION_SINK.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(sink));
+}
+
+fn publish_transform_completion(message: String) {
+    if let Some(sink) = TRANSFORM_COMPLETION_SINK.get().and_then(|cell| cell.lock().ok().and_then(|g| g.clone())) { sink(message); }
+}
 
 /// Install the resident host's nonblocking surface for durable pocket write failures.
 pub fn install_persist_failure_sink<F>(sink: F)
@@ -1455,6 +1543,8 @@ mod imp {
 mod tests {
     use super::*;
 
+    static CLIP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn utf16le(s: &str) -> Vec<u8> {
         let mut b: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
         b.extend_from_slice(&[0, 0]); // NUL terminator
@@ -1492,6 +1582,34 @@ mod tests {
         }
         assert!(validate_slot_name("notes-2").is_ok());
         assert!(validate_slot_name("").is_ok());
+    }
+
+    #[test]
+    fn native_transform_commits_through_the_fake_clipboard_without_arming() {
+        let _lock = CLIP_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::action::arm_input(false);
+        testclip::install_text("  hello  ");
+        testclip::authorize_moves(true);
+        history().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        let result = transform(&[crate::clipboard_transform::TransformOp::Trim]);
+        assert_eq!(result, "clipboard transformed (5 chars)");
+        assert_eq!(testclip::current().and_then(|p| p.text()), Some("hello".into()));
+        assert_eq!(history_item(0).and_then(|p| p.text()), Some("  hello  ".into()));
+        testclip::uninstall();
+    }
+
+    #[test]
+    fn macro_transform_is_refused_while_disarmed_and_keeps_clipboard() {
+        let _lock = CLIP_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::action::arm_input(false);
+        testclip::install_text("keep me");
+        let result = transform_ctx(
+            &[crate::clipboard_transform::TransformOp::Macro { id: "rewrite".into() }],
+            &crate::macros::context::Context::default(),
+        );
+        assert_eq!(result, "clipboard transform [disarmed]");
+        assert_eq!(testclip::current().and_then(|p| p.text()), Some("keep me".into()));
+        testclip::uninstall();
     }
 
     #[test]

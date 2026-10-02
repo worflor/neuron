@@ -129,6 +129,7 @@ pub type DocumentParseResult = Result<MacroDocument, ParseError>;
 /// Hard ceiling on a single blocking macro invocation (test-run / CLI). The input path uses
 /// [`fire_async`] and never waits at all.
 pub const FIRE_BUDGET: Duration = Duration::from_millis(2500);
+const TRANSFORM_TEXT_BUDGET: Duration = Duration::from_secs(300);
 /// How long to wait for the sidecar to come warm (boot + register every macro) before giving up.
 const WARM_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bounded macro-log ring (last N lines kept; old dropped — a flood can't grow memory).
@@ -1757,6 +1758,102 @@ impl MacroHost {
     /// Never call from the input/UI thread.
     pub fn invoke(&self, id: &str, ctx: &crate::macros::context::Context) -> String {
         self.invoke_with_budget(id, ctx, FIRE_BUDGET)
+    }
+
+    /// Run a stored macro as a clipboard-text transform. The macro receives the current pipeline
+    /// value as `ctx.clipboard`; only an actual string result is accepted.
+    pub(crate) fn transform_text(
+        &self,
+        id: &str,
+        ctx: &crate::macros::context::Context,
+        text: &str,
+    ) -> Result<String, String> {
+        self.transform_text_inner(id, ctx, text, TRANSFORM_TEXT_BUDGET, false)
+    }
+
+    /// Budgeted, mock-authorized variant for sidecar contract tests. Mock fires keep every
+    /// brokered effect inert while allowing the return-value protocol to run disarmed.
+    #[cfg(test)]
+    pub(crate) fn transform_text_with_budget(
+        &self,
+        id: &str,
+        ctx: &crate::macros::context::Context,
+        text: &str,
+        budget: Duration,
+    ) -> Result<String, String> {
+        self.transform_text_inner(id, ctx, text, budget, true)
+    }
+
+    fn transform_text_inner(
+        &self,
+        id: &str,
+        ctx: &crate::macros::context::Context,
+        text: &str,
+        budget: Duration,
+        mock: bool,
+    ) -> Result<String, String> {
+        validate_macro_id(id)?;
+        if text.len() > crate::clipboard_transform::MAX_TEXT_BYTES {
+            return Err("clipboard transform input exceeds 1048576 bytes".into());
+        }
+        let mut transform_ctx = ctx.clone();
+        transform_ctx.clipboard = Some(text.to_string());
+        let (rx, shared, rid, sent) = {
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.sync_manifest(&mut g);
+            let mode = g.modes.get(id).copied().ok_or_else(|| format!("no macro '{id}'"))?;
+            self.ensure_lane_locked(&mut g, mode)?;
+            // Warming a cold lane may take seconds. Re-sample after it is ready so a disarm
+            // during startup cannot launch unrestricted RAW Python under stale authority.
+            let (armed, arm_generation) = self.arm_snapshot(mock);
+            if !armed && !mock {
+                return Err("clipboard transform [disarmed]".into());
+            }
+            let generation = g.generations.get(id).copied().unwrap_or(0);
+            let s = lane_session_mut(&mut g, mode).unwrap();
+            let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = channel();
+            let shared = Arc::clone(&s.shared);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
+            let sent = self.send_fire(s, &json!({
+                "t": "fire", "rid": rid, "id": id, "generation": generation,
+                "ctx": ctx_json(&transform_ctx, armed), "options": load_option_values(id),
+                "authorized": armed, "arm_generation": arm_generation,
+                "mock": mock,
+                "contract": "clipboard-text-v1",
+            }));
+            (rx, shared, rid, sent)
+        };
+        match sent {
+            FireSend::Sent => {}
+            FireSend::Full => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                return Err("macro sidecar fire queue full".into());
+            }
+            FireSend::Dead => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                return Err("macro sidecar pipe broken".into());
+            }
+        }
+        match rx.recv_timeout(budget) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                if v.get("value_type").and_then(Value::as_str) != Some("str") {
+                    return Err("clipboard transform macro returned no text".into());
+                }
+                let value = v.get("value").and_then(Value::as_str)
+                    .ok_or_else(|| "clipboard transform macro returned no text".to_string())?;
+                if value.len() > crate::clipboard_transform::MAX_TEXT_BYTES {
+                    return Err("clipboard transform output exceeds 1048576 bytes".into());
+                }
+                Ok(value.to_string())
+            }
+            Ok(v) => Err(v.get("error").and_then(Value::as_str)
+                .unwrap_or("clipboard transform macro failed").to_string()),
+            Err(_) => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                Err("clipboard transform macro timed out".into())
+            }
+        }
     }
 
     /// [`invoke`](MacroHost::invoke) with an explicit wait budget. The CLI's `macro run` passes a
@@ -3469,6 +3566,49 @@ pub(crate) static SIDECAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_text_contract_accepts_only_bounded_strings() {
+        let _sidecar = SIDECAR_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = crate::runroot::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!("neuron_clipboard_contract_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let pin = crate::runroot::RunDirPin::to(&root);
+        let host = macro_host();
+        if !host.available() {
+            drop(pin);
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let id = format!("clipboard_contract_{}", std::process::id());
+        let raw_id = format!("clipboard_contract_raw_{}", std::process::id());
+        let ctx = crate::macros::context::Context::synthetic(
+            Some("editor.exe".into()), Some("note".into()), None, Some("old".into()), Some("selection".into()),
+        );
+        host.register(&id, "def macro(ctx):\n    return ctx.clipboard[::-1]\n").unwrap();
+        assert!(host.transform_text(&id, &ctx, "abc").unwrap_err().contains("[disarmed]"));
+        assert_eq!(host.transform_text_with_budget(&id, &ctx, "abc", Duration::from_secs(3)).unwrap(), "cba");
+        host.register(&id, "def macro(ctx):\n    return ''\n").unwrap();
+        assert_eq!(host.transform_text_with_budget(&id, &ctx, "abc", Duration::from_secs(3)).unwrap(), "");
+        host.register(&id, "def macro(ctx):\n    return None\n").unwrap();
+        assert!(host.transform_text_with_budget(&id, &ctx, "abc", Duration::from_secs(3)).unwrap_err().contains("string"));
+        host.register(&id, "def macro(ctx):\n    return 7\n").unwrap();
+        assert!(host.transform_text_with_budget(&id, &ctx, "abc", Duration::from_secs(3)).unwrap_err().contains("string"));
+        host.register(&id, "def macro(ctx):\n    raise ValueError('broken')\n").unwrap();
+        assert!(host.transform_text_with_budget(&id, &ctx, "abc", Duration::from_secs(3)).unwrap_err().contains("broken"));
+        host.register(&id, "def macro(ctx):\n    return 'x' * (1024 * 1024 + 1)\n").unwrap();
+        assert!(host.transform_text_with_budget(&id, &ctx, "abc", Duration::from_secs(3)).unwrap_err().contains("1048576"));
+        // Each fixture keeps one policy so its durable file and sidecar lane have one lifecycle.
+        host.register(&raw_id, "# neuron: raw\nimport time\ndef macro(ctx):\n    time.sleep(0.2)\n    return ctx.clipboard\n").unwrap();
+        assert!(host.transform_text_with_budget(&raw_id, &ctx, "late", Duration::from_millis(20)).unwrap_err().contains("timed out"));
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(host.transform_text_with_budget(&raw_id, &ctx, "fresh", Duration::from_secs(3)).unwrap(), "fresh");
+        host.unregister(&id);
+        host.unregister(&raw_id);
+        drop(pin);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn sanitize_id_is_fs_safe() {

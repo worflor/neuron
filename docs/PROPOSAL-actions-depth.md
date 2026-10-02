@@ -12,7 +12,14 @@ serve preview, validation and execution. One ordered list of typed operations:
 ```toml
 { type = "clipboard-transform", ops = [{ op = "trim" }, { op = "lines-unique" }] }
 { type = "clipboard-transform", ops = [{ op = "regex", pattern = '(?P<date>\d{4}-\d{2}-\d{2}) (?P<msg>.*)', replace = '[${date}] ${msg}' }] }
+{ type = "clipboard-transform", ops = [{ op = "macro", id = "rewrite" }] }
 ```
+
+One stored Python macro may appear in the ordered list. It receives the current intermediate text as
+`ctx.clipboard`; `def macro(ctx):` must return an actual Python `str` (including `""`). Missing or
+non-string results fail without replacing the clipboard. Macro-backed transforms run off the input
+thread, require the arm gate, and have a five-minute result budget; the existing clipboard sequence
+check still decides whether the result may commit.
 
 | family | operations | contract |
 |---|---|---|
