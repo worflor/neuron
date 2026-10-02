@@ -1,17 +1,20 @@
 ---
 name: neuron-cli
-description: Drive Neuron end to end from the command line. Use when a user wants binds, rebinds, macros, the cast wheel, glyphs, lighting, profiles, app routing, device feel or their whole setup created, changed or inspected without the GUI, or wants a Neuron setup exported and restored.
+description: Inspect and configure Neuron through its CLI. Use for bindings, macro registration and routing, cast wheels, glyphs, lighting, profiles, app routes, device settings, and exporting or restoring complete setups.
 ---
 
 # Driving Neuron through the CLI
 
-`neuron` is the same engine as the tray app. Everything the app can author, the CLI can author, and a
-running app picks the edit up within about a second. Full reference: [`docs/CLI.md`](../../docs/CLI.md).
+`neuron` shares its engine and configuration with the tray app. Discover the
+installed build's commands with `neuron --help` and its authoring capabilities
+with `neuron catalog --json`. Full reference: [`docs/CLI.md`](../../docs/CLI.md).
+For Python macro source and return contracts, use [neuron-macros](../neuron-macros/SKILL.md).
 
-## Rules before you touch anything
+## Authority and configuration
 
-- **Never arm input.** No verb here synthesizes keystrokes. Do not pass `--arm` to `macro run` or
-  `button apply` unless the user asked for that run.
+- **Armed operations need an explicit request.** Pass `--arm` to `macro run` or
+  `button apply` when the user requested that operation. RAW macro effects use the
+  user's account authority even with Neuron input disarmed.
 - **Device writes are the user's hardware.** Reads (`control list`, `button plan`, `bind list`, `status`)
   are safe. `button apply`, `dpi`, `idle`, `profile apply` write the device; do them only when asked,
   and report the read-back the command prints. Do not enable the gated writes.

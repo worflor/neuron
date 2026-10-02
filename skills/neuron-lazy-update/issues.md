@@ -1,7 +1,7 @@
 # When something didn't work
 
-Users will say "x didn't work" or "why is x like that?". Your job is to find out and answer. Filing
-an issue is an **offer** you make at the end, only when it fits. It isn't the goal.
+Investigate the user's symptom, explain the evidence, and identify a useful
+next step. Offer an issue draft when the findings support one.
 
 ## 1. Research first
 
@@ -63,7 +63,7 @@ missing. Gather what applies, running only read-only commands:
 | Windows build | `cmd /c ver` |
 | device + PID | `neuron.exe list` |
 | steps, expected, actual | from the conversation, in the user's own terms |
-| diagnostics | ask the user to run the bench on the SYSTEM page and paste it; you can't run it |
+| diagnostics | use the read-only bench on the SYSTEM page when device access is available; otherwise ask for its results |
 | crash log | `neuron-crash.log` in the config folder, if it exists; only the relevant lines |
 
 ### Make it good, cheaply

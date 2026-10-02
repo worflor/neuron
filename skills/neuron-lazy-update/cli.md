@@ -3,21 +3,20 @@
 The CLI is `neuron.exe`, in the install folder next to `neuron-app.exe`. It uses the same engine
 and the same config as the app. Run it with its full path, or from inside that folder.
 
-On Linux a source build produces `neuron` and a partial `neuron-app`. No Linux download is published yet.
-The CLI commands below use `neuron` there; drop the `.exe` and the `.\`.
+On Linux use `neuron`; drop the `.exe` and the `.\` from the examples.
+Check the selected release and `docs/STATUS.md` for platform availability and verification.
 
 ## Find the right command
 
-Don't guess command names. Ask the CLI:
+Read the installed CLI's command interface:
 
 ```powershell
 .\neuron.exe --help
 .\neuron.exe dpi --help
 ```
 
-Every command is top-level (`neuron dpi`, not `neuron device dpi`). A few take their own
-subcommand: `lighting`, `profile`, `macro`, `audio`, `bind`, `radial`, `cast`, `gesture`, `twin`,
-`prof`.
+Use the command groups and options shown by that build. For complete setup
+authoring, follow [neuron-cli](../neuron-cli/SKILL.md).
 
 ## Safe any time: read-only
 
@@ -40,12 +39,12 @@ These only read. Run them freely to answer questions or check things before a ch
 | `profile list`, `profile show <name>` | saved profiles |
 | `macro list`, `audio list`, `bind list` | what's configured |
 
-## Changes the device: confirm first
+## Changes to the device
 
-Anything given a value writes to the hardware. Before running one:
+For a hardware write:
 
 1. Read the current value first (the read-only form above), so you can tell the user what's changing.
-2. Tell the user the exact command, and get a yes.
+2. Match the command to the user's authorized change; ask if the scope needs clarification.
 3. Run it.
 4. Read the value back and report both numbers.
 
@@ -76,8 +75,8 @@ retry with other values.
 - **`macro run`** executes BOUND Python by default; `# neuron: raw` in a file's header opts into
   ordinary Python with file, network and process access. RAW module-level code can run even when
   the CLI's Neuron effect gate is disarmed. Only run macros the user wrote or has read.
-- **`probe`**, **`discover`** and **`adopt`** are for supporting new or unknown hardware. They're
-  not needed for everyday use.
+- **`probe`**, **`discover`** and **`adopt`** support new or unknown hardware. Use them for an
+  explicit hardware-adoption task.
 - **`neuron-app.exe --purge-synapse`** stops and disables Razer Synapse's services and needs admin.
   `--scan-synapse` shows what it would touch without changing anything. Run that first.
 
@@ -86,5 +85,5 @@ retry with other values.
 | symptom | try |
 |---|---|
 | `list` shows no devices | is Razer Synapse running? neuron and Synapse can't share a device. Is the device plugged in? |
-| a setting doesn't stick after unplugging | writes are volatile by default. That's expected, not a bug |
+| a setting doesn't stick after unplugging | check whether the write was volatile; volatile settings reset on power-cycle |
 | an error you don't understand | see [answers.md](answers.md) for where to look, or the bug report steps there |

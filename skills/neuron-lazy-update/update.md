@@ -1,15 +1,16 @@
 # Install, update, roll back, uninstall
 
-The released Windows package uses the updater script in this skill's `scripts/` folder:
+Use the updater in this skill's `scripts/` folder for the selected package's platform:
 
 | platform | script | runs in |
 |---|---|---|
 | Windows | `neuron-update.ps1` | the Windows PowerShell that comes with Windows |
-| Linux (future package) | `neuron-update.sh` | bash, with `curl` and `tar` |
+| Linux | `neuron-update.sh` | bash, with `curl` and `tar` |
 
-No Linux asset is published yet. **Do not run the Linux updater against a Windows-only release.** The Linux
-script and archive steps below are for a future packaged release. For now, build from source as
-described in the [README](../../README.md).
+Check that the selected release includes the matching platform archive before
+using its updater. When a platform has no release asset, use the source-build
+instructions in the [README](../../README.md). Check [STATUS](../../docs/STATUS.md)
+for runtime and hardware verification.
 
 The Windows release includes the app and CLI, so updating it closes and reopens neuron. The
 updater does not touch user config.
@@ -25,7 +26,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<path to skill>\scripts\neu
 `-ExecutionPolicy Bypass` applies to that single command only. It doesn't change any system
 setting.
 
-On Linux, after a package is published:
+On Linux, with a matching release archive:
 
 ```bash
 bash "<path to skill>/scripts/neuron-update.sh" --action check
@@ -55,8 +56,8 @@ Read the output as lines:
    | `source-build` | a developer build from the git repo | go to **Source builds** |
    | `error` | couldn't reach GitHub or read the release | show the `FLAG` line, stop |
 
-3. **Confirm.** Tell the user something like: "neuron `<installed_version>` → `<latest_version>`.
-   This closes neuron for a few seconds and reopens it. Your settings aren't touched. OK?"
+3. **Establish scope.** Report the installed and selected versions and the app restart.
+   Proceed with the requested update; ask if the target or operation needs additional authorization.
 4. **Apply.** Run `-Action apply`.
 5. **Decide from the `RESULT`:**
 
@@ -81,7 +82,7 @@ stays beside its binaries. Both layouts use a per-user program directory by defa
 2. Use the update script when the user wants an agent-managed portable copy or already has Neuron.
    It detects Windows Setup installations and runs the matching verified setup instead of copying
    ZIP files across the installer's ownership boundary.
-3. Confirm with the user, then run:
+3. Use the authorized installation target, then run:
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File "<path to skill>\scripts\neuron-update.ps1" -Action apply -InstallDir "$env:LOCALAPPDATA\Programs\neuron"
@@ -99,9 +100,10 @@ stays beside its binaries. Both layouts use a per-user program directory by defa
 
 ### Linux
 
-There is no Linux release asset to install or update yet. Build from source using the
-[README](../../README.md). The GUI exists but its live input, overlay, and audio paths are
-incomplete on `main`. The updater script remains for a future Linux package.
+Check the selected release for a Linux archive. If one is available, use the
+Linux updater; otherwise follow the [README](../../README.md) source-build
+instructions. Use [STATUS](../../docs/STATUS.md) for the verification of input,
+overlays, audio, and hardware on the user's platform.
 
 ## Roll back
 
@@ -194,7 +196,7 @@ from the build directory; ask before removing either.
 | `BACKUP_FAILED` | a complete backup could not be created | installation did not start; report the error |
 | `ROLLBACK_FAILED` | recovery could not finish | report it; don't claim the previous release was restored |
 | `ROLLBACK_PRESERVED` | rollback kept a modified or user-owned new path | tell the user which state the updater preserved |
-| `NO_RELEASE_INFO` | GitHub couldn't be reached | check internet; the repo may not be public yet |
+| `NO_RELEASE_INFO` | release metadata could not be read | check connectivity, repository access, and the reported error |
 | `ASSETS_MISSING` / `BAD_ZIP` / `BAD_ARCHIVE` | the release is incomplete | report it on the issues page |
 | `COPY_FAILED` / `VERIFY_FAILED` | install went wrong partway; recovery was attempted | show the lines and any `ROLLBACK_FAILED` or `ROLLBACK_PRESERVED` flag |
 | `NO_BACKUP` | nothing to roll back to | tell the user |
@@ -206,16 +208,16 @@ from the build directory; ask before removing either.
 
 ## Offline or specific versions
 
-- `-Version v0.1.2` / `--version v0.1.2` installs that tag instead of the latest.
+- `-Version <tag>` / `--version <tag>` selects that release tag.
 - `-ZipPath <zip>` (Windows) or `--archive <tar.gz>` (Linux) installs an archive the user already
   downloaded. `SHA256SUMS.txt` must sit next to it, or be passed with `-SumsPath` / `--sums`. An
   installer-managed Windows copy also needs the matching `*-setup.exe` beside the ZIP; both hashes
   are checked before setup runs.
-- `-NoRelaunch` (Windows) leaves neuron closed afterwards. Linux has nothing to relaunch.
+- `-NoRelaunch` (Windows) leaves Neuron closed afterwards.
 
 ## Linux: no device found
 
-This is the common one, and it is almost never a neuron bug. Work through it in order:
+Check device permissions and discovery in order:
 
 1. Is the udev rule installed? `ls /etc/udev/rules.d/70-neuron.rules`. If it isn't, that's the
    answer — the two commands are in the archive's `SOURCE.txt`, the user runs them, then replugs.
@@ -227,14 +229,13 @@ This is the common one, and it is almost never a neuron bug. Work through it in 
    file has a commented-out `plugdev` group line for exactly that case; the user swaps which line
    is active and adds themselves to the group.
 
-If all four check out and the device still isn't found, that is worth an issue — and a genuinely
-useful one, because **no Razer device has been plugged into a Linux box running neuron by anyone
-yet**. Say so honestly; the user is not doing something wrong, they are first. See
-[issues.md](issues.md).
+If the device remains undiscovered, collect the device identity, platform,
+permission checks, and observed results. Compare them with `docs/STATUS.md`
+and follow [issues.md](issues.md).
 
 ## Doing it by hand
 
-For a future Linux release archive, the script can perform these steps. No such asset is published yet.
+For a matching Linux release archive, the manual steps are:
 
 ```bash
 sha256sum -c SHA256SUMS.txt --ignore-missing   # must say OK, or stop
