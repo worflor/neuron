@@ -4,7 +4,7 @@
 
 import { Theme, Signal } from "../theme.slint";
 import { ChromaLab } from "chromalab.slint";
-import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, SheenText } from "../widgets/controls.slint";
+import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow } from "../widgets/controls.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
 import { EffectTile, EffectParam } from "../models.slint";
@@ -621,6 +621,26 @@ component SpectrumEditor inherits VerticalLayout {
 export component LightingPanel inherits VerticalLayout {
     spacing: 0;
 
+    property <bool> has-target: State.selected-device >= 0 && State.selected-device-name != "—";
+    property <bool> has-surface: root.has-target && State.sel-can-light && State.grid-rows > 0 && State.grid-cols > 0;
+    property <Signal> surface-signal: root.has-surface && State.writes-paused ? Signal.provisional
+        : root.has-surface && State.light-foreign ? Signal.live
+        : root.has-surface && (State.light-brush-on || State.light-place-on) ? Signal.listening
+        : root.has-surface && State.compositing ? Signal.live : Signal.idle;
+    property <string> surface-detail: !root.has-target ? ""
+        : !State.sel-can-light ? "no addressable RGB"
+        : !root.has-surface ? "layout unavailable"
+        : root.zone-mode ? State.grid-rows * State.grid-cols
+            + (State.grid-rows * State.grid-cols == 1 ? " LED zone" : " LED zones")
+        : State.grid-rows + " × " + State.grid-cols + " grid";
+    property <string> surface-status: !root.has-surface ? ""
+        : State.writes-paused ? "writes paused"
+        : State.light-foreign ? "visitor painting"
+        : State.light-brush-on ? "paint draft"
+        : State.light-place-on ? "placing layer"
+        : State.compositing ? "streaming"
+        : State.light-effect != "" ? "preview only" : "no effect";
+
     // a mouse with a handful of LEDs is drawn as ZONES, not a lattice (see DeviceRender.zone-mode) — the
     // place-a-region gesture needs a grid to drag on, so it's hidden for those honest few-zone devices.
     property <bool> zone-mode: State.grid-kind == "mouse" && State.grid-rows * State.grid-cols <= 4;
@@ -639,122 +659,39 @@ export component LightingPanel inherits VerticalLayout {
         // so without `window-shown && page == 1` this hero render ran every frame even while you were on
         // another tab or the window was hidden in the tray. Render nothing you can't see.
         running: State.window-shown && State.page == 1
-            && !State.light-brush-on && State.sel-can-light && State.grid-rows > 0 && State.light-effect != "";
+            && !State.light-brush-on && root.has-surface && State.light-effect != "";
         triggered => { State.preview-tick(); }
     }
     // the GRID swatches animate a touch slower still (each tile is a Rust-side render — cheap but not
     // free), and ONLY while the lighting page is actually on screen (same gate as the hero).
     Timer {
         interval: 120ms;
-        running: State.window-shown && State.page == 1 && State.sel-can-light && State.grid-rows > 0;
+        running: State.window-shown && State.page == 1 && root.has-surface;
         triggered => { State.tile-preview-tick(); }
     }
 
     PanelHead {
         label: "LIGHTING";
-        // no device-name caption: the status strip 36px below already opens with the device name
-        // (plus its LED geometry) — printing it twice in one header block read as generated filler.
         caption: "paint it · or hand it to your games";
-        if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; signal: Signal.provisional; tint: Theme.warn; } }
     }
     Divider {}
     Rectangle { height: Theme.lead-in; }
 
-    // ── no-lighting empty states — honest, terse, real info ───────────────
-    if !State.sel-can-light : Rectangle {
-        height: 300px;
-        background: Theme.bg-2; border-radius: Theme.radius;
-        border-width: Theme.hair; border-color: Theme.line;
-        VerticalLayout {
-            alignment: center; spacing: 6px;
-            Mono {
-                text: State.selected-device-name == "—" ? "no device selected" : State.selected-device-name + " has no lighting";
-                color: Theme.text-dim; horizontal-alignment: center;
-            }
-            Mono {
-                text: State.selected-device-name == "—" ? "pick a Razer device on DEVICE"
-                    : "no addressable RGB on this channel · pick a keyboard or mouse on DEVICE";
-                color: Theme.text-faint; horizontal-alignment: center; wrap: word-wrap;
-            }
-        }
-    }
-    if State.sel-can-light && State.grid-rows == 0 : Rectangle {
-        height: 300px;
-        background: Theme.bg-2; border-radius: Theme.radius;
-        border-width: Theme.hair; border-color: Theme.line;
-        VerticalLayout {
-            alignment: center; spacing: 6px;
-            Mono { text: "no lit device selected"; color: Theme.text-dim; horizontal-alignment: center; }
-            Mono { text: "connect one, or pick another channel on DEVICE"; color: Theme.text-faint; horizontal-alignment: center; }
-        }
-    }
-
-    // ── THE SURFACE: render hero (centred) → gallery + contextual inspector ─
-    // FOREIGN-OWNER / SUPPRESSED truth now lives ON the subject, not as a banner above it:
-    // the status strip names the painter, the render's frame glows while a visitor holds the
-    // brush (the same earned-glow doctrine as the connection lamps), and one faint line under
-    // the render carries the explanation. Clears itself the moment the client releases (the
-    // ~1s claims poll rides the preview tick).
-    if State.sel-can-light && State.grid-rows > 0 : VerticalLayout {
+    // Visitor ownership stays beside the subject; its frame follows the same arbiter claim.
+    VerticalLayout {
         spacing: Theme.section-gap;
 
         // ── HERO: the render, centred + constrained so it stays a calm SUBJECT, not a banner. ──
         VerticalLayout {
             alignment: start;
             spacing: 7px;
-            // status strip — the device geometry on the left, the honest "what this is" on the right.
-            //
-            // It shares the RENDER's 760px measure and centring, deliberately. At full window width
-            // the name sat at x=0 and its live state at x~1700, so the two halves of one caption were
-            // flung to opposite edges of a wide monitor and the state read as belonging to nothing.
-            // Constrained to the subject's own measure they are one caption over one subject, and the
-            // status is right-aligned against that measure rather than the window.
-            HorizontalLayout {
-                alignment: center;
-                HorizontalLayout {
-                    width: min(parent.width, 760px);
-                    spacing: 7px;
-                    SheenText {
-                        value: State.selected-device-name + " · " + State.grid-rows + " × " + State.grid-cols + " led";
-                        // LIVE means YOUR stack is streaming to this board. A visitor painting on top
-                        // does NOT switch this off: your lighting keeps compositing underneath (the
-                        // VISITORS blend decides how), which is exactly the state this reports. Gating
-                        // it on `&& !light-foreign` blanked the indicator on precisely the machines
-                        // running a game — i.e. most of the time.
-                        live: State.compositing;
-                        ink: Theme.text-faint;
-                        size: Theme.fs-data;
-                        weight: 400;
-                        tracking: 0px;
-                    }
-                    // the gap that pins the status cluster hard right against the measure above
-                    Rectangle { horizontal-stretch: 1; }
-                    // the live-truth slot: a visitor painting OUTRANKS the live name (it IS what's live
-                    // on the device); suppressed rides beside it as a quiet fact. No lamp — the sheen
-                    // on the name already says "mine is live", so a second dot beside it just repeated
-                    // one fact twice in two visual languages.
-                    if State.light-foreign : Mono {
-                        text: (State.light-foreign-app == "" ? "another app" : State.light-foreign-app) + " is painting";
-                        color: Theme.accent;
-                    }
-                    if State.light-suppressed && !State.light-foreign : Mono {
-                        text: (State.light-foreign-app == "" ? "a visitor" : State.light-foreign-app) + " connected \u{00b7} suppressed \u{00b7} ";
-                        color: Theme.text-faint;
-                    }
-                    if !State.compositing && !State.light-foreign && !State.light-brush-on && State.light-effect != "" : Mono {
-                        text: "preview only"; color: Theme.text-faint;
-                    }
-                    if State.light-brush-on : Mono { text: "brush down · L paint · R erase · drag sweeps"; color: Theme.listen; }
-                    if State.light-place-on : Mono { text: "place mode · drag a rectangle to set this layer's area"; color: Theme.listen; }
-                }
-            }
             // the render itself — capped to a comfortable subject width and centred on the void so it
             // reads as the page's calm subject instead of stretching edge-to-edge into a banner.
             HorizontalLayout {
                 alignment: center;
                 Rectangle {
                     width: min(parent.width, 760px);
-                    height: 280px;
+                    height: 306px;
                     // while a visitor paints, the FRAME says so: a soft accent halo around the
                     // subject (earned — someone else genuinely holds the brush right now), so the
                     // preview/board disagreement reads as arbitration, not a glitch. Settles in
@@ -767,40 +704,62 @@ export component LightingPanel inherits VerticalLayout {
                     animate drop-shadow-color, drop-shadow-blur { duration: Theme.settle; }
                     DeviceRender {
                         width: 100%; height: 100%;
-                        rows: State.grid-rows;
-                        cols: State.grid-cols;
-                        px: State.grid-px;
-                        kind: State.grid-kind;
-                        editable: State.light-brush-on;
+                        rows: root.has-surface ? State.grid-rows : 0;
+                        cols: root.has-surface ? State.grid-cols : 0;
+                        px: root.has-surface ? State.grid-px : [];
+                        kind: root.has-surface ? State.grid-kind : "";
+                        device-name: root.has-target ? State.selected-device-name : "Lighting device";
+                        device-detail: root.surface-detail;
+                        stream-status: root.surface-status;
+                        stream-signal: root.surface-signal;
+                        editable: root.has-surface && State.light-brush-on;
                         paint(i) => { State.paint-cell(i); }
                         erase(i) => { State.erase-cell(i); }
                         // PLACE gesture — a sibling to the brush (mutually exclusive). The committed region
                         // corners drive the persistent placement outline; a drag commits a fresh rect.
-                        placing: State.light-place-on;
+                        placing: root.has-surface && State.light-place-on;
                         place-r0: State.light-place-r0;
                         place-c0: State.light-place-c0;
                         place-r1: State.light-place-r1;
                         place-c1: State.light-place-c1;
                         place-region(r0, c0, r1, c1) => { State.set-layer-region(r0, c0, r1, c1); }
+                        if !root.has-surface : VerticalLayout {
+                            width: 100%; height: 100%;
+                            padding: 36px; padding-top: 58px; alignment: center; spacing: 12px;
+                            Mono {
+                                text: !root.has-target ? "Pick a keyboard or mouse with RGB"
+                                    : !State.sel-can-light ? "Choose a lighting device"
+                                    : "Choose another lighting channel";
+                                color: Theme.text-dim; horizontal-alignment: center; wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                alignment: center;
+                                Button { text: "choose device"; clicked => { State.page = 0; } }
+                            }
+                        }
                     }
                 }
             }
-            // the one explanatory line — under the subject, only while a claim exists. Names the
-            // arbitration ("no tool without an arbiter can tell you this") without becoming a box.
-            if State.light-foreign || State.light-suppressed : Mono {
-                text: State.light-foreign
-                    ? "your lighting composes underneath and returns the moment it lets go \u{00b7} tune the blend in VISITORS"
-                    : "connected but outranked. flip off \u{201c}my lighting always wins\u{201d} in VISITORS to let it through";
-                color: Theme.text-faint;
-                horizontal-alignment: center;
-                wrap: word-wrap;
+            if root.has-surface && (State.light-brush-on || State.light-place-on || State.light-foreign || State.light-suppressed) : HorizontalLayout {
+                alignment: center;
+                Mono {
+                    width: min(parent.width, 760px) * 0.92;
+                    text: State.light-brush-on ? (State.light-foreign ? "Paint draft · " : "") + "left paint · right erase · drag to sweep"
+                        : State.light-place-on ? "Drag on the grid to place this layer"
+                        : State.light-foreign
+                            ? (State.light-foreign-app == "" ? "Another app" : State.light-foreign-app) + " is painting · blend in VISITORS"
+                            : (State.light-foreign-app == "" ? "A visitor" : State.light-foreign-app) + " is suppressed · your lighting has priority";
+                    color: State.light-brush-on || State.light-place-on ? Theme.listen : Theme.text-dim;
+                    font-size: Theme.fs-small;
+                    wrap: word-wrap;
+                }
             }
         }
 
         // ── GALLERY + INSPECTOR — fills the width. The gallery is elastic (it widens its tiles to
         // use the room); the inspector slides in only once a tile is picked, and takes no width at
         // all when nothing is — so the empty page is a full-width gallery, never a stranded third. ──
-        HorizontalLayout {
+        if root.has-surface : HorizontalLayout {
             spacing: State.light-effect == "" ? 0px : Theme.gap-col;
 
             // ── the catalog: THREE SHELVES of live-preview tiles, grouped by what feeds each look.
@@ -847,7 +806,8 @@ export component LightingPanel inherits VerticalLayout {
                 }
                 TileShelf {
                     title: "YOUR EFFECTS";
-                    caption: "saved by you · click to load, \u{00d7} to delete";
+                    caption: State.light-user-tiles.length == 0 ? "save a look above to keep it here"
+                        : "saved by you · click to load, \u{00d7} to delete";
                     tiles: State.light-user-tiles;
                     selected-extra: State.light-user-effect;
                     deletable: true;
