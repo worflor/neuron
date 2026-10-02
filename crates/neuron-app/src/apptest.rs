@@ -496,6 +496,26 @@ fn action_palette_populated() {
             "{want} must be pickable from any editor"
         );
     }
+    // the rail filters on `group` and names the hover; entries must carry theirs (only the
+    // groupless tail, unbind, is allowed an empty one) and every row a scanning blurb. Every
+    // header must count exactly the entries under it (its "· N" and the rail's hover label).
+    let rows: Vec<_> = st.get_action_choices().iter().collect();
+    for (i, c) in rows.iter().enumerate() {
+        if c.header {
+            let n = rows[i + 1..]
+                .iter()
+                .take_while(|r| !r.header && r.group == c.group)
+                .count();
+            assert_eq!(n as i32, c.count, "header '{}' entry count", c.label);
+        } else {
+            assert!(!c.blurb.is_empty(), "'{}' must carry its blurb", c.id);
+            assert!(
+                !c.group.is_empty() || c.id == "noop",
+                "'{}' must know its group",
+                c.id
+            );
+        }
+    }
     st.set_action_choice(2);
     assert_eq!(st.get_action_choice(), 2);
 }

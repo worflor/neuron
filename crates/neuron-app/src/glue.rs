@@ -501,19 +501,29 @@ fn launch_mode_now() -> i32 {
 }
 
 /// Populate the Action palette model from the editor's single source of truth, interleaving a
-/// HEADER row whenever the group changes — the picker renders structure, not a flat dump.
+/// HEADER row whenever the group changes — the picker renders structure, not a flat dump. Headers
+/// carry their entry count (the header's "· N" and the rail's hover label); entries carry their
+/// group (the rail filters by it and lights the group the list is in) and their six-word blurb (the
+/// row's second scanning line).
 fn init_action_palette(app: &AppWindow) {
     let mut rows: Vec<crate::ui::ActionChoice> = Vec::new();
     let mut last_group = "";
     for (id, label, hint, group, required, tier) in crate::editor::ACTION_PALETTE {
         if *group != last_group && !group.is_empty() {
+            let count = crate::editor::ACTION_PALETTE
+                .iter()
+                .filter(|(_, _, _, g, _, _)| g == group)
+                .count();
             rows.push(crate::ui::ActionChoice {
                 id: "".into(),
                 label: (*group).into(),
                 param_hint: "".into(),
+                group: (*group).into(),
+                blurb: "".into(),
                 header: true,
                 required: false,
                 tier: 0,
+                count: count as i32,
             });
             last_group = group;
         }
@@ -521,9 +531,12 @@ fn init_action_palette(app: &AppWindow) {
             id: (*id).into(),
             label: (*label).into(),
             param_hint: (*hint).into(),
+            group: (*group).into(),
+            blurb: crate::editor::action_blurb(id).into(),
             header: false,
             required: *required,
             tier: i32::from(*tier),
+            count: 0,
         });
     }
     let st = app.global::<State>();

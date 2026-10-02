@@ -171,8 +171,8 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
         false,
         5,
     ),
-    ("lighting-layer", "lighting layer", "JSON/TOML operation", "lighting", true, 3),
-    ("undo", "undo", "last reversible change", "editing", false, 3),
+    // audio stays ONE consecutive run below — the picker's header interleave and group rail read
+    // consecutive same-group runs, so an entry of another group sandwiched here would split it.
     (
         "mute",
         "mute",
@@ -197,6 +197,8 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
         false,
         5,
     ),
+    ("lighting-layer", "lighting layer", "JSON/TOML operation", "lighting", true, 3),
+    ("undo", "undo", "last reversible change", "editing", false, 3),
     ("dpi", "dpi", "800  |  up / down", "device", false, 4),
     (
         "scroll-stage",
