@@ -1,7 +1,7 @@
 # Action depth — implementation brief
 
 > **status:** implemented; native verification and remaining limits are recorded in
-> [STATUS.md](STATUS.md). This brief defines the intended contracts.
+> [STATUS.md](../STATUS.md). This brief defines the intended contracts.
 > One Trigger -> Action pipeline; GUI, CLI, radial, glyphs and sequences share typed actions.
 
 ## Clipboard transform

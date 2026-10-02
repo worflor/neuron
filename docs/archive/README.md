@@ -8,7 +8,7 @@ date it was taken. The live docs are one level up:
 
 - [`../GDD.md`](../GDD.md) — what neuron does
 - [`../TDD.md`](../TDD.md) — how it's built
-- [`../PROTOCOL-HOST.md`](../PROTOCOL-HOST.md) — the protocol hub's design
+- [`../reference/PROTOCOL-HOST.md`](../reference/PROTOCOL-HOST.md) — the protocol hub's design
 - [`../STATUS.md`](../STATUS.md) — what actually works today
 
 If you find something here that is still true and still matters, the fix is to move it

@@ -740,7 +740,7 @@ Feature-level design notes are implementation plans, not the source of truth for
 Mitigation:
 
 - Use this file as an architecture map and verify implementation details against the code.
-- Keep feature-specific docs under `docs/` but link their status to actual code.
+- Keep feature-specific briefs under `docs/briefs/` but link their status to actual code.
 - Update this TDD when new workers, config files, or dispatch sources are added.
 
 ### Risk: Device Input Model Is Implicit
@@ -786,7 +786,7 @@ Neuron is ready to replace Synapse for daily use when these checks are true on t
   hard invariants, and what "verified" has to mean before you claim it. Start there.
 - [`GDD.md`](GDD.md): feature design. Every subsystem in depth, and why each is shaped
   the way it is. The counterpart to this document.
-- [`PROTOCOL-HOST.md`](PROTOCOL-HOST.md): the design record for `crates/neuron-host` —
+- [`PROTOCOL-HOST.md`](reference/PROTOCOL-HOST.md): the design record for `crates/neuron-host` —
   the ownership arbiter, the signal bus, the supervision model, and the wire formats
   each adapter speaks.
 - [`STATUS.md`](STATUS.md): what actually works today, graded solid to barely-started.
