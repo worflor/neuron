@@ -7,7 +7,7 @@ description: Inspect and configure Neuron through its CLI. Use for bindings, mac
 
 `neuron` shares its engine and configuration with the tray app. Discover the
 installed build's commands with `neuron --help` and its authoring capabilities
-with `neuron catalog --json`. Full reference: [`docs/CLI.md`](../../docs/CLI.md).
+with `neuron catalog --json`. Full reference: [`docs/reference/CLI.md`](../../docs/reference/CLI.md).
 For Python macro source and return contracts, use [neuron-macros](../neuron-macros/SKILL.md).
 
 ## Authority and configuration

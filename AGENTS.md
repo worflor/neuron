@@ -64,15 +64,15 @@ one).
 | What it does and why anyone would want it | [`README.md`](README.md) |
 | The features in depth — every subsystem, and what it feels like to use | [`docs/GDD.md`](docs/GDD.md) |
 | How it's built — runtime model, dispatch flow, safety contracts, risks | [`docs/TDD.md`](docs/TDD.md) |
-| The protocol hub's design | [`docs/PROTOCOL-HOST.md`](docs/PROTOCOL-HOST.md) |
+| The protocol hub's design | [`docs/reference/PROTOCOL-HOST.md`](docs/reference/PROTOCOL-HOST.md) |
 | What actually works today, honestly graded | [`docs/STATUS.md`](docs/STATUS.md) |
 | How to send a change | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 | The label taxonomy, if you're filing or picking up issues | [`.github/LABELS.md`](.github/LABELS.md) |
 | You're helping a *user* install, update, or run neuron, not changing its code | [`skills/neuron-lazy-update/SKILL.md`](skills/neuron-lazy-update/SKILL.md) |
 | You're writing a Python macro or using beacons | [`skills/neuron-macros/SKILL.md`](skills/neuron-macros/SKILL.md) |
-| You're setting up or changing a user's binds, lighting, profiles or whole setup through the CLI | [`skills/neuron-cli/SKILL.md`](skills/neuron-cli/SKILL.md), reference in [`docs/CLI.md`](docs/CLI.md) |
+| You're setting up or changing a user's binds, lighting, profiles or whole setup through the CLI | [`skills/neuron-cli/SKILL.md`](skills/neuron-cli/SKILL.md), reference in [`docs/reference/CLI.md`](docs/reference/CLI.md) |
 
-**The code is the source of truth.** `docs/TDD.md` and `docs/PROTOCOL-HOST.md` both
+**The code is the source of truth.** `docs/TDD.md` and `docs/reference/PROTOCOL-HOST.md` both
 carry a banner saying an LLM wrote them while building neuron. That banner is
 accurate, and it is not a disclaimer to skim past: these docs are a map, and a map
 can be stale. Verify against the tree before you lean on a detail.

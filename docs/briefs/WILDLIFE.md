@@ -718,8 +718,10 @@ user.
 2. **Living structure** — crisp enough to recognise and follow.
 3. **Active weather front / traveler source accent** — localised, bounded.
 4. **Death memory** — softer and dimmer than comparable living structure.
-5. **Habitat warmth / nutrients** — a faint substrate, never an illuminated
-   blanket.
+5. **Habitat warmth / nutrients** — a faint seasonal substrate following the
+   existing moving sunlight and soil. It remains visible when colonies empty,
+   without feeding the simulation or brightening living structure. Fading death
+   memory shares this brightness floor.
 
 ### 10.2 One `u`, one intensity — pick a dominant contributor
 

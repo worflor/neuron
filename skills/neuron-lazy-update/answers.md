@@ -13,7 +13,7 @@ repository: https://github.com/worflor/neuron
 | which device writes are proven, gated, or unsupported | `README.md`, section *honesty: proven, gated, absent* |
 | how a feature behaves in detail (lighting, binds, spellweaving, macros, the app pages) | [docs/GDD.md](https://github.com/worflor/neuron/blob/main/docs/GDD.md) |
 | how it's built internally | [docs/TDD.md](https://github.com/worflor/neuron/blob/main/docs/TDD.md) |
-| the lighting integrations hub (OpenRGB, Chroma, OBS) | [docs/PROTOCOL-HOST.md](https://github.com/worflor/neuron/blob/main/docs/PROTOCOL-HOST.md) |
+| the lighting integrations hub (OpenRGB, Chroma, OBS) | [docs/reference/PROTOCOL-HOST.md](https://github.com/worflor/neuron/blob/main/docs/reference/PROTOCOL-HOST.md) |
 | what's exposed on the machine, macro safety, reporting a vulnerability | `SECURITY.md` |
 | a command's exact options | `neuron.exe <command> --help` |
 | contributing | [CONTRIBUTING.md](https://github.com/worflor/neuron/blob/main/CONTRIBUTING.md) |
