@@ -377,9 +377,12 @@ export struct ActionChoice {
     id: string,          // builder id ("key", "turbo", "teleport", …); "" on header rows
     label: string,       // human label shown in the picker (the group name on header rows)
     param_hint: string,  // placeholder for the parameter field ("" if the action takes none)
+    group: string,       // the section this row belongs to ("" only for the groupless tail, unbind)
+    blurb: string,       // six-word plain-words line (the row's second line; the hint swaps in on hover)
     header: bool,        // section title row (not a choice)
     required: bool,      // a blank param won't commit (the param IS the payload)
     tier: int,           // maturity 0=placeholder · 1-4=WIP · 5=done — shown as a small badge
+    count: int,          // header rows: how many entries the group holds (the header's "· N" + the rail's hover label)
 }
 
 // A current compositor row offered as a convenient index shortcut in the shared ActionPicker.

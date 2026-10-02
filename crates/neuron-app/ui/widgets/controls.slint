@@ -1183,11 +1183,47 @@ export component ClipboardTransformEditor inherits VerticalLayout {
     }
 }
 
+// A GROUP EMBLEM — the action palette's rail glyph: one hairline mark per group, drawn on the SAME
+// grammar as DeviceEmblem (a stroked path on a 24 grid in a 14px box). `ink` carries the state, so
+// the glyph obeys the rail's colour ramp instead of owning a vocabulary of its own.
+component GroupEmblem inherits Rectangle {
+    in property <string> group;
+    in property <color> ink: Theme.text-dim;
+    // the glyph moves on the SAME clock as the letters beside it — an unsnapped stroke next to an
+    // animated mark reads as two halves disagreeing, which is what "flickery" was.
+    in property <bool> lit: false;
+    width: 14px;
+    height: 14px;
+    // the marks, in the palette's group order. Key dots are 0.5-long segments with round caps — the
+    // trick DeviceEmblem's keyboard emblem already uses.
+    property <string> shape:
+        root.group == "press & type" ? "M4.5 6.5 H19.5 Q21.5 6.5 21.5 8.5 V15.5 Q21.5 17.5 19.5 17.5 H4.5 Q2.5 17.5 2.5 15.5 V8.5 Q2.5 6.5 4.5 6.5 Z M6.5 10.5 H7 M9.7 10.5 H10.2 M12.9 10.5 H13.4 M16.1 10.5 H16.6 M8.5 14 H15.5"
+        : root.group == "clipboard" ? "M6.5 5.5 H17.5 Q19.5 5.5 19.5 7.5 V18.5 Q19.5 20.5 17.5 20.5 H6.5 Q4.5 20.5 4.5 18.5 V7.5 Q4.5 5.5 6.5 5.5 Z M9 3.5 H15 V7 H9 Z M8 11.5 H16 M8 15.5 H13"
+        : root.group == "run & code" ? "M4.5 4.5 H19.5 Q21.5 4.5 21.5 6.5 V17.5 Q21.5 19.5 19.5 19.5 H4.5 Q2.5 19.5 2.5 17.5 V6.5 Q2.5 4.5 4.5 4.5 Z M7 9.5 L10 12 L7 14.5 M12.5 15.5 H17"
+        : root.group == "instruments" ? "M3.5 3.5 H16 V16 H3.5 Z M8.5 8.5 H21 V21 H8.5 Z"
+        : root.group == "windows" ? "M2.5 4.5 H21.5 V19.5 H2.5 Z M2.5 9.5 H21.5"
+        : root.group == "system" ? "M12 3 V11 M7 6.6 A7.4 7.4 0 1 0 17 6.6"
+        : root.group == "obs" ? "M12 3.8 A8.2 8.2 0 1 0 12 20.2 A8.2 8.2 0 1 0 12 3.8 Z M12 8.9 A3.1 3.1 0 1 0 12 15.1 A3.1 3.1 0 1 0 12 8.9 Z"
+        : root.group == "audio" ? "M4 9.5 H7.4 L12 5.5 V18.5 L7.4 14.5 H4 Z M15.4 9.2 A4.4 4.4 0 0 1 15.4 14.8 M18 6.6 A8 8 0 0 1 18 17.4"
+        : root.group == "lighting" ? "M12 3 A6 6 0 0 1 15.6 13.8 V17 H8.4 V13.8 A6 6 0 0 1 12 3 Z M9.6 20 H14.4"
+        : root.group == "editing" ? "M4.5 9.5 H14.3 A5.2 5.2 0 0 1 14.3 19.9 H10.7 M8 5.5 L4.5 9.5 L8 13.5"
+        : root.group == "device" ? "M12 2.5 A4.5 4.5 0 0 1 16.5 7 V17 A4.5 4.5 0 0 1 12 21.5 A4.5 4.5 0 0 1 7.5 17 V7 A4.5 4.5 0 0 1 12 2.5 Z M12 6.5 V10.1"
+        : root.group == "profiles" ? "M12 3 L20.6 7.6 L12 12.2 L3.4 7.6 Z M3.4 12.4 L12 17 L20.6 12.4 M3.4 16.6 L12 21.2 L20.6 16.6"
+        : "";
+    if root.shape != "" : Path {
+        width: 100%; height: 100%; viewbox-width: 24; viewbox-height: 24;
+        fill: transparent; stroke: root.ink; stroke-width: 1.2px;
+        commands: root.shape;
+        animate stroke { duration: root.lit ? Theme.hover-in : Theme.hover-out; }
+    }
+}
+
 // The shared ACTION PICKER — the typed-action palette + its single parameter field. Used by the
 // Bindings add-flow, the radial per-sector editor, and the gesture->action binder. Reads/writes
 // State.action-choices / action-choice / action-param so one builder serves every editor.
-// Click opens the FULL palette as a popup (label + parameter hint per row); choosing a different
-// action type clears the stale parameter so '+4' can't silently become a key name.
+// Click opens the FULL palette inline (blurb per row, parameter hint on hover); a group RAIL
+// outside the scroll narrows to one section, and clicking a group header does the same. Choosing
+// a different action type clears the stale parameter so '+4' can't silently become a key name.
 export component ActionPicker inherits VerticalLayout {
     property <int> n: State.action-choices.length;
     property <string> cur-label:
@@ -1215,6 +1251,74 @@ export component ActionPicker inherits VerticalLayout {
     // gates the palette TRIGGER chip: false → dimmed ink + inert (mirrors SplitToggle's disabled
     // state). The param field/chips keep their own state; this is the palette-open affordance's gate.
     in property <bool> enabled: true;
+    // RAIL FILTER — the model index of the active group's header row; -1 = all groups. The rail
+    // and a click on any group header both drive it. It survives closing the drawer (reopening
+    // keeps your place) and resets with the picker instance.
+    property <int> filter: -1;
+    property <length> rail-w: 42px;
+    property <string> filter-group:
+        (root.filter >= 0 && root.filter < root.n)
+            ? State.action-choices[root.filter].group : "";
+    // Two-letter marks for the rail; hover names the group, so these only need to be distinct.
+    // ENGAGED = this mark is being pointed at (itself, or any row of its group) or is the active
+    // filter. LOCATED = the list is merely scrolled into that group — bright, not chosen.
+    pure function engaged(i: int, g: string, hot: bool) -> bool {
+        root.filter == i || hot || root.hover-group == g
+    }
+    pure function located(g: string) -> bool {
+        root.filter-group == "" && root.top-group == g
+    }
+    // resting ink, shared by glyph and letters so the obs caveat is stated once
+    pure function rest-ink(g: string) -> color {
+        (g == "obs" && !State.host-obs-live) ? Theme.text-faint : Theme.text-dim
+    }
+    // ONE hue ladder for the rail, so when several marks are lit at once the DEPTH says which is
+    // which: accent = engaged (pointed at, or the group you clicked — it KEEPS accent once chosen)
+    // · accent-dim = merely where the list is scrolled · grey = nothing. No white tier: a second
+    // bright hue competing with accent is what made two lit marks read as noise.
+    pure function glyph-ink(i: int, g: string, hot: bool) -> color {
+        root.engaged(i, g, hot) ? Theme.accent
+            : root.located(g) ? Theme.accent-dim
+            : root.rest-ink(g)
+    }
+    pure function mark-ink(i: int, g: string, hot: bool) -> color {
+        root.filter == i ? Theme.accent
+            : (root.engaged(i, g, hot) || root.located(g)) ? Theme.accent-dim
+            : root.rest-ink(g)
+    }
+    pure function group-mark(g: string) -> string {
+        g == "press & type" ? "ky"
+        : g == "clipboard" ? "cb"
+        : g == "run & code" ? "rc"
+        : g == "instruments" ? "in"
+        : g == "windows" ? "wn"
+        : g == "system" ? "sy"
+        : g == "obs" ? "ob"
+        : g == "audio" ? "au"
+        : g == "lighting" ? "lt"
+        : g == "editing" ? "ed"
+        : g == "device" ? "dv"
+        : g == "profiles" ? "pf"
+        : "··"
+    }
+    // RAIL FOLLOWERS — the rail lights the group the list is IN, in the same ink as a hovered mark.
+    // `hover-group`: the group of the row under the pointer (a leave clears only that row's OWN
+    // group, so moving between two rows of one group can't wipe the one just entered).
+    // `top-group`: the group of the row straddling the viewport's top edge — the layout's own `y`
+    // answers "what am I scrolled to", so nothing is summed here. Exactly one row straddles at a
+    // time, so only the true transition writes.
+    property <string> hover-group: "";
+    property <string> top-group: "";
+    // ONE place the filter changes (the rail mark and the group header both call it): re-narrowing
+    // to the same group widens back to all. The callers reset the viewport themselves — a Flickable
+    // does not re-clamp when its content shrinks under a scroll (same reason device.slint clamps
+    // viewport-y by hand), and a narrowed list must start at its own header.
+    callback toggle-filter(int);
+    toggle-filter(i) => {
+        root.filter = (root.filter == i) ? -1 : i;
+        root.top-group = "";
+        root.hover-group = "";
+    }
     // the palette drawer is open under the field
     property <bool> open: false;
     property <[string]> lighting-operations: ["toggle", "enable", "disable", "push", "pop", "replace", "move", "spec"];
@@ -1265,17 +1369,48 @@ export component ActionPicker inherits VerticalLayout {
         clip: true;
         // the FULL spine, grouped — every action the engine can do, structured by what
         // the user is trying to achieve. Scrolls (the palette must never be trimmed to
-        // fit a box; the engine's breadth IS the point).
-        Flickable {
+        // fit a box; the engine's breadth IS the point); the rail outside the Flickable
+        // narrows to one section without scrolling.
+        palette := Flickable {
+            x: 0;
+            width: parent.width - root.rail-w;
+            height: parent.height;
             viewport-width: self.width;
             VerticalLayout {
                 padding: 4px;
                 for c[i] in State.action-choices : Rectangle {
-                    // a hint present -> the row is TALLER so the name + hint stack on two rows
-                    // (never cramped/elided); no hint -> the compact single row.
-                    height: c.header ? (i == 0 ? 24px : 30px) : (c.param-hint == "" ? 26px : 40px);
+                    // the rail filter: show the filtered group's run (header + entries) and the
+                    // groupless tail (unbind); hidden rows collapse to zero height — the list
+                    // layout has no spacing, so a hidden row leaves no gap.
+                    property <bool> shown:
+                        root.filter-group == "" || c.group == root.filter-group || c.group == "";
+                    // reporting the two rail signals from where the truth already lives: the row's
+                    // own hover (a HEADING counts — cta is inert on headers, so without hta the icon
+                    // would drop out of accent the moment you crossed from an action onto its own
+                    // heading), and the row crossing the viewport's top edge (i == 0 at the top of
+                    // the list, where nothing straddles). A hidden row is 0 tall and can never
+                    // straddle, so it never claims the rail.
+                    property <bool> hovered: cta.has-hover || hta.has-hover;
+                    property <bool> at-top: palette.viewport-y == 0px ? i == 0
+                        : self.y + palette.viewport-y < 0px
+                            && self.y + self.height + palette.viewport-y > 0px;
+                    changed hovered => {
+                        root.hover-group = self.hovered ? c.group
+                            : (root.hover-group == c.group ? "" : root.hover-group);
+                    }
+                    changed at-top => { if (self.at-top) { root.top-group = c.group; } }
+                    // a blurb (or hint) -> the row is TALLER so the name + second line stack on
+                    // two rows (never cramped/elided); neither -> the compact single row.
+                    height: self.shown
+                        ? (c.header ? (i == 0 ? 24px : 30px) : (c.blurb == "" && c.param-hint == "" ? 26px : 40px))
+                        : 0px;
+                    animate height { duration: Theme.quick; }
+                    // CLIP is load-bearing: a hidden (zero-height) row without it still paints its
+                    // full content outside its bounds, overlapping the rows below. It also makes the
+                    // collapse clean — content clips to the shrinking row instead of smearing.
+                    clip: true;
                     border-radius: Theme.radius-sm;
-                    background: !c.header && cta.has-hover ? Theme.well : transparent;
+                    background: ((!c.header && cta.has-hover) || (c.header && hta.has-hover)) ? Theme.well : transparent;
                     cta := TouchArea {
                         enabled: !c.header;
                         mouse-cursor: c.header ? MouseCursor.default : MouseCursor.pointer;
@@ -1286,7 +1421,19 @@ export component ActionPicker inherits VerticalLayout {
                             root.open = false;
                         }
                     }
-                    // a header is structure: a small tracked-out title above its group
+                    // headers toggle the same filter the rail drives — click a group title to
+                    // narrow to it, click again to return to all.
+                    hta := TouchArea {
+                        enabled: c.header;
+                        mouse-cursor: c.header ? MouseCursor.pointer : MouseCursor.default;
+                        clicked => {
+                            root.toggle-filter(i);
+                            if (root.filter >= 0) { palette.viewport-y = 0px; }
+                        }
+                    }
+                    // a header is structure: a small tracked-out title above its group, and how many
+                    // entries it holds. (A WIP marker lived here once; the per-row tier badge already
+                    // says which entry isn't done, and a dot you can't decode is noise.)
                     if c.header : HorizontalLayout {
                         padding-left: 9px;
                         padding-right: 9px;
@@ -1303,6 +1450,14 @@ export component ActionPicker inherits VerticalLayout {
                                     font-size: Theme.fs-small;
                                     font-weight: 700;
                                     letter-spacing: Theme.track-4;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "· " + c.count;
+                                    color: Theme.text-faint;
+                                    font-family: Theme.mono;
+                                    font-size: Theme.fs-small;
+                                    vertical-alignment: center;
                                 }
                             }
                         }
@@ -1347,14 +1502,93 @@ export component ActionPicker inherits VerticalLayout {
                                 font-size: Theme.fs-body;
                                 horizontal-alignment: left;
                             }
-                            if c.param-hint != "" : Text {
-                                text: c.param-hint;
+                            // the blurb is the scanning line; the param hint swaps in on hover
+                            // (the chosen action's placeholder below teaches the format too).
+                            if (cta.has-hover && c.param-hint != "") || c.blurb != "" : Text {
+                                text: (cta.has-hover && c.param-hint != "") ? c.param-hint : c.blurb;
                                 overflow: elide;
                                 color: Theme.text-faint;
                                 font-family: Theme.mono;
                                 font-size: Theme.fs-small;
                                 horizontal-alignment: left;
                             }
+                        }
+                    }
+                }
+            }
+        }
+        // the RAIL — one mark per group, pinned outside the scroll. Click narrows the list to
+        // that group; click the lit mark (or the group's header) to return to all. Hover names
+        // the group, so a two-letter mark never has to be guessed; obs reads dim until a live
+        // OBS connection, without gating the authoring (it fires honestly-unavailable).
+        Rectangle {
+            x: parent.width - self.width;
+            width: root.rail-w;
+            height: parent.height;
+            Rectangle {
+                x: 0;
+                width: 1px;
+                height: parent.height;
+                background: Theme.line-soft;
+            }
+            VerticalLayout {
+                padding-top: 6px;
+                padding-bottom: 6px;
+                // groups only: non-header rows collapse to zero height, and the column has no
+                // spacing, so skipping rows leaves no gaps.
+                for c[i] in State.action-choices : Rectangle {
+                    height: c.header ? 20px : 0px;
+                    if c.header : HorizontalLayout {
+                        padding-left: 7px;
+                        padding-right: 4px;
+                        spacing: 4px;
+                        alignment: center;
+                        GroupEmblem {
+                            group: c.group;
+                            lit: root.engaged(i, c.group, rta.has-hover);
+                            ink: root.glyph-ink(i, c.group, rta.has-hover);
+                        }
+                        Text {
+                            text: root.group-mark(c.group);
+                            color: root.mark-ink(i, c.group, rta.has-hover);
+                            font-family: Theme.mono;
+                            font-size: Theme.fs-small;
+                            font-weight: 700;
+                            // hover answers at once and lets go slowly, so sweeping the rail leaves a
+                            // trail instead of a blink (theme.slint's hover-in/hover-out rule).
+                            animate color {
+                                duration: root.engaged(i, c.group, rta.has-hover)
+                                    ? Theme.hover-in : Theme.hover-out;
+                            }
+                        }
+                    }
+                    // the hover name — a transient label over the list side so it costs no rail width
+                    if c.header && rta.has-hover : Rectangle {
+                        width: 140px;
+                        height: 20px;
+                        x: -(self.width + 6px);
+                        y: (parent.height - self.height) / 2;
+                        background: Theme.bg-2;
+                        border-width: Theme.hair;
+                        border-color: Theme.line;
+                        border-radius: Theme.radius-sm;
+                        Text {
+                            text: c.label + "  ·  " + c.count;
+                            width: parent.width;
+                            height: parent.height;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            color: Theme.text-mid;
+                            font-family: Theme.mono;
+                            font-size: Theme.fs-small;
+                        }
+                    }
+                    rta := TouchArea {
+                        enabled: c.header;
+                        mouse-cursor: c.header ? MouseCursor.pointer : MouseCursor.default;
+                        clicked => {
+                            root.toggle-filter(i);
+                            if (root.filter >= 0) { palette.viewport-y = 0px; }
                         }
                     }
                 }
