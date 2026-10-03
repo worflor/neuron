@@ -2222,8 +2222,8 @@ impl Pattern for Ring {
 
         let mut cells = vec![Cell::new(0.0, 0.0); n];
         if self.waves.is_empty() {
-            for i in 0..n {
-                cells[i] = Cell::new(0.0, self.contact_level[i]);
+            for (cell, contact) in cells.iter_mut().zip(&self.contact_level) {
+                *cell = Cell::new(0.0, *contact);
             }
             return Field::Scalar(cells);
         }
@@ -4947,7 +4947,7 @@ mod tests {
         let _ = ignite.field(6, 22, 0.0);
 
         // M1 is at (row 1, col 0)
-        let cell = 1 * 22 + 0;
+        let cell = 22;
 
         // (1) Fresh strike guarantee: press M1
         crate::capture::set_macro_held(1 << 0);
@@ -5117,7 +5117,7 @@ mod tests {
         ring.configure(&Params::defaults_for("ring"));
         let _ = ring.field(6, 22, 0.0);
 
-        let cell = 1 * 22 + 0;
+        let cell = 22;
         crate::capture::set_macro_held(1 << 0);
         let f = scalar(ring.field(6, 22, 0.10));
         assert_eq!(f[cell].intensity, 1.0, "fresh strike emits peak 1.0");

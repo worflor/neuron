@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.4
+
+- Made binding and lighting UI more intentional: grouped action selection, inline controls, compact filtered bind lists, and device identity in the lighting preview.
+- Added general controller input on Windows, stick-driven radial casting, verified Xbox-protocol pad haptics, device badges and sensor reads. Switch Pro startup remains gated; Tartarus V2 is untested.
+- Added Wildlife, a seasonal cellular lighting habitat shaped by typing, with idle recovery and region-aware dynamics. Refined Fire wind, Starlight twinkles, Reactive and Ripple contact response, Typing Heat, and saved-effect editing.
+- Added clipboard transforms and session history, screenshots, lighting-layer actions and session Undo; expanded Pockets and dial scrolling.
+- Hardened controller identity, firmware-backed Naga binds, side-plate handling, clipboard formats, screenshot reporting, nested actions and editor state through adversarial testing. Added Synapse 3 mapping-log import.
+
 ## v0.1.3
 
 - Added a Chroma lab under LIGHTING → VISITORS that splits a game's lighting into ambient, held keys, animated keys and recurring effects, with per-game ids, names, replay, hiding and a colour lens.

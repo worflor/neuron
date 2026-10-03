@@ -23,7 +23,7 @@ members = [
 
 # Shared metadata so every crate stays in lockstep.
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license-file = "LICENSE.md"
 authors = ["Woflo Labs"]
