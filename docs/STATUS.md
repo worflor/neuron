@@ -1,6 +1,6 @@
 # neuron: state of the project
 
-This page tracks the v0.1.3 Windows beta: what has been exercised on hardware, what is implemented but needs more use, and what is still planned. The [README](../README.md) has the device-write ledger.
+This page tracks the v0.1.4 Windows beta candidate: what has been exercised on hardware, what is implemented but needs more use, and what is still planned. The [README](../README.md) has the device-write ledger.
 
 | grade | meaning |
 |---|---|
@@ -44,6 +44,8 @@ This page tracks the v0.1.3 Windows beta: what has been exercised on hardware, w
 For device-write evidence and feature gates, see the [README ledger](../README.md#honesty-proven-gated-absent). If a feature marked solid breaks, please [report the device and steps to reproduce](https://github.com/worflor/neuron/issues).
 
 ## Current engineering checks
+
+On Windows on 2026-10-03, `./validate.ps1 -Mode full -Locked` passed for the v0.1.4 candidate: 1,179 core tests, 261 app tests and 239 host tests, plus integration tests, strict Clippy, gated-write feature checks, an optimized release build and the CI-safe ignored tests. Disarmed software-renderer screenshots checked the controller editor and lighting page. The Wildlife promotional mock uses frames from the actual compositor and the existing 6×22 key map, rendered with Cycles OptiX on an RTX 3060; it does not establish physical LED behavior. No new Linux, Tartarus or Switch Pro hardware run was performed.
 
 On Windows on 2026-10-01, the isolated review app exercised DIRECT filtering, eight-row pagination, editing a filtered binding without changing its neighbours, and reopening saved clipboard and lighting actions. A native clipboard sequence restored a four-format sample, transformed it to `ORDER [7391] SHIPPED`, and restored the original full-format input from session history. A window screenshot produced a PNG and a clipboard image; an image Pocket restored and retained its 4,215,260-byte payload. Region selection opened and cancelled without creating a file; automated dragging shifted focus and cancelled the selector, so completed region capture is not verified. Direct output gain changed the Razer USB sound card from 26% to 27%, Undo restored 26%, and a nested gain/Undo sequence also restored 26%. All nine read-only SYSTEM probes passed, including BlackWidow Chroma V2 firmware and the Seiren V3 Mini endpoint. Review bindings, Pocket contents and history were removed, and the original empty clipboard and output gain were restored. Wildlife was checked in the software preview; its physical LED output and the revised controller casting under live stick movement still need owner testing.
 
