@@ -150,27 +150,58 @@ fn macro_host_warm_persists_and_isolates_errors() {
         "failed replacement must not overwrite the durable source"
     );
 
-    // A queued fire belongs to the revision that accepted it. Hold generation N's first fire long
-    // enough to queue a second, publish N+1, then prove that queued N work is REFUSED rather than
-    // silently executing the new callable.
+    // A file barrier holds the first fire across publication; scheduler delays cannot let the
+    // second fire finish before the replacement and turn this into a timing-dependent test.
+    let ready = tmp.join("generation-ready");
+    let release = tmp.join("generation-release");
+    let _ = std::fs::remove_file(&ready);
+    let _ = std::fs::remove_file(&release);
+    let generation_src = format!(
+        concat!(
+            "# neuron: raw\nimport pathlib, time\n",
+            "def macro(ctx):\n",
+            "    print('old:' + ctx.app)\n",
+            "    if ctx.app == 'first':\n",
+            "        pathlib.Path({}).touch()\n",
+            "        deadline = time.monotonic() + 10\n",
+            "        while not pathlib.Path({}).exists():\n",
+            "            if time.monotonic() >= deadline:\n",
+            "                raise RuntimeError('generation release barrier timed out')\n",
+            "            time.sleep(0.01)\n",
+        ),
+        serde_json::to_string(&ready.to_string_lossy()).unwrap(),
+        serde_json::to_string(&release.to_string_lossy()).unwrap(),
+    );
     host.register(
         "e2e_generation",
-        "import time\ndef macro(ctx):\n    print('old:' + ctx.app)\n    time.sleep(0.4)\n",
+        &generation_src,
     )
     .expect("register generation baseline");
     host.drain_log();
     let first = Context::synthetic(Some("first".into()), None, None, None, None);
     let second = Context::synthetic(Some("second".into()), None, None, None, None);
     assert!(host.fire_async("e2e_generation", &first).contains("dispatched"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "first generation fire did not reach its barrier");
     assert!(host.fire_async("e2e_generation", &second).contains("dispatched"));
-    std::thread::sleep(Duration::from_millis(80));
-    host.register(
+    let replacement = host.register(
         "e2e_generation",
-        "def macro(ctx):\n    return 'new:' + ctx.app\n",
-    )
-    .expect("publish generation replacement");
-    std::thread::sleep(Duration::from_millis(700));
-    let generation_log = host.drain_log();
+        "# neuron: raw\ndef macro(ctx):\n    return 'new:' + ctx.app\n",
+    );
+    std::fs::write(&release, b"release").unwrap();
+    replacement.expect("publish generation replacement");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut generation_log = Vec::new();
+    while Instant::now() < deadline {
+        generation_log.extend(host.drain_log());
+        if generation_log.iter().any(|l| l.contains("queued for generation")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         generation_log.iter().any(|l| l.contains("old:first")),
         "the already-running old revision should finish: {generation_log:?}"
@@ -178,6 +209,10 @@ fn macro_host_warm_persists_and_isolates_errors() {
     assert!(
         generation_log.iter().any(|l| l.contains("queued for generation")),
         "queued old work must be refused at the revision boundary: {generation_log:?}"
+    );
+    assert!(
+        !generation_log.iter().any(|l| l.contains("old:second")),
+        "queued old work ran despite the committed replacement: {generation_log:?}"
     );
     assert!(
         !generation_log.iter().any(|l| l.contains("new:second")),
