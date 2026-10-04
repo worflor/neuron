@@ -8,6 +8,7 @@
 //! and per tick emits a [`Field`]: for each cell a sample coordinate `u` (0..1, what to look up in the
 //! layer's [`Spectrum`](crate::spectrum::Spectrum)) and an `intensity` (0..1, brightness/mask). A
 //! pattern knows NOTHING about colour. It is stateful (`Box<dyn Pattern>`, one instance per layer).
+//! Registry metadata may replace `u` with a normalized placement coordinate for selected scalar shapes.
 //!
 //! The render pipeline for a layer is: `field = pattern.field(rows, cols, t)`, then per cell
 //! `cell = spectrum.at(t, u).scale_f(intensity)` ([`Field::render`]) — then (phase 3) the region mask
@@ -18,7 +19,8 @@
 //!
 //! ## The registry — the single source of truth
 //! Every pattern is defined ONCE in [`REGISTRY`] as a [`PatternDef`] carrying ALL its metadata
-//! (`key`, `label`, the `make` factory, the typed param schema, a `default_spectrum`, tile meta). The
+//! (`key`, `label`, the `make` factory, the typed param schema, a `default_spectrum`, palette addressing,
+//! tile meta). The
 //! factory ([`make_pattern`]), the inspector param schema ([`pattern_params`]) and the tile catalog
 //! ([`registry`]) ALL derive from this one table. **Adding a pattern = one [`PatternDef`] entry + the
 //! [`Pattern`] impl — nothing else.** A registry-completeness test guarantees every entry is whole and
@@ -356,6 +358,15 @@ pub struct TileMeta {
     pub live_input: bool,
 }
 
+/// The default scalar coordinate a pattern's palette consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteAddressing {
+    /// Preserve the coordinate emitted by the pattern, including semantic bands and signal values.
+    Field,
+    /// Replace the coordinate with its normalized position in the layer's placement bounds.
+    Placement,
+}
+
 /// The single definition of one pattern: its stable `key`, display `label`, the `make` factory, the
 /// typed param schema, a `default_spectrum`, and tile meta. The factory, the inspector schema and the
 /// tile catalog ALL derive from this — adding a pattern is ONE entry here plus the [`Pattern`] impl.
@@ -375,6 +386,8 @@ pub struct PatternDef {
     /// and ignore the spectrum (`screen`, `custom`, `vitals`). The app reads this to hide the spectrum
     /// editor for full-colour layers instead of branching on the pattern key by hand.
     pub has_spectrum: bool,
+    /// Default palette coordinate source, consumed by the compositor.
+    pub palette_addressing: PaletteAddressing,
     /// Is this a device-telemetry READOUT (data rendered as a gauge) rather than a decorative effect?
     /// `true` only for `vitals`. Lets the app surface / group it distinctly without string-matching keys.
     pub readout: bool,
@@ -402,6 +415,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: false,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Placement,
         readout: false,
     },
     PatternDef {
@@ -414,6 +428,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: false,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -426,6 +441,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: false,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -438,6 +454,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: false,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -450,6 +467,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: false,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -462,6 +480,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -474,6 +493,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: false,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Placement,
         readout: false,
     },
     PatternDef {
@@ -486,6 +506,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Placement,
         readout: false,
     },
     PatternDef {
@@ -498,6 +519,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Placement,
         readout: false,
     },
     PatternDef {
@@ -510,6 +532,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: false,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -522,6 +545,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -534,6 +558,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -546,6 +571,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: false,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -558,6 +584,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: false,
         },
         has_spectrum: false,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
     PatternDef {
@@ -572,6 +599,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: false,
+        palette_addressing: PaletteAddressing::Field,
         readout: true,
     },
     PatternDef {
@@ -586,6 +614,7 @@ static REGISTRY: &[PatternDef] = &[
         // A SCALAR readout — unlike vitals it colours THROUGH the spectrum, so the user paints the
         // on-air look with the full engine (any colour, gradient, breathe/cycle motion).
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Placement,
         readout: true,
     },
     PatternDef {
@@ -598,6 +627,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Placement,
         readout: true,
     },
     PatternDef {
@@ -610,6 +640,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Placement,
         readout: true,
     },
     PatternDef {
@@ -623,6 +654,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: false,
+        palette_addressing: PaletteAddressing::Field,
         readout: true,
     },
     PatternDef {
@@ -635,6 +667,7 @@ static REGISTRY: &[PatternDef] = &[
             live_input: true,
         },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: true,
     },
     PatternDef {
@@ -645,6 +678,7 @@ static REGISTRY: &[PatternDef] = &[
         default_spectrum: life_spectrum,
         tile: TileMeta { live_input: false },
         has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
 ];
@@ -2967,7 +3001,7 @@ impl Pattern for OnAir {
 }
 
 /// The shared body of the boolean readout layers (on-air / mic light / mode held): a scalar
-/// field at one `intensity` whose `u` spans the PLACEMENT horizontally — so a gradient spectrum
+/// field at one `intensity` whose `u` spans the placement — so a gradient spectrum
 /// paints across the painted region (a solid spectrum ignores `u`; Motion spectra breathe/cycle
 /// on top). The spectrum does ALL the colour work; these patterns only gate. Zero intensity is
 /// the all-dark field their Cut-blended presets treat as transparent.
@@ -2977,15 +3011,10 @@ fn placement_field(bounds: Option<Bounds>, rows: u8, cols: u8, intensity: f32) -
         return Field::Scalar(vec![Cell::new(0.0, 0.0); n]);
     }
     let bounds = bounds.unwrap_or_else(|| Bounds::board(rows, cols));
-    let span = f32::from(bounds.cols.max(1)) - 1.0;
     let mut cells = Vec::with_capacity(n);
-    for _r in 0..rows {
+    for r in 0..rows {
         for c in 0..cols {
-            let u = if span > 0.0 {
-                (f32::from(c.saturating_sub(bounds.col0)) / span).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+            let u = placement_coordinate(bounds, usize::from(r), usize::from(c));
             cells.push(Cell::new(u, intensity));
         }
     }
@@ -3447,7 +3476,8 @@ fn sp_pulse() -> Spectrum {
 
 // ─────────────────────────── THE COMPOSITOR — a stack of Pattern × Spectrum layers ─────────────
 //
-// Each layer renders its pattern's field, resolves it through the layer's spectrum (× intensity), then
+// Each layer renders its pattern's field, applies registry-declared addressing to scalar fields, resolves
+// it through the layer's spectrum (× intensity), then
 // masks to its region and blends over the layers beneath — the full render pipeline. [`Compositor::render`]
 // produces one `rows*cols` frame at time `t`; the device animate / stream / preview paths (lighting.rs)
 // drive it directly. Colour lives entirely in each layer's spectrum (there is no base colour).
@@ -3456,6 +3486,8 @@ fn sp_pulse() -> Spectrum {
 pub struct Layer {
     pub pattern: Box<dyn Pattern>,
     pub spectrum: Spectrum,
+    /// Registry-declared source for this layer's scalar palette coordinate.
+    pub palette_addressing: PaletteAddressing,
     /// Sorted, de-duplicated row-major cell indices the layer paints; empty = the whole board.
     pub region: Vec<u32>,
     pub blend: Blend,
@@ -3488,6 +3520,9 @@ impl Compositor {
                 Layer {
                     pattern,
                     spectrum: d.spectrum.clone(),
+                    palette_addressing: pattern_def(&d.pattern)
+                        .or_else(|| pattern_def("uniform"))
+                        .map_or(PaletteAddressing::Field, |def| def.palette_addressing),
                     region,
                     blend: d.blend,
                     enabled: d.enabled,
@@ -3516,7 +3551,7 @@ impl Compositor {
             if field.len() != n {
                 continue; // a misbehaving pattern can't corrupt the stack
             }
-            let px = field.render(&layer.spectrum, t);
+            let px = render_palette_addressing(&field, &layer.spectrum, t, layer.palette_addressing, bbox, cols);
             for i in 0..n {
                 if layer.covers(i) {
                     out[i] = crate::effects::blend_px(out[i], px[i], layer.blend);
@@ -3525,6 +3560,40 @@ impl Compositor {
         }
         out
     }
+}
+
+fn render_palette_addressing(
+    field: &Field,
+    spectrum: &Spectrum,
+    t: f32,
+    addressing: PaletteAddressing,
+    bounds: Bounds,
+    cols: u8,
+) -> Vec<Rgb> {
+    let Field::Scalar(cells) = field else {
+        return field.render(spectrum, t);
+    };
+    if addressing == PaletteAddressing::Field {
+        return field.render(spectrum, t);
+    }
+    cells.iter().enumerate().map(|(i, cell)| {
+        let row = i / cols.max(1) as usize;
+        let col = i % cols.max(1) as usize;
+        let u = placement_coordinate(bounds, row, col);
+        spectrum.at(t, u).scale_f(cell.intensity)
+    }).collect()
+}
+
+fn placement_coordinate(bounds: Bounds, row: usize, col: usize) -> f32 {
+    // A one-column placement still has a usable axis when it contains multiple rows.
+    let down = bounds.cols == 1 && bounds.rows > 1;
+    let extent = if down { bounds.rows } else { bounds.cols };
+    let position = if down {
+        row.saturating_sub(bounds.row0 as usize)
+    } else {
+        col.saturating_sub(bounds.col0 as usize)
+    } as f32;
+    if extent > 1 { (position / (extent - 1) as f32).clamp(0.0, 1.0) } else { 0.0 }
 }
 
 // ─────────────────────────────────────────── tests ───────────────────────────────────────────
@@ -3592,6 +3661,130 @@ mod tests {
     }
 
     #[test]
+    fn placement_addressing_is_registry_driven_and_keeps_field_semantics() {
+        for key in ["uniform", "sparkle", "ignite", "ring", "onair", "miclight", "modeheld"] {
+            let addressing = pattern_def(key).unwrap().palette_addressing;
+            assert_eq!(addressing, PaletteAddressing::Placement);
+            let fixture = Field::Scalar(vec![Cell::new(0.0, 1.0); 3]);
+            assert_eq!(render_palette_addressing(&fixture, &Spectrum::gradient(vec![
+                Rgb::new(255, 0, 0), Rgb::new(0, 0, 255),
+            ]), 0.0, addressing, Bounds::board(1, 3), 3), vec![
+                Rgb::new(255, 0, 0), Rgb::new(128, 0, 128), Rgb::new(0, 0, 255),
+            ]);
+        }
+        for key in ["axis", "radial", "heat", "rain", "comet", "flow", "thermal", "meter", "life", "signal"] {
+            assert_eq!(pattern_def(key).unwrap().palette_addressing, PaletteAddressing::Field);
+        }
+
+        let spectrum = Spectrum::gradient(vec![
+            Rgb::new(255, 0, 0), Rgb::new(0, 255, 0), Rgb::new(0, 0, 255),
+        ]);
+        let constant_u = Field::Scalar(vec![Cell::new(0.0, 1.0); 3]);
+        let default = pattern_def("uniform").unwrap().palette_addressing;
+        let mut horizontal = Compositor::from_defs(&[LayerDef {
+            pattern: "uniform".into(),
+            spectrum: spectrum.clone(),
+            ..LayerDef::default()
+        }]);
+        assert_eq!(horizontal.layers[0].palette_addressing, default);
+        assert_eq!(horizontal.render(1, 3, 0.0), vec![
+            Rgb::new(255, 0, 0), Rgb::new(0, 255, 0), Rgb::new(0, 0, 255),
+        ]);
+        let expected_native = constant_u.render(&spectrum, 0.0);
+        assert_eq!(render_palette_addressing(&constant_u, &spectrum, 0.0,
+            PaletteAddressing::Field, Bounds::board(1, 3), 3), expected_native);
+
+        // A placement's bbox supplies coordinates; the exact region still masks holes.
+        let mut sparse = Compositor::from_defs(&[LayerDef {
+            pattern: "uniform".into(),
+            spectrum: spectrum.clone(),
+            region: vec![1, 3],
+            ..LayerDef::default()
+        }]);
+        assert_eq!(sparse.render(1, 5, 0.0), vec![
+            Rgb::BLACK, Rgb::new(255, 0, 0), Rgb::BLACK, Rgb::new(0, 0, 255), Rgb::BLACK,
+        ]);
+
+        // A one-column placement uses its vertical coordinate; a single cell has only its first sample.
+        let mut vertical = Compositor::from_defs(&[LayerDef {
+            pattern: "uniform".into(),
+            spectrum: spectrum.clone(),
+            region: vec![0, 1, 2],
+            ..LayerDef::default()
+        }]);
+        assert_eq!(vertical.render(3, 1, 0.0), vec![
+            Rgb::new(255, 0, 0), Rgb::new(0, 255, 0), Rgb::new(0, 0, 255),
+        ]);
+        let mut single = Compositor::from_defs(&[LayerDef {
+            pattern: "uniform".into(),
+            spectrum: spectrum.clone(),
+            region: vec![0],
+            ..LayerDef::default()
+        }]);
+        assert_eq!(single.render(1, 1, 0.0), vec![Rgb::new(255, 0, 0)]);
+        let mut built_in_solid = Compositor::from_defs(&[preset_layer("static").unwrap()]);
+        assert_eq!(built_in_solid.render(1, 3, 0.0), vec![ACCENT; 3]);
+        assert!(horizontal.render(0, 3, 0.0).is_empty());
+
+        // Geometry changes the sample coordinate only; pattern intensity and full-colour sources stay intact.
+        let dimmed = Field::Scalar(vec![Cell::new(0.0, 0.0), Cell::new(0.0, 0.5), Cell::new(0.0, 1.0)]);
+        let mapped = render_palette_addressing(&dimmed, &spectrum, 0.0,
+            PaletteAddressing::Placement, Bounds::board(1, 3), 3);
+        assert_eq!(mapped, vec![Rgb::BLACK, Rgb::new(0, 128, 0), Rgb::new(0, 0, 255)]);
+        let solid = Spectrum::solid(Rgb::new(27, 51, 83));
+        assert_eq!(render_palette_addressing(&constant_u, &solid, 0.0,
+            PaletteAddressing::Placement, Bounds::board(1, 3), 3), vec![Rgb::new(27, 51, 83); 3]);
+        let colors = Field::Color(vec![Rgb::new(12, 34, 56); 3]);
+        assert_eq!(render_palette_addressing(&colors, &spectrum, 0.0,
+            PaletteAddressing::Placement, Bounds::board(1, 3), 3), colors.render(&spectrum, 0.0));
+        let life_field = Field::Scalar(vec![Cell::new(0.0, 0.4); 3]);
+        assert_eq!(render_palette_addressing(&life_field, &spectrum, 0.0,
+            pattern_def("life").unwrap().palette_addressing, Bounds::board(1, 3), 3),
+            life_field.render(&spectrum, 0.0));
+    }
+
+    #[test]
+    fn animated_shapes_use_all_stops_without_changing_their_intensity() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ring = Ring::default();
+        ring.configure(&Params::defaults_for("ring"));
+        let _ = ring.field(6, 22, 0.0);
+        ring.spawn(3.0, 10.0, 0.0);
+        let mut sparkle = Sparkle::default();
+        sparkle.configure(&Params::defaults_for("sparkle"));
+        for (key, pattern) in [
+            ("ring", Box::new(ring) as Box<dyn Pattern>),
+            ("sparkle", Box::new(sparkle) as Box<dyn Pattern>),
+        ] {
+            let white = Spectrum::solid(Rgb::new(255, 255, 255));
+            let gradient = Spectrum::gradient(vec![Rgb::new(255, 0, 0), Rgb::new(0, 0, 255)]);
+            let mut comp = Compositor { layers: vec![Layer {
+                pattern,
+                spectrum: white.clone(),
+                palette_addressing: pattern_def(key).unwrap().palette_addressing,
+                region: Vec::new(),
+                blend: Blend::Normal,
+                enabled: true,
+            }] };
+            let mut reached_other_stops = false;
+            for tick in 0..60 {
+                let t = tick as f32 / 30.0;
+                comp.layers[0].spectrum = white.clone();
+                let intensity = comp.render(6, 22, t);
+                comp.layers[0].spectrum = gradient.clone();
+                let coloured = comp.render(6, 22, t);
+                for (i, (solid, colour)) in intensity.iter().zip(&coloured).enumerate() {
+                    assert_eq!(colour.g, 0);
+                    assert!((i16::from(colour.r) + i16::from(colour.b) - i16::from(solid.r)).abs() <= 1,
+                        "{key}: palette must preserve pattern intensity at cell {i}");
+                    reached_other_stops |= colour.b > 0;
+                }
+            }
+            assert!(reached_other_stops, "{key}: later stops must colour live cells");
+        }
+    }
+
+    #[test]
     fn unknown_pattern_key_is_graceful() {
         assert!(make_pattern("nope").is_none());
         assert!(pattern_params("nope").is_empty());
@@ -3634,6 +3827,17 @@ mod tests {
         // live → the layer's OWN spectrum at full brightness (preset default: tally red)
         publish_broadcast(Broadcast { connected: true, streaming: true, recording: false });
         assert!(comp.render(2, 4, 0.2).iter().all(|p| *p == Rgb::new(255, 0, 0)));
+        let mut vertical = Compositor::from_defs(&[LayerDef {
+            pattern: "onair".into(),
+            spectrum: Spectrum::gradient(vec![
+                Rgb::new(255, 0, 0), Rgb::new(0, 255, 0), Rgb::new(0, 0, 255),
+            ]),
+            region: vec![0, 1, 2],
+            ..LayerDef::default()
+        }]);
+        assert_eq!(vertical.render(3, 1, 0.2), vec![
+            Rgb::new(255, 0, 0), Rgb::new(0, 255, 0), Rgb::new(0, 0, 255),
+        ]);
         // the teardown publish (disconnected) kills it — a torn-down OBS can NEVER leave a
         // stale "live" on the board, even though `streaming` was last announced true.
         publish_broadcast(Broadcast { connected: false, streaming: true, recording: false });
@@ -3911,6 +4115,7 @@ mod tests {
             frame: Vec::new(),
         };
         let j = serde_json::to_string(&def).unwrap();
+        assert!(!j.contains("palette_addressing"), "palette addressing is registry metadata, not layer state");
         let back: LayerDef = serde_json::from_str(&j).unwrap();
         assert_eq!(def, back);
     }
@@ -3937,6 +4142,7 @@ mod tests {
         let t = toml::to_string(&stack).unwrap();
         // the solid layer's spectrum is a flat hex string, and params don't appear at all.
         assert!(t.contains("spectrum = \"4AF2B0\""), "solid spectrum is flat hex:\n{t}");
+        assert!(!t.contains("palette_addressing ="), "palette addressing is not serialized:\n{t}");
         assert!(!t.contains("[layers.params]"), "empty params omitted:\n{t}");
         let back: Stack = toml::from_str(&t).unwrap();
         assert_eq!(back.layers.len(), 2);
@@ -4656,6 +4862,7 @@ mod tests {
             layers: vec![Layer {
                 pattern: Box::new(Probe(seen.clone())),
                 spectrum: Spectrum::solid(Rgb::new(1, 2, 3)),
+                palette_addressing: PaletteAddressing::Field,
                 region: vec![5, 6, 9, 10],
                 blend: Blend::Normal,
                 enabled: true,
@@ -4670,6 +4877,7 @@ mod tests {
             layers: vec![Layer {
                 pattern: Box::new(Probe(seen2.clone())),
                 spectrum: Spectrum::solid(Rgb::new(1, 2, 3)),
+                palette_addressing: PaletteAddressing::Field,
                 region: Vec::new(),
                 blend: Blend::Normal,
                 enabled: true,

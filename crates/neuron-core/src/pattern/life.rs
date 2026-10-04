@@ -2218,6 +2218,7 @@ mod tests {
             layers: vec![super::super::Layer {
                 pattern: Box::new(life),
                 spectrum: super::super::life_spectrum(),
+                palette_addressing: super::super::PaletteAddressing::Field,
                 region: Vec::new(),
                 blend: crate::effects::Blend::Normal,
                 enabled: true,
@@ -2373,6 +2374,7 @@ mod tests {
         let comp_layer = super::super::Layer {
             pattern: Box::new(Fixture(cells)),
             spectrum: super::super::life_spectrum(),
+            palette_addressing: super::super::PaletteAddressing::Field,
             region: vec![1, 2, 3],
             blend: crate::effects::Blend::Normal,
             enabled: true,
@@ -2399,6 +2401,7 @@ mod tests {
             layers: vec![super::super::Layer {
                 pattern: Box::new(life),
                 spectrum: super::super::life_spectrum(),
+                palette_addressing: super::super::PaletteAddressing::Field,
                 region: Vec::new(),
                 blend: crate::effects::Blend::Normal,
                 enabled: true,
