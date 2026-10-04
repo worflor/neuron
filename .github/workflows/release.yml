@@ -109,6 +109,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          # Match the validated release compiler; moving stable also changes Clippy's gates.
+          toolchain: 1.96.0
           components: clippy # -Mode full runs clippy; without this it reports a phantom failure
 
       - uses: Swatinem/rust-cache@v2
