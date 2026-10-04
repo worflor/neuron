@@ -8,6 +8,7 @@
 //! read), `SLINT_BACKEND=winit-software` and `SLINT_SCALE_FACTOR=2` for the window scenes:
 //! `NEURON_SHOT_SCENE=<device|lighting|input|weave|system|profiles> NEURON_SHOT_OUT=<png>
 //! cargo test -p neuron-app --bin neuron-app -- --ignored --exact readme_shots::shot`.
+//! `NEURON_SHOT_GRADIENT=1` renders a three-stop Uniform palette in the lighting scene.
 //! `overlay_radial`, `overlay_glyph` and `notif_cards` dump the real overlay renderer's frames into the
 //! directory named by `NEURON_SHOT_OUT`. Seeded state is demo data; devices are phantoms. The
 //! `docs/media` images are these renders composed over a wallpaper crop with Pillow (not committed).
@@ -119,6 +120,13 @@ fn shot() {
 }
 
 fn save_snapshot(app: &AppWindow, path: &str) {
+    if env("NEURON_SHOT_SCENE").as_deref() == Some("lighting") && env("NEURON_SHOT_GRADIENT").is_some() {
+        let st = app.global::<State>();
+        assert_eq!(st.get_light_stops().row_count(), 3, "gradient must survive device restoration and persistence");
+        let pixels = st.get_grid_px();
+        let first = pixels.row_data(0).unwrap();
+        assert!((1..pixels.row_count()).any(|i| pixels.row_data(i).unwrap() != first), "preview must contain a gradient");
+    }
     let shot = app.window().take_snapshot().unwrap();
     let rgb: Vec<u8> = shot.as_bytes().chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
     image::save_buffer(path, &rgb, shot.width(), shot.height(), image::ColorType::Rgb8).unwrap();
@@ -148,7 +156,8 @@ fn select_and_open(app: &AppWindow, scene: &str) {
     st.set_input_view(view);
     if scene == "lighting" {
         st.set_window_shown(true);
-        st.invoke_pick_tile("aurora".into());
+        let gradient = env("NEURON_SHOT_GRADIENT").is_some();
+        st.invoke_pick_tile(if gradient { "static" } else { "aurora" }.into());
         let weak = app.as_weak();
         let ticker = slint::Timer::default();
         ticker.start(slint::TimerMode::Repeated, Duration::from_millis(80), move || {
@@ -164,6 +173,20 @@ fn select_and_open(app: &AppWindow, scene: &str) {
 /// seed cannot overwrite it before the snapshot.
 fn finish_seed(app: &AppWindow, scene: &str) {
     let st = app.global::<State>();
+    if scene == "lighting" && env("NEURON_SHOT_GRADIENT").is_some() {
+        // Device selection restores saved lighting asynchronously; edit only after its readouts settle.
+        assert_ne!(st.get_idle_readout().as_str(), "…");
+        st.invoke_pick_tile("static".into());
+        st.invoke_add_stop(0.5);
+        st.invoke_add_stop(0.5);
+        let count = st.get_light_stops().row_count();
+        assert_eq!(count, 3);
+        st.invoke_set_stop_color(0, "FF3D56".into());
+        st.invoke_set_stop_color((count - 1) as i32, "45E0B5".into());
+        st.invoke_set_stop_color(1, "668CFF".into());
+        st.invoke_move_stop((count - 1) as i32, 1.0);
+        st.invoke_move_stop(1, 0.5);
+    }
     // readouts a phantom bus cannot answer: plausible and consistent with the device defs
     let rows = st.get_devices();
     let mut keep = Vec::new();
