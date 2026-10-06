@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "promo-pattern-export"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not a member of the product workspace.
+[workspace]
+
+[dependencies]
+neuron = { path = "../../../crates/neuron-core" }
+serde_json = "1"

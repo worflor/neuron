@@ -1,32 +1,41 @@
 # Dev ad: "i'm lazy. set up my devices."
 
-A 23-second vertical (1080×1920, 30 fps) promo for developers. One continuous Blender shot: a
+A 41-second vertical (1080×1920, 30 fps) promo for developers. One continuous Blender shot: a
 terminal pane floats behind the rig, an agent drives the `neuron` CLI, and each command sends a
-thread of light from its line in the terminal to the device it configures.
+thread of light from its line to the device it configures.
 
 Draft, not approved for publication.
 
 ## What is real and what is staged
 
-- Every command in the terminal is real `neuron` CLI syntax (checked against v0.1.4 `--help`).
-  The devices are the owner's: Naga V2 Pro, BlackWidow Chroma V2, Seiren V3 Mini.
+- Every command in the terminal, and every reply shown under one, was run against v0.1.4 in a
+  scratch run root (`NEURON_RUN_DIR`). The devices are the owner's: Naga V2 Pro, BlackWidow
+  Chroma V2, Seiren V3 Mini. `feel stages` writes the mouse, so it was checked against `--help`
+  only.
 - The agent's dialogue is written copy, not a recorded session.
+- **Every LED frame is Neuron's own output.** `gen_lighting.py` runs `../pattern-export`, which
+  links neuron-core and renders the `fire` and `typingheat` presets through `pattern::Compositor`,
+  switched on the frames the commands land and fed the ad's keystrokes through
+  `capture::script_key_reads`. Nothing else paints the LEDs; spotlights, threads, rings and labels
+  are staging in the scene.
 - The keyboard is the generic BlackWidow fixture from `.local/showcase` (core 6×22 key map, not a
   scan). The mouse and mic are stylised stand-ins.
-- The keyboard's light is visualisation, except where a capture is passed: `gen_lighting.py
-  --capture` replaces the aurora beat with real frames recorded by
-  `.local/showcase/tools/capture_controller.py`. Without one, the aurora is a stand-in field in the
-  brand palette.
+- Sound is synthesized from the same timeline (`gen_audio.py`); tool-call blips use the soft-pulse
+  FM construction from `crates/neuron-core/src/tone.rs`.
 
 ## Build
 
-All timing lives in `timeline.py`. Output goes to `D:\build-cache\promo\dev-ad` (`PROMO_OUT`).
+All timing, shots and attention cues live in `timeline.py`. Output goes to
+`D:\build-cache\promo\dev-ad` (`PROMO_OUT`).
 
 ```powershell
+$env:CARGO_TARGET_DIR = "D:\build-cache\promo\target"
+cargo build --release --manifest-path ..\pattern-export\Cargo.toml
 python gen_terminal.py      # term/#####.png + anchors.json
-python gen_lighting.py      # lighting.npz  (add --capture FILE for real aurora frames)
-& D:\tools\blender-5.2.2-windows-x64\blender.exe -b --factory-startup --python build_scene.py -- --resume
-python assemble.py          # end card + neuron-dev-ad.mp4
+python gen_lighting.py      # lighting.npz, through the real pattern engine
+python gen_audio.py         # audio.wav
+& D:\tools\blender-5.2.2-windows-x64\blender.exe -b --factory-startup --python build_scene.py -- --resume --out D:\build-cache\promo\dev-ad\render2
+python assemble.py          # end card + audio -> neuron-dev-ad.mp4
 ```
 
 `build_scene.py` takes `--frames 1,90,300`, `--range a:b`, `--scale 0.5` and `--samples N` for test

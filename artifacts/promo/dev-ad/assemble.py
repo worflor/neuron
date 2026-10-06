@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Woflo Labs
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Composite the end card over the rendered frames and encode the ad.
+"""Composite the end card over the rendered frames, mux audio.wav and encode the ad.
 
     python assemble.py            # render/ -> final/ -> neuron-dev-ad.mp4
 """
@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, os.path.dirname(__file__))
 import timeline as tl
 
-SRC = os.path.join(tl.OUT, "render")
+SRC = os.path.join(tl.OUT, os.environ.get("PROMO_RENDER", "render2"))
 DST = os.path.join(tl.OUT, "final")
 MP4 = os.path.join(tl.OUT, "neuron-dev-ad.mp4")
 WORD = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", 132)
@@ -82,6 +82,8 @@ def main():
     subprocess.run([
         "ffmpeg", "-y", "-loglevel", "error", "-framerate", str(tl.FPS),
         "-i", os.path.join(DST, "%05d.png"),
+        "-i", os.path.join(tl.OUT, "audio.wav"),
+        "-c:a", "aac", "-b:a", "192k", "-shortest",
         "-c:v", "libx264", "-preset", "slow", "-crf", "15", "-pix_fmt", "yuv420p",
         "-profile:v", "high", "-movflags", "+faststart", MP4,
     ], check=True)

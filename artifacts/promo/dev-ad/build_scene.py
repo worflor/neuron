@@ -188,6 +188,12 @@ def pop_in(obj, t, dur=0.18, scale=1.0):
     key(obj, "scale", t + dur, (scale, scale, scale))
 
 
+def gone(obj, t):
+    """Drop a faded-out object from the render: black emission still occludes."""
+    key(obj, "hide_render", t, False)
+    key(obj, "hide_render", t + 0.04, True)
+
+
 def color_keys(obj, seq):
     """seq: [(t, rgba)] with smooth transitions."""
     for t, c in seq:
@@ -209,6 +215,9 @@ clear()
 SCN = bpy.context.scene
 FONT = bpy.data.fonts.load(CONSOLAS)
 BLACK = (0.0, 0.0, 0.0, 1.0)
+ACC = hexlin(tl.ACCENT)
+DIM = hexlin(tl.TEXT_DIM)
+LIS = hexlin(tl.LISTEN)
 
 # ----------------------------------------------------------------------------- keyboard
 # Builder adapted from .local/showcase/tools/render_showcase.py: same pitch, rows and core
@@ -417,7 +426,7 @@ def build_mouse():
     logo.parent = MOUSE_ROOT
     # Button split line, as a shallow dark seam.
     # Side plate: 12 buttons, 4 rows x 3 columns, on the thumb (left) side.
-    plate = []
+    plate, caps = [], []
     for r in range(4):
         for c in range(3):
             s = 0.02 + (c - 1) * 0.165
@@ -427,10 +436,11 @@ def build_mouse():
             led = box(f"zone plate {r}{c}", pos, (0.0022, 0.0098, 0.0064), M_ZONE, 0.0008, MOUSE_ROOT)
             cap = box(f"plate cap {r}{c}", (x - 0.0012, s * ML / 2, z), (0.0024, 0.0086, 0.0054), M_SHELL, 0.0009, MOUSE_ROOT)
             plate.append(led)
-    return ring, logo, plate
+            caps.append(cap)
+    return ring, logo, plate, caps
 
 
-M_WHEEL, M_LOGO, M_PLATE_LEDS = build_mouse()
+M_WHEEL, M_LOGO, M_PLATE_LEDS, MOUSE_PLATE_CAPS = build_mouse()
 
 # ----------------------------------------------------------------------------- mic
 
@@ -515,15 +525,65 @@ def area(name, loc, target, energy, size, color=(1, 1, 1), shape="DISK", size_y=
     return o
 
 
-KEY_LIGHT = area("key", (-0.35, -0.45, 0.65), (0, 0, 0), 3.0, 0.6)
+KEY_LIGHT = area("key", (-0.35, -0.45, 0.65), (0, 0, 0), 1.4, 0.6)
 RIM_L = area("rim left", (-0.60, 0.55, 0.38), (0.0, 0.0, 0.02), 0.7, 0.9, (0.75, 0.88, 1.0), "RECTANGLE", 0.04)
 RIM_R = area("rim right", (0.65, 0.50, 0.36), (0.25, 0.0, 0.02), 0.6, 0.9, (0.75, 0.88, 1.0), "RECTANGLE", 0.04)
 
-# The room starts dark and the lights come up with the wake.
-for lamp, e in ((KEY_LIGHT, 2.2), (RIM_L, 0.7), (RIM_R, 0.6)):
+# The room comes up once the devices have answered.
+_room_up = tl.arrival("wake_mic") + 0.3
+for lamp, e in ((KEY_LIGHT, 1.4), (RIM_L, 0.7), (RIM_R, 0.6)):
     key(lamp.data, "energy", 0.0, 0.0)
-    key(lamp.data, "energy", 1.9, 0.0)
-    key(lamp.data, "energy", 3.4, e)
+    key(lamp.data, "energy", tl.arrival("wake_mouse"), 0.0)
+    key(lamp.data, "energy", _room_up + 0.8, e)
+
+
+def spot(name, target, height=0.55, size=0.30):
+    """A soft overhead spot on one device: the attention light."""
+    d = bpy.data.lights.new(name, "SPOT")
+    d.spot_size = math.radians(44)
+    d.spot_blend = 0.85
+    d.shadow_soft_size = size
+    d.color = (0.86, 0.94, 1.0)
+    o = link(bpy.data.objects.new(name, d))
+    o.location = Vector(target) + Vector((0, -0.18, height))
+    o.rotation_euler = (Vector(target) - o.location).to_track_quat("-Z", "Y").to_euler()
+    return d
+
+
+SPOTS = {
+    "mouse": (spot("spot mouse", MOUSE), 2.6),
+    "keyboard": (spot("spot keyboard", (0, 0, 0), 0.62, 0.4), 5.0),
+    "mic": (spot("spot mic", MIC + Vector((0, 0, 0.06))), 2.2),
+}
+_WAKE = {"mouse": tl.arrival("wake_mouse"), "keyboard": tl.arrival("wake_keyboard"), "mic": tl.arrival("wake_mic")}
+
+
+def spot_level(dev, t):
+    """Energy factor for one device's spot at time t, from timeline.SUBJECTS."""
+    if t < _WAKE[dev]:
+        return 0.0
+    subject = None
+    for when, who in tl.SUBJECTS:
+        if when <= t:
+            subject = who
+    if subject == dev:
+        return 1.0
+    if subject in ("all", None):
+        return 0.45
+    return 0.12
+
+
+# Key each spot at every subject change and wake, easing over 0.35 s.
+for dev, (data, peak) in SPOTS.items():
+    times = sorted({0.0, _WAKE[dev], *[w for w, _ in tl.SUBJECTS], tl.DURATION})
+    key(data, "energy", 0.0, 0.0)
+    for w in times:
+        if w <= 0.0:
+            continue
+        key(data, "energy", w, spot_level(dev, w - 0.01) * peak)
+        key(data, "energy", min(tl.DURATION, w + 0.35), spot_level(dev, w + 0.01) * peak)
+    # The wake: a brief overshoot as the device answers.
+    key(data, "energy", _WAKE[dev] + 0.12, peak * 1.6)
 
 # ----------------------------------------------------------------------------- terminal pane
 
@@ -573,18 +633,44 @@ ANCHORS = json.load(open(os.path.join(tl.OUT, "anchors.json")))
 M_THREAD = glow("Thread", 14.0)
 
 
-def thread(name, a, b, t0, travel=tl.THREAD_TRAVEL, lift=0.10, color=tl.ACCENT, tail=0.14):
-    """A comet of light from a to b, leaving at t0."""
+M_HEAD = glow("Thread head", 40.0)
+M_PING = glow("Ping", 6.0)
+
+
+def ease_sine(k):
+    k = max(0.0, min(1.0, k))
+    return 0.5 - 0.5 * math.cos(math.pi * k)
+
+
+def ping(name, center, t0, r0=0.02, r1=0.10, life=0.7, z=0.0015, squash=1.0, gain=2.0):
+    """A ring that blooms where a thread lands: 'here'."""
+    bpy.ops.mesh.primitive_torus_add(major_radius=1.0, minor_radius=0.012, major_segments=96, minor_segments=8,
+                                     location=(center[0], center[1], z))
+    o = bpy.context.object
+    o.name = name
+    o.data.materials.append(M_PING)
+    o.color = BLACK
+    key(o, "hide_render", 0.0, True)
+    key(o, "hide_render", t0 - 0.01, False)
+    key(o, "hide_render", t0 + life + 0.02, True)
+    for i in range(int(life * tl.FPS) + 2):
+        tt = t0 + i / tl.FPS
+        k = min(1.0, i / (life * tl.FPS))
+        r = r0 + (r1 - r0) * (1 - (1 - k) ** 3)
+        key(o, "scale", tt, (r, r * squash, r))
+        a = (1 - k) ** 1.6
+        key(o, "color", tt, (ACC[0] * gain * a, ACC[1] * gain * a, ACC[2] * gain * a, 1))
+    return o
+
+
+def thread(name, a, b, t0, travel=tl.THREAD_TRAVEL, lift=0.10, color=tl.ACCENT, tail=0.16):
+    """A comet of light from a to b, leaving at t0, with a bright head riding its front."""
     a, b = Vector(a), Vector(b)
     mid = (a + b) / 2 + Vector((0, -0.04, lift))
-    pts = []
-    for i in range(48):
-        s = i / 47
-        p = (1 - s) ** 2 * a + 2 * (1 - s) * s * mid + s * s * b
-        pts.append(p)
+    pts = [(1 - s) ** 2 * a + 2 * (1 - s) * s * mid + s * s * b for s in (i / 63 for i in range(64))]
     cu = bpy.data.curves.new(name, "CURVE")
     cu.dimensions = "3D"
-    cu.bevel_depth = 0.0011
+    cu.bevel_depth = 0.0010
     cu.bevel_resolution = 3
     cu.use_fill_caps = True
     sp = cu.splines.new("POLY")
@@ -605,6 +691,20 @@ def thread(name, a, b, t0, travel=tl.THREAD_TRAVEL, lift=0.10, color=tl.ACCENT, 
     key(o, "hide_render", 0.0, True)
     key(o, "hide_render", t0, False)
     key(o, "hide_render", t0 + travel + tail + 0.02, True)
+    # The head: rides the same eased path, so the eye has one point to follow.
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.0028, segments=16, ring_count=8)
+    h = bpy.context.object
+    h.name = name + " head"
+    h.data.materials.append(M_HEAD)
+    h.color = (0.75, 1.0, 0.9, 1)
+    key(h, "hide_render", 0.0, True)
+    key(h, "hide_render", t0, False)
+    key(h, "hide_render", t0 + travel + 0.02, True)
+    steps = int(travel * tl.FPS) + 1
+    for i in range(steps + 1):
+        k = ease_sine(i / steps)
+        p = pts[min(len(pts) - 1, int(round(k * (len(pts) - 1))))]
+        key(h, "location", t0 + i * travel / steps, p)
     return o
 
 
@@ -612,20 +712,37 @@ def anchor(ev):
     return pane_point(*ANCHORS[ev])
 
 
+KEY_BY_NAME = {k["name"]: k for k in KEYS}
 KB_CENTER = Vector((0.0, 0.0, 0.03))
 MOUSE_TOP = MOUSE + Vector((0, 0.0, 0.048))
 MIC_TOP = MIC + Vector((0, 0, 0.15))
-thread("thr wake mouse", anchor("wake_mouse"), MOUSE_TOP, tl.event_time("wake_mouse"))
-thread("thr wake kb", anchor("wake_keyboard"), KB_CENTER, tl.event_time("wake_keyboard"))
-thread("thr wake mic", anchor("wake_mic"), MIC_TOP, tl.event_time("wake_mic"))
+ENTER = Vector((KEY_BY_NAME["ENTER"]["x"], KEY_BY_NAME["ENTER"]["y"], 0.032))
+# Thumb 2 on the side plate: top row, middle column.
+THUMB = MOUSE_PLATE_CAPS[3 * 3 + 1]
+THUMB_P = MOUSE + Vector(THUMB.location) + Vector((-0.004, 0, 0))
+
+for ev, target, ring in (("wake_mouse", MOUSE_TOP, 0.07), ("wake_keyboard", KB_CENTER, 0.30), ("wake_mic", MIC_TOP, 0.07)):
+    thread(f"thr {ev}", anchor(ev), target, tl.event_time(ev))
+    ping(f"ping {ev}", (target.x, target.y), tl.arrival(ev), r1=ring, squash=0.45 if ev == "wake_keyboard" else 1.0)
 thread("thr profile", anchor("profile"), KB_CENTER + Vector((0, 0.06, 0.03)), tl.event_time("profile"))
 thread("thr dpi", anchor("dpi"), MOUSE_TOP, tl.event_time("dpi"))
-thread("thr mute a", anchor("mute"), MOUSE + Vector((-0.04, 0.0, 0.02)), tl.event_time("mute"))
-thread("thr mute b", MOUSE + Vector((-0.04, 0.0, 0.02)), MIC_TOP, tl.arrival("mute"), travel=0.5, lift=0.06)
+thread("thr mute a", anchor("mute"), THUMB_P, tl.event_time("mute"))
+ping("ping thumb", (MOUSE.x - 0.045, MOUSE.y), tl.arrival("mute"), r1=0.04)
+thread("thr mute b", THUMB_P, MIC_TOP, tl.arrival("mute") + 0.25, travel=0.6, lift=0.08)
+ping("ping mic", (MIC.x, MIC.y), tl.arrival("mute") + 0.85, r1=0.09)
 _wedge_dir = math.radians(tl.RADIAL_WEDGE * 360 / tl.RADIAL_SECTORS)
 WEDGE2 = MOUSE + Vector((math.sin(_wedge_dir) * 0.098, math.cos(_wedge_dir) * 0.098, 0.004))
 thread("thr radial", anchor("radial"), WEDGE2, tl.event_time("radial"), lift=0.16)
-thread("thr aurora", anchor("aurora"), KB_CENTER, tl.event_time("aurora"))
+for ev in ("fire", "fire_off", "heat"):
+    thread(f"thr {ev}", anchor(ev), KB_CENTER, tl.event_time(ev))
+    ping(f"ping {ev}", (0, 0), tl.arrival(ev), r1=0.27, squash=0.42, gain=0.7, life=0.55)
+
+# Thumb 2 presses in as its bind lands.
+_tz = THUMB.location.copy()
+for o in (THUMB,):
+    key(o, "location", tl.arrival("mute") - 0.02, _tz)
+    key(o, "location", tl.arrival("mute") + 0.06, _tz + Vector((0.0018, 0, 0)))
+    key(o, "location", tl.arrival("mute") + 0.22, _tz)
 
 # ----------------------------------------------------------------------------- the drop
 
@@ -637,11 +754,12 @@ DROP.color = (0.8, 1.0, 0.92, 1)
 _drop_start = PANE_M @ Vector((0, 0, 0.003))
 key(DROP, "hide_render", 0.0, True)
 key(DROP, "hide_render", _ct + 0.40, False)
-key(DROP, "hide_render", tl.DROP_T + 0.43, True)
+key(DROP, "hide_render", tl.DROP_LAND + 0.01, True)
 key(DROP, "location", _ct + 0.40, _drop_start)
 key(DROP, "location", tl.DROP_T, _drop_start + Vector((0, -0.02, 0.01)))
-key(DROP, "location", tl.DROP_T + 0.42, KB_CENTER + Vector((0, 0, -0.004)))
+key(DROP, "location", tl.DROP_LAND, ENTER)
 interp(DROP, tl.DROP_T, "QUAD", "EASE_IN")
+ping("ping enter", (ENTER.x, ENTER.y), tl.DROP_LAND, r1=0.05, z=0.03)
 
 # ----------------------------------------------------------------------------- mechanisms
 
@@ -676,13 +794,10 @@ def mono_label(name, body, origin, size, color, t, rot=(0, 0, 0), stagger=0.03, 
         if hold is not None:
             key(o, "color", t + hold, color)
             key(o, "color", t + hold + fade, BLACK)
+            gone(o, t + hold + fade)
         objs.append(o)
     return objs
 
-
-ACC = hexlin(tl.ACCENT)
-DIM = hexlin(tl.TEXT_DIM)
-LIS = hexlin(tl.LISTEN)
 
 # Profile: the rig squares up and its name resolves above the board.
 _pa = tl.arrival("profile")
@@ -698,7 +813,7 @@ for root, loc0, rot0 in ((MOUSE_ROOT, MOUSE + Vector((0.025, -0.03, 0)), math.ra
     key(root, "location", _pa + 0.55, final)
     key(root, "rotation_euler", _pa + 0.55, (0, 0, 0))
 mono_label("profile", "profile", (0, 0.115, 0.115), 0.012, DIM, _pa + 0.05, rot=(math.radians(78), 0, 0), hold=1.9)
-mono_label("dev", "dev", (0, 0.118, 0.085), 0.032, ACC, _pa + 0.15, rot=(math.radians(78), 0, 0), hold=1.8)
+mono_label("dev", "dev", (0, 0.118, 0.090), 0.046, ACC, _pa + 0.15, rot=(math.radians(78), 0, 0), hold=1.8)
 
 # DPI: five stages around the mouse settle to the two you use.
 _da = tl.arrival("dpi")
@@ -715,9 +830,11 @@ for i in range(5):
         key(s, "color", _da + 0.72, ACC if i == 1 else hexlin(tl.TEXT))
         key(s, "color", _da + 1.9, ACC if i == 1 else hexlin(tl.TEXT))
         key(s, "color", _da + 2.5, BLACK)
+        gone(s, _da + 2.5)
     else:
         key(s, "color", _da + 0.45 + i * 0.05, hexlin(tl.TEXT_DIM))
         key(s, "color", _da + 0.70 + i * 0.05, BLACK)
+        gone(s, _da + 0.70 + i * 0.05)
     segs.append(s)
 for i, lab in enumerate(("800", "1600")):
     a = math.radians(i * 72)
@@ -725,7 +842,7 @@ for i, lab in enumerate(("800", "1600")):
     mono_label(f"dpi lab {lab}", lab, p, 0.0085, ACC if i == 1 else hexlin(tl.TEXT_MID), _da + 0.7, rot=(0, 0, 0), hold=1.2, fade=0.5)
 
 # Mute: a wide, restless ring at the mic settles into a tight steady band.
-_ma = tl.arrival("mute") + 0.5
+_ma = tl.arrival("mute") + 0.85
 bpy.ops.mesh.primitive_torus_add(major_radius=0.06, minor_radius=0.0012, location=MIC + Vector((0, 0, 0.0015)), major_segments=96)
 MIC_RING = bpy.context.object
 MIC_RING.data.materials.append(M_MECH)
@@ -734,8 +851,9 @@ key(MIC_RING, "color", _ma - 0.01, BLACK)
 key(MIC_RING, "color", _ma + 0.1, ACC)
 key(MIC_RING, "color", _ma + 1.4, ACC)
 key(MIC_RING, "color", _ma + 2.2, (ACC[0] * 0.12, ACC[1] * 0.12, ACC[2] * 0.12, 1))
-key(MIC_RING, "color", tl.arrival("aurora"), (ACC[0] * 0.12, ACC[1] * 0.12, ACC[2] * 0.12, 1))
-key(MIC_RING, "color", tl.arrival("aurora") + 0.6, BLACK)
+key(MIC_RING, "color", 20.0, (ACC[0] * 0.12, ACC[1] * 0.12, ACC[2] * 0.12, 1))
+key(MIC_RING, "color", 20.6, BLACK)
+gone(MIC_RING, 20.6)
 _rng = np.random.default_rng(3)
 for i in range(0, 22):
     tt = _ma + i * 0.05
@@ -775,39 +893,38 @@ for i in range(n):
         key(w, "color", _ra - 0.02, base)
         key(w, "color", _ra + 0.08, (ACC[0] * 2.2, ACC[1] * 2.2, ACC[2] * 2.2, 1))
         key(w, "color", _ra + 0.6, ACC)
-    key(w, "color", tl.event_time("aurora") - 1.2, ACC if i == tl.RADIAL_WEDGE else base)
-    key(w, "color", tl.event_time("aurora") - 0.5, BLACK)
+    key(w, "color", 19.9, ACC if i == tl.RADIAL_WEDGE else base)
+    key(w, "color", 20.5, BLACK)
+    gone(w, 20.5)
 _lab_dir = Vector((math.sin(_wedge_dir), math.cos(_wedge_dir), 0))
 mono_label("macro", tl.RADIAL_LABEL, MOUSE + _lab_dir * 0.142 + Vector((0, 0, 0.0015)), 0.0105, ACC, _ra + 0.25,
-           hold=tl.event_time("aurora") - 1.0 - (_ra + 0.25), fade=0.5)
+           hold=19.9 - (_ra + 0.25), fade=0.5)
 
 # ----------------------------------------------------------------------------- keypresses
 
-KEY_BY_NAME = {k["name"]: k for k in KEYS}
-sys.path.insert(0, HERE)
-from gen_lighting import key_for  # noqa: E402
-
+# The same presses the pattern engine saw, so a key goes down on the frame its heat lands.
+L = np.load(os.path.join(tl.OUT, "lighting.npz"))
+KEY_BY_CELL = {k["index"]: k for k in KEYS}
 _down = {}
-for t, ch in tl.typed_chars():
-    for name in key_for(ch):
-        k = KEY_BY_NAME.get(name)
-        if not k:
-            continue
-        _down.setdefault(name, []).append(t)
-for name, times in _down.items():
+for d, u, cell in L["presses"]:
+    k = KEY_BY_CELL.get(int(cell))
+    if k:
+        _down.setdefault(k["name"], []).append((d, u))
+for name, spans in _down.items():
     k = KEY_BY_NAME[name]
     for o in (k["cap"], k["legend"]):
         if o is None:
             continue
-        z = o.location.z
+        base = o.location.copy()
         last = -1.0
-        for t in times:
-            if t - last < 0.09:
+        for d, u in sorted(spans):
+            if d - last < 0.08:
                 continue
-            key(o, "location", max(0.0, t - 0.03), (o.location.x, o.location.y, z))
-            key(o, "location", t + 0.015, (o.location.x, o.location.y, z - 0.0028))
-            key(o, "location", t + 0.10, (o.location.x, o.location.y, z))
-            last = t
+            key(o, "location", max(0.0, d - 0.03), base)
+            key(o, "location", d + 0.012, base - Vector((0, 0, 0.0028)))
+            key(o, "location", max(d + 0.03, u), base - Vector((0, 0, 0.0028)))
+            key(o, "location", max(d + 0.03, u) + 0.05, base)
+            last = u + 0.05
 
 # ----------------------------------------------------------------------------- camera
 
@@ -825,34 +942,17 @@ CAM_D.dof.use_dof = True
 CAM_D.dof.aperture_fstop = 4.0
 CAM_D.dof.focus_object = TARGET
 
-# (time, camera, target, lens). Equal neighbours hold; moves ease between them.
-W = Vector
-SHOTS = {
-    "term": (W((0.0, -0.70, 0.44)), W((0.0, 0.24, 0.27)), 30),
-    "wide": (W((0.0, -1.05, 0.62)), W((0.0, 0.08, 0.22)), 34),
-    "mouse": (W((0.42, -0.30, 0.34)), W((0.285, -0.01, 0.0)), 42),
-    "top": (W((0.285, -0.06, 0.62)), W((0.285, -0.03, 0.0)), 34),
-    "hero0": (W((-0.20, -0.29, 0.15)), W((-0.12, 0.01, 0.0)), 32),
-    "hero1": (W((0.14, -0.29, 0.15)), W((0.20, 0.01, 0.0)), 32),
-    "end": (W((0.0, -0.80, 0.40)), W((0.0, 0.08, 0.08)), 28),
-}
-CAM_KEYS = [
-    (0.0, "term"), (1.85, "term"), (3.45, "wide"),
-    (6.75, "wide"), (7.45, "mouse"), (8.35, "mouse"), (9.05, "wide"),
-    (11.35, "wide"), (12.05, "top"), (13.35, "top"), (14.05, "wide"),
-    (15.05, "wide"), (15.85, "hero0"), (17.30, "hero1"), (17.95, "wide"),
-    (18.9, "wide"), (21.0, "end"), (tl.DURATION, "end"),
-]
-for t, name in CAM_KEYS:
-    loc, tgt, lens = SHOTS[name]
-    key(CAM, "location", t, loc)
-    key(TARGET, "location", t, tgt)
+for t, name in tl.CAM_KEYS:
+    loc, tgt, lens = tl.SHOTS[name]
+    key(CAM, "location", t, Vector(loc))
+    key(TARGET, "location", t, Vector(tgt))
     key(CAM_D, "lens", t, lens)
 for idb in (CAM, TARGET, CAM_D):
     for fc in fcurves(idb):
         for p in fc.keyframe_points:
             p.interpolation = "BEZIER"
             p.handle_left_type = p.handle_right_type = "AUTO_CLAMPED"
+
 
 # ----------------------------------------------------------------------------- render setup
 
@@ -900,9 +1000,8 @@ tree.links.new(gl.outputs["Image"], go.inputs[0])
 
 # ----------------------------------------------------------------------------- per-frame light
 
-L = np.load(os.path.join(tl.OUT, "lighting.npz"))
 KB_LIN = srgb_lin(L["kb"])
-ZONES = {z: srgb_lin(L[z]) for z in ("wheel", "logo", "plate", "mic")}
+MOUSE_LIN = srgb_lin(L["mouse"])
 M_COLLAR.node_tree.nodes["Emission"].inputs["Strength"].default_value = A.led
 M_LEGEND.node_tree.nodes["Emission"].inputs["Strength"].default_value = A.led * 1.3
 M_ZONE.node_tree.nodes["Emission"].inputs["Strength"].default_value = A.led * 1.2
@@ -917,11 +1016,13 @@ def paint(f):
         k["cap"].color = c
         if k["legend"] is not None:
             k["legend"].color = c
-    M_WHEEL.color = (*ZONES["wheel"][i], 1)
-    M_LOGO.color = (*ZONES["logo"][i], 1)
+    m = MOUSE_LIN[i]
+    M_WHEEL.color = (*m[0], 1)
+    M_LOGO.color = (*m[1], 1)
     for o in M_PLATE_LEDS:
-        o.color = (*ZONES["plate"][i], 1)
-    MIC_LED.color = (*ZONES["mic"][i], 1)
+        o.color = (*m[2], 1)
+    # The Seiren's own status light; Neuron does not drive it.
+    MIC_LED.color = (0.05, 0.055, 0.06, 1)
     global PANE_IMG
     path = os.path.join(tl.OUT, "term", f"{f:05d}.png")
     if os.path.exists(path):
