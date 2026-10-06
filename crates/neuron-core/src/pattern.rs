@@ -36,9 +36,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+mod input;
 mod life;
+mod session;
+
+pub use input::*;
+pub use session::*;
 use life::Life;
 
 // ─────────────────────────────────────── Field & Pattern ─────────────────────────────────
@@ -63,6 +68,7 @@ impl Cell {
 /// `Scalar` is the normal case (per-cell `u`+`intensity`, coloured by the layer's spectrum). `Color`
 /// is the Screen/Ambient exception — a full-colour pattern that emits `Rgb` directly, bypassing the
 /// spectrum.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Field {
     Scalar(Vec<Cell>),
     Color(Vec<Rgb>),
@@ -229,8 +235,48 @@ pub trait Pattern: Send {
     /// Receive the exact row-major layer mask when a pattern's dynamics use its true footprint.
     fn set_visible_region(&mut self, _region: &[u32], _rows: u8, _cols: u8) {}
 
+    /// Check if pattern can be reconfigured in place without reconstruction.
+    fn reconfigure_policy(&self, _delta: &PatternReconfigure) -> ReconfigurePolicy {
+        ReconfigurePolicy::Rebuild
+    }
+
+    /// Mutate pattern in place under an accepted plan.
+    fn apply_reconfigure(&mut self, _delta: &PatternReconfigure) {}
+
+    /// Discontinuity notification.
+    fn on_discontinuity(&mut self) {}
+
+    /// Advance stateful simulation at logical tick cadence.
+    fn advance(&mut self, _ctx: &FrameContext, _geom: &LayerGeometry) {}
+
+    /// Pure, read-only field emission from current state.
+    fn emit(&self, _ctx: &EmitContext, _geom: &LayerGeometry) -> Field {
+        Field::Scalar(Vec::new())
+    }
+
     /// Emit this tick's field for a `rows`×`cols` matrix at elapsed time `t` (seconds).
-    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field;
+    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
+        let geom = LayerGeometry {
+            bounds: Bounds::board(rows, cols),
+            region: Vec::new(),
+            board_dims: (rows, cols),
+        };
+        static DUMMY_INPUT: OnceLock<MatrixInputSnapshot> = OnceLock::new();
+        let input = DUMMY_INPUT.get_or_init(MatrixInputSnapshot::empty);
+        let ctx = FrameContext {
+            session_epoch: 0,
+            tick: 0,
+            elapsed: std::time::Duration::from_secs_f32(t.max(0.0)),
+            dt: LOGICAL_TICK_DT,
+            discontinuity: false,
+            input,
+        };
+        self.advance(&ctx, &geom);
+        let emit_ctx = EmitContext {
+            elapsed: std::time::Duration::from_secs_f32(t.max(0.0)),
+        };
+        self.emit(&emit_ctx, &geom)
+    }
 }
 
 // ──────────────────────────────────────────── Params ─────────────────────────────────────
@@ -474,7 +520,7 @@ static REGISTRY: &[PatternDef] = &[
         key: "comet",
         label: "Comet",
         make: || Box::new(Comet::default()),
-        params: || vec![speed_param(), density_param()],
+        params: || vec![speed_param(), density_param(), trails_param()],
         default_spectrum: streak_spectrum,
         tile: TileMeta {
             live_input: true,
@@ -888,6 +934,16 @@ fn glow_param() -> Param {
     }
 }
 
+/// The persistent light-painting trail toggle (Comet).
+fn trails_param() -> Param {
+    Param {
+        key: "trails",
+        label: "light painting",
+        only_when: None,
+        kind: ParamKind::Toggle { default: false },
+    }
+}
+
 /// Meter's `source` — the live signal driving the bars: speaker output, mic, CPU, RAM, or the
 /// combined CPU/RAM "load" view (the old Pulse). The label IS the value (data-driven, no bespoke UI).
 fn source_param() -> Param {
@@ -1040,6 +1096,13 @@ fn style_param() -> Param {
 pub struct Uniform;
 
 impl Pattern for Uniform {
+    fn advance(&mut self, _ctx: &FrameContext, _geom: &LayerGeometry) {}
+
+    fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
+        let n = geom.board_dims.0 as usize * geom.board_dims.1 as usize;
+        Field::Scalar(vec![Cell::new(0.0, 1.0); n])
+    }
+
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
         let n = rows as usize * cols as usize;
         Field::Scalar(vec![Cell::new(0.0, 1.0); n])
@@ -1065,6 +1128,32 @@ impl Pattern for Axis {
     fn configure(&mut self, p: &Params) {
         self.direction = p.u8("direction", 0);
         self.speed = p.f32("speed", 1.0);
+    }
+
+    fn advance(&mut self, ctx: &FrameContext, _geom: &LayerGeometry) {
+        const SCROLL_RATE: f32 = 0.2;
+        let dt = ctx.dt.as_secs_f32();
+        self.shift_phase = (self.shift_phase + dt * self.speed * SCROLL_RATE).rem_euclid(1.0);
+    }
+
+    fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
+        let (r, c) = (geom.board_dims.0 as usize, geom.board_dims.1 as usize);
+        let mut cells = vec![Cell::default(); r * c];
+        let shift = self.shift_phase;
+        let cf = c.max(1) as f32;
+        let rf = r.max(1) as f32;
+        for y in 0..r {
+            for x in 0..c {
+                let pos = match self.direction {
+                    1 => (c - 1 - x) as f32 / cf,
+                    2 => (r - 1 - y) as f32 / rf,
+                    3 => y as f32 / rf,
+                    _ => x as f32 / cf,
+                };
+                cells[y * c + x] = Cell::new((pos + shift).rem_euclid(1.0), 1.0);
+            }
+        }
+        Field::Scalar(cells)
     }
 
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
@@ -1183,6 +1272,7 @@ pub const KEY_SCAN_SLOTS: usize = 256 + 6;
 /// `key_down`). Their down-state lives in `prev` slots `256..256+6` ([`KEY_SCAN_SLOTS`]) and uses the
 /// SAME down-edge logic, so a pressed macro key lights its cell ([`crate::lighting::razer_key_cell`] of
 /// [`crate::lighting::MACRO_KEY_NAMES`]) — fixing the macro column going dark on the live-input effects.
+#[allow(dead_code)]
 fn scan_key_presses(
     prev: &mut [bool],
     r: usize,
@@ -1418,25 +1508,37 @@ fn fire_flicker(x: usize, t: f32, speed: f32, heat: f32) -> f32 {
 /// (a ≥1-per-frame floor would tie the sim to the frame rate and make slow speeds a lie). A
 /// static/reset clock (dt == 0 — the first frame after init, or a frozen `t`) still steps once so
 /// the sim never freezes. Capped at 8 so a long stall can't run thousands of steps in one frame.
-#[derive(Default)]
-struct StepClock {
-    last_t: f32,
-    acc: f32,
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepClock {
+    pub last_t: f32,
+    pub acc: f32,
 }
 
 impl StepClock {
-    fn reset(&mut self, t: f32) {
+    pub fn reset(&mut self) {
+        self.acc = 0.0;
+        self.last_t = 0.0;
+    }
+
+    pub fn reset_t(&mut self, t: f32) {
         self.last_t = t;
         self.acc = 0.0;
     }
 
-    fn accrue(&mut self, t: f32, base_per_sec: f32, speed: f32) -> u32 {
+    pub fn accrue(&mut self, dt: f32, base_per_sec: f32, speed: f32) -> u32 {
+        if dt <= 0.0 {
+            return 0;
+        }
+        self.acc += dt * base_per_sec * speed.clamp(0.1, 6.0);
+        let steps = self.acc.floor() as u32;
+        self.acc -= self.acc.floor();
+        steps
+    }
+
+    pub fn accrue_t(&mut self, t: f32, base_per_sec: f32, speed: f32) -> u32 {
         let dt = (t - self.last_t).max(0.0);
         self.last_t = t;
-        self.acc += dt * base_per_sec * speed.clamp(0.1, 6.0);
-        let steps = if dt > 0.0 { self.acc.floor() as u32 } else { 1 };
-        self.acc -= self.acc.floor();
-        steps.min(8)
+        self.accrue(dt, base_per_sec, speed)
     }
 }
 
@@ -1588,7 +1690,7 @@ impl Pattern for Rain {
         if self.dims != (rows, cols) {
             self.rng = 0x2545_F491;
             self.dims = (rows, cols);
-            self.clock.reset(t);
+            self.clock.reset_t(t);
             self.level = vec![0.0; n];
             self.head = vec![0.0; c];
             self.active = vec![false; c];
@@ -1596,6 +1698,7 @@ impl Pattern for Rain {
             self.col_speed = vec![1.0; c];
             if n > 0 {
                 self.init(r, c);
+                self.step(r, c);
             }
         }
         if n == 0 {
@@ -1607,7 +1710,7 @@ impl Pattern for Rain {
         // rows/sec read as molasses at the design default; before THAT, 20/sec was a downpour
         // nobody ran, shipped pre-slowed to 0.25 on the knob — the knob now spans drizzle→storm
         // around a default that's actually right.)
-        let steps = self.clock.accrue(t, 8.0, self.speed);
+        let steps = self.clock.accrue_t(t, 8.0, self.speed);
         for _ in 0..steps {
             self.step(r, c);
         }
@@ -1638,19 +1741,170 @@ impl Pattern for Rain {
 /// white-hot burst) and respawns it different. `speed` is the travel rate, `density` the parade
 /// size (1 calm streak by default, up to ~7). Emits `(u, intensity)` with `u` rising toward the
 /// head, so the head reads as the spectrum's hot/white end. Paced by [`StepClock`].
-#[derive(Default)]
 pub struct Comet {
     speed: f32,
     density: f32,
+    trails: bool,
     dims: (u8, u8),
     rng: u32,
     clock: StepClock,
     comets: Vec<CometBody>,
     burst: Vec<f32>,
-    prev: Vec<bool>,
+    trail_field: Vec<Cell>,
+    last_field_t: f32,
+}
+
+impl Default for Comet {
+    fn default() -> Self {
+        Comet {
+            speed: 1.0,
+            density: 1.0,
+            trails: false,
+            dims: (0, 0),
+            rng: 0x2545_F491,
+            clock: StepClock::default(),
+            comets: Vec::new(),
+            burst: Vec::new(),
+            trail_field: Vec::new(),
+            last_field_t: 0.0,
+        }
+    }
+}
+
+const GL_X: [f32; 5] = [
+    0.046_910_077,
+    0.230_765_34,
+    0.5,
+    0.769_234_66,
+    0.953_089_95,
+];
+
+const GL_W: [f32; 5] = [
+    0.118_463_44,
+    0.239_314_33,
+    0.284_444_45,
+    0.239_314_33,
+    0.118_463_44,
+];
+
+const RIBBON_RADIUS: f32 = 0.90;
+const TRAIL_EXPOSURE: f32 = 0.60;
+const TRAIL_BASE_U: f32 = 0.10;
+const OVERLAP_HEAT: f32 = 0.55;
+const TRAIL_TAU_S: f32 = 30.0;
+const TRAIL_FLOOR: f32 = 0.008;
+
+pub fn decay_trail_field(trail: &mut [Cell], dt: f32) {
+    if dt <= 0.0 {
+        return;
+    }
+    let decay = (-dt / TRAIL_TAU_S).exp();
+    for cell in trail {
+        if cell.intensity > 0.0 {
+            cell.intensity *= decay;
+            if cell.intensity < TRAIL_FLOOR {
+                *cell = Cell::default();
+            }
+        }
+    }
+}
+
+pub fn paint_trail_segment(
+    trail_field: &mut [Cell],
+    a: (f32, f32),
+    b: (f32, f32),
+    strength: f32,
+    r: usize,
+    c: usize,
+) {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let ds = (dx * dx + dy * dy).sqrt();
+    if ds <= 1e-5 {
+        return;
+    }
+
+    let min_x = (a.0.min(b.0) - RIBBON_RADIUS).floor().max(0.0) as usize;
+    let max_x = (a.0.max(b.0) + RIBBON_RADIUS).ceil().min(c as f32 - 1.0).max(0.0) as usize;
+    let min_y = (a.1.min(b.1) - RIBBON_RADIUS).floor().max(0.0) as usize;
+    let max_y = (a.1.max(b.1) + RIBBON_RADIUS).ceil().min(r as f32 - 1.0).max(0.0) as usize;
+
+    for row in min_y..=max_y {
+        for col in min_x..=max_x {
+            let px = col as f32;
+            let py = row as f32;
+            let mut cov = 0.0f32;
+            for k in 0..5 {
+                let qx = a.0 + GL_X[k] * dx;
+                let qy = a.1 + GL_X[k] * dy;
+                let dist = ((px - qx).powi(2) + (py - qy).powi(2)).sqrt();
+                if dist < RIBBON_RADIUS {
+                    cov += GL_W[k] * (1.0 - dist / RIBBON_RADIUS).powf(1.40);
+                }
+            }
+            let exposure = TRAIL_EXPOSURE * strength * ds * cov;
+            if exposure > 1e-6 {
+                let idx = row * c + col;
+                let old_cell = trail_field[idx];
+                let old_i = old_cell.intensity;
+                let old_u = old_cell.u;
+
+                let alpha = -(-exposure).exp_m1();
+                let gain = (1.0 - old_i) * alpha;
+                let new_i = old_i + gain;
+
+                if gain > 0.0 && new_i > 0.0 {
+                    let deposit_heat = TRAIL_BASE_U + OVERLAP_HEAT * (old_i + new_i);
+                    let new_u = (old_i * old_u + gain * deposit_heat) / new_i;
+                    trail_field[idx] = Cell::new(new_u, new_i);
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+pub fn compose_comet_cell(live: Cell, sediment: Cell, burst_v: f32) -> Cell {
+    let mut out = live;
+
+    if sediment.intensity > 0.0 {
+        let s_sed = sediment.intensity.clamp(0.0, 1.0);
+        let s_live = out.intensity.clamp(0.0, 1.0);
+        out.intensity = s_sed + s_live - s_sed * s_live;
+
+        if live.intensity <= 1e-4 {
+            out.u = sediment.u;
+        }
+    }
+
+    if burst_v > 0.0 {
+        let bi = burst_v.min(1.0);
+        if bi >= out.intensity {
+            out.intensity = bi;
+            out.u = bi;
+        }
+    }
+
+    out
 }
 
 impl Comet {
+    #[must_use]
+    pub fn trails_enabled(&self) -> bool {
+        self.trails
+    }
+
+    #[must_use]
+    pub fn trail_field(&self) -> &[Cell] {
+        &self.trail_field
+    }
+
+    pub fn set_trail_cell(&mut self, idx: usize, cell: Cell) {
+        if idx < self.trail_field.len() {
+            self.trail_field[idx] = cell;
+        }
+    }
+
     fn rand(&mut self) -> f32 {
         xorshift(&mut self.rng)
     }
@@ -1662,16 +1916,12 @@ impl Comet {
         (1.0 + (d - 1.0).max(0.0) * 3.0).round().clamp(1.0, 8.0) as usize
     }
 
-    /// Roll a brand-NEW comet — everything fresh from the PRNG so no two are alike: a cardinal-biased,
-    /// axis-COUPLED direction (clean H/V common, a gentle lean frequent, a true ~45° rake rare) with the
-    /// entry edge coupled to it, plus its own pace, trail length and head brightness. Born ALIVE.
+    /// Roll a brand-NEW comet — everything fresh from the PRNG so no two are alike. Born ALIVE.
     fn spawn_body(&mut self, r: usize, c: usize) -> CometBody {
         let (rf, cf) = (r.max(1) as f32, c.max(1) as f32);
-        // PRIMARY AXIS — the board's long axis gently favoured, clamped so both axes stay populated.
         let p_horizontal = (cf / (cf + rf)).clamp(0.4, 0.6);
         let horizontal = self.rand() < p_horizontal;
         let positive = self.rand() < 0.5;
-        // PERPENDICULAR DRIFT cubed to pile mass near zero (most near-cardinal; the thin tail reaches 45°).
         let drift_sign = if self.rand() < 0.5 { -1.0 } else { 1.0 };
         let u = self.rand();
         let drift = drift_sign * u * u * u;
@@ -1694,9 +1944,7 @@ impl Comet {
         CometBody { x, y, vx, vy, speed_mul, trail, bright, respawn: 0.0 }
     }
 
-    /// Paint a bright radial BURST into the break-flash field at `(x, y)` — the comet-break shatter. The
-    /// core is pushed ABOVE 1.0 so the render drives it to the spectrum's hot/white end (the brightest
-    /// moment); it falls off to a glow at the rim. Out-of-board cells are clipped (no wrap).
+    /// Paint a bright radial BURST into the break-flash field at `(x, y)` — the comet-break shatter.
     fn paint_burst(&mut self, x: f32, y: f32, r: usize, c: usize) {
         const BURST_RADIUS: f32 = 2.2;
         let bx = x.round() as isize;
@@ -1721,9 +1969,7 @@ impl Comet {
         }
     }
 
-    /// A press at cell `(pr, pc)`: BREAK every live comet whose head sits within the hit radius — a burst
-    /// at the impact + a fresh respawn (so a broken comet comes back DIFFERENT). Dead comets are skipped.
-    /// Returns whether anything broke. Pure of I/O (the live key read happens in `field`), so it's testable.
+    /// A press at cell `(pr, pc)`: BREAK every live comet whose head sits within the hit radius.
     fn break_at(&mut self, pr: f32, pc: f32, r: usize, c: usize) -> bool {
         const HIT_RADIUS: f32 = 1.5;
         let mut broke = false;
@@ -1749,9 +1995,7 @@ impl Comet {
         b.x < -m || b.x > (c as f32 - 1.0) + m || b.y < -m || b.y > (r as f32 - 1.0) + m
     }
 
-    /// Advance the comet parade one step: fade the break-flash field; then each comet either counts down
-    /// its respawn gap (and re-rolls when it elapses) or — if alive — moves along its velocity (no wrap)
-    /// and dies once it has fully left the board. Step count IS the travel rate — how `speed` is honoured.
+    /// Advance the comet parade one step: fade the break-flash field; advance live meteors.
     fn comet_step(&mut self, r: usize, c: usize) {
         const BURST_DECAY: f32 = 0.80;
         const ADVANCE: f32 = 0.45;
@@ -1772,39 +2016,73 @@ impl Comet {
                 continue;
             }
             let dist = ADVANCE * self.comets[i].speed_mul;
-            self.comets[i].x += self.comets[i].vx * dist;
-            self.comets[i].y += self.comets[i].vy * dist;
+            let a = (self.comets[i].x, self.comets[i].y);
+            let b = (a.0 + self.comets[i].vx * dist, a.1 + self.comets[i].vy * dist);
+            self.comets[i].x = b.0;
+            self.comets[i].y = b.1;
+            if self.trails && !self.trail_field.is_empty() {
+                paint_trail_segment(&mut self.trail_field, a, b, self.comets[i].bright, r, c);
+            }
             if self.comet_fully_off(i, r, c) {
                 self.comets[i].respawn = RESPAWN_MIN + self.rand() * RESPAWN_SPAN;
             }
         }
     }
-
 }
 
 impl Pattern for Comet {
     fn configure(&mut self, p: &Params) {
         self.speed = p.f32("speed", 1.0);
         self.density = p.f32("density", 1.0);
+        let new_trails = p.0.get("trails").copied().unwrap_or(0.0) >= 0.5;
+        if self.trails && !new_trails {
+            self.trail_field.clear();
+        }
+        self.trails = new_trails;
     }
 
-    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
-        let (r, c) = (rows as usize, cols as usize);
+    fn reconfigure_policy(&self, _delta: &PatternReconfigure) -> ReconfigurePolicy {
+        ReconfigurePolicy::Preserve
+    }
+
+    fn apply_reconfigure(&mut self, delta: &PatternReconfigure) {
+        self.configure(delta.params);
+    }
+
+    fn on_discontinuity(&mut self) {
+        self.trail_field.clear();
+        self.burst.fill(0.0);
+        self.clock.acc = 0.0;
+    }
+
+    fn advance(&mut self, ctx: &FrameContext, geom: &LayerGeometry) {
+        let (r, c) = (geom.board_dims.0 as usize, geom.board_dims.1 as usize);
         let n = r * c;
-        if self.dims != (rows, cols) {
-            self.rng = 0x2545_F491;
-            self.dims = (rows, cols);
-            self.clock.reset(t);
-            self.burst = vec![0.0; n];
-            self.comets.clear();
-            self.prev = vec![false; KEY_SCAN_SLOTS];
-        }
         if n == 0 {
-            return Field::Scalar(Vec::new());
+            return;
         }
 
-        // Reconcile the parade to the density count, scattering fresh comets along their path
-        // so the board is alive immediately (a comet pushed past the far edge simply dies + re-enters).
+        if self.dims != geom.board_dims {
+            self.rng = 0x2545_F491;
+            self.dims = geom.board_dims;
+            self.clock.acc = 0.0;
+            self.burst = vec![0.0; n];
+            self.comets.clear();
+            if self.trails {
+                self.trail_field = vec![Cell::default(); n];
+            } else {
+                self.trail_field.clear();
+            }
+        }
+
+        if self.trails {
+            if self.trail_field.len() != n {
+                self.trail_field.resize(n, Cell::default());
+            }
+        } else if !self.trail_field.is_empty() {
+            self.trail_field.clear();
+        }
+
         let want = self.comet_count();
         let span = ((r as f32).powi(2) + (c as f32).powi(2)).sqrt();
         while self.comets.len() < want {
@@ -1817,40 +2095,96 @@ impl Pattern for Comet {
         if self.comets.len() > want {
             self.comets.truncate(want);
         }
-        let steps = self.clock.accrue(t, 24.0, self.speed);
+
+        if self.trails && !self.trail_field.is_empty() {
+            decay_trail_field(&mut self.trail_field, ctx.dt.as_secs_f32());
+        }
+
+        let dt_sec = ctx.dt.as_secs_f32();
+        let steps = self.clock.accrue(dt_sec, 24.0, self.speed);
         for _ in 0..steps {
             self.comet_step(r, c);
         }
-        // BREAK on fresh key-downs that hit a live head (the same safe down-edge scan reactive uses).
-        let mut hits: Vec<(usize, usize)> = Vec::new();
-        scan_key_presses(&mut self.prev, r, c, false, |ry, cx| hits.push((ry, cx)));
-        for (ry, cx) in hits {
-            self.break_at(ry as f32, cx as f32, r, c);
+
+        for press in &ctx.input.pressed {
+            self.break_at(press.row as f32, press.col as f32, r, c);
         }
-        // RENDER: each live comet draws its own gradient streak (tail → white-hot head) into the
-        // per-cell field, kept by MAX intensity so overlapping streaks read "lighten"; the break
-        // burst overlays on top (its core drives toward the spectrum's hot/white end).
+    }
+
+    fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
+        let (r, c) = (geom.board_dims.0 as usize, geom.board_dims.1 as usize);
+        let n = r * c;
+        if n == 0 {
+            return Field::Scalar(Vec::new());
+        }
+
         let mut inten = vec![0.0f32; n];
         let mut ucoord = vec![0.0f32; n];
-        let comets = std::mem::take(&mut self.comets);
-        for b in &comets {
+
+        for b in &self.comets {
             if b.respawn <= 0.0 {
                 draw_comet(&mut inten, &mut ucoord, b, r, c);
             }
         }
-        self.comets = comets;
-        for i in 0..n {
-            let v = self.burst[i];
-            if v > 0.0 {
-                let bi = v.min(1.0);
-                if bi > inten[i] {
-                    inten[i] = bi;
-                    ucoord[i] = v.min(1.0); // a hot burst reads as the spectrum's white/hot end
+
+        if !self.trails {
+            for i in 0..n {
+                let v = self.burst[i];
+                if v > 0.0 {
+                    let bi = v.min(1.0);
+                    if bi > inten[i] {
+                        inten[i] = bi;
+                        ucoord[i] = v.min(1.0);
+                    }
                 }
             }
+            let cells = (0..n).map(|i| Cell::new(ucoord[i], inten[i])).collect();
+            Field::Scalar(cells)
+        } else {
+            let mut cells = Vec::with_capacity(n);
+            for i in 0..n {
+                let live = Cell::new(ucoord[i], inten[i]);
+                let sediment = self.trail_field.get(i).copied().unwrap_or_default();
+                let burst_v = self.burst.get(i).copied().unwrap_or(0.0);
+                cells.push(compose_comet_cell(live, sediment, burst_v));
+            }
+            Field::Scalar(cells)
         }
-        let cells = (0..n).map(|i| Cell::new(ucoord[i], inten[i])).collect();
-        Field::Scalar(cells)
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
+        let geom = LayerGeometry {
+            bounds: Bounds::board(rows, cols),
+            region: Vec::new(),
+            board_dims: (rows, cols),
+        };
+        let mut hub = ProcessInputHub::new();
+        hub.poll_system_keys(Duration::from_secs_f32(t.max(0.0)));
+        let _ = hub.publish_tick();
+        let (input, _) = hub.snapshot_for_matrix(0, default_control_to_matrix);
+
+        let dt = if self.last_field_t > 0.0 && t > self.last_field_t {
+            (t - self.last_field_t).min(0.25)
+        } else if self.last_field_t == 0.0 {
+            1.0 / 60.0
+        } else {
+            0.0
+        };
+        self.last_field_t = t;
+
+        let ctx = FrameContext {
+            session_epoch: 0,
+            tick: 0,
+            elapsed: Duration::from_secs_f32(t.max(0.0)),
+            dt: Duration::from_secs_f32(dt),
+            discontinuity: false,
+            input: &input,
+        };
+        self.advance(&ctx, &geom);
+        let emit_ctx = EmitContext {
+            elapsed: Duration::from_secs_f32(t.max(0.0)),
+        };
+        self.emit(&emit_ctx, &geom)
     }
 }
 
@@ -3534,7 +3868,43 @@ impl Compositor {
 
     /// Render one composited frame (`rows*cols`, row-major) at elapsed time `t`. Per layer: the pattern's
     /// field → resolved through the spectrum (× intensity) → region mask → blend over the layers below.
+    #[must_use]
+    pub fn render_at_time(&mut self, rows: u8, cols: u8, t: std::time::Duration) -> Vec<Rgb> {
+        let n = rows as usize * cols as usize;
+        let mut out = vec![Rgb::BLACK; n];
+        for layer in &mut self.layers {
+            if !layer.enabled {
+                continue;
+            }
+            let bbox = Bounds::from_region(&layer.region, rows, cols);
+            layer.pattern.set_bounds(bbox);
+            layer.pattern.set_visible_region(&layer.region, rows, cols);
+            let field = layer.pattern.field(rows, cols, t.as_secs_f32());
+            if field.len() != n {
+                continue;
+            }
+            let px = render_palette_addressing_time(
+                &field,
+                &layer.spectrum,
+                t,
+                layer.palette_addressing,
+                bbox,
+                cols,
+            );
+            for i in 0..n {
+                if layer.covers(i) {
+                    out[i] = crate::effects::blend_px(out[i], px[i], layer.blend);
+                }
+            }
+        }
+        out
+    }
+
     pub fn render(&mut self, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+        self.render_at_time(rows, cols, std::time::Duration::from_secs_f32(t.max(0.0)))
+    }
+
+    pub fn render_legacy(&mut self, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
         let n = rows as usize * cols as usize;
         let mut out = vec![Rgb::BLACK; n];
         for layer in &mut self.layers {
@@ -3570,21 +3940,17 @@ fn render_palette_addressing(
     bounds: Bounds,
     cols: u8,
 ) -> Vec<Rgb> {
-    let Field::Scalar(cells) = field else {
-        return field.render(spectrum, t);
-    };
-    if addressing == PaletteAddressing::Field {
-        return field.render(spectrum, t);
-    }
-    cells.iter().enumerate().map(|(i, cell)| {
-        let row = i / cols.max(1) as usize;
-        let col = i % cols.max(1) as usize;
-        let u = placement_coordinate(bounds, row, col);
-        spectrum.at(t, u).scale_f(cell.intensity)
-    }).collect()
+    render_palette_addressing_time(
+        field,
+        spectrum,
+        std::time::Duration::from_secs_f32(t.max(0.0)),
+        addressing,
+        bounds,
+        cols,
+    )
 }
 
-fn placement_coordinate(bounds: Bounds, row: usize, col: usize) -> f32 {
+pub(crate) fn placement_coordinate(bounds: Bounds, row: usize, col: usize) -> f32 {
     // A one-column placement still has a usable axis when it contains multiple rows.
     let down = bounds.cols == 1 && bounds.rows > 1;
     let extent = if down { bounds.rows } else { bounds.cols };

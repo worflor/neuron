@@ -36,7 +36,7 @@
 
 use crate::lighting::Rgb;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::f32::consts::TAU;
+use std::time::Duration;
 
 // ───────────────────────────────────────── enums ─────────────────────────────────────────
 
@@ -318,30 +318,38 @@ impl Palette {
         }
     }
 
-    /// Sample the palette at `(t, u)`, applying its [`Motion`]. This is the per-frame colour program:
-    /// Drift/Flow shift the lookup `u`; Cycle rotates the sampled hue; Breathe modulates brightness.
+    /// Sample the palette at `(t, u)` with high-precision [`Duration`] timing, applying its [`Motion`].
     #[must_use]
-    pub fn at(&self, t: f32, u: f32) -> Rgb {
+    pub fn at_time(&self, t: Duration, u: f32) -> Rgb {
+        let t_sec = t.as_secs_f64();
         match self.motion {
             Motion::Hold => self.sample(u),
-            Motion::Drift { speed } => self.sample((u + t * speed).rem_euclid(1.0)),
+            Motion::Drift { speed } => {
+                let offset = (t_sec * (speed as f64)).rem_euclid(1.0) as f32;
+                self.sample((u + offset).rem_euclid(1.0))
+            }
             Motion::Cycle { speed } => {
                 let col = self.sample(u);
-                // reuse the comet hue-rotate (no-ops on a near-grey colour, which has no hue to turn)
-                crate::effects::jitter_hue(col, (t * speed * 360.0).rem_euclid(360.0))
+                let deg = (t_sec * (speed as f64) * 360.0).rem_euclid(360.0) as f32;
+                crate::effects::jitter_hue(col, deg)
             }
             Motion::Breathe { speed, depth } => {
                 let col = self.sample(u);
                 let d = depth.clamp(0.0, 1.0);
-                // asymmetric breathe (quick inhale, crest hold, long relax) dip in [1-d, 1]: full
-                // bright at the crest, dimmed by `depth` at the trough. Phase is shifted a third of a
-                // cycle so the crest (not the zero-crossing) sits at t=0, as the old cos did — but the
-                // shape's positive-shifted mean means this reads a touch brighter overall than cosine.
-                let f = 1.0 - d * 0.5 * (1.0 - crate::effects::breathe_shape(t * TAU * speed + TAU / 3.0));
+                let tau = std::f64::consts::TAU;
+                let phase = (t_sec * tau * (speed as f64) + tau / 3.0).rem_euclid(tau) as f32;
+                let f = 1.0 - d * 0.5 * (1.0 - crate::effects::breathe_shape(phase));
                 col.scale_f(f)
             }
-            Motion::Flow { speed, chaos } => self.sample(flow_u(u, t, speed, chaos)),
+            Motion::Flow { speed, chaos } => self.sample(flow_u_time(u, t, speed, chaos)),
         }
+    }
+
+    /// Sample the palette at `(t, u)`, applying its [`Motion`]. This is the per-frame colour program:
+    /// Drift/Flow shift the lookup `u`; Cycle rotates the sampled hue; Breathe modulates brightness.
+    #[must_use]
+    pub fn at(&self, t: f32, u: f32) -> Rgb {
+        self.at_time(Duration::from_secs_f32(t.max(0.0)), u)
     }
 
     // ── editing (the gradient-strip editor) — keep the stops sorted ascending by `at` ──────────
@@ -494,33 +502,30 @@ impl Spectrum {
     }
 
     /// Sample the colour at animation time `t` (seconds) for the spectrum coordinate `u` (0..1).
-    ///
-    /// Resolution: total duration `Σ(hold+fade)` -> a forward position under `play` (Once clamps, Loop
-    /// wraps, `PingPong` reflects) -> the active frame + the eased crossfade with the previous frame
-    /// during its `fade` window -> each frame's palette is sampled WITH its motion at `t` -> the two are
-    /// blended by the eased fade factor. Fully N-generic; O(stops) per call.
+    /// Sample the spectrum program at `(t, u)` with high-precision [`Duration`] timing.
     #[must_use]
-    pub fn at(&self, t: f32, u: f32) -> Rgb {
+    pub fn at_time(&self, t: Duration, u: f32) -> Rgb {
         let n = self.seq.len();
         if n == 0 {
             return Rgb::BLACK;
         }
         if n == 1 {
-            return self.seq[0].palette.at(t, u);
+            return self.seq[0].palette.at_time(t, u);
         }
         // total cycle duration (each frame occupies hold + fade seconds)
-        let dur = |f: &Frame| f.hold.max(0.0) + f.fade.max(0.0);
-        let total: f32 = self.seq.iter().map(dur).sum();
+        let dur = |f: &Frame| (f.hold.max(0.0) + f.fade.max(0.0)) as f64;
+        let total: f64 = self.seq.iter().map(dur).sum();
         if total <= 1e-6 {
             // degenerate timing (all-zero durations) — nothing to advance through; show the first frame.
-            return self.seq[0].palette.at(t, u);
+            return self.seq[0].palette.at_time(t, u);
         }
+        let t_sec = t.as_secs_f64();
         // map t -> a forward position p in [0, total]
         let p = match self.play {
-            Loop::Once => t.clamp(0.0, total),
-            Loop::Loop => t.rem_euclid(total),
+            Loop::Once => t_sec.clamp(0.0, total),
+            Loop::Loop => t_sec.rem_euclid(total),
             Loop::PingPong => {
-                let q = t.rem_euclid(2.0 * total);
+                let q = t_sec.rem_euclid(2.0 * total);
                 if q <= total {
                     q
                 } else {
@@ -543,8 +548,8 @@ impl Spectrum {
             acc += d;
         }
         let frame = &self.seq[i];
-        let this = frame.palette.at(t, u);
-        let fade = frame.fade.max(0.0);
+        let this = frame.palette.at_time(t, u);
+        let fade = frame.fade.max(0.0) as f64;
         if fade > 1e-6 && local < fade {
             // the previous frame to crossfade in FROM. Loop wraps (frame 0's prev is the last frame) so
             // the loop seam is seamless; Once/PingPong have no wrap at frame 0 (it simply appears).
@@ -553,12 +558,21 @@ impl Spectrum {
                 Loop::Once | Loop::PingPong => i.checked_sub(1),
             };
             if let Some(pi) = prev_idx {
-                let prev = self.seq[pi].palette.at(t, u);
-                let f = frame.ease.apply(local / fade);
+                let prev = self.seq[pi].palette.at_time(t, u);
+                let f = frame.ease.apply((local / fade) as f32);
                 return Rgb::lerp(prev, this, f);
             }
         }
         this
+    }
+
+    /// Sample the spectrum program at `(t, u)`. If `seq` has 1 frame, its palette is sampled with its
+    /// motion at `t`; if >1 frame, resolves the timeline: which frame is active under `play`, whether it's
+    /// during its `fade` window -> each frame's palette is sampled WITH its motion at `t` -> the two are
+    /// blended by the eased fade factor. Fully N-generic; O(stops) per call.
+    #[must_use]
+    pub fn at(&self, t: f32, u: f32) -> Rgb {
+        self.at_time(Duration::from_secs_f32(t.max(0.0)), u)
     }
 }
 
@@ -627,13 +641,22 @@ fn even_pos(i: usize, n: usize) -> f32 {
 
 /// Organic multi-octave `u`-drift for [`Motion::Flow`]: one base octave (always on) plus two finer
 /// octaves scaled by `chaos`, wrapped into 0..1. Bounded so it stays a gentle wander, not a jump.
-fn flow_u(u: f32, t: f32, speed: f32, chaos: f32) -> f32 {
+fn flow_u_time(u: f32, t: Duration, speed: f32, chaos: f32) -> f32 {
     let c = chaos.clamp(0.0, 1.0);
-    let o1 = (t * speed * TAU * 0.50 + u * TAU).sin();
-    let o2 = (t * speed * TAU * 1.13 + u * TAU * 2.0).sin();
-    let o3 = (t * speed * TAU * 0.27 + u * TAU * 3.0).sin();
+    let t_sec = t.as_secs_f64();
+    let tau = std::f64::consts::TAU;
+    let s = speed as f64;
+    let uf = u as f64;
+    let o1 = ((t_sec * s * tau * 0.50 + uf * tau).rem_euclid(tau)).sin() as f32;
+    let o2 = ((t_sec * s * tau * 1.13 + uf * tau * 2.0).rem_euclid(tau)).sin() as f32;
+    let o3 = ((t_sec * s * tau * 0.27 + uf * tau * 3.0).rem_euclid(tau)).sin() as f32;
     let drift = (o1 * 0.5 + o2 * 0.3 * c + o3 * 0.2 * c) * 0.5; // ~±0.5
     (u + drift).rem_euclid(1.0)
+}
+
+#[allow(dead_code)]
+fn flow_u(u: f32, t: f32, speed: f32, chaos: f32) -> f32 {
+    flow_u_time(u, Duration::from_secs_f32(t.max(0.0)), speed, chaos)
 }
 
 /// True when the stops are (within epsilon) evenly spaced 0..1 — i.e. representable by the bare hex
