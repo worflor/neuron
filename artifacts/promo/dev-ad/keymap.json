@@ -1,0 +1,562 @@
+{
+"source": "neuron::lighting::razer_key_cell",
+"rows": 6,
+"cols": 22,
+"key_map": [
+{
+"name": "M6",
+"row": 0,
+"col": 0
+},
+{
+"name": "ESC",
+"row": 0,
+"col": 1
+},
+{
+"name": "F1",
+"row": 0,
+"col": 3
+},
+{
+"name": "F2",
+"row": 0,
+"col": 4
+},
+{
+"name": "F3",
+"row": 0,
+"col": 5
+},
+{
+"name": "F4",
+"row": 0,
+"col": 6
+},
+{
+"name": "F5",
+"row": 0,
+"col": 7
+},
+{
+"name": "F6",
+"row": 0,
+"col": 8
+},
+{
+"name": "F7",
+"row": 0,
+"col": 9
+},
+{
+"name": "F8",
+"row": 0,
+"col": 10
+},
+{
+"name": "F9",
+"row": 0,
+"col": 11
+},
+{
+"name": "F10",
+"row": 0,
+"col": 12
+},
+{
+"name": "F11",
+"row": 0,
+"col": 13
+},
+{
+"name": "F12",
+"row": 0,
+"col": 14
+},
+{
+"name": "PRINTSCREEN",
+"row": 0,
+"col": 15
+},
+{
+"name": "SCROLLLOCK",
+"row": 0,
+"col": 16
+},
+{
+"name": "PAUSE",
+"row": 0,
+"col": 17
+},
+{
+"name": "LOGO",
+"row": 0,
+"col": 20
+},
+{
+"name": "M1",
+"row": 1,
+"col": 0
+},
+{
+"name": "BACKTICK",
+"row": 1,
+"col": 1
+},
+{
+"name": "1",
+"row": 1,
+"col": 2
+},
+{
+"name": "2",
+"row": 1,
+"col": 3
+},
+{
+"name": "3",
+"row": 1,
+"col": 4
+},
+{
+"name": "4",
+"row": 1,
+"col": 5
+},
+{
+"name": "5",
+"row": 1,
+"col": 6
+},
+{
+"name": "6",
+"row": 1,
+"col": 7
+},
+{
+"name": "7",
+"row": 1,
+"col": 8
+},
+{
+"name": "8",
+"row": 1,
+"col": 9
+},
+{
+"name": "9",
+"row": 1,
+"col": 10
+},
+{
+"name": "0",
+"row": 1,
+"col": 11
+},
+{
+"name": "DASH",
+"row": 1,
+"col": 12
+},
+{
+"name": "EQUALS",
+"row": 1,
+"col": 13
+},
+{
+"name": "BACKSPACE",
+"row": 1,
+"col": 14
+},
+{
+"name": "INSERT",
+"row": 1,
+"col": 15
+},
+{
+"name": "HOME",
+"row": 1,
+"col": 16
+},
+{
+"name": "PAGEUP",
+"row": 1,
+"col": 17
+},
+{
+"name": "NUMLOCK",
+"row": 1,
+"col": 18
+},
+{
+"name": "NUMDIVIDE",
+"row": 1,
+"col": 19
+},
+{
+"name": "NUMMULTIPLY",
+"row": 1,
+"col": 20
+},
+{
+"name": "NUMSUBTRACT",
+"row": 1,
+"col": 21
+},
+{
+"name": "M2",
+"row": 2,
+"col": 0
+},
+{
+"name": "TAB",
+"row": 2,
+"col": 1
+},
+{
+"name": "Q",
+"row": 2,
+"col": 2
+},
+{
+"name": "W",
+"row": 2,
+"col": 3
+},
+{
+"name": "E",
+"row": 2,
+"col": 4
+},
+{
+"name": "R",
+"row": 2,
+"col": 5
+},
+{
+"name": "T",
+"row": 2,
+"col": 6
+},
+{
+"name": "Y",
+"row": 2,
+"col": 7
+},
+{
+"name": "U",
+"row": 2,
+"col": 8
+},
+{
+"name": "I",
+"row": 2,
+"col": 9
+},
+{
+"name": "O",
+"row": 2,
+"col": 10
+},
+{
+"name": "P",
+"row": 2,
+"col": 11
+},
+{
+"name": "LEFTBRACKET",
+"row": 2,
+"col": 12
+},
+{
+"name": "RIGHTBRACKET",
+"row": 2,
+"col": 13
+},
+{
+"name": "BACKSLASH",
+"row": 2,
+"col": 14
+},
+{
+"name": "DELETE",
+"row": 2,
+"col": 15
+},
+{
+"name": "END",
+"row": 2,
+"col": 16
+},
+{
+"name": "PAGEDOWN",
+"row": 2,
+"col": 17
+},
+{
+"name": "NUM7",
+"row": 2,
+"col": 18
+},
+{
+"name": "NUM8",
+"row": 2,
+"col": 19
+},
+{
+"name": "NUM9",
+"row": 2,
+"col": 20
+},
+{
+"name": "NUMADD",
+"row": 2,
+"col": 21
+},
+{
+"name": "M3",
+"row": 3,
+"col": 0
+},
+{
+"name": "CAPSLOCK",
+"row": 3,
+"col": 1
+},
+{
+"name": "A",
+"row": 3,
+"col": 2
+},
+{
+"name": "S",
+"row": 3,
+"col": 3
+},
+{
+"name": "D",
+"row": 3,
+"col": 4
+},
+{
+"name": "F",
+"row": 3,
+"col": 5
+},
+{
+"name": "G",
+"row": 3,
+"col": 6
+},
+{
+"name": "H",
+"row": 3,
+"col": 7
+},
+{
+"name": "J",
+"row": 3,
+"col": 8
+},
+{
+"name": "K",
+"row": 3,
+"col": 9
+},
+{
+"name": "L",
+"row": 3,
+"col": 10
+},
+{
+"name": "SEMICOLON",
+"row": 3,
+"col": 11
+},
+{
+"name": "QUOTE",
+"row": 3,
+"col": 12
+},
+{
+"name": "ENTER",
+"row": 3,
+"col": 14
+},
+{
+"name": "NUM4",
+"row": 3,
+"col": 18
+},
+{
+"name": "NUM5",
+"row": 3,
+"col": 19
+},
+{
+"name": "NUM6",
+"row": 3,
+"col": 20
+},
+{
+"name": "M4",
+"row": 4,
+"col": 0
+},
+{
+"name": "LSHIFT",
+"row": 4,
+"col": 1
+},
+{
+"name": "Z",
+"row": 4,
+"col": 3
+},
+{
+"name": "X",
+"row": 4,
+"col": 4
+},
+{
+"name": "C",
+"row": 4,
+"col": 5
+},
+{
+"name": "V",
+"row": 4,
+"col": 6
+},
+{
+"name": "B",
+"row": 4,
+"col": 7
+},
+{
+"name": "N",
+"row": 4,
+"col": 8
+},
+{
+"name": "M",
+"row": 4,
+"col": 9
+},
+{
+"name": "COMMA",
+"row": 4,
+"col": 10
+},
+{
+"name": "PERIOD",
+"row": 4,
+"col": 11
+},
+{
+"name": "SLASH",
+"row": 4,
+"col": 12
+},
+{
+"name": "RSHIFT",
+"row": 4,
+"col": 14
+},
+{
+"name": "UP",
+"row": 4,
+"col": 16
+},
+{
+"name": "NUM1",
+"row": 4,
+"col": 18
+},
+{
+"name": "NUM2",
+"row": 4,
+"col": 19
+},
+{
+"name": "NUM3",
+"row": 4,
+"col": 20
+},
+{
+"name": "NUMENTER",
+"row": 4,
+"col": 21
+},
+{
+"name": "M5",
+"row": 5,
+"col": 0
+},
+{
+"name": "LCTRL",
+"row": 5,
+"col": 1
+},
+{
+"name": "WIN",
+"row": 5,
+"col": 2
+},
+{
+"name": "LALT",
+"row": 5,
+"col": 3
+},
+{
+"name": "SPACE",
+"row": 5,
+"col": 7
+},
+{
+"name": "RALT",
+"row": 5,
+"col": 11
+},
+{
+"name": "FN",
+"row": 5,
+"col": 12
+},
+{
+"name": "MENU",
+"row": 5,
+"col": 13
+},
+{
+"name": "RCTRL",
+"row": 5,
+"col": 14
+},
+{
+"name": "LEFT",
+"row": 5,
+"col": 15
+},
+{
+"name": "DOWN",
+"row": 5,
+"col": 16
+},
+{
+"name": "RIGHT",
+"row": 5,
+"col": 17
+},
+{
+"name": "NUM0",
+"row": 5,
+"col": 19
+},
+{
+"name": "NUMDECIMAL",
+"row": 5,
+"col": 20
+}
+]
+}
