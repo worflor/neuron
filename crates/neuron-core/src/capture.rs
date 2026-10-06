@@ -132,6 +132,52 @@ pub(crate) fn key_reads_suppressed() -> bool {
     SUPPRESS_KEY_READS.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// While set on a thread, [`key_down`] and [`macro_key_down`] report this down-state instead of
+    /// the OS's. Lets an offline renderer drive the live-input patterns from a recorded or authored
+    /// key script; it only changes what a read returns and never synthesizes input.
+    static SCRIPTED_KEYS: std::cell::RefCell<Option<[bool; 256]>> = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard returned by [`script_key_reads`]: key reads on THIS thread return the scripted state
+/// until it drops. Every key starts UP.
+pub struct ScriptedKeys(());
+
+impl ScriptedKeys {
+    /// Set one virtual-key's scripted state. Out-of-range keys are ignored.
+    pub fn set(&self, vk: i32, down: bool) {
+        if let Ok(i) = usize::try_from(vk) {
+            SCRIPTED_KEYS.with(|s| {
+                if let Some(keys) = s.borrow_mut().as_mut() {
+                    if let Some(slot) = keys.get_mut(i) {
+                        *slot = down;
+                    }
+                }
+            });
+        }
+    }
+}
+
+impl Drop for ScriptedKeys {
+    fn drop(&mut self) {
+        SCRIPTED_KEYS.with(|s| *s.borrow_mut() = None);
+    }
+}
+
+/// Replace live key reads on the current thread with a scripted state for the guard's lifetime.
+/// Macro keys read as UP while it is active.
+#[must_use]
+pub fn script_key_reads() -> ScriptedKeys {
+    SCRIPTED_KEYS.with(|s| *s.borrow_mut() = Some([false; 256]));
+    ScriptedKeys(())
+}
+
+fn scripted_key(vk: i32) -> Option<bool> {
+    SCRIPTED_KEYS.with(|s| {
+        s.borrow().as_ref().map(|keys| usize::try_from(vk).ok().and_then(|i| keys.get(i).copied()).unwrap_or(false))
+    })
+}
+
 /// Read the current pressed state of one virtual-key. Reads only (never injects), so it is safe
 /// regardless of the input-arm gate. Returns `false` immediately (no syscall) while a
 /// [`suppress_key_reads`] guard is active on this thread.
@@ -141,16 +187,19 @@ pub fn key_down(vk: i32) -> bool {
     if SUPPRESS_KEY_READS.with(std::cell::Cell::get) {
         return false;
     }
+    if let Some(down) = scripted_key(vk) {
+        return down;
+    }
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: GetAsyncKeyState is a pure read of the async key state for a valid VK in 0..256.
     unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
 }
 #[cfg(not(windows))]
-pub fn key_down(_vk: i32) -> bool {
+pub fn key_down(vk: i32) -> bool {
     if SUPPRESS_KEY_READS.with(|s| s.get()) {
         return false;
     }
-    false
+    scripted_key(vk).unwrap_or(false)
 }
 
 /// Held-state bitmask for the Razer macro keys — bit `i` = the i-th macro key (M(i+1)) currently held.
@@ -358,7 +407,7 @@ pub fn set_macro_held(mask: u8) {
 /// suppression `key_down` honours, so the lighting tile-grid thumbnails skip the macro scan too. `i ≥ 8`
 /// is always `false` (the mask is 8 bits). Pure read of shared state — safe regardless of the input gate.
 pub fn macro_key_down(i: usize) -> bool {
-    if SUPPRESS_KEY_READS.with(std::cell::Cell::get) {
+    if SUPPRESS_KEY_READS.with(std::cell::Cell::get) || SCRIPTED_KEYS.with(|s| s.borrow().is_some()) {
         return false;
     }
     i < 8 && (MACRO_HELD.load(std::sync::atomic::Ordering::Relaxed) & (1 << i)) != 0
@@ -415,6 +464,27 @@ fn capture_filtered_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scripted_key_reads_report_the_script_and_clear_on_drop() {
+        {
+            let keys = script_key_reads();
+            assert!(!key_down(0x41));
+            keys.set(0x41, true);
+            keys.set(300, true);
+            assert!(key_down(0x41));
+            assert!(!key_down(0x42));
+            assert!(!macro_key_down(0));
+            keys.set(0x41, false);
+            assert!(!key_down(0x41));
+            keys.set(0x41, true);
+        }
+        assert!(SCRIPTED_KEYS.with(|s| s.borrow().is_none()));
+        let _quiet = suppress_key_reads();
+        let keys = script_key_reads();
+        keys.set(0x41, true);
+        assert!(!key_down(0x41), "suppression outranks a script");
+    }
 
     #[test]
     fn key_observation_readers_attach_at_head_are_independent_and_report_overflow() {
