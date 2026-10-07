@@ -6,15 +6,28 @@
 //!
 //! script.json: { "fps": 30, "frames": N,
 //!                "grids": [{"name": "kb", "rows": 6, "cols": 22}, ...],
-//!                "segments": [{"frame": 0, "preset": "off"}, {"frame": 412, "preset": "fire"}, ...],
+//!                "segments": [{"frame": 0, "preset": "off"}, {"frame": 412, "preset": "fire"},
+//!                             {"frame": 600, "preset": "comet", "pairing": 0}, ...],
 //!                "keys": [[frame, vk, down], ...] }
 //! Writes <out_dir>/<grid>.bin: N frames of rows*cols RGB bytes, row-major.
-//! A segment starts a fresh compositor, as applying a preset does; "off" renders black.
+//! A segment starts a fresh compositor, as applying a preset does; "off" renders black. `pairing` is
+//! an index into `neuron::pairing::pairings_for(preset)`, the same chip the lighting page offers.
 //! Keys reach the live-input patterns through `capture::script_key_reads`, never the OS.
 
 use std::{env, fs, io::Write, path::Path};
 
 use serde_json::Value;
+
+/// The layer a segment applies: the preset, or the preset with its `pairing`-th suggested pairing.
+fn layer_for(slug: &str, pairing: Option<usize>) -> Option<neuron::pattern::LayerDef> {
+    match pairing {
+        None => neuron::pattern::preset_layer(slug),
+        Some(i) => {
+            let p = neuron::pairing::pairings_for(slug).into_iter().nth(i)?;
+            neuron::pairing::pairing_layer(slug, &p)
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
@@ -24,13 +37,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fps = script["fps"].as_f64().ok_or("fps")? as f32;
     let frames = script["frames"].as_u64().ok_or("frames")? as usize;
 
-    let mut segments: Vec<(usize, String)> = script["segments"].as_array().ok_or("segments")?.iter()
-        .map(|s| (s["frame"].as_u64().unwrap_or(0) as usize, s["preset"].as_str().unwrap_or("off").to_string()))
+    let mut segments: Vec<(usize, String, Option<usize>)> = script["segments"].as_array().ok_or("segments")?.iter()
+        .map(|s| (
+            s["frame"].as_u64().unwrap_or(0) as usize,
+            s["preset"].as_str().unwrap_or("off").to_string(),
+            s["pairing"].as_u64().map(|p| p as usize),
+        ))
         .collect();
     segments.sort_by_key(|s| s.0);
-    for (_, slug) in &segments {
-        if slug != "off" && neuron::pattern::preset_layer(slug).is_none() {
-            return Err(format!("unknown preset {slug}").into());
+    for (_, slug, pairing) in &segments {
+        if slug != "off" && layer_for(slug, *pairing).is_none() {
+            return Err(format!("unknown preset or pairing {slug} {pairing:?}").into());
         }
     }
     let mut keys: Vec<(usize, i32, bool)> = script["keys"].as_array().ok_or("keys")?.iter()
@@ -53,10 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for f in 0..frames {
         while next_seg < segments.len() && segments[next_seg].0 <= f {
-            let slug = &segments[next_seg].1;
+            let (slug, pairing) = (&segments[next_seg].1, segments[next_seg].2);
             seg_start = segments[next_seg].0;
             for comp in comps.iter_mut() {
-                *comp = neuron::pattern::preset_layer(slug).map(|l| neuron::pattern::Compositor::from_defs(&[l]));
+                *comp = layer_for(slug, pairing).map(|l| neuron::pattern::Compositor::from_defs(&[l]));
             }
             next_seg += 1;
         }
