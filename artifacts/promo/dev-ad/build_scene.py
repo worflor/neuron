@@ -737,12 +737,6 @@ for ev in ("fire", "fire_off", "heat"):
     thread(f"thr {ev}", anchor(ev), KB_CENTER, tl.event_time(ev))
     ping(f"ping {ev}", (0, 0), tl.arrival(ev), r1=0.27, squash=0.42, gain=0.7, life=0.55)
 
-# Thumb 2 presses in as its bind lands.
-_tz = THUMB.location.copy()
-for o in (THUMB,):
-    key(o, "location", tl.arrival("mute") - 0.02, _tz)
-    key(o, "location", tl.arrival("mute") + 0.06, _tz + Vector((0.0018, 0, 0)))
-    key(o, "location", tl.arrival("mute") + 0.22, _tz)
 
 # ----------------------------------------------------------------------------- the drop
 
@@ -861,6 +855,27 @@ for i in range(0, 22):
     sc = 1.0 + 0.7 * settle + 0.12 * settle * _rng.uniform(-1, 1)
     key(MIC_RING, "scale", tt, (sc, sc * (1 + 0.06 * settle * _rng.uniform(-1, 1)), 1))
 key(MIC_RING, "scale", _ma - 0.01, (1.7, 1.7, 1))
+
+# Listening: a ring on the mic breathes with the voice, on the same schedule as the waveform and the
+# sound, so it is clear who is talking and why nothing is being typed.
+bpy.ops.mesh.primitive_torus_add(major_radius=0.049, minor_radius=0.0013, location=MIC + Vector((0, 0, 0.0016)), major_segments=96)
+LISTEN_RING = bpy.context.object
+LISTEN_RING.name = "listen ring"
+LISTEN_RING.data.materials.append(M_MECH)
+LISTEN_RING.color = BLACK
+key(LISTEN_RING, "hide_render", 0.0, True)
+for _a, _b in tl.voice_windows():
+    key(LISTEN_RING, "hide_render", _a - 0.12, False)
+    for _i in range(int((_b - _a + 0.7) * tl.FPS)):
+        _t = _a - 0.10 + _i / tl.FPS
+        _fin = ease_sine((_t - (_a - 0.10)) / 0.25)
+        _fout = 1.0 - ease_sine((_t - _b) / 0.45)
+        _lvl = tl.voice_env(_t)
+        _g = (0.30 + 1.9 * _lvl) * _fin * _fout
+        key(LISTEN_RING, "color", _t, (LIS[0] * _g, LIS[1] * _g, LIS[2] * _g, 1))
+        _sc = 1.0 + 0.10 * _lvl
+        key(LISTEN_RING, "scale", _t, (_sc, _sc, 1))
+    key(LISTEN_RING, "hide_render", _b + 0.62, True)
 
 # Radial: the cast wheel assembles around the mouse; wedge 2 takes the macro.
 _ra = tl.arrival("radial")

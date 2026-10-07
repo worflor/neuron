@@ -18,9 +18,9 @@ import timeline as tl
 
 TW, TH = 1440, 1280
 PAD_X, PAD_TOP, PAD_BOT = 78, 96, 70
-FONT_PX = 56
-LINE_H = 78
-GROUP_GAP = 26
+FONT_PX = 46
+LINE_H = 68
+GROUP_GAP = 22
 PROMPT_GAP = 30
 FONT = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", FONT_PX)
 FONT_B = ImageFont.truetype(r"C:\Windows\Fonts\consolab.ttf", FONT_PX)
@@ -65,7 +65,9 @@ def waveform(d, x, y, t, live, bars=7):
     w = CHAR_W * 0.26
     for i in range(bars):
         if live:
-            a = 0.25 + 0.75 * abs(math.sin(t * (7.0 + i * 1.7) + i * 1.3)) * (0.6 + 0.4 * math.sin(t * 3.1 + i))
+            # The same schedule as the sound; each bar trails the voice a hair, so it ripples.
+            lvl = tl.voice_env(t - i * 0.028)
+            a = 0.10 + 0.90 * lvl * (0.72 + 0.28 * math.sin(t * 23.0 + i * 1.9))
         else:
             a = (0.35, 0.6, 0.9, 0.55, 0.75, 0.4, 0.3)[i % 7]
         h = LINE_H * 0.62 * max(0.12, a)
@@ -77,7 +79,7 @@ def waveform(d, x, y, t, live, bars=7):
 
 def rows_of(idx):
     line = tl.SCRIPT[idx]
-    return tl.wrap(line["text"], tl.WRAP - indent(line["kind"]) + (0 if line["kind"] != "agent" else 2))
+    return tl.wrap(line["text"], tl.WRAP - indent(line["kind"]))
 
 
 def owner_tool(idx):

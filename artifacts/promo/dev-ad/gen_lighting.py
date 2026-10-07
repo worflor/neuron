@@ -51,7 +51,6 @@ def presses():
             names = names[1:]
         for name in names:
             out.append((t, t + 0.065, name))
-    out.append((tl.DROP_LAND, tl.DROP_LAND + 0.12, "ENTER"))
     return out
 
 

@@ -25,8 +25,13 @@ Draft, not approved for publication.
 - The score is a chiptune composed in Harmonia (`gen_music.py`) on the timeline's 120 BPM grid:
   each layer enters when its cause lands, "too animated." stops the tape, and the reveal is the
   loudest section.
-- The "looks basic" complaint is spoken (transcribed beside a waveform), so no key moves and the
-  board stays idle until "type a bit."
+- The user talks to the agent through the Seiren: every line is spoken (words land as text beside a
+  waveform, each syllable a synthesized muted "muh", a listening ring on the mic on the same
+  schedule). Nothing is typed, no key moves and no key sounds until the agent says "type a bit.", so
+  the real typingheat stays idle until then. Nothing presses a key at the end either.
+- Commands honour what they really do: `profile apply dev` precedes the lighting edits (a new
+  profile is not active), and `macro add` passes its source file. `feel stages` and `profile apply`
+  write devices, so their syntax was checked with `--help` and their replies are not shown.
 
 ## Build
 
@@ -41,7 +46,7 @@ python gen_terminal.py      # term/#####.png + anchors.json
 python gen_lighting.py      # lighting.npz, through the real pattern engine
 & C:\Users\Micha\Documents\Projects\Harmonia\.venv\Scripts\python.exe gen_music.py   # music.wav
 python gen_audio.py         # audio.wav (sound design + the score)
-& D:\tools\blender-5.2.2-windows-x64\blender.exe -b --factory-startup --python build_scene.py -- --resume --out D:\build-cache\promo\dev-ad\render3
+& D:\tools\blender-5.2.2-windows-x64\blender.exe -b --factory-startup --python build_scene.py -- --resume --out D:\build-cache\promo\dev-ad\render4
 python assemble.py          # end card + audio -> neuron-dev-ad.mp4
 ```
 

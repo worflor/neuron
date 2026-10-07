@@ -13,11 +13,13 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, os.path.dirname(__file__))
 import timeline as tl
 
-SRC = os.path.join(tl.OUT, os.environ.get("PROMO_RENDER", "render3"))
+SRC = os.path.join(tl.OUT, os.environ.get("PROMO_RENDER", "render4"))
 DST = os.path.join(tl.OUT, "final")
 MP4 = os.path.join(tl.OUT, "neuron-dev-ad.mp4")
 WORD = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", 132)
 TAG = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", 46)
+SITE = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", 54)
+CODE = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", 38)
 
 
 def rgb(h):
@@ -41,7 +43,7 @@ def tracked(d, xy, text, font, fill, track):
     return total
 
 
-def card(img, k_dim, k_word, k_tag):
+def card(img, k_dim, k_word, k_tag, k_links=0.0):
     if k_dim > 0:
         img = Image.blend(img, Image.new("RGB", img.size, rgb(tl.BG)), 0.55 * k_dim)
     over = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -57,6 +59,12 @@ def card(img, k_dim, k_word, k_tag):
     if k_tag > 0:
         a = int(255 * k_tag)
         d.text((tl.W / 2, cy + 130 + (1 - k_tag) * 12), tl.TAGLINE, font=TAG, fill=(*rgb(tl.TEXT_MID), a), anchor="mm")
+    if k_links > 0:
+        a = int(255 * k_links)
+        rise = (1 - k_links) * 10
+        site, code = tl.END_LINKS
+        d.text((tl.W / 2, 1318 + rise), site, font=SITE, fill=(*rgb(tl.TEXT), a), anchor="mm")
+        d.text((tl.W / 2, 1392 + rise), code, font=CODE, fill=(*rgb(tl.TEXT_MID), a), anchor="mm")
     img = img.convert("RGBA")
     img.alpha_composite(over)
     return img.convert("RGB")
@@ -75,9 +83,10 @@ def main():
             img = img.resize((tl.W, tl.H), Image.LANCZOS)
         k_dim = ease((t - tl.ENDCARD_T) / 0.9)
         k_word = ease((t - tl.ENDCARD_T - 0.25) / 0.7)
-        k_tag = ease((t - tl.ENDCARD_T - 0.85) / 0.6)
+        k_tag = ease((t - tl.ENDCARD_T - 0.70) / 0.55)
+        k_links = ease((t - tl.ENDCARD_T - 1.00) / 0.55)
         if k_dim > 0:
-            img = card(img, k_dim, k_word, k_tag)
+            img = card(img, k_dim, k_word, k_tag, k_links)
         img.save(os.path.join(DST, f"{f:05d}.png"), compress_level=1)
     subprocess.run([
         "ffmpeg", "-y", "-loglevel", "error", "-framerate", str(tl.FPS),
