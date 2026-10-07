@@ -89,6 +89,8 @@ the **pattern** is the shape and motion (a heat sim, a scroll, a keypress ripple
 
 a preset is just a pattern plus a spectrum, pure data, no code (adding your own pattern or preset is covered in [contributing](../CONTRIBUTING.md)). and a spectrum is only as complicated as you make it: one stop is a solid colour, two is a gradient, add motion (drift / cycle / breathe / flow) and it animates, add keyframes and it sequences over time. it serialises down to the tightest shape that still describes it (a bare hex for a solid, an array for a gradient, a table only when you ask for more). the built-in presets:
 
+Eight named gradients (rainbow, fire, aurora, thermal, sunset, meadow, ice, bubble) sit under the colour picker as one-click bases, and the editor header names the palette in its own colours. Effect tiles that colour through the spectrum carry a small chip that opens in place into suggested pairings: hand-picked ones first, then the best gradients by a lightness and hue score, never the effect's own colours. A pairing can also set a mode, like Cascade's matrix or Comet's light painting.
+
 | preset | pattern × spectrum |
 |---|---|
 | `fire` | a real upward heat sim, run through a *recolourable* ember→white gradient; paint it blue and it's cold fire |
@@ -96,7 +98,7 @@ a preset is just a pattern plus a spectrum, pure data, no code (adding your own 
 | `wildlife` | a seeded Conway habitat: little colonies age, contact feeds exact keys, and the palette follows spring, summer, autumn, and winter |
 | `aurora` | a multi-octave flow field under an animated, settable aurora palette |
 | `wave` / `cycle` | a rolling, or board-wide, hue: a two-colour gradient or the full spectrum, your call |
-| `cascade` / `comet` | rain and shooting streaks with real head→tail gradients (type the key a comet's head sits on to *break* it) |
+| `cascade` / `comet` | rain and shooting streaks with real head→tail gradients (type the key a comet's head sits on to *break* it); comet's light painting leaves a long fading trail |
 | `starlight` / `reactive` / `ripple` | stars twinkling and fading, the key you pressed lighting up, rings spreading from each strike |
 | `audio meter` / `pulse` | your live output *or mic* peak, or live CPU and RAM, painted low→high |
 | `ambient` | the whole board as an ambilight, mirroring your screen |
