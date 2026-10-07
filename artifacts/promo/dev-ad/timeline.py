@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: 2026 Woflo Labs
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""The dev ad's single source of truth: what is typed, when, what it causes, where we look, and
-what the music does about it.
+"""The dev ad's single source of truth: what is said, typed, caused, looked at and scored.
 
 Everything runs on a 120 BPM grid (a beat is 0.5 s, a bar 2 s): thread landings sit on beats so
 the picture cuts like a music video. Every other script reads from here.
+
+World rule: the user talks to the agent through the Seiren. Nothing is typed, no key moves and no
+key sounds until the agent says "type a bit."; from then on typing is the point.
 """
 import os
+import random
+import re
 
 FPS = int(os.environ.get("PROMO_FPS", "30"))
 BPM = 120
@@ -31,59 +35,67 @@ WARN = "#f2b34a"
 
 AGENT_LABEL = "your coding agent"
 
-# Terminal script. kind: user (typed on the board), voice (spoken: transcribes beside a waveform,
-# no keys move), agent (streamed), tool (a neuron call; `event` names what it does to the rig),
-# out (the CLI's real reply), cont (a call's wrapped continuation). `grid` quantizes a typed line
-# to the beat. Every tool line and reply was run against v0.1.4 in a scratch run root.
+# Terminal script. kind: voice (spoken into the mic: transcribes beside a waveform, no keys move),
+# user (typed: the only typing in the ad), agent (streamed), tool (a CLI call; `event` names what
+# it does to the rig), out (the CLI's real reply), cont (a call's wrapped continuation).
+# Every tool line and reply was run against v0.1.4 in a scratch run root, except the verbs that
+# write devices (`profile apply`, `feel stages`), whose syntax was checked with --help and whose
+# replies are not shown. `neuron control list | findstr Razer` prints exactly the three lines shown.
 SCRIPT = [
-    dict(t=0.50, kind="user", text="i'm lazy. set up my devices."),
-    dict(t=2.45, kind="tool", text="neuron control list"),
-    dict(t=2.95, kind="out", text="Naga V2 Pro           mouse", event="wake_mouse"),
-    dict(t=3.20, kind="out", text="BlackWidow Chroma V2  keyboard", event="wake_keyboard"),
-    dict(t=3.45, kind="out", text="Seiren V3 Mini        mic", event="wake_mic"),
+    dict(t=0.50, kind="voice", text="i'm lazy. set up my devices."),
+    dict(t=2.55, kind="tool", text="neuron control list | findstr Razer"),
+    dict(t=2.95, kind="out", text="Razer Naga V2 Pro  [mouse]  pid=00a7", event="wake_mouse"),
+    dict(t=3.20, kind="out", text="Razer BlackWidow Chroma V2  [keyboard]  pid=0221", event="wake_keyboard"),
+    dict(t=3.45, kind="out", text="Razer Seiren V3 Mini  [mic]  pid=056a", event="wake_mic"),
     dict(t=4.90, kind="agent", text="you code a lot."),
-    dict(t=5.70, kind="user", text="unfortunately."),
-    dict(t=7.45, kind="tool", text="neuron profile new dev", event="profile"),
-    dict(t=7.65, kind="out", text="created profile 'dev'"),
-    dict(t=8.90, kind="agent", text="5 dpi stages. you need 2."),
+    dict(t=5.70, kind="voice", text="unfortunately."),
+    dict(t=7.15, kind="tool", text="neuron profile new dev"),
+    dict(t=7.35, kind="out", text="created profile 'dev'"),
+    dict(t=7.95, kind="tool", text="neuron profile apply dev", event="profile"),
+    dict(t=9.00, kind="agent", text="5 dpi stages. you need 2."),
     dict(t=9.95, kind="tool", text="neuron feel stages 800 1600", event="dpi"),
     dict(t=12.45, kind="tool", text="neuron bind add --trigger mouse:5", event="mute"),
     dict(t=12.60, kind="cont", text="--action mute:mic"),
     dict(t=12.80, kind="out", text="added: [0] Mouse 5 (thumb 2)  ->  mic mute [toggle]"),
-    dict(t=14.70, kind="user", text='also the "is this true?" thing'),
-    dict(t=17.00, kind="tool", text="neuron macro add fact-check"),
+    dict(t=14.70, kind="voice", text='also the "is this true?" thing'),
+    dict(t=16.95, kind="tool", text="neuron macro add fact-check fact-check.py"),
+    dict(t=17.15, kind="out", text="added macro 'fact-check' (bound, checked + warm)"),
     dict(t=17.45, kind="tool", text="neuron cast wedge set 4", event="radial"),
     dict(t=17.60, kind="cont", text="--action macro:fact-check"),
-    dict(t=20.00, kind="user", text="now make it pretty."),
+    dict(t=17.80, kind="out", text="wedge 4 -> script `fact-check` [python]"),
+    dict(t=19.45, kind="voice", text="now make it pretty."),
     dict(t=21.45, kind="tool", text="neuron light stack add --profile dev", event="fire"),
     dict(t=21.60, kind="cont", text="--preset fire"),
     dict(t=21.85, kind="out", text="added [0] heat (fire)  blend=normal"),
     dict(t=23.50, kind="agent", text="how's fire?"),
-    dict(t=24.10, kind="user", text="too animated."),
+    dict(t=24.10, kind="voice", text="too animated."),
     dict(t=25.40, kind="agent", text="right. you're a vampire who never leaves his room."),
     dict(t=26.80, kind="agent", text="this one's more your speed."),
     dict(t=27.45, kind="tool", text="neuron light stack rm 0 --profile dev", event="fire_off"),
+    dict(t=27.65, kind="out", text="removed [0] heat (fire)  blend=normal"),
     dict(t=27.95, kind="tool", text="neuron light stack add --profile dev", event="heat"),
     dict(t=28.10, kind="cont", text="--preset typingheat"),
+    dict(t=28.30, kind="out", text="added [0] thermal (typingheat)  blend=normal"),
     dict(t=29.30, kind="voice", text="what's the gimmick? looks basic."),
     dict(t=31.50, kind="agent", text="type a bit."),
     dict(t=32.25, kind="user", text="ok. that's actually sick.", grid=BEAT / 4),
     dict(t=36.00, kind="agent", text="done. go do something."),
 ]
 
-TYPE_CPS = 16.5    # user typing speed, jittered per char
+TYPE_CPS = 16.5    # typing speed, jittered per char
 STREAM_CPS = 48.0  # agent text streaming speed
-VOICE_CPS = 19.0   # how fast a spoken line transcribes
 VOICE_LEAD = 0.35  # the waveform moves this long before the first word lands
-WRAP = 40          # terminal columns before a line wraps
+WRAP = 50          # terminal columns before a line wraps
 
 THREAD_TRAVEL = 0.55  # seconds a light thread takes from its terminal line to the rig
 
 COLLAPSE_T = 37.00   # terminal folds away
 DROP_T = 37.45       # its last light falls...
-DROP_LAND = 38.00    # ...and presses Enter on the downbeat
-ENDCARD_T = 38.60    # end card fades in
+DROP_LAND = 38.00    # ...and lands on the downbeat (nothing presses a key)
+ENDCARD_T = 38.45    # end card fades in
 TAGLINE = "your devices can figure it out."
+# Under the keyboard; the site is the repo's own homepage (gh repo view worflor/neuron).
+END_LINKS = ("www.woflo.dev/neuron", "code on github.com/worflor/neuron")
 
 RADIAL_SECTORS = 8
 RADIAL_WEDGE = 4     # 0 = north, clockwise
@@ -95,7 +107,7 @@ LIGHT_SEGMENTS = [(0.0, "off"), ("fire", "fire"), ("fire_off", "off"), ("heat", 
 # Camera: (time, shot). Equal neighbours hold; moves ease between them. The camera arrives
 # before an effect lands and holds after it.
 SHOTS = {
-    "term": ((0.0, -0.70, 0.44), (0.0, 0.24, 0.27), 30),
+    "term": ((-0.08, -0.70, 0.44), (-0.03, 0.24, 0.27), 24),
     "wide": ((0.0, -1.05, 0.62), (0.0, 0.08, 0.22), 34),
     "mouse": ((0.42, -0.30, 0.34), (0.285, -0.01, 0.0), 42),
     "mute": ((-0.02, -0.92, 0.50), (0.0, 0.03, 0.06), 30),
@@ -114,11 +126,12 @@ CAM_KEYS = [
     (37.30, "wide"), (39.60, "end"), (DURATION, "end"),
 ]
 
-# Which device the eye should be on: (time, subject). Spotlights and focus follow it.
-SUBJECTS = [
+# Which device the eye should be on: (time, subject). Spotlights and focus follow it. The mic takes
+# the spotlight whenever someone speaks (see SUBJECTS below).
+_BASE_SUBJECTS = [
     (0.0, None), (3.50, "mouse"), (3.75, "keyboard"), (4.00, "mic"), (4.80, "all"),
     (9.90, "mouse"), (12.30, "all"), (13.85, "mic"), (15.20, "all"), (17.40, "mouse"),
-    (20.20, "keyboard"), (29.20, "mic"), (31.40, "keyboard"), (36.80, "all"),
+    (20.20, "keyboard"), (31.40, "keyboard"), (36.80, "all"),
 ]
 
 
@@ -147,11 +160,54 @@ def light_segments():
     return [(when if isinstance(when, float) else arrival(when), preset) for when, preset in LIGHT_SEGMENTS]
 
 
+# --- speech --------------------------------------------------------------------------------------
+# Speech is a pseudo-voice: words land as text and each syllable is a muted "muh". No real voice,
+# no recognition. One schedule feeds the transcript, the waveform, the mic ring and the sound.
+
+
+def voice_words(line):
+    """[{word, i0, i1, t, dur}] with the char span of each word in the line's text."""
+    out, pos, t = [], 0, line["t"] + VOICE_LEAD
+    for w in re.findall(r"\S+", line["text"]):
+        i0 = line["text"].index(w, pos)
+        letters = len(re.sub(r"[^A-Za-z0-9]", "", w))
+        dur = 0.08 + 0.030 * letters
+        out.append(dict(word=w, i0=i0, i1=i0 + len(w), t=t, dur=dur))
+        pos = i0 + len(w)
+        t += dur + 0.045 + (0.14 if w[-1] in ".?!" else 0.0)
+    return out
+
+
+def voice_syllables(line):
+    """[{t, dur, semis, glide}]: one muted syllable per ~3 letters, a question rising and a
+    statement falling on its last."""
+    out = []
+    words = voice_words(line)
+    for wi, w in enumerate(words):
+        letters = len(re.sub(r"[^A-Za-z0-9]", "", w["word"]))
+        n = max(1, round(letters / 3.2))
+        rnd = random.Random(f"{line['text']}|{wi}")
+        base = rnd.choice([-2, 0, 2, 3])
+        for s in range(n):
+            glide = -2.0
+            if s == n - 1 and wi == len(words) - 1:
+                glide = 5.0 if w["word"].rstrip('"').endswith("?") else -4.0
+            out.append(dict(t=w["t"] + s * w["dur"] / n, dur=w["dur"] / n * 0.92,
+                            semis=base + rnd.choice([-1, 0, 1]), glide=glide))
+    return out
+
+
 def line_times(line):
-    """When each char of a typed or spoken line lands."""
-    import random
+    """When each char of a spoken or typed line lands (a spoken line lands word by word)."""
     if line["kind"] == "voice":
-        return [line["t"] + VOICE_LEAD + i / VOICE_CPS for i in range(len(line["text"]))]
+        words = voice_words(line)
+        out, cur = [], words[0]["t"]
+        for i in range(len(line["text"])):
+            for w in words:
+                if w["i0"] <= i < w["i1"]:
+                    cur = w["t"]
+            out.append(cur)
+        return out
     if "grid" in line:
         return [line["t"] + i * line["grid"] for i in range(len(line["text"]))]
     rnd = random.Random(int(line["t"] * 1000))
@@ -167,6 +223,14 @@ def line_times(line):
     return out
 
 
+def commit_time(line):
+    """When a spoken or typed line leaves the prompt for the history."""
+    if line["kind"] == "voice":
+        w = voice_words(line)[-1]
+        return w["t"] + w["dur"] + 0.12
+    return line_times(line)[-1] + 0.18
+
+
 def typed_chars():
     """(time, char) for every keystroke. Spoken lines press nothing."""
     out = []
@@ -176,14 +240,50 @@ def typed_chars():
     return out
 
 
-def commit_time(line):
-    """When a typed or spoken line leaves the prompt for the history."""
-    return line_times(line)[-1] + 0.18
+def voice_lines():
+    return [l for l in SCRIPT if l["kind"] == "voice"]
+
+
+def voice_windows():
+    """[(start, end)] of each spoken line, from its waveform's first movement to its commit."""
+    return [(l["t"], commit_time(l)) for l in voice_lines()]
+
+
+_SYLLABLES = [s for l in voice_lines() for s in voice_syllables(l)]
+
+
+def voice_env(t):
+    """0..1 loudness of the speech at time t: a faint hold inside a line, a swell per syllable."""
+    lvl = 0.0
+    for a, b in voice_windows():
+        if a <= t <= b:
+            lvl = 0.12
+    for s in _SYLLABLES:
+        x = (t - s["t"]) / s["dur"]
+        if 0.0 <= x <= 1.0:
+            lvl = max(lvl, 0.15 + 0.85 * (__import__("math").sin(3.141592653589793 * x) ** 0.8))
+    return lvl
+
+
+def _subjects():
+    def at(base, t):
+        who = None
+        for when, w in base:
+            if when <= t:
+                who = w
+        return who
+    out = list(_BASE_SUBJECTS)
+    for a, b in voice_windows():
+        out.append((a, "mic"))
+        out.append((b, at(_BASE_SUBJECTS, b)))
+    return sorted(out, key=lambda e: e[0])
+
+
+SUBJECTS = _subjects()
 
 
 def wrap(text, width=WRAP):
     """Word-wrap a line into terminal rows, keeping the source's own spacing."""
-    import re
     rows, cur = [], ""
     for tok in re.findall(r"\S+\s*", text):
         if cur and len(cur + tok.rstrip()) > width:

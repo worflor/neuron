@@ -27,6 +27,17 @@ Neuron's brand is honesty about hardware, so the ad cannot fake the product.
 - **Continuity beats convenience.** If a character types, the keys move and any live-input
   effect reacts. When a beat needs the board quiet, change the story (the dev ad's complaint is
   spoken, transcribed beside a waveform), never the physics.
+- **A character only does what the world lets them do.** In the dev ad the user talks to the agent
+  through the mic, so nothing is typed, no key moves and no key sounds until the agent says
+  "type a bit."; from then on typing is the point. Speech is a pseudo-voice: words land as text
+  beside a waveform, each syllable is a muted synthesized "muh", never a real or processed voice.
+  The mic gets a listening ring on the same schedule so the viewer sees where it comes from. Apply
+  the same test to every moving part: if nobody could have caused it, cut it (a button pressing
+  itself, a key landing the Enter). Rings, pings and highlights say "here" without faking a cause.
+- **A command only does what it would really do.** `profile new` makes a profile but does not
+  activate it (`profile active` stays `(none)`), so edits to it paint nothing until `profile apply`.
+  `macro add` needs its source argument. Prefer a real filter over an invented reply:
+  `neuron control list | findstr Razer` prints exactly three true lines.
 - Use the owner's real rig: Naga V2 Pro, BlackWidow Chroma V2, Seiren V3 Mini (`neuron control list`).
 - Say plainly in the handoff what is staged copy, what is a stylised model, and what is engine output.
 

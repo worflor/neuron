@@ -116,14 +116,45 @@ room += np.sin(2 * np.pi * 55 * t_all) * 0.008
 fade_in = np.clip(t_all / 1.5, 0, 1)
 MIX += np.vstack([room, np.roll(room, 997)]) * fade_in
 
-# --- typing --------------------------------------------------------------------------------------
+# --- speech: a muted "muh" per syllable ------------------------------------------------------------
+# Not a voice and not a voice effect: a harmonic buzz through a low-pass that closes on an "m" and
+# opens on an "uh". Same schedule as the waveform and the mic ring (timeline.voice_syllables).
+
+
+def muh(dur, f0, glide):
+    n = max(8, int(dur * SR))
+    t = np.arange(n) / SR
+    u = t / dur
+    f = f0 * 2 ** (glide * u ** 1.6 / 12) * (1 + 0.012 * np.sin(2 * np.pi * 5.5 * t))
+    ph = np.cumsum(f) / SR
+    src = np.zeros(n)
+    for k in range(1, 27):
+        src += np.sin(2 * np.pi * k * ph) / k
+    opening = np.sin(np.pi * np.clip(u * 1.15, 0, 1))
+    cut = 280 + 2300 * opening ** 1.3
+    out = np.zeros(n)
+    zi = None
+    blk = 96
+    for s in range(0, n, blk):
+        b, a = signal.butter(2, min(float(cut[s]), 9000) / (SR / 2))
+        if zi is None:
+            zi = signal.lfilter_zi(b, a) * src[s]
+        out[s:s + blk], zi = signal.lfilter(b, a, src[s:s + blk], zi=zi)
+    out += np.sin(2 * np.pi * ph) * (1 - opening ** 2) * 0.9
+    out = np.tanh(1.7 * out / max(1e-6, np.abs(out).max()))
+    return out * np.sin(np.pi * np.clip(u, 0, 1)) ** 0.6 * np.minimum(1, t / 0.012)
+
+
+for line in tl.voice_lines():
+    for syl in tl.voice_syllables(line):
+        place(muh(syl["dur"], 128.0 * 2 ** (syl["semis"] / 12), syl["glide"]), syl["t"], -0.30, 0.19)
+
+# --- typing (only the line after "type a bit.") --------------------------------------------------
 for down, up, name in presses():
     k = KEYMAP.get(name)
     pan = ((k["col"] - 10.5) / 10.5 * 0.35) if k else 0.0
-    heavy = 1.6 if name in ("SPACE", "ENTER") else (0.8 if name == "LSHIFT" else 1.0)
+    heavy = 1.6 if name == "SPACE" else (0.8 if name == "LSHIFT" else 1.0)
     gain = 0.30 * RNG.uniform(0.85, 1.1) * (0.5 if name == "LSHIFT" else 1.0)
-    if name == "ENTER" and abs(down - tl.DROP_LAND) < 0.01:
-        gain = 0.5
     place(click(heavy), down, pan, gain)
     place(bandnoise(int(0.02 * SR), 3000, 8000) * np.exp(-np.arange(int(0.02 * SR)) / SR / 0.003), up, pan, 0.10)
 
@@ -235,6 +266,10 @@ if os.path.exists(music_path):
         m /= 32767.0
     m = signal.resample_poly(m, SR, msr, axis=0).T
     m = np.pad(m, ((0, 0), (0, max(0, N - m.shape[1]))))[:, :N]
+    # The score gives way a little under speech.
+    _tt = np.arange(0, tl.DURATION, 0.01)
+    _env = np.array([tl.voice_env(x) for x in _tt])
+    m *= 1.0 - 0.32 * np.interp(t_all, _tt, _env) ** 0.8
     # "too animated.": the tape slows to a stop, then a breath before the vamp.
     too = next(l for l in tl.SCRIPT if l["text"] == "too animated.")
     stop = tl.commit_time(too)
