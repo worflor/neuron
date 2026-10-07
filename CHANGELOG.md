@@ -1,11 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Added gradient presets to the spectrum editor: rainbow, fire, aurora, thermal, sunset, meadow, ice and bubble (a soap-film ramp computed from thin-film interference). One click swaps a layer's stops and keeps its motion and blend; the editor header names the current palette in its own colours.
+- Added suggested pairings on effect tiles. A small chip opens in place to apply an effect with another gradient or mode, such as Comet with sunset and light painting, or Cascade in matrix mode with bubble. Hand-picked pairings come first and the rest are scored from the gradient's lightness, hue spread and contrast; an effect is never offered its own gradient.
+- Gave Typing Heat and Fire a dark foot on bright gradients so heat still reads dim to bright in the gradient's own hue.
+- Lengthened Comet's light-painting fade to about 30 s (was 2.6 s) so repeated passes stack.
+- Switched palette motion to high-precision timing, and added an offline key script so input-driven patterns can be rendered without synthesizing input.
+- Added a render smoke test that draws the lighting page, hovers a pairing chip and fails on Slint binding loops.
+
 ## v0.1.4
 
 - Made binding and lighting UI more intentional: grouped action selection, inline controls, compact filtered bind lists, and device identity in the lighting preview.
 - Added general controller input on Windows, stick-driven radial casting, verified Xbox-protocol pad haptics, device badges and sensor reads. Switch Pro startup remains gated; Tartarus V2 is untested.
 - Added Wildlife, a seasonal cellular lighting habitat shaped by typing, with idle recovery and region-aware dynamics. Refined Fire wind, Starlight twinkles, Reactive and Ripple contact response, Typing Heat, and saved-effect editing.
 - Added clipboard transforms and session history, screenshots, lighting-layer actions and session Undo; expanded Pockets and dial scrolling.
+- Expanded the CLI to everything the app can author: `neuron <noun> <verb>` commands with `--json` output, validated writes that echo the saved state, live reload of a running app, and the whole setup as one document.
 - Hardened controller identity, firmware-backed Naga binds, side-plate handling, clipboard formats, screenshot reporting, nested actions and editor state through adversarial testing. Added Synapse 3 mapping-log import.
 
 ## v0.1.3
