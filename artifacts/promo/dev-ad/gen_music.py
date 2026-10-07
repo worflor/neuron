@@ -50,10 +50,10 @@ _too = next(l for l in tl.SCRIPT if l["text"] == "too animated.")
 STOP = tl.commit_time(_too)            # the tape stops here (gen_audio.py)
 VAMP = STOP + 0.5
 HEART = tl.arrival("heat")
-_tab = next(l for l in tl.SCRIPT if l["text"] == "type a bit.")
-HUSH = _tab["t"]
-REVEAL = 32.0
-THIN = 36.0
+_typed = next(l for l in tl.SCRIPT if l["kind"] == "user")
+REVEAL = _typed["t"]                    # the first keystroke: everything comes back
+HUSH = REVEAL - 1.0                     # the heartbeat gives way as the camera swings to the board
+THIN = [l for l in tl.SCRIPT if l["kind"] == "agent"][-1]["t"]   # "done.": thin to arp and pad
 FALL = tl.COLLAPSE_T
 HIT = tl.DROP_LAND
 

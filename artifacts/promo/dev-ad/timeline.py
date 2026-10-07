@@ -16,7 +16,7 @@ FPS = int(os.environ.get("PROMO_FPS", "30"))
 BPM = 120
 BEAT = 60.0 / BPM
 BAR = 4 * BEAT
-DURATION = 42.0
+DURATION = 44.0
 W, H = 1080, 1920
 
 OUT = os.environ.get("PROMO_OUT", r"D:\build-cache\promo\dev-ad")
@@ -77,9 +77,9 @@ SCRIPT = [
     dict(t=28.10, kind="cont", text="--preset typingheat"),
     dict(t=28.30, kind="out", text="added [0] thermal (typingheat)  blend=normal"),
     dict(t=29.30, kind="voice", text="what's the gimmick? looks basic."),
-    dict(t=31.50, kind="agent", text="type a bit."),
-    dict(t=32.25, kind="user", text="ok. that's actually sick.", grid=BEAT / 4),
-    dict(t=36.00, kind="agent", text="done. go do something."),
+    dict(t=31.60, kind="agent", text="type a bit."),
+    dict(t=34.00, kind="user", text="ok. that's actually sick.", grid=BEAT / 4),
+    dict(t=37.75, kind="agent", text="done. go do something."),
 ]
 
 TYPE_CPS = 16.5    # typing speed, jittered per char
@@ -89,10 +89,10 @@ WRAP = 50          # terminal columns before a line wraps
 
 THREAD_TRAVEL = 0.55  # seconds a light thread takes from its terminal line to the rig
 
-COLLAPSE_T = 37.00   # terminal folds away
-DROP_T = 37.45       # its last light falls...
-DROP_LAND = 38.00    # ...and lands on the downbeat (nothing presses a key)
-ENDCARD_T = 38.45    # end card fades in
+COLLAPSE_T = 38.75   # terminal folds away
+DROP_T = 39.45       # its last light falls...
+DROP_LAND = 40.00    # ...and lands on the downbeat (nothing presses a key)
+ENDCARD_T = 40.45    # end card fades in
 TAGLINE = "your devices can figure it out."
 # Under the keyboard; the site is the repo's own homepage (gh repo view worflor/neuron).
 END_LINKS = ("www.woflo.dev/neuron", "code on github.com/worflor/neuron")
@@ -113,6 +113,8 @@ SHOTS = {
     "mute": ((-0.02, -0.92, 0.50), (0.0, 0.03, 0.06), 30),
     "top": ((0.285, -0.06, 0.62), (0.285, -0.03, 0.0), 34),
     "convo": ((0.0, -0.80, 0.30), (0.0, 0.16, 0.20), 28),
+    # The agent's reply, big enough to read before anything else happens.
+    "read": ((0.0, -0.62, 0.40), (0.0, 0.24, 0.26), 26),
     "hero0": ((-0.16, -0.30, 0.17), (-0.06, 0.01, 0.0), 32),
     "hero1": ((0.04, -0.31, 0.16), (0.10, 0.01, 0.0), 32),
     "end": ((0.0, -0.80, 0.40), (0.0, 0.08, 0.08), 28),
@@ -122,8 +124,9 @@ CAM_KEYS = [
     (9.50, "wide"), (10.35, "mouse"), (12.00, "mouse"), (12.80, "mute"),
     (14.90, "mute"), (15.50, "wide"),
     (17.00, "wide"), (17.85, "top"), (19.60, "top"), (20.50, "convo"),
-    (31.45, "convo"), (32.15, "hero0"), (35.40, "hero1"), (36.20, "wide"),
-    (37.30, "wide"), (39.60, "end"), (DURATION, "end"),
+    (31.25, "convo"), (31.95, "read"), (33.25, "read"),   # push in, hold on "type a bit."
+    (34.00, "hero0"), (37.15, "hero1"), (37.95, "wide"),   # swing to the board as typing starts
+    (39.05, "wide"), (41.60, "end"), (DURATION, "end"),
 ]
 
 # Which device the eye should be on: (time, subject). Spotlights and focus follow it. The mic takes
@@ -131,7 +134,7 @@ CAM_KEYS = [
 _BASE_SUBJECTS = [
     (0.0, None), (3.50, "mouse"), (3.75, "keyboard"), (4.00, "mic"), (4.80, "all"),
     (9.90, "mouse"), (12.30, "all"), (13.85, "mic"), (15.20, "all"), (17.40, "mouse"),
-    (20.20, "keyboard"), (31.40, "keyboard"), (36.80, "all"),
+    (20.20, "keyboard"), (31.40, "all"), (33.90, "keyboard"), (38.55, "all"),
 ]
 
 
