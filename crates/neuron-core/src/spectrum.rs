@@ -590,6 +590,72 @@ pub fn rainbow() -> Spectrum {
     ])
 }
 
+/// Named gradient presets for the spectrum editor's base-colour row: `(name, colours)` laid evenly
+/// across 0..1. `fire`, `aurora` and `thermal` mirror the stock Heat/Flow ramps so "fire on everything"
+/// is the same fire the patterns ship; `meadow` is Wildlife's meadow palette; `bubble` is a soap film,
+/// the colours of thin-film interference (n = 1.33, thickness 100-330 nm, normal incidence, CIE 1931
+/// observer, saturation x0.8).
+pub const GRADIENT_PRESETS: &[(&str, &[(u8, u8, u8)])] = &[
+    ("rainbow", &[(255, 0, 0), (255, 255, 0), (0, 255, 0), (0, 255, 255), (0, 0, 255), (255, 0, 255), (255, 0, 0)]),
+    ("fire", &[(180, 0, 0), (255, 90, 0), (255, 210, 40), (255, 255, 220)]),
+    ("aurora", &[(0, 200, 120), (0, 180, 200), (40, 80, 255), (150, 60, 220)]),
+    ("thermal", &[(72, 6, 2), (190, 22, 0), (255, 96, 0), (255, 200, 46), (255, 255, 255)]),
+    ("sunset", &[(52, 22, 104), (150, 34, 120), (232, 66, 98), (255, 138, 62), (255, 214, 140)]),
+    ("meadow", &[(12, 45, 34), (67, 190, 116), (206, 229, 128)]),
+    ("ice", &[(90, 130, 255), (130, 210, 255), (235, 250, 255)]),
+    ("bubble", &[(253, 249, 236), (244, 214, 143), (191, 109, 45), (77, 40, 178), (29, 173, 227), (192, 239, 191), (237, 220, 33)]),
+];
+
+/// The index of the gradient preset called `name`.
+#[must_use]
+pub fn gradient_index(name: &str) -> Option<usize> {
+    GRADIENT_PRESETS.iter().position(|g| g.0 == name)
+}
+
+/// The preset at `idx` as a palette (RGB blend, no motion), or `None` out of range.
+#[must_use]
+pub fn gradient_preset(idx: usize) -> Option<Palette> {
+    GRADIENT_PRESETS
+        .get(idx)
+        .map(|(_, cols)| Palette::gradient(cols.iter().map(|&(r, g, b)| Rgb::new(r, g, b)).collect()))
+}
+
+/// Named solids for [`palette_name`]: the nearest (by RGB distance) names a single colour.
+const COLOUR_NAMES: &[(&str, (u8, u8, u8))] = &[
+    ("black", (0, 0, 0)), ("white", (255, 255, 255)), ("grey", (128, 128, 128)),
+    ("red", (230, 30, 40)), ("crimson", (190, 0, 30)), ("orange", (255, 140, 0)),
+    ("amber", (255, 191, 0)), ("yellow", (255, 230, 0)), ("lime", (150, 230, 30)),
+    ("green", (40, 200, 70)), ("mint", (74, 242, 176)), ("teal", (0, 160, 160)),
+    ("cyan", (0, 220, 240)), ("sky", (100, 190, 255)), ("blue", (20, 90, 255)),
+    ("indigo", (70, 40, 200)), ("violet", (170, 80, 240)), ("magenta", (240, 40, 220)),
+    ("pink", (255, 90, 150)), ("brown", (120, 70, 30)),
+];
+
+/// A short human name for a palette: its preset's name when the stops match one, the nearest named
+/// colour for a solid, else `"custom"`.
+#[must_use]
+pub fn palette_name(p: &Palette) -> &'static str {
+    let near = |a: Rgb, b: (u8, u8, u8)| {
+        (i32::from(a.r) - i32::from(b.0)).abs().max((i32::from(a.g) - i32::from(b.1)).abs()).max((i32::from(a.b) - i32::from(b.2)).abs()) <= 2
+    };
+    if let [only] = p.stops.as_slice() {
+        let d = |n: &(u8, u8, u8)| {
+            let (dr, dg, db) = (i32::from(only.col.r) - i32::from(n.0), i32::from(only.col.g) - i32::from(n.1), i32::from(only.col.b) - i32::from(n.2));
+            dr * dr + dg * dg + db * db
+        };
+        return COLOUR_NAMES.iter().min_by_key(|(_, c)| d(c)).map_or("custom", |(n, _)| n);
+    }
+    for (name, cols) in GRADIENT_PRESETS {
+        let n = cols.len();
+        if p.stops.len() == n
+            && p.stops.iter().enumerate().all(|(i, s)| near(s.col, cols[i]) && (s.at - even_pos(i, n)).abs() < 0.01)
+        {
+            return name;
+        }
+    }
+    "custom"
+}
+
 // ─────────────────────────────────────── helpers ─────────────────────────────────────────
 
 /// Blend two stop colours by factor `f` (0..1) in the chosen [`Interp`] space — the one place the
@@ -1483,5 +1549,23 @@ mod tests {
         // an absent/unknown interp tag defaults to RGB.
         let d: Spectrum = serde_json::from_str(r#"{"stops":["FF0000","0000FF"]}"#).unwrap();
         assert_eq!(d.seq[0].palette.interp, Interp::Rgb);
+    }
+
+    #[test]
+    fn gradient_presets_are_real_ramps() {
+        for i in 0..GRADIENT_PRESETS.len() {
+            let p = gradient_preset(i).expect("in range");
+            assert!(p.stops.len() >= 3, "{} is a ramp", GRADIENT_PRESETS[i].0);
+            assert_eq!(p.stops[0].at, 0.0);
+            assert_eq!(p.stops.last().unwrap().at, 1.0);
+        }
+        assert!(gradient_preset(GRADIENT_PRESETS.len()).is_none());
+    }
+
+    #[test]
+    fn palettes_name_themselves() {
+        assert_eq!(palette_name(&gradient_preset(1).unwrap()), "fire");
+        assert_eq!(palette_name(&Palette::solid(Rgb::new(0x4A, 0xF2, 0xB0))), "mint");
+        assert_eq!(palette_name(&Palette::gradient(vec![Rgb::new(1, 2, 3), Rgb::new(9, 9, 9)])), "custom");
     }
 }

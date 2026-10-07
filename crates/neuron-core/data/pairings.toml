@@ -1,0 +1,66 @@
+# Hand-picked "effect with gradient" pairings, shown first on an effect's tile. `effect` is a preset
+# slug, `with` a gradient preset name (spectrum::GRADIENT_PRESETS). `params` sets the effect's knobs
+# for that chip and `on` names them on the chip. The math in pairing.rs fills any remaining slots
+# unless the effect is `closed`; a pin always outranks it and a `skip` is never offered. Unknown names
+# fail the pairing tests.
+
+# effects whose list is exactly their pins
+closed = ["fire"]
+
+[[pin]]
+effect = "comet"
+with = "rainbow"
+
+[[pin]]
+effect = "comet"
+with = "bubble"
+
+# the Comet `trails` toggle is its light painting
+[[pin]]
+effect = "comet"
+with = "sunset"
+params = { trails = 1 }
+on = "light painting"
+
+[[pin]]
+effect = "fire"
+with = "aurora"
+
+[[pin]]
+effect = "fire"
+with = "sunset"
+
+[[pin]]
+effect = "aurora"
+with = "fire"
+
+[[pin]]
+effect = "starlight"
+with = "rainbow"
+
+[[pin]]
+effect = "starlight"
+with = "bubble"
+
+[[pin]]
+effect = "ripple"
+with = "bubble"
+
+[[pin]]
+effect = "ripple"
+with = "sunset"
+
+[[pin]]
+effect = "typingheat"
+with = "rainbow"
+
+# Cascade's two modes are the rain pattern's `mode` knob: 0 = rain, 1 = matrix.
+[[pin]]
+effect = "cascade"
+with = "bubble"
+params = { mode = 1 }
+on = "matrix"
+
+[[pin]]
+effect = "cascade"
+with = "aurora"

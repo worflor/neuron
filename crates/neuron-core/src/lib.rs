@@ -84,6 +84,7 @@ pub mod manage;
 pub mod mic_state;
 pub mod obs_hook;
 pub mod pad;
+pub mod pairing;
 pub mod pattern;
 pub mod pocket;
 pub mod prof;
