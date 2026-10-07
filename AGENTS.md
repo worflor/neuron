@@ -223,7 +223,9 @@ effect looks right, your GUI control responds to a click, or your device write l
 So:
 
 - **GUI changes:** launch `neuron-app` and look at it. A screenshot in the PR is
-  worth more than a paragraph.
+  worth more than a paragraph. A Slint binding loop only fails when its element is drawn
+  in the state that reads it (hover-gated UI hides one from every unit test), so extend the
+  render smoke in `apptest.rs` when you add UI that changes on hover.
 - **Device / lighting changes:** the diagnostics bench on the SYSTEM page runs nine
   read-only probes against real hardware and is always safe. That is the "prove it
   works" surface. Name the hardware you tested on.

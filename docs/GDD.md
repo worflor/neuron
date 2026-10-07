@@ -79,7 +79,7 @@ razer's lighting hardware speaks two dialects, and neuron confirmed both live: t
 - **per-key custom frames** painted at the device's *true* LED count, one report per matrix row, never downsampled. you can paint directly on the device in the GUI.
 - **an open effects engine** that computes frames host-side for anything the firmware lacks.
 
-that last one is the fun part, and it just got rebuilt from the ground up. a custom effect is two halves that compose, a **pattern** and a **spectrum**:
+that last one is the fun part. a custom effect is two halves that compose, a **pattern** and a **spectrum**:
 
 ```rust
 trait Pattern { fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field; }

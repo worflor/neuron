@@ -14,6 +14,7 @@ two small executables, one shared core. no account, no cloud, no telemetry. no "
 | **platform** | windows app + CLI. linux app + CLI build from source, but the linux release is deferred and hardware control is unverified; no mac |
 | **hardware** | razer mice + keyboards over raw HID; daily-driven and hardware-verified on a Naga V2 Pro + BlackWidow Chroma V2. other `razer_report` devices need their own checks. experimental Logitech HID++ discovery is read-only and has no hardware verification |
 | **install** | use the windows installer or unpack its portable zip anywhere writable, or build from source: `cargo build --release` |
+| **built to hold** | one trigger → action engine for every input; every device write reads itself back and fails loudly on a mismatch; tests cannot arm input or reach hardware; every wire fact has a graded entry in a [protocol ledger](crates/neuron-core/protocol/ledger.toml) |
 | **footprint** | no vendor driver, account, or cloud; your config is plain TOML |
 | **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
 
@@ -82,18 +83,34 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 
 <p align="center"><img src="docs/media/lighting-aurora-loop.webp" alt="The lighting page: an aurora effect running on the keyboard render while every catalog tile plays its own preview" width="100%"></p>
 
+<table>
+<tr>
+<td width="50%"><img src="docs/media/effect-fire-aurora.webp" alt="Fire running through the aurora gradient on a keyboard"><br><sub><b>fire</b> in aurora</sub></td>
+<td width="50%"><img src="docs/media/effect-typing-heat-rainbow.webp" alt="Typing Heat in rainbow, a sentence spreading heat across the keys"><br><sub><b>typing heat</b> in rainbow, a sentence being typed</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/media/effect-ripple-bubble.webp" alt="Ripple in the bubble gradient, rings spreading from each keystroke"><br><sub><b>ripple</b> in bubble</sub></td>
+<td width="50%"><img src="docs/media/effect-cascade-bubble.webp" alt="Cascade in matrix mode with the bubble gradient"><br><sub><b>cascade</b> in matrix mode, in bubble</sub></td>
+</tr>
+</table>
+
+<p align="center"><sub>each is one chip on its tile. these are neuron's own pattern-engine frames on a generic keyboard model rendered in Blender, not a photo; the optics are an estimate.</sub></p>
+
 <p align="center"><img src="docs/media/device-feel.webp" alt="The device page: dpi with its stage table on the fader, the side plate readout, and the verify-gated shelf for unconfirmed writes" width="100%"></p>
 
 | | |
 |---|---|
 | **[talks to your gear](docs/GDD.md#talks-to-your-gear)** | dpi (single or the whole stage table), polling to 8000 Hz where the hardware has it, brightness, idle timer, scroll stage, lift-off distance, onboard storage, battery. reads decode the device's own bytes and match synapse byte-for-byte. no driver, no vendor SDK: razer's control collection answers feature reports on an access-zero handle, and that one trick is the whole foundation. |
-| **[lighting](docs/GDD.md#lighting)** | native firmware effects invoked by their real effect-id, per-key frames painted at the device's true LED count, and an open effects engine where a look is a **pattern** (shape and motion) composed with a **spectrum** (colour as a whole program). presets are pure data, from fire and aurora to Wildlife's seasonal cellular habitat. live vitals drop in as another layer in the same stack. |
+| **[lighting](docs/GDD.md#lighting)** | native firmware effects invoked by their real effect-id, per-key frames painted at the device's true LED count, and an open effects engine where a look is a **pattern** (shape and motion) composed with a **spectrum** (colour as a whole program). presets are pure data, from fire and aurora to Wildlife's seasonal cellular habitat. eight gradients drop onto any effect in one click, and each tile suggests pairings (comet in rainbow, fire in aurora, Cascade's matrix mode in bubble). live vitals drop in as another layer in the same stack. |
 | **[audio](docs/GDD.md#audio)** | mute and gain for any mic or output, and flipping your default device, from a binding. your mic's mute is itself a trigger. |
 | **[actions](docs/reference/CLI.md#triggers-and-actions)** | absolute mic gain stays distinct from relative nudges; dial actions can scroll at the pointer or at a hold-anchored window. Undo restores the last successful audio, profile, or app lighting change only while its resource still matches. |
 | **[the spine](docs/GDD.md#the-spine)** | binds, hypershift layers with four stances (hold · latch · smart · one-shot), side-plate layers that scope binds to the plate actually seated on the mouse, and app-aware profile switching with a fallback so closing a game puts you back. |
 | **[spellweaving](docs/GDD.md#spellweaving)** | hold, weave a stroke, release, and it fires as a real keybind. recognised by **eigenmotion** — a stroke fit as a damped complex oscillator, where the eigenvalues are the stroke's identity, so it's invariant to where you drew it, how big, and how fast. the same capture drives a family of instruments: teleport, tether, whiteboard, glance, window verbs, dial, knockback, control. |
 | **[macros & beacons](docs/GDD.md#macros--beacons)** | bundled CPython starts on demand and stays **warm** in two authority domains: new macros are BOUND to Neuron's brokered capabilities, while `# neuron: raw` is the explicit full-Python escape hatch. every macro gets a frozen trigger snapshot, persistent state, macro composition, and beacons; RAW and BOUND never share an interpreter. don't want to write Python? the block builder edits the same source document and preserves module-level code/metadata while you work visually. |
 | **[life after synapse](docs/GDD.md#life-after-synapse)** | import your synapse export (it's a zip of plaintext XML), purge synapse off the machine properly, and point `neuron discover` at hardware it's never seen to fingerprint it into a TOML. |
+| **[any controller](docs/GDD.md#controllers-and-anything-else-with-buttons)** | gamepads, mice, keyboards and macro pads all become the same bindable controls, read from each device's own report descriptor. a stick can aim the radial; Xbox-protocol pads get rumble. windows only for now. |
+| **[plays with games and RGB tools](docs/reference/PROTOCOL-HOST.md)** | games on the Chroma SDK and tools that speak OpenRGB paint through neuron's lighting arbiter instead of fighting it, with your own lighting underneath; a Chroma lab splits a game's frames into ambient, held keys and effects. early, and off until you enable it in SYSTEM → CONNECTIONS. |
+| **[scriptable](docs/reference/CLI.md)** | `neuron <noun> <verb>`: everything the app can author, with `--json`, validated writes, and a running app reloading within a second. built to be driven by an agent as much as by hand. |
 | **[the app](docs/GDD.md#the-app)** | a tray-resident GUI in four sections — device, lighting, input, system — plus profiles as one object: its settings, its lighting, and its binds. |
 
 <p align="center"><img src="docs/media/macro-blocks.webp" alt="The macro workshop in blocks view: press, ask, then a yes branch and a no branch" width="100%"></p>
