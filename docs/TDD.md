@@ -634,7 +634,7 @@ Coverage that already exists:
 - Controls runtime assembly from bindings/cast/app rules/sidecars.
 - Profile parsing/apply helpers and cycle index behavior.
 - Device write payload builders and gated unsupported writes.
-- Slint callback smoke and state-drive tests in `crates/neuron-app/src/apptest.rs`.
+- Slint callback smoke and state-drive tests in `crates/neuron-app/src/apptest.rs`, including a render smoke that draws the lighting page with the software renderer, hovers a pairing chip and fails on a Slint binding loop (which only fires when the element is drawn in the state that reads it).
 - Runtime diagnostics behavior without hardware.
 - Macro Host protocol/e2e tests, including opt-in system-Python fallback for tests.
 - Gesture/radial/rhythm/twin/scene/overlay helper tests.
