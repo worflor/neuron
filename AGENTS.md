@@ -71,6 +71,7 @@ one).
 | You're helping a *user* install, update, or run neuron, not changing its code | [`skills/neuron-lazy-update/SKILL.md`](skills/neuron-lazy-update/SKILL.md) |
 | You're writing a Python macro or using beacons | [`skills/neuron-macros/SKILL.md`](skills/neuron-macros/SKILL.md) |
 | You're setting up or changing a user's binds, lighting, profiles or whole setup through the CLI | [`skills/neuron-cli/SKILL.md`](skills/neuron-cli/SKILL.md), reference in [`docs/reference/CLI.md`](docs/reference/CLI.md) |
+| You're making or revising a promo / ad video | [`skills/neuron-promo/SKILL.md`](skills/neuron-promo/SKILL.md) |
 
 **The code is the source of truth.** `docs/TDD.md` and `docs/reference/PROTOCOL-HOST.md` both
 carry a banner saying an LLM wrote them while building neuron. That banner is

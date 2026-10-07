@@ -42,29 +42,37 @@ def ease(k):
     return k * k * (3 - 2 * k)
 
 
-_typed = tl.typed_chars()
-USER_TIMES = {}
-_i = 0
-for idx, line in enumerate(tl.SCRIPT):
-    if line["kind"] == "user":
-        n = len(line["text"])
-        USER_TIMES[idx] = [t for t, _ in _typed[_i:_i + n]]
-        _i += n
+USER_TIMES = {idx: tl.line_times(line) for idx, line in enumerate(tl.SCRIPT) if line["kind"] in ("user", "voice")}
 
 
 def commit_time(idx):
     line = tl.SCRIPT[idx]
-    if line["kind"] == "user":
-        return USER_TIMES[idx][-1] + 0.18
+    if line["kind"] in ("user", "voice"):
+        return tl.commit_time(line)
     return line["t"]
 
 
 def speaker(kind):
-    return {"user": "user", "agent": "agent"}.get(kind, "tool")
+    return {"user": "user", "voice": "user", "agent": "agent"}.get(kind, "tool")
 
 
 def indent(kind):
-    return {"user": 2, "agent": 0, "tool": 2, "out": 2, "cont": 4}[kind]
+    return {"user": 2, "voice": 2, "agent": 0, "tool": 2, "out": 2, "cont": 4}[kind]
+
+
+def waveform(d, x, y, t, live, bars=7):
+    """Speech bars beside a spoken line: moving while it is heard, still once it is text."""
+    w = CHAR_W * 0.26
+    for i in range(bars):
+        if live:
+            a = 0.25 + 0.75 * abs(math.sin(t * (7.0 + i * 1.7) + i * 1.3)) * (0.6 + 0.4 * math.sin(t * 3.1 + i))
+        else:
+            a = (0.35, 0.6, 0.9, 0.55, 0.75, 0.4, 0.3)[i % 7]
+        h = LINE_H * 0.62 * max(0.12, a)
+        cx = x + i * w * 1.9
+        cy = y + LINE_H * 0.5
+        d.rounded_rectangle([cx, cy - h / 2, cx + w, cy + h / 2], radius=w / 2,
+                            fill=rgb(tl.LISTEN, 0.9 if live else 0.45))
 
 
 def rows_of(idx):
@@ -152,10 +160,12 @@ def draw_row(d, idx, r, y, t):
         bg = mix(rgb(tl.BG2), rgb(tl.ACCENT), 0.10 * h)
         d.rectangle([PAD_X - 34, y + 4, TW - PAD_X + 20, y + LINE_H - 4], fill=bg)
         d.rectangle([PAD_X - 34, y + 4, PAD_X - 28, y + LINE_H - 4], fill=mix(rgb(tl.BG2), rgb(tl.ACCENT), h))
-    if kind == "user":
+    if kind in ("user", "voice"):
         if r == 0:
             d.text((x, ty), ">", font=FONT_B, fill=rgb(tl.LISTEN, 0.85))
         d.text((x + CHAR_W * 2, ty), text, font=FONT, fill=rgb(tl.TEXT, 0.92))
+        if kind == "voice" and r == len(rows_of(idx)) - 1:
+            waveform(d, x + CHAR_W * (3 + len(text)), y, t, live=False)
     elif kind == "agent":
         d.text((x, ty), text, font=FONT, fill=rgb(tl.TEXT))
     elif kind == "tool":
@@ -175,7 +185,8 @@ def draw_row(d, idx, r, y, t):
 
 def typing_line(t):
     for idx, times in USER_TIMES.items():
-        if times[0] - 0.001 <= t < commit_time(idx):
+        start = tl.SCRIPT[idx]["t"] if tl.SCRIPT[idx]["kind"] == "voice" else times[0]
+        if start - 0.001 <= t < commit_time(idx):
             return idx, sum(1 for ct in times if ct <= t)
     return None, 0
 
@@ -186,7 +197,7 @@ def render(f, scroll, pending, anchors):
     d = ImageDraw.Draw(img)
     d.rounded_rectangle([3, 3, TW - 4, TH - 4], radius=34, outline=rgb(tl.LINE), width=4)
     d.rectangle([PAD_X, 44, PAD_X + 16, 60], fill=rgb(tl.ACCENT, 0.9))
-    d.text((PAD_X + 34, 30), "neuron", font=FONT_TAB, fill=rgb(tl.TEXT_FAINT))
+    d.text((PAD_X + 34, 30), tl.AGENT_LABEL, font=FONT_TAB, fill=rgb(tl.TEXT_FAINT))
 
     rows, _ = layout(t)
     top = PAD_TOP - scroll
@@ -224,7 +235,9 @@ def render(f, scroll, pending, anchors):
     if text:
         d.text((PAD_X + CHAR_W * 2, ty), text, font=FONT, fill=rgb(tl.TEXT))
     cx = PAD_X + CHAR_W * (2 + len(text))
-    if (typing or (t % 1.0) < 0.55) and t < tl.COLLAPSE_T:
+    if typing and tl.SCRIPT[idx]["kind"] == "voice":
+        waveform(d, PAD_X + CHAR_W * (3 + len(text)), py, t, live=True)
+    elif (typing or (t % 1.0) < 0.55) and t < tl.COLLAPSE_T:
         d.rectangle([cx, py + 12, cx + CHAR_W * 0.92, py + LINE_H - 12], fill=rgb(tl.LISTEN, 0.9))
 
     k = ease((t - 0.05) / 0.55)
