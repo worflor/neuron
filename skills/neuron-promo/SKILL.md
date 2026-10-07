@@ -48,6 +48,10 @@ Neuron's brand is honesty about hardware, so the ad cannot fake the product.
 - **Tell the eye where to look before something happens.** The acting terminal line gets an accent
   bar until its effect lands; threads carry a bright head; a ring blooms where they land; the
   subject device gets its spotlight while the rest dims; the camera arrives first and holds after.
+- **Let the viewer read before the next thing happens.** A line the story turns on (the agent's
+  "type a bit.") gets its own shot: push in, hold about a second and a half with the text legible
+  and nothing else moving, then swing to the effect. Never start the camera move, or the
+  next action, while the line is still streaming in.
 - **Cut to the music.** Put the timeline on a beat grid (dev ad: 120 BPM, 2 s bars) and land
   thread arrivals on beats. Layers enter as the story earns them; a rejection can stop the tape.
 - **Comedy is the agent being dry**, never a mascot. Short lines, terminal-first, no yap.
@@ -87,3 +91,8 @@ the RTX 3060. Check free space on C: and D: before long renders.
 - `PROMO_FPS` 30 with motion blur (shutter 0.25) reads smoother than it sounds; heavy blur smears text.
 - Harmonia `delay` takes `delay_ms`, not beats; lint warns on unknown params, read the warnings.
 - PowerShell here-strings drop the trailing newline: re-read a file after scripted splices.
+- Hard-coded seconds in a downstream script (gen_music had `REVEAL = 32.0`) silently desync from a
+  retimed timeline. Derive every time from `timeline.py`.
+- After a retime, only the frames after the first changed moment need rendering: re-render one early
+  frame and diff it against the old one (max difference <= 1/255 is render noise), then delete from
+  just before the change and `--resume`.

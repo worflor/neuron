@@ -1,6 +1,6 @@
 # Dev ad: "i'm lazy. set up my devices."
 
-A 42-second vertical (1080×1920, 30 fps) promo for developers. One continuous Blender shot: a
+A 44-second vertical (1080×1920, 30 fps) promo for developers. One continuous Blender shot: a
 terminal pane floats behind the rig, an agent drives the `neuron` CLI, and each command sends a
 thread of light from its line to the device it configures.
 
