@@ -1,6 +1,6 @@
 # Dev ad: "i'm lazy. set up my devices."
 
-A 41-second vertical (1080×1920, 30 fps) promo for developers. One continuous Blender shot: a
+A 42-second vertical (1080×1920, 30 fps) promo for developers. One continuous Blender shot: a
 terminal pane floats behind the rig, an agent drives the `neuron` CLI, and each command sends a
 thread of light from its line to the device it configures.
 
@@ -22,10 +22,16 @@ Draft, not approved for publication.
   scan). The mouse and mic are stylised stand-ins.
 - Sound is synthesized from the same timeline (`gen_audio.py`); tool-call blips use the soft-pulse
   FM construction from `crates/neuron-core/src/tone.rs`.
+- The score is a chiptune composed in Harmonia (`gen_music.py`) on the timeline's 120 BPM grid:
+  each layer enters when its cause lands, "too animated." stops the tape, and the reveal is the
+  loudest section.
+- The "looks basic" complaint is spoken (transcribed beside a waveform), so no key moves and the
+  board stays idle until "type a bit."
 
 ## Build
 
-All timing, shots and attention cues live in `timeline.py`. Output goes to
+All timing, shots, attention cues and the beat grid live in `timeline.py`. Direction rules for
+this and future ads: [`skills/neuron-promo`](../../../skills/neuron-promo/SKILL.md). Output goes to
 `D:\build-cache\promo\dev-ad` (`PROMO_OUT`).
 
 ```powershell
@@ -33,8 +39,9 @@ $env:CARGO_TARGET_DIR = "D:\build-cache\promo\target"
 cargo build --release --manifest-path ..\pattern-export\Cargo.toml
 python gen_terminal.py      # term/#####.png + anchors.json
 python gen_lighting.py      # lighting.npz, through the real pattern engine
-python gen_audio.py         # audio.wav
-& D:\tools\blender-5.2.2-windows-x64\blender.exe -b --factory-startup --python build_scene.py -- --resume --out D:\build-cache\promo\dev-ad\render2
+& C:\Users\Micha\Documents\Projects\Harmonia\.venv\Scripts\python.exe gen_music.py   # music.wav
+python gen_audio.py         # audio.wav (sound design + the score)
+& D:\tools\blender-5.2.2-windows-x64\blender.exe -b --factory-startup --python build_scene.py -- --resume --out D:\build-cache\promo\dev-ad\render3
 python assemble.py          # end card + audio -> neuron-dev-ad.mp4
 ```
 

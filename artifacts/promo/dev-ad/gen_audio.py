@@ -213,14 +213,6 @@ place(fall, tl.DROP_T, 0.0, 0.05)
 place(bell(penta(5), 2.2), tl.DROP_LAND, 0.2, 0.22)
 place(fm(penta(-5), 2.5, ratio=0.5, index=1.5, index_tau=0.4, attack=0.01, t60=2.0), tl.DROP_LAND, 0.0, 0.20)
 
-# End card: a soft pad swelling under the wordmark.
-pad = np.zeros(N)
-for semis in (-21, -14, -9, -2, 3):
-    f = hz(semis)
-    pad += np.sign(np.sin(2 * np.pi * f * t_all)) * 0.2 + np.sin(2 * np.pi * f * 1.003 * t_all)
-pad = signal.lfilter(*signal.butter(2, 900 / (SR / 2)), pad)
-sw = np.clip((t_all - tl.ENDCARD_T) / 1.6, 0, 1) ** 2 * np.clip((tl.DURATION - t_all) / 1.2, 0, 1)
-MIX += np.vstack([pad, np.roll(pad, 523)]) * sw * 0.045
 
 # --- space and master ----------------------------------------------------------------------------
 ir_n = int(1.3 * SR)
@@ -231,8 +223,35 @@ for ir in irs:
 wet = np.vstack([signal.fftconvolve(MIX[c], irs[c])[:N] for c in range(2)])
 wet *= 0.18 / np.abs(wet).max() * np.abs(MIX).max()
 out = MIX + wet
-fade = np.clip((tl.DURATION - t_all) / 0.6, 0, 1)
+
+# --- the score (gen_music.py, Harmonia) ----------------------------------------------------------
+MUSIC_GAIN = 0.62
+TAPE_STOP_S = 0.45
+music_path = os.path.join(tl.OUT, "music.wav")
+if os.path.exists(music_path):
+    msr, m = wavfile.read(music_path)
+    m = m.astype(np.float64)
+    if np.abs(m).max() > 2:
+        m /= 32767.0
+    m = signal.resample_poly(m, SR, msr, axis=0).T
+    m = np.pad(m, ((0, 0), (0, max(0, N - m.shape[1]))))[:, :N]
+    # "too animated.": the tape slows to a stop, then a breath before the vamp.
+    too = next(l for l in tl.SCRIPT if l["text"] == "too animated.")
+    stop = tl.commit_time(too)
+    i0, i1, i2 = int(stop * SR), int((stop + TAPE_STOP_S) * SR), int((stop + 0.5) * SR)
+    u = np.arange(i1 - i0) / (i1 - i0)
+    pos = i0 + np.cumsum((1 - u) ** 2)
+    for c in range(2):
+        m[c, i0:i1] = np.interp(pos, np.arange(N), m[c]) * (1 - u ** 3)
+    m[:, i1:i2] = 0.0
+    out = out + m * MUSIC_GAIN
+else:
+    print("no music.wav: run gen_music.py with Harmonia's python first")
+fade =np.clip((tl.DURATION - t_all) / 0.6, 0, 1)
 out *= fade
+# A gentle soft clip gives the quiet sections body without hard peaks.
+out *= 1.7 / np.abs(out).max()
+out = np.tanh(out) / np.tanh(1.7)
 out *= 10 ** (-1.0 / 20) / np.abs(out).max()
 
 rms = 20 * np.log10(np.sqrt((out ** 2).mean()))

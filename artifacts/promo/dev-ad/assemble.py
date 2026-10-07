@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, os.path.dirname(__file__))
 import timeline as tl
 
-SRC = os.path.join(tl.OUT, os.environ.get("PROMO_RENDER", "render2"))
+SRC = os.path.join(tl.OUT, os.environ.get("PROMO_RENDER", "render3"))
 DST = os.path.join(tl.OUT, "final")
 MP4 = os.path.join(tl.OUT, "neuron-dev-ad.mp4")
 WORD = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", 132)
