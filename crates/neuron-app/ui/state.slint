@@ -15,7 +15,7 @@ import {
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
-    SpectrumStop, SpectrumFrame,
+    SpectrumStop, SpectrumFrame, GradientPreset, PairChip,
     ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene,
     LightingLayerChoice, LightingPresetChoice
 } from "models.slint";
@@ -317,6 +317,7 @@ export global State {
     in-out property <bool> light-is-readout: false;   // the SELECTED layer is a live device readout (vitals), not a tunable effect
     callback set-light-fps(float);                     // re-pace the live stream + preview together (1–30)
     callback tile-preview-tick();                     // re-render the grid swatches (animated, ~throttled)
+    callback pick-pair(string, int);                  // (effect slug, gradient idx) — pick the tile with that gradient
     callback pick-tile(string);                       // slug → make it the active single effect, play on render + show knobs
     callback set-param-range(string, float);          // (param key, value) — a slider edit
     callback set-param-enum(string, int);             // (param key, index) — a segment edit
@@ -391,6 +392,10 @@ export global State {
     // GRADIENT INTERPOLATION — how colour blends between stops. "rgb" (default, predictable) | "hsv"
     // (perceptual: the shortest hue path, so 2-stop+ gradients stay vivid). Per active-frame palette.
     in-out property <string> light-interp: "rgb";      // rgb | hsv
+    in-out property <[GradientPreset]> gradient-presets;   // the base-colour gradient chips (built once at startup)
+    in-out property <[string]> light-name-chars;           // the palette's name, one string per character
+    in-out property <[color]> light-name-ramp;             // the palette sampled forward-then-back (a seamless loop) for the name's flow
+    callback apply-gradient(int);                      // preset idx — swap the active palette's stops, keep motion + blend
     callback set-interp(string);                        // rgb | hsv — the gradient colour space
     // TIMELINE / sequencer — the keyframe track. The model `light-seq` is the SINGLE source of truth for
     // the frame count: `light-seq.length` 1 = no sequence (the timeline collapses); >1 = a sequence, with

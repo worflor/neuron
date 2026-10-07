@@ -205,6 +205,12 @@ export struct EffectRow {
 // the MATERIAL-card pattern applied to lighting. `slug` is the stable id the picker passes back;
 // `kind` groups the tile ("effect" | "data" | "stub"); `swatch` is the rendered preview image (the
 // tile IS the effect, running). Selection is derived in the view (slug == State.light-effect).
+export struct PairChip {
+    name: string,        // the gradient's name ("aurora")
+    swatch: image,       // the gradient ramp
+    pair: int,           // index into pairing::pairings_for(slug)
+}
+
 export struct EffectTile {
     name: string,        // human label ("Breathing", "Vitals")
     slug: string,        // generator/data id ("breathing", "vitals")
@@ -212,6 +218,7 @@ export struct EffectTile {
     blurb: string,       // one plain-words line: what this look IS / what feeds it
     source: string,      // the named real-world feed ("keys", "audio", "battery", …; "" = none)
     swatch: image,       // a live (or demo) preview of this tile, rendered Rust-side
+    pairs: [PairChip],   // suggested gradients for this effect (pins first); empty = none
 }
 
 // One auto-rendered PARAM control for the selected effect — the weave-knobs pattern applied to
@@ -249,6 +256,11 @@ export struct SpectrumStop {
 // One KEYFRAME in the active layer's spectrum SEQUENCE — the timeline track's unit. A frame holds its
 // palette for `hold` seconds after crossfading IN from the previous frame over `fade` seconds (eased).
 // `swatch` is a rendered strip of the frame's palette (the timeline chip). seq length 1 = no sequence.
+export struct GradientPreset {
+    name: string,
+    swatch: image,       // the preset ramp, rendered Rust-side
+}
+
 export struct SpectrumFrame {
     idx: int,            // position in the sequence (the address the frame setters use)
     hold: float,         // dwell seconds

@@ -23,7 +23,7 @@ use crate::runtime::AppRuntime;
 use crate::ui::{
     AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, ClipboardOperationRow, ClipboardVariable, DeviceRow, DiagRow, EffectParam,
     EffectRow, EffectTile, GlyphChip, ImportLine, KnobRow, LightingLayerChoice, LightingPresetChoice, MacroBlock, MacroCard, MaterialCard, OrganRow,
-    PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame,
+    PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame, GradientPreset, PairChip,
     SpectrumStop,
     State, Theme,
 };
@@ -2642,7 +2642,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     // into the stack. Vitals is just another preset now — no data-mode fork.
                     let readout = {
                         let mut s = sh.borrow_mut();
-                        let layer = preset_layer(&slug);
+                        let layer = PAIR_PICK
+                            .take()
+                            .and_then(|i| {
+                                let p = neuron::pairing::pairings_for(&slug).into_iter().nth(i)?;
+                                neuron::pairing::pairing_layer(&slug, &p)
+                            })
+                            .unwrap_or_else(|| preset_layer(&slug));
                         if s.light_layers.is_empty() {
                             // single-effect default — no layer ceremony.
                             s.light_layers.push(layer);
@@ -2688,6 +2694,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     flush_lighting_save();
                     app.global::<State>()
                         .set_status_line(format!("lighting → {slug}").into());
+                }
+            });
+        }
+        // pick-pair(slug, gradient): the tile pick, with the gradient swapped in — same path, same stack.
+        {
+            let w = app.as_weak();
+            app.global::<State>().on_pick_pair(move |slug, pair| {
+                if let Some(app) = w.upgrade() {
+                    PAIR_PICK.set(Some(pair.max(0) as usize));
+                    app.global::<State>().invoke_pick_tile(slug);
+                    PAIR_PICK.set(None);
                 }
             });
         }
@@ -2943,6 +2960,30 @@ pub fn install(app: &AppWindow) -> SharedRt {
             });
         }
         // the INTERPOLATION toggle — set the active palette's gradient colour space (rgb | hsv).
+        {
+            let presets: Vec<GradientPreset> = (0..neuron::spectrum::GRADIENT_PRESETS.len())
+                .filter_map(|i| {
+                    neuron::spectrum::gradient_preset(i).map(|p| GradientPreset {
+                        name: neuron::spectrum::GRADIENT_PRESETS[i].0.into(),
+                        swatch: palette_strip_image(&p),
+                    })
+                })
+                .collect();
+            app.global::<State>().set_gradient_presets(ModelRc::new(VecModel::from(presets)));
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_apply_gradient(move |idx| {
+                if let (Some(app), Some(p)) = (w.upgrade(), neuron::spectrum::gradient_preset(idx.max(0) as usize)) {
+                    let pattern = {
+                        let s = sh.borrow();
+                        s.light_layers.get(s.selected_layer).map(|l| l.pattern.clone()).unwrap_or_default()
+                    };
+                    let p = neuron::pairing::palette_for_pattern(&pattern, p);
+                    edit_active_palette(&app, &sh, |pal| pal.stops = p.stops);
+                    app.global::<State>().set_light_sel_stop(0);
+                }
+            });
+        }
         {
             let w = app.as_weak();
             let sh = sh.clone();
@@ -10127,6 +10168,7 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
         blurb: row.spec.blurb.into(),
         source: row.spec.source.into(),
         swatch: frame_to_preview(&row.frame, ru, cu),
+        pairs: pair_chips(row.spec.slug),
     };
     // THREE shelf models (effects / input-driven / data-fed), each updated the same way. UPDATE rows
     // IN PLACE, never replace a model: swapping the ModelRc destroys + recreates every `for`-item in
@@ -10238,6 +10280,7 @@ fn render_user_effect_tiles(app: &AppWindow, sh: &SharedRt, reload: bool) {
                 blurb: user_effect_blurb(&layers_blurb(&effect.layers), &effect.tags).into(),
                 source: String::new().into(),
                 swatch: frame_to_preview(&frame, usize::from(rows), usize::from(cols)),
+                pairs: ModelRc::default(),
             });
         }
     });
@@ -10461,6 +10504,7 @@ fn clear_spectrum_surface(app: &AppWindow) {
     st.set_light_active_frame(0);
     st.set_light_motion("hold".into());
     st.set_light_interp("rgb".into());
+    st.set_light_name_chars(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
 }
 
 /// Project a spectrum into the State spectrum-editor surface: the ACTIVE frame's palette stops +
@@ -10504,6 +10548,20 @@ fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_fra
     st.set_light_motion_chaos(chaos);
     // gradient interpolation space (rgb default | hsv perceptual)
     st.set_light_interp(palette.interp.as_str().into());
+    // the palette's name, drawn in the palette: one string per char + the palette sampled forward then
+    // back (a seamless loop for the hover flow)
+    st.set_light_name_chars(ModelRc::new(VecModel::from(
+        neuron::spectrum::palette_name(palette).chars().map(|c| SharedString::from(c.to_string())).collect::<Vec<_>>(),
+    )));
+    const RAMP: usize = 24;
+    let ramp: Vec<slint::Color> = (0..RAMP)
+        .chain((0..RAMP).rev())
+        .map(|j| {
+            let c = palette.sample(j as f32 / (RAMP - 1) as f32);
+            slint::Color::from_rgb_u8(c.r, c.g, c.b)
+        })
+        .collect();
+    st.set_light_name_ramp(ModelRc::new(VecModel::from(ramp)));
     // timeline — one chip per frame (a live strip of its palette)
     let seq: Vec<SpectrumFrame> = sp
         .seq
@@ -10520,6 +10578,34 @@ fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_fra
     st.set_light_seq(ModelRc::new(VecModel::from(seq)));
     st.set_light_active_frame(fr as i32);
     st.set_light_loop(sp.play.as_str().into());
+}
+
+thread_local! {
+    /// The pairing (index into `pairings_for(slug)`) a `pick-pair` is applying, read once by the
+    /// `pick-tile` it triggers.
+    static PAIR_PICK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Per-effect suggestion chips, built once so a tile's row rewrite reuses the same model.
+    static PAIR_CHIPS: std::cell::RefCell<std::collections::HashMap<&'static str, ModelRc<PairChip>>> = Default::default();
+}
+
+/// The suggested-gradient chips for an effect slug (empty model when it has none).
+fn pair_chips(slug: &'static str) -> ModelRc<PairChip> {
+    PAIR_CHIPS.with(|c| {
+        c.borrow_mut()
+            .entry(slug)
+            .or_insert_with(|| {
+                let chips: Vec<PairChip> = neuron::pairing::pairings_for(slug)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| {
+                        let pal = neuron::spectrum::gradient_preset(p.gradient)?;
+                        Some(PairChip { name: p.label().into(), swatch: palette_strip_image(&pal), pair: i as i32 })
+                    })
+                    .collect();
+                ModelRc::new(VecModel::from(chips))
+            })
+            .clone()
+    })
 }
 
 /// Render a small horizontal strip of a palette (the timeline frame chip) — samples the gradient across

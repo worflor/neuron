@@ -939,3 +939,75 @@ fn a_device_push_lands_on_the_view_without_stomping_an_edit() {
     assert_eq!(row_dpi(&app), "30000");
     assert_eq!(st.get_dpi(), 30000.0);
 }
+
+// ── RENDER SMOKE ───────────────────────────────────────────────────────────────────────────────
+// Slint evaluates bindings lazily, so a binding loop (`Recursion detected`) never fires on a
+// property set; it fires when the element is DRAWN in the state that reads the loop. The pairing
+// drawer only reads its hover bindings while hovered, so this renders the lighting page, finds a
+// chip by its (unique) swatch colour in the frame, moves the pointer onto it and across its
+// capsules, and draws again each time. A loop fails here instead of in the running app.
+
+const CHIP_MARK: (u8, u8, u8) = (255, 0, 255);
+
+fn marked_chip(name: &str, gradient: i32) -> crate::ui::PairChip {
+    let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(22, 8);
+    buf.make_mut_slice().fill(slint::Rgba8Pixel { r: CHIP_MARK.0, g: CHIP_MARK.1, b: CHIP_MARK.2, a: 255 });
+    crate::ui::PairChip { name: name.into(), swatch: slint::Image::from_rgba8(buf), pair: gradient }
+}
+
+/// Top-left-most pixel of the chip mark in a frame.
+fn find_mark(shot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>) -> Option<(u32, u32)> {
+    let w = shot.width();
+    shot.as_slice().iter().position(|p| (p.r, p.g, p.b) == CHIP_MARK).map(|i| (i as u32 % w, i as u32 / w))
+}
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn lighting_page_draws_pairing_chips_hovered_and_not() {
+    use crate::ui::EffectTile;
+    use slint::platform::WindowEvent;
+    use slint::{LogicalPosition, ModelRc, VecModel};
+    // the GPU renderer cannot snapshot without a running event loop; the software one can. Each GUI
+    // test owns its process, so choosing the backend here cannot leak into another test.
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let st = app.global::<State>();
+    let tile = |slug: &str, names: &[&str]| EffectTile {
+        name: slug.into(),
+        slug: slug.into(),
+        kind: "effect".into(),
+        blurb: "a look".into(),
+        source: "".into(),
+        swatch: slint::Image::default(),
+        pairs: ModelRc::new(VecModel::from(
+            names.iter().enumerate().map(|(i, n)| marked_chip(n, i as i32)).collect::<Vec<_>>(),
+        )),
+    };
+    st.set_light_tiles(ModelRc::new(VecModel::from(vec![
+        tile("fire", &["aurora", "sunset", "bubble", "meadow", "ice"]),
+        tile("comet", &["rainbow"]),
+    ])));
+    // the catalog only draws once a lighting surface exists: a selected, lit-capable board with a grid
+    st.set_selected_device(0);
+    st.set_selected_device_name("Test Board".into());
+    st.set_sel_can_light(true);
+    st.set_grid_rows(6);
+    st.set_grid_cols(22);
+    st.set_page(1);
+    st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(1240.0, 1100.0));
+    app.show().expect("show the window");
+    let cold = app.window().take_snapshot().expect("a frame is drawn");
+    let (x, y) = find_mark(&cold).expect("a chip is on the page");
+    let at = |dx: f32| WindowEvent::PointerMoved { position: LogicalPosition::new(x as f32 + dx, y as f32 + 3.0) };
+    // onto the first capsule, then across the drawer as it opens (the drawer animates, so a few
+    // frames), then back out
+    for dx in [3.0, 3.0, 30.0, 56.0, 82.0, 3.0] {
+        app.window().dispatch_event(at(dx));
+        app.window().take_snapshot().expect("a hovered frame is drawn");
+    }
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    let after = app.window().take_snapshot().expect("a frame after the pointer leaves");
+    assert!(after.as_bytes().len() == cold.as_bytes().len());
+}

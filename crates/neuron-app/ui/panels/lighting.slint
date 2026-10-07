@@ -119,6 +119,83 @@ component EffectTileCard inherits Rectangle {
         mouse-cursor: root.dimmed ? MouseCursor.default : MouseCursor.pointer;
         clicked => { if (!root.dimmed) { root.picked(); } }
     }
+    // SUGGESTED GRADIENTS — a capsule on the art that opens in place into the rest of its pairings.
+    // The pill's left edge never moves; it only grows rightward, so hovering never shifts the first
+    // capsule under the pointer. Everything is arithmetic over ONE touch area (outside any `for`, so
+    // the tick's row rewrites can't kill it): the hovered capsule is derived from the mouse x.
+    if root.tile.pairs.length > 0 && !root.dimmed : pairs := Rectangle {
+        property <length> cw: 18px;
+        property <length> gap: 3px;
+        property <length> pad: 4px;
+        property <length> rowh: 13px;
+        property <length> labh: 13px;
+        property <int> n: root.tile.pairs.length;
+        // the widest the pill may grow: the art's width minus a margin each side
+        property <length> avail: root.width - 12px - 20px;
+        // one row + the name inline when it all fits, else a row/grid of capsules under a name line
+        // sized by the longest possible name, NOT the hovered one, so the width can't depend on `hov`
+        property <length> inline-w: self.pad * 2 + self.n * (self.cw + self.gap) + measure.preferred-width;
+        property <bool> stacked: self.inline-w > self.avail;
+        property <int> cols: self.stacked ? max(1, Math.floor((self.avail - self.pad * 2 + self.gap) / (self.cw + self.gap))) : self.n;
+        property <int> rows: Math.ceil(self.n / self.cols);
+        property <length> open-w: self.stacked ? max(self.pad * 2 + min(self.n, self.cols) * (self.cw + self.gap) - self.gap, min(self.avail, self.pad * 2 + measure.preferred-width)) : self.inline-w;
+        property <length> open-h: 18px + (self.stacked ? self.labh + (self.rows - 1) * self.rowh : 0px);
+        property <length> lab-off: self.stacked ? self.labh : 0px;
+        property <bool> open: pta.has-hover;
+        // closed: a slice of up to three capsules in one row (+ a plus when there are more); the grid
+        // geometry above only applies while open, or a stacked pill would push them out of view
+        property <int> shown: min(self.n, 3);
+        property <length> plus-w: self.n > 3 ? 11px : 0px;
+        property <length> closed-w: self.pad * 2 + self.shown * (self.cw + self.gap) - self.gap + self.plus-w;
+        property <int> hov: self.open ? max(0, min(self.n - 1,
+            Math.floor((pta.mouse-y - self.lab-off - 2px) / self.rowh) * self.cols
+            + max(0, min(self.cols - 1, Math.floor((pta.mouse-x - self.pad) / (self.cw + self.gap)))))) : 0;
+        x: 10px;
+        // bottom edge pinned: the pill grows upward over the art, the first capsule never moves
+        y: 6px + (root.width - 12px) * 0.52 - 5px - self.height;
+        height: self.open ? self.open-h : 18px;
+        width: self.open ? self.open-w : self.closed-w;
+        animate width, height { duration: 200ms; easing: ease-out; }
+        border-radius: 3px;
+        background: Theme.bg.with-alpha(0.88);
+        border-width: Theme.hair;
+        border-color: pta.has-hover ? Theme.text-faint : Theme.line;
+        animate border-color { duration: Theme.quick; }
+        clip: true;
+        for p[i] in root.tile.pairs : Rectangle {
+            x: pairs.pad + (pairs.open ? mod(i, pairs.cols) : i) * (pairs.cw + pairs.gap);
+            y: (pairs.open ? pairs.lab-off + floor(i / pairs.cols) * pairs.rowh + (pairs.rowh - self.height) / 2 + 2px : (18px - self.height) / 2);
+            width: pairs.cw;
+            height: (pta.has-hover && i == pairs.hov) ? 11px : 8px;
+            opacity: (pairs.open || i < pairs.shown) ? 1.0 : 0.0;
+            animate x, y { duration: 200ms; easing: ease-out; }
+            animate height, opacity { duration: Theme.quick; }
+            border-radius: 2px;
+            clip: true;
+            Image { source: p.swatch; width: 100%; height: 100%; image-fit: fill; }
+        }
+        Mono {
+            x: pairs.pad + pairs.shown * (pairs.cw + pairs.gap) - 1px;
+            y: (18px - self.height) / 2;
+            text: "+";
+            color: Theme.text-dim; font-size: Theme.fs-small;
+            opacity: (!pairs.open && pairs.n > 3) ? 1.0 : 0.0;
+            animate opacity { duration: Theme.quick; }
+        }
+        measure := Mono { text: "with bubble on matrix"; font-size: Theme.fs-small; visible: false; }
+        lbl := Mono {
+            x: pairs.stacked ? pairs.pad : pairs.pad + pairs.n * (pairs.cw + pairs.gap);
+            y: pairs.stacked ? 2px : (18px - self.height) / 2;
+            text: "with " + root.tile.pairs[pairs.hov].name;
+            color: Theme.text-dim; font-size: Theme.fs-small;
+            opacity: pta.has-hover ? 1.0 : 0.0;
+            animate opacity { duration: 200ms; }
+        }
+        pta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => { State.pick-pair(root.tile.slug, root.tile.pairs[pairs.hov].pair); }
+        }
+    }
     Timer {
         interval: 3s;
         running: root.delete-armed;
@@ -327,6 +404,25 @@ component SpectrumEditor inherits VerticalLayout {
             SectionTitle { text: "SPECTRUM"; }
             // the book button — opens the SPECTRUM + MOTION guide (what a stop is, the motion kinds)
             VerticalLayout { alignment: center; GuideButton { guide-id: "spectrum"; } }
+            // the palette's name, painted in the palette itself; hovering lets the gradient drift
+            // through the letters and settle back. Character i samples the mirrored ramp at
+            // (i/n + phase), so the wrap is seamless.
+            if State.light-name-chars.length > 0 : name-hit := Rectangle {
+                property <int> m: State.light-name-ramp.length;
+                property <float> phase: nta.has-hover ? 0.5 : 0.0;
+                animate phase { duration: 1400ms; easing: ease-in-out; }
+                HorizontalLayout {
+                    spacing: 0px;
+                    Mono { text: "– "; color: Theme.text-faint; }
+                    for ch[i] in State.light-name-chars : Mono {
+                        property <float> pos: mod((i / max(State.light-name-chars.length, 1) * 0.5 + name-hit.phase) * name-hit.m, name-hit.m);
+                        property <int> j: Math.floor(self.pos);
+                        color: State.light-name-ramp[self.j].mix(State.light-name-ramp[mod(self.j + 1, name-hit.m)], 1 - (self.pos - self.j));
+                        text: ch;
+                    }
+                }
+                nta := TouchArea {}
+            }
             Rectangle {}
             // no stop-count here: "stop N of M" under the strip already carries the total —
             // the same number twice in 75px, in two grammars, read as unconsidered.
@@ -418,6 +514,21 @@ component SpectrumEditor inherits VerticalLayout {
             swatches: Palette.accent;
             pick(h) => { State.set-stop-color(root.stop-idx, h); }
             preview(h) => { State.set-stop-color(root.stop-idx, h); }
+        }
+        // GRADIENT PRESETS — whole-ramp bases ("fire on everything"), the same 26px chips as the colour
+        // swatch row above so the two read as one palette. A click swaps the stops; motion/blend stay.
+        HorizontalLayout {
+            spacing: 6px;
+            for g[i] in State.gradient-presets : Rectangle {
+                width: 26px; height: 26px; border-radius: Theme.radius-sm;
+                border-width: Theme.hair;
+                border-color: gta.has-hover ? Theme.text-faint : Theme.line-soft;
+                clip: true;
+                animate border-color { duration: Theme.quick; }
+                Image { source: g.swatch; width: 100%; height: 100%; image-fit: fill; }
+                gta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.apply-gradient(i); } }
+            }
+            Rectangle {}
         }
         // BLEND — how colour interpolates between stops. Only meaningful with 2+ stops (a gradient to
         // blend): RGB is predictable, HSV takes the shortest hue path so the blend stays vivid (no muddy
