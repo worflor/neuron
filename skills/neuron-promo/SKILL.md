@@ -25,8 +25,8 @@ Neuron's brand is honesty about hardware, so the ad cannot fake the product.
   `--help` and say so. Rehearsal catches real bugs in the script (`stack set` cannot change a
   layer's pattern; the honest swap is `rm 0` then `add`).
 - **Continuity beats convenience.** If a character types, the keys move and any live-input
-  effect reacts. When a beat needs the board quiet, change the story (the dev ad's complaint is
-  spoken, transcribed beside a waveform), never the physics.
+  effect reacts. When a beat needs the board quiet, change the story (the dev ad's user speaks
+  every line until told to type), never the physics.
 - **A character only does what the world lets them do.** In the dev ad the user talks to the agent
   through the mic, so nothing is typed, no key moves and no key sounds until the agent says
   "type a bit."; from then on typing is the point. Speech is a pseudo-voice: words land as text
@@ -68,6 +68,14 @@ Neuron's brand is honesty about hardware, so the ad cannot fake the product.
 | Keyboard model, captures | the ignored harness in `.local/showcase/` (`render_showcase.py`, read-only `capture_controller.py`) |
 | Output | `D:\build-cache\promo\<ad>`; never write renders into the repo |
 
+`artifacts/promo/pattern-export` is shared: `artifacts/promo/effects/gen_effects.py` (README effect
+clips) drives it too. Keep its script format backward-compatible (new fields optional, as `pairing`
+is) and rebuild it after any neuron-core change before trusting old output.
+
+Requirements: Blender 5.2 portable at the path above (winget's download 403s; the OCF mirror
+works, check the sha256), ffmpeg on PATH, Python 3.11 with numpy, Pillow and scipy, a Rust
+toolchain, the Harmonia repo, and the installed neuron CLI for rehearsing commands.
+
 Blender 5.x: the compositor is `scene.compositing_node_group` with a `NodeGroupOutput`; Glare
 settings are node inputs. Render with Cycles + OptiX; a 1080x1920 frame is ~2.6 s at 24 samples on
 the RTX 3060. Check free space on C: and D: before long renders.
@@ -82,6 +90,14 @@ the RTX 3060. Check free space on C: and D: before long renders.
 - Send the cut with SendUserFile, say what you could not verify (the sound is unheard), commit
   sources on main, never push or publish.
 
+## After the cut
+
+The owner posts; you never do. Help with the words, and keep them as honest as the ad: say Windows,
+Razer-verified and source available, and that agents are optional. Do not claim the agent's lines
+were an unscripted session (they are written). On X: no link in the main post (put it in the first
+reply), native video, hashtags are not worth it, be there for the first hour of replies, then a
+real app clip as proof. Drafts for X, Reddit and Show HN are fine; do not publish any of them.
+
 ## Pitfalls already paid for
 
 - Vertical frames: fit width with the **horizontal** FOV (36 mm sensor height -> 20.25 mm width).
@@ -91,6 +107,8 @@ the RTX 3060. Check free space on C: and D: before long renders.
 - `PROMO_FPS` 30 with motion blur (shutter 0.25) reads smoother than it sounds; heavy blur smears text.
 - Harmonia `delay` takes `delay_ms`, not beats; lint warns on unknown params, read the warnings.
 - PowerShell here-strings drop the trailing newline: re-read a file after scripted splices.
+- PowerShell 5.1 splits `git commit -m "..."` at inner double quotes and treats the rest as paths.
+  Write the message to a file and use `git commit -F file`.
 - Hard-coded seconds in a downstream script (gen_music had `REVEAL = 32.0`) silently desync from a
   retimed timeline. Derive every time from `timeline.py`.
 - After a retime, only the frames after the first changed moment need rendering: re-render one early

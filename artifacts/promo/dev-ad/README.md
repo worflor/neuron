@@ -4,7 +4,9 @@ A 44-second vertical (1080×1920, 30 fps) promo for developers. One continuous B
 terminal pane floats behind the rig, an agent drives the `neuron` CLI, and each command sends a
 thread of light from its line to the device it configures.
 
-Draft, not approved for publication.
+Published on X on 2026-10-07 (the 44 s cut, v5). Draft X copy: "synapse wanted an account. / my coding agent
+wanted a sentence. / neuron: a razer synapse replacement. no account, no cloud, source available. agents
+optional, but fun." with the links (`www.woflo.dev/neuron`, the GitHub repo) in the first reply.
 
 ## What is real and what is staged
 
@@ -33,7 +35,18 @@ Draft, not approved for publication.
   profile is not active), and `macro add` passes its source file. `feel stages` and `profile apply`
   write devices, so their syntax was checked with `--help` and their replies are not shown.
 
+## Provenance
+
+`provenance/lighting-v5.npz` and `provenance/pattern-script-v5.json` are the exact LED frames and the
+engine script behind the posted cut (`kb` is 1320x132 RGB, `mouse` 1320x3x3, sRGB 0..1). They came
+from the exporter built against neuron-core on 2026-10-06, so re-running `gen_lighting.py` after
+later engine changes may not reproduce them. Keep these if anyone asks whether the board is real.
+
 ## Build
+
+Requirements: see [`skills/neuron-promo`](../../../skills/neuron-promo/SKILL.md#tools) (Blender 5.2
+portable, ffmpeg on PATH, Python 3.11 with numpy/Pillow/scipy, Rust, the Harmonia repo, the installed
+neuron CLI). `pattern-export` is shared with `../effects/gen_effects.py`.
 
 All timing, shots, attention cues and the beat grid live in `timeline.py`. Direction rules for
 this and future ads: [`skills/neuron-promo`](../../../skills/neuron-promo/SKILL.md). Output goes to
