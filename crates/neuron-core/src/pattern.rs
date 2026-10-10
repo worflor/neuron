@@ -72,6 +72,7 @@ impl Cell {
 pub enum Field {
     Scalar(Vec<Cell>),
     Color(Vec<Rgb>),
+    Emissive(Vec<[f32; 3]>),
 }
 
 impl Field {
@@ -80,6 +81,7 @@ impl Field {
         match self {
             Field::Scalar(v) => v.len(),
             Field::Color(v) => v.len(),
+            Field::Emissive(v) => v.len(),
         }
     }
 
@@ -89,8 +91,8 @@ impl Field {
     }
 
     /// Resolve this field to concrete colours via `spectrum` at time `t`. A `Scalar` cell becomes
-    /// `spectrum.at(t, u).scale_f(intensity)`; a `Color` cell passes through unchanged (the spectrum is
-    /// ignored). This is the per-layer core of the render pipeline (region mask + blend come on top).
+    /// `spectrum.at(t, u).scale_f(intensity)`; a `Color` cell passes through unchanged; an `Emissive`
+    /// linear-light cell converts back to sRGB.
     #[must_use]
     pub fn render(&self, spectrum: &Spectrum, t: f32) -> Vec<Rgb> {
         match self {
@@ -99,6 +101,10 @@ impl Field {
                 .map(|c| spectrum.at(t, c.u).scale_f(c.intensity))
                 .collect(),
             Field::Color(px) => px.clone(),
+            Field::Emissive(lights) => lights
+                .iter()
+                .map(|&lin| Rgb::from_linear(lin))
+                .collect(),
         }
     }
 }
@@ -339,6 +345,19 @@ impl Params {
 
 // ─────────────────────────────────────────── LayerDef ────────────────────────────────────
 
+/// Colour Attachment Policy for a layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentPolicy {
+    /// Colour belongs to a stationary surface or positional field.
+    #[default]
+    Placed,
+    /// An event retains a stable palette identity across its lifetime.
+    Carried,
+    /// A physical or logical state determines colour progression.
+    StateDriven,
+}
+
 /// A serialisable layer: a pattern (by key) + its params + the colour [`Spectrum`] + region mask +
 /// blend. The new shape of a lighting layer — the GUI sends it and a profile persists it; the live
 /// pattern (with its stateful generator) is built from this on demand (phase 2/3).
@@ -350,6 +369,8 @@ impl Params {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LayerDef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<LayerInstanceId>,
     pub pattern: String,
     #[serde(skip_serializing_if = "Params::is_empty")]
     pub params: Params,
@@ -364,11 +385,16 @@ pub struct LayerDef {
     /// first-class layer in the stack rather than a per-profile sidecar.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frame: Vec<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<AttachmentPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<crate::spectrum::BoundaryMode>,
 }
 
 impl Default for LayerDef {
     fn default() -> Self {
         LayerDef {
+            id: None,
             pattern: "uniform".into(),
             params: Params::default(),
             spectrum: Spectrum::solid(Rgb::new(0x4A, 0xF2, 0xB0)),
@@ -376,6 +402,8 @@ impl Default for LayerDef {
             blend: Blend::Normal,
             enabled: true,
             frame: Vec::new(),
+            attachment: None,
+            boundary: None,
         }
     }
 }
@@ -1206,6 +1234,34 @@ impl Pattern for Radial {
         self.speed = p.f32("speed", 1.0);
     }
 
+    fn advance(&mut self, ctx: &FrameContext, _geom: &LayerGeometry) {
+        const SPIN_RATE: f32 = 0.15;
+        let dir = if matches!(self.direction, 1 | 2) { -1.0 } else { 1.0 };
+        let dt = ctx.dt.as_secs_f32();
+        self.spin_phase = (self.spin_phase + dt * self.speed * SPIN_RATE * dir).rem_euclid(1.0);
+    }
+
+    fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
+        let (r, c) = (geom.board_dims.0 as usize, geom.board_dims.1 as usize);
+        let mut cells = vec![Cell::default(); r * c];
+        let cx = (c as f32 - 1.0) / 2.0;
+        let cy = (r as f32 - 1.0) / 2.0;
+        let max_rad = (cx * cx + cy * cy).sqrt().max(1.0);
+        let spin = self.spin_phase;
+        for y in 0..r {
+            for x in 0..c {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let ang = dy.atan2(dx) / (2.0 * std::f32::consts::PI) + 0.5;
+                let u = (ang + spin).rem_euclid(1.0);
+                let rad = (dx * dx + dy * dy).sqrt() / max_rad;
+                let intensity = 1.0 - 0.30 * rad;
+                cells[y * c + x] = Cell::new(u, intensity.clamp(0.0, 1.0));
+            }
+        }
+        Field::Scalar(cells)
+    }
+
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
         let (r, c) = (rows as usize, cols as usize);
         let mut cells = vec![Cell::default(); r * c];
@@ -1442,13 +1498,27 @@ impl Pattern for Heat {
         for _ in 0..steps {
             self.step(r, c, self.weather_t);
         }
-        // emit (u = heat, intensity = per-column flicker). The flicker DEPTH ramps with heat (steady
-        // embers, dancing tips), so the white-hot licks flare and gutter while the base stays a calm bed.
+        // emit (u = heat, intensity = per-column flicker × extinction envelope). The extinction
+        // envelope smoothstep(0.02, 0.25, h) guarantees zero emission at zero heat.
         let cells = self
             .heat
             .iter()
             .enumerate()
-            .map(|(i, &h)| Cell::new(h.clamp(0.0, 1.0), fire_flicker(i % c, t, spd, h)))
+            .map(|(i, &h)| {
+                let heat_val = h.clamp(0.0, 1.0);
+                if heat_val < 0.02 {
+                    Cell::new(0.0, 0.0)
+                } else {
+                    let env = if heat_val < 0.25 {
+                        let f = (heat_val - 0.02) / (0.25 - 0.02);
+                        f * f * (3.0 - 2.0 * f)
+                    } else {
+                        1.0
+                    };
+                    let flicker = fire_flicker(i % c, t, spd, heat_val);
+                    Cell::new(heat_val, (flicker * env).clamp(0.0, 1.0))
+                }
+            })
             .collect();
         Field::Scalar(cells)
     }
@@ -1654,7 +1724,12 @@ impl Rain {
             if self.active[x] {
                 let h = self.head[x];
                 if h >= 0.0 && (h as usize) < r {
-                    self.level[h as usize * c + x] = 1.0;
+                    let y0 = h.floor() as usize;
+                    let frac = (h - y0 as f32).clamp(0.0, 1.0);
+                    self.level[y0 * c + x] = self.level[y0 * c + x].max(1.0 - frac * 0.3);
+                    if y0 + 1 < r {
+                        self.level[(y0 + 1) * c + x] = self.level[(y0 + 1) * c + x].max(frac * 0.95);
+                    }
                 }
                 let mul = if matrix { self.col_speed[x] } else { 1.0 };
                 let nh = h + advance * mul;
@@ -1706,28 +1781,23 @@ impl Pattern for Rain {
         }
 
         // The base rate ANCHORS speed 1.0 at lively rain — 8 steps/sec × 0.22 rows/step ≈ 1.8
-        // rows/sec, a drop crossing a keyboard in ~3.4s. (The previous anchor of 5/sec ≈ 1.1
-        // rows/sec read as molasses at the design default; before THAT, 20/sec was a downpour
-        // nobody ran, shipped pre-slowed to 0.25 on the knob — the knob now spans drizzle→storm
-        // around a default that's actually right.)
+        // rows/sec, a drop crossing a keyboard in ~3.4s.
         let steps = self.clock.accrue_t(t, 8.0, self.speed);
         for _ in 0..steps {
             self.step(r, c);
         }
-        // emit (u, intensity): the tail (v < HEAD_THRESH) sits at u≈0 (the spectrum's tail colour)
-        // with intensity = v; the head ramps u → 1 (the spectrum's white head) at full intensity.
-        const HEAD_THRESH: f32 = 0.9;
+        // emit (u, intensity): tail progression u = v^1.4 moves smoothly across the authored palette;
+        // expired cells emit zero light.
         let cells = self
             .level
             .iter()
             .map(|&v| {
-                if v <= 0.0 {
+                if v <= 0.002 {
                     Cell::new(0.0, 0.0)
-                } else if v >= HEAD_THRESH {
-                    let f = ((v - HEAD_THRESH) / (1.0 - HEAD_THRESH)).clamp(0.0, 1.0);
-                    Cell::new(f, 1.0)
                 } else {
-                    Cell::new(0.0, v)
+                    let u = v.powf(1.4).clamp(0.0, 1.0);
+                    let intensity = v.clamp(0.0, 1.0);
+                    Cell::new(u, intensity)
                 }
             })
             .collect();
@@ -1793,6 +1863,55 @@ const TRAIL_BASE_U: f32 = 0.10;
 const OVERLAP_HEAT: f32 = 0.55;
 const TRAIL_TAU_S: f32 = 30.0;
 const TRAIL_FLOOR: f32 = 0.008;
+
+/// Persistent multi-emitter sediment cohort for Comet light painting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SedimentCohort {
+    pub anchor_u: f32,
+    pub excitation: f32,
+    pub intensity: f32,
+}
+
+/// Comet sediment cell with inline storage for up to 3 cohorts plus pooled overflow.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SedimentCell {
+    pub inline: [Option<SedimentCohort>; 3],
+    pub overflow: Vec<SedimentCohort>,
+}
+
+impl SedimentCell {
+    pub fn push(&mut self, cohort: SedimentCohort) {
+        for slot in &mut self.inline {
+            if slot.is_none() {
+                *slot = Some(cohort);
+                return;
+            }
+        }
+        self.overflow.push(cohort);
+    }
+
+    pub fn decay(&mut self, dt: f32) {
+        if dt <= 0.0 {
+            return;
+        }
+        let decay_emission = (-dt / TRAIL_TAU_S).exp();
+        let decay_color = (-dt / 15.0).exp();
+        for slot in &mut self.inline {
+            if let Some(c) = slot {
+                c.intensity *= decay_emission;
+                c.excitation *= decay_color;
+                if c.intensity < TRAIL_FLOOR {
+                    *slot = None;
+                }
+            }
+        }
+        self.overflow.retain_mut(|c| {
+            c.intensity *= decay_emission;
+            c.excitation *= decay_color;
+            c.intensity >= TRAIL_FLOOR
+        });
+    }
+}
 
 pub fn decay_trail_field(trail: &mut [Cell], dt: f32) {
     if dt <= 0.0 {
@@ -2050,7 +2169,7 @@ impl Pattern for Comet {
     }
 
     fn on_discontinuity(&mut self) {
-        self.trail_field.clear();
+        decay_trail_field(&mut self.trail_field, 2.0);
         self.burst.fill(0.0);
         self.clock.acc = 0.0;
     }
@@ -2247,6 +2366,7 @@ struct StarCell {
     peak: f32,
     shimmer_freq: f32,
     shimmer_phase: f32,
+    stellar_u: f32,
 }
 
 #[derive(Default)]
@@ -2306,6 +2426,7 @@ impl Pattern for Sparkle {
                 let peak = 0.75 + 0.25 * xorshift(&mut self.rng);
                 let shimmer_freq = 4.0 + 5.0 * xorshift(&mut self.rng);
                 let shimmer_phase = xorshift(&mut self.rng) * TAU;
+                let stellar_u = xorshift(&mut self.rng);
                 self.stars[idx] = StarCell {
                     active: true,
                     age_s: 0.0,
@@ -2313,6 +2434,7 @@ impl Pattern for Sparkle {
                     peak,
                     shimmer_freq,
                     shimmer_phase,
+                    stellar_u,
                 };
             }
         }
@@ -2335,12 +2457,14 @@ impl Pattern for Sparkle {
                 let u = sigma / SIGMA_PEAK;
                 u * u * (3.0 - 2.0 * u)
             } else {
-                let v = (sigma - SIGMA_PEAK) / (1.0 - SIGMA_PEAK);
-                (1.0 - v).powf(1.8)
+                let v = ((sigma - SIGMA_PEAK) / (1.0 - SIGMA_PEAK)).clamp(0.0, 1.0);
+                (std::f32::consts::FRAC_PI_2 * v).cos().powf(1.5)
             };
             let shimmer = 1.0 - 0.08 * (star.age_s * star.shimmer_freq + star.shimmer_phase).sin();
             let intensity = (star.peak * env * shimmer).clamp(0.0, 1.0);
-            cells.push(Cell::new(0.0, intensity));
+            let flare_excursion = 0.05 * (star.age_s * star.shimmer_freq * 0.5).sin();
+            let u = (star.stellar_u + flare_excursion).clamp(0.0, 1.0);
+            cells.push(Cell::new(u, intensity));
         }
         Field::Scalar(cells)
     }
@@ -2445,7 +2569,19 @@ impl Pattern for Ignite {
                 self.level[i] = (self.level[i] - decay_step).max(0.0);
             }
         }
-        let cells = self.level.iter().map(|&l| Cell::new(0.0, l)).collect();
+        let cells = self
+            .level
+            .iter()
+            .zip(self.contact_age.iter())
+            .map(|(&l, &age)| {
+                if l <= 0.002 {
+                    Cell::new(0.0, 0.0)
+                } else {
+                    let u = (-age / 0.120).exp();
+                    Cell::new(u.clamp(0.0, 1.0), l.clamp(0.0, 1.0))
+                }
+            })
+            .collect();
         Field::Scalar(cells)
     }
 }
@@ -2602,6 +2738,7 @@ impl Pattern for Ring {
                 let contact = self.contact_level[idx];
                 let mut base = 0.0f32;
                 let mut sum = 0.0f32;
+                let mut best_u = 0.0f32;
                 for w in &self.waves {
                     let age = t - w.t0;
                     let radius = age * BASE_SPEED * speed;
@@ -2610,9 +2747,13 @@ impl Pattern for Ring {
                     let d = (dr * dr + dc * dc).sqrt();
                     let band_arg = (d - radius) / RING_WIDTH;
                     let band = (-(band_arg * band_arg)).exp();
-                    let envelope = (1.0 - age / life).clamp(0.0, 1.0);
+                    let atten = 1.0 / (radius + 1.0).sqrt();
+                    let envelope = (1.0 - age / life).clamp(0.0, 1.0) * atten;
                     let val = (band * envelope).clamp(0.0, 1.0);
-                    base = base.max(val);
+                    if val > base {
+                        base = val;
+                        best_u = (band_arg.clamp(-1.0, 1.0) + 1.0) * 0.5;
+                    }
                     sum += val;
                 }
                 let excess = (sum - base).max(0.0);
@@ -2622,7 +2763,8 @@ impl Pattern for Ring {
                     base
                 };
                 let intensity = wave_intensity.max(contact);
-                cells[idx] = Cell::new(0.0, intensity.clamp(0.0, 1.0));
+                let u = if contact > wave_intensity { 0.0 } else { best_u };
+                cells[idx] = Cell::new(u, intensity.clamp(0.0, 1.0));
             }
         }
         Field::Scalar(cells)
@@ -2781,8 +2923,8 @@ impl Pattern for Thermal {
                 self.heat[i] += diff * approach;
             }
         }
-        // emit (u = temperature clamped to the ramp, intensity = breath × heat-haze shimmer). A fresh
-        // flare (temp > 1) clamps u to the spectrum's hot/white end.
+        // emit (u = temperature clamped to the ramp, intensity = G(T) × breath × heat-haze shimmer). A fresh
+        // flare (temp > 1) clamps u to the spectrum's hot/white end; cold (temp ≈ 0) emits 0 light.
         let breath = 0.94 + 0.06 * crate::effects::breathe_shape(t * TAU / 6.0);
         let cells = self.heat.iter_mut()
             .enumerate()
@@ -2790,11 +2932,12 @@ impl Pattern for Thermal {
                 let temp = (*heat).max(0.0);
                 if temp < 0.002 {
                     *heat = 0.0;
-                    return Cell::new(0.0, 1.0);
+                    return Cell::new(0.0, 0.0);
                 }
                 let (x, y) = (i % c, i / c);
                 let shimmer = heat_shimmer(x, y, t, temp);
-                Cell::new(temp.min(1.0), (breath * shimmer).clamp(0.0, 1.0))
+                let emission = (temp / (temp + 0.08)).clamp(0.0, 1.0);
+                Cell::new(temp.min(1.0), (breath * shimmer * emission).clamp(0.0, 1.0))
             })
             .collect();
         Field::Scalar(cells)
@@ -2827,26 +2970,38 @@ fn deposit_heat(heat: &mut [f32], ry: usize, cx: usize, r: usize, c: usize, peak
     }
 }
 
-/// Cool the whole heat field one frame — a temperature-DEPENDENT, dt-scaled radiative+convective leak
-/// (`dT/dt = -(RAD·T³ + LIN·T)·fade`, integrated by freezing the per-cell rate and stepping
-/// exponentially: stable, never negative). A hot cell sheds heat FAST (the radiative T³ term), a cool one
-/// SLOWLY (the Newtonian baseline) — so a white-hot key flashes down through the ramp in ~½–1s while the
-/// embers LINGER for several seconds. `fade` scales the whole rate. fps-independent (dt 0 ⇒ frozen).
+/// Cool the whole heat field one frame via the analytical closed-form solution to the Bernoulli ODE:
+/// `dT/dt = -(a·T³ + b·T)` where `a = RAD·fade` and `b = LIN·fade`.
+/// Exact closed-form update: `T(t+dt) = (T·exp(-b·dt)) / sqrt(1 + (a/b)·T²·(1 - exp(-2·b·dt)))`.
+/// Integrated stably via `exp_m1`, with no step-size dependence and zero numerical blowup.
 fn cool_field(field: &mut [f32], fade: f32, dt: f32) {
     const RAD: f32 = 3.0;
     const LIN: f32 = 0.22;
     let f = fade.clamp(0.1, 4.0);
     let dt = dt.max(0.0);
-    if dt == 0.0 {
+    if dt <= 0.0 {
         return;
     }
+    let a = RAD * f;
+    let b = LIN * f;
+    let exp_neg_b_dt = (-b * dt).exp();
+    let term = if b > 1e-6 {
+        -(-2.0 * b * dt).exp_m1() / b
+    } else {
+        2.0 * dt
+    };
+
     for h in field.iter_mut() {
         let t = *h;
         if t <= 0.0 {
             continue;
         }
-        let rate = (RAD * t * t + LIN) * f;
-        *h = t * (-rate * dt).exp();
+        let denom = (1.0 + a * t * t * term).max(0.0).sqrt();
+        *h = if denom > 1e-6 {
+            t * exp_neg_b_dt / denom
+        } else {
+            0.0
+        };
     }
 }
 
@@ -3670,6 +3825,7 @@ impl Preset {
             blend: if pattern_is_readout(self.pattern) { Blend::Cut } else { Blend::Normal },
             enabled: true,
             frame: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -3864,6 +4020,29 @@ impl Compositor {
             })
             .collect();
         Compositor { layers }
+    }
+
+    /// Update existing layers in-place from updated layer definitions without reconstructing
+    /// stateful pattern instances (retaining temperatures, sediment, velocities, etc.).
+    pub fn update_defs(&mut self, defs: &[LayerDef]) {
+        if self.layers.len() == defs.len() {
+            for (layer, d) in self.layers.iter_mut().zip(defs.iter()) {
+                layer.spectrum = d.spectrum.clone();
+                layer.blend = d.blend;
+                layer.enabled = d.enabled;
+                layer.palette_addressing = pattern_def(&d.pattern)
+                    .or_else(|| pattern_def("uniform"))
+                    .map_or(PaletteAddressing::Field, |def| def.palette_addressing);
+                let mut region = d.region.clone();
+                region.sort_unstable();
+                region.dedup();
+                layer.region = region;
+                layer.pattern.configure(&d.params);
+                layer.pattern.set_frame(&d.frame);
+            }
+        } else {
+            *self = Self::from_defs(defs);
+        }
     }
 
     /// Render one composited frame (`rows*cols`, row-major) at elapsed time `t`. Per layer: the pattern's
@@ -4479,6 +4658,7 @@ mod tests {
             blend: Blend::Add,
             enabled: false,
             frame: Vec::new(),
+            ..Default::default()
         };
         let j = serde_json::to_string(&def).unwrap();
         assert!(!j.contains("palette_addressing"), "palette addressing is registry metadata, not layer state");
@@ -4862,7 +5042,7 @@ mod tests {
             if c.iter().any(|x| x.intensity > 0.0) {
                 any = true;
             }
-            assert!(c.iter().all(|x| x.u == 0.0), "sparkle samples one solid colour (u=0)");
+            assert!(c.iter().all(|x| (0.0..=1.0).contains(&x.u)), "sparkle coordinates stay bounded in [0, 1]");
         }
         assert!(any, "stars must ignite over time");
     }

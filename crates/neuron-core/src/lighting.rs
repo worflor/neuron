@@ -98,6 +98,35 @@ impl Rgb {
         format!("{:02X}{:02X}{:02X}", self.r, self.g, self.b)
     }
 
+    /// Convert sRGB 8-bit channels to linear light floats in 0.0..=1.0.
+    #[must_use]
+    pub fn to_linear(self) -> [f32; 3] {
+        let lin = |v: u8| {
+            let c = f32::from(v) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        [lin(self.r), lin(self.g), lin(self.b)]
+    }
+
+    /// Convert linear light float channels [0.0..=1.0] back to sRGB 8-bit bytes.
+    #[must_use]
+    pub fn from_linear(linear: [f32; 3]) -> Self {
+        let srgb = |v: f32| {
+            let v = v.clamp(0.0, 1.0);
+            let c = if v <= 0.0031308 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            (c * 255.0).round().clamp(0.0, 255.0) as u8
+        };
+        Rgb::new(srgb(linear[0]), srgb(linear[1]), srgb(linear[2]))
+    }
+
     /// Parse "RRGGBB" (optional leading #).
     #[must_use]
     pub fn parse(s: &str) -> Option<Rgb> {
@@ -1349,6 +1378,18 @@ impl<'a> Lights<'a> {
         comp: &mut crate::pattern::Compositor,
         fps: impl Fn() -> u32,
         secs: u64,
+        stop: impl FnMut() -> bool,
+    ) -> anyhow::Result<()> {
+        self.animate_with_updates(comp, fps, |_| {}, secs, stop)
+    }
+
+    /// Stream an animation to the device with periodic in-place compositor updates.
+    pub fn animate_with_updates(
+        &self,
+        comp: &mut crate::pattern::Compositor,
+        fps: impl Fn() -> u32,
+        mut update_comp: impl FnMut(&mut crate::pattern::Compositor),
+        secs: u64,
         mut stop: impl FnMut() -> bool,
     ) -> anyhow::Result<()> {
         use std::time::{Duration, Instant};
@@ -1378,6 +1419,7 @@ impl<'a> Lights<'a> {
         let run_start = Instant::now();
         let mut next = run_start; // deadline-pacing anchor (separate from the wall-clock phase).
         while !stop() && run_start.elapsed().as_secs_f64() < secs as f64 {
+            update_comp(comp);
             let fps = fps().clamp(1, MAX_STREAM_FPS);
             let dt = Duration::from_millis(1000 / u64::from(fps));
             // Quantize the SHARED render clock to 1/fps steps via the ONE helper the GUI preview also

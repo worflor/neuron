@@ -17,7 +17,10 @@ use crate::pattern::{
 };
 use crate::spectrum::Spectrum;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LayerInstanceId(pub u64);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -74,6 +77,8 @@ pub enum ReconcileStep {
         pattern_key: String,
         new_pattern: Box<dyn Pattern>,
         geometry: LayerGeometry,
+        params: Params,
+        frame: Vec<[u8; 3]>,
     },
     Remove {
         id: LayerInstanceId,
@@ -153,6 +158,8 @@ pub struct SessionLayer {
     pub geometry: LayerGeometry,
     pub cached_field: Arc<Field>,
     pub paused_first_tick: bool,
+    pub params: Params,
+    pub frame: Vec<[u8; 3]>,
 }
 
 /// Authoritative per-device lighting session.
@@ -234,7 +241,11 @@ impl LightingSession {
     pub fn plan_reconcile(&self, next_specs: &[SceneLayerSpec]) -> Result<ReconcilePlan, ApplyError> {
         let (rows, cols) = self.board_dims;
 
+        let mut seen = std::collections::HashSet::new();
         for s in next_specs {
+            if !seen.insert(s.id) {
+                return Err(ApplyError::InvalidSpec(format!("duplicate layer id: {}", s.id.0)));
+            }
             if pattern_def(&s.def.pattern).is_none() && make_pattern(&s.def.pattern).is_none() {
                 return Err(ApplyError::UnknownPattern(s.def.pattern.clone()));
             }
@@ -287,6 +298,8 @@ impl LightingSession {
                 pattern_key: s.def.pattern.clone(),
                 new_pattern: new_p,
                 geometry,
+                params: s.def.params.clone(),
+                frame: s.def.frame.clone(),
             });
         }
 
@@ -333,6 +346,8 @@ impl LightingSession {
                     if let Some(layer) = self.layers.iter_mut().find(|l| l.id == id) {
                         let view = delta.as_view(&layer.geometry);
                         layer.pattern.apply_reconfigure(&view);
+                        layer.params = delta.params;
+                        layer.frame = delta.frame;
                         layer.geometry = delta.geometry;
                         layer.pattern.set_bounds(layer.geometry.bounds);
                         layer.pattern.set_visible_region(
@@ -347,6 +362,8 @@ impl LightingSession {
                     pattern_key,
                     new_pattern,
                     geometry,
+                    params,
+                    frame,
                 } => {
                     let n = self.board_dims.0 as usize * self.board_dims.1 as usize;
                     let blank_field = Arc::new(Field::Scalar(vec![crate::pattern::Cell::default(); n]));
@@ -356,6 +373,8 @@ impl LightingSession {
                         layer.geometry = geometry;
                         layer.cached_field = blank_field;
                         layer.paused_first_tick = false;
+                        layer.params = params;
+                        layer.frame = frame;
                     } else {
                         self.layers.push(SessionLayer {
                             id,
@@ -364,6 +383,8 @@ impl LightingSession {
                             geometry,
                             cached_field: blank_field,
                             paused_first_tick: false,
+                            params,
+                            frame,
                         });
                     }
                 }
@@ -383,7 +404,7 @@ impl LightingSession {
         self.presentation = plan.presentation;
     }
 
-    /// Explicitly restart a single layer instance fresh.
+    /// Explicitly restart a single layer instance fresh, reapplying saved configuration.
     pub fn reset_layer(&mut self, id: LayerInstanceId) -> Result<(), ApplyError> {
         let (rows, cols) = self.board_dims;
         let layer = self
@@ -394,6 +415,8 @@ impl LightingSession {
 
         let mut fresh = make_pattern(&layer.pattern_key)
             .ok_or_else(|| ApplyError::UnknownPattern(layer.pattern_key.clone()))?;
+        fresh.configure(&layer.params);
+        fresh.set_frame(&layer.frame);
         fresh.set_bounds(layer.geometry.bounds);
         fresh.set_visible_region(&layer.geometry.region, rows, cols);
 
@@ -564,6 +587,10 @@ pub fn render_palette_addressing_time(
 ) -> Vec<Rgb> {
     match field {
         Field::Color(px) => px.clone(),
+        Field::Emissive(lights) => lights
+            .iter()
+            .map(|&lin| Rgb::from_linear(lin))
+            .collect(),
         Field::Scalar(cells) => {
             if addressing == PaletteAddressing::Field {
                 cells
