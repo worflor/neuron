@@ -28,7 +28,7 @@ use neuron::transport;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// A snapshot of one enumerated device's live state, ready to map into a `DeviceRow`.
 pub struct DeviceState {
@@ -100,6 +100,7 @@ pub struct DeviceState {
 pub struct AnimStream {
     pub stop: Arc<AtomicBool>,
     pub fps: Arc<AtomicU32>,
+    pub update_defs: Arc<Mutex<Option<Vec<neuron::pattern::LayerDef>>>>,
 }
 
 /// Re-probe cadence for a pid that stayed unknown (e.g. a mouse deep-asleep at first probe — it
@@ -1091,6 +1092,18 @@ impl AppRuntime {
         if defs.is_empty() {
             return "no layers".into();
         }
+        // If THIS board is already streaming locally and the host does not own it, update its
+        // compositor in-place without restarting the thread, dropping custody, or re-opening the USB device.
+        if !crate::host::active() {
+            if let Some(existing) = self.anim.get(unit) {
+                if !existing.stop.load(Ordering::SeqCst) {
+                    if let Ok(mut slot) = existing.update_defs.lock() {
+                        *slot = Some(defs);
+                        return "compositing".into();
+                    }
+                }
+            }
+        }
         // Stop THIS board's prior LOCAL stream first — before EITHER pipe below — so a board that
         // was streaming app-side when the host came up (the runtime host toggle) can't end up with
         // both the old anim thread AND the host writer painting it: the exact double-writer race
@@ -1115,14 +1128,17 @@ impl AppRuntime {
         // this stream's OWN fps copy, seeded from the GUI's current value — so re-pacing or selecting
         // another board can never change THIS stream's speed.
         let fps_src = Arc::new(AtomicU32::new(self.light_fps.load(Ordering::Relaxed)));
+        let update_defs = Arc::new(Mutex::new(None));
         self.anim.insert(
             unit.to_string(),
             AnimStream {
                 stop: stop.clone(),
                 fps: fps_src.clone(),
+                update_defs: update_defs.clone(),
             },
         );
         let unit = unit.to_string();
+        let update_slot = update_defs.clone();
         // `on_done` (glue) is the SOLE cleanup authority: it removes this board's `anim` entry and
         // clears the "compositing" indicator. The worker returns its outcome and `done` calls
         // `on_done` exactly once — with the real error, a synthesized error on spawn refusal, or
@@ -1155,9 +1171,21 @@ impl AppRuntime {
                             let streamed = lights
                                 // LIVE fps: read the shared atomic each frame so the GUI's fps
                                 // control re-paces this running composite without a restart.
-                                .animate(&mut comp, || fps_src.load(Ordering::Relaxed), 86_400, || {
-                                    stop.load(Ordering::SeqCst) || neuron::writes::writes_paused()
-                                })
+                                .animate_with_updates(
+                                    &mut comp,
+                                    || fps_src.load(Ordering::Relaxed),
+                                    |c| {
+                                        if let Ok(mut slot) = update_slot.lock() {
+                                            if let Some(new_defs) = slot.take() {
+                                                c.update_defs(&new_defs);
+                                            }
+                                        }
+                                    },
+                                    86_400,
+                                    || {
+                                        stop.load(Ordering::SeqCst) || neuron::writes::writes_paused()
+                                    },
+                                )
                                 .map_err(|e| format!("animate: {e}"));
                             // CUSTODY RELEASE (the DPI-16000 trap): streaming lighting holds this board
                             // in driver mode (every write flips it via ensure_custody), which defers its

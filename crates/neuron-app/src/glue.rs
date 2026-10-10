@@ -2354,10 +2354,19 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     .as_ref()
                     .is_none_or(|(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols);
                 if stale {
-                    // ONLY on a real rebuild (the stack revision or the grid dims changed) do we clone the
-                    // stack into fresh generators — the clone deferred from the cheap read above.
+                    // Rebuild only when grid dims change or first construct; update in place on rev bump
+                    // so stateful simulation (comet trails, thermal fields, rain drops) is preserved seamlessly.
                     let defs = sh.borrow().light_layers.clone();
-                    *c = Some((rev, rows, cols, neuron::pattern::Compositor::from_defs(&defs)));
+                    if let Some((r, cr, cc, comp)) = c.as_mut() {
+                        if *cr == rows && *cc == cols {
+                            *r = rev;
+                            comp.update_defs(&defs);
+                        } else {
+                            *c = Some((rev, rows, cols, neuron::pattern::Compositor::from_defs(&defs)));
+                        }
+                    } else {
+                        *c = Some((rev, rows, cols, neuron::pattern::Compositor::from_defs(&defs)));
+                    }
                 }
                 let Some((_, _, _, comp)) = c.as_mut() else {
                     return;

@@ -125,9 +125,61 @@ impl Loop {
     }
 }
 
+/// How a [`Palette`] behaves when sampled outside the [0, 1] stop range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BoundaryMode {
+    /// Clamp to the nearest endpoint (0.0 or 1.0). Default for open gradients.
+    #[default]
+    Clamp,
+    /// Reflect back and forth smoothly across boundaries.
+    PingPong,
+    /// Wrap periodically in [0, 1) (modulo 1.0).
+    Wrap,
+}
+
+impl BoundaryMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BoundaryMode::Clamp => "clamp",
+            BoundaryMode::PingPong => "pingpong",
+            BoundaryMode::Wrap => "wrap",
+        }
+    }
+
+    #[must_use]
+    pub fn from_str(s: &str) -> BoundaryMode {
+        match s.to_ascii_lowercase().as_str() {
+            "pingpong" | "ping-pong" => BoundaryMode::PingPong,
+            "wrap" => BoundaryMode::Wrap,
+            _ => BoundaryMode::Clamp,
+        }
+    }
+
+    /// Map a coordinate `u` according to this boundary mode into 0.0..=1.0.
+    #[must_use]
+    pub fn map(self, u: f32) -> f32 {
+        match self {
+            BoundaryMode::Clamp => u.clamp(0.0, 1.0),
+            BoundaryMode::Wrap => u.rem_euclid(1.0),
+            BoundaryMode::PingPong => {
+                let u2 = u.rem_euclid(2.0);
+                if u2 > 1.0 {
+                    2.0 - u2
+                } else {
+                    u2
+                }
+            }
+        }
+    }
+}
+
 /// How a [`Palette`] interpolates COLOUR between its stops. The default is raw RGB (predictable,
-/// preserves every existing preset's look); [`Interp::Hsv`] is the opt-in perceptual path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// preserves every existing preset's look); [`Interp::Hsv`] is the opt-in perceptual path; [`Interp::Oklab`]
+/// provides perceptually uniform lightness and uniform chroma.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Interp {
     /// Linear RGB lerp between stops — predictable and cheap, but a red→blue blend sags through a
     /// muddy, desaturated purple at the midpoint. The default so no preset's look changes.
@@ -135,7 +187,11 @@ pub enum Interp {
     Rgb,
     /// HSV interpolation taking the SHORTEST hue path between stops (so red→blue rounds through vivid
     /// magenta, never grey) with saturation/value lerped linearly — vivid like the built-in rainbow.
+    /// Uses CSS Color 4 Powerless Hue Model so achromatic stops borrow their chromatic neighbor's hue.
     Hsv,
+    /// Perceptually uniform Oklab interpolation with gamut mapping. Preserves perceived lightness and
+    /// hue across subtle gradients without midpoint lightness dips or oversaturation.
+    Oklab,
 }
 
 impl Interp {
@@ -144,6 +200,7 @@ impl Interp {
         match self {
             Interp::Rgb => "rgb",
             Interp::Hsv => "hsv",
+            Interp::Oklab => "oklab",
         }
     }
 
@@ -153,6 +210,7 @@ impl Interp {
     pub fn from_str(s: &str) -> Interp {
         match s.to_ascii_lowercase().as_str() {
             "hsv" => Interp::Hsv,
+            "oklab" => Interp::Oklab,
             _ => Interp::Rgb,
         }
     }
@@ -316,6 +374,12 @@ impl Palette {
                 stops[last].col
             }
         }
+    }
+
+    /// Sample the palette stops at coordinate `u`, mapping it through [`BoundaryMode`].
+    #[must_use]
+    pub fn sample_with_boundary(&self, u: f32, mode: BoundaryMode) -> Rgb {
+        self.sample(mode.map(u))
     }
 
     /// Sample the palette at `(t, u)` with high-precision [`Duration`] timing, applying its [`Motion`].
@@ -664,11 +728,11 @@ fn blend_stops(a: Rgb, b: Rgb, f: f32, interp: Interp) -> Rgb {
     match interp {
         Interp::Rgb => Rgb::lerp(a, b, f),
         Interp::Hsv => hsv_lerp_short(a, b, f),
+        Interp::Oklab => oklab_lerp(a, b, f),
     }
 }
 
-/// Decompose an [`Rgb`] into (hue°, saturation 0..1, value 0..1). Hue reuses [`rgb_hue`](crate::effects::rgb_hue)
-/// (which falls back to a stable aurora-green for an achromatic colour, so the short-path stays defined).
+/// Decompose an [`Rgb`] into (hue°, saturation 0..1, value 0..1). Hue reuses [`rgb_hue`](crate::effects::rgb_hue).
 fn rgb_to_hsv(c: Rgb) -> (f32, f32, f32) {
     let (r, g, b) = (f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0);
     let max = r.max(g).max(b);
@@ -677,12 +741,24 @@ fn rgb_to_hsv(c: Rgb) -> (f32, f32, f32) {
     (crate::effects::rgb_hue(c), s, max)
 }
 
-/// Interpolate two colours in HSV, taking the SHORTEST way round the hue wheel (so red↔blue rounds
-/// through magenta, not through the muddy grey an RGB lerp produces). Saturation/value lerp linearly.
+/// Interpolate two colours in HSV, taking the SHORTEST way round the hue wheel.
+/// Implements CSS Color 4 Powerless Hue Model: an achromatic stop (S < 1e-4) inherits the
+/// hue of its chromatic neighbor; two achromatic stops stay strictly achromatic.
 fn hsv_lerp_short(a: Rgb, b: Rgb, f: f32) -> Rgb {
     let f = f.clamp(0.0, 1.0);
-    let (ha, sa, va) = rgb_to_hsv(a);
-    let (hb, sb, vb) = rgb_to_hsv(b);
+    let (mut ha, sa, va) = rgb_to_hsv(a);
+    let (mut hb, sb, vb) = rgb_to_hsv(b);
+
+    const ACHROMATIC_THRESH: f32 = 1e-4;
+    let a_achromatic = sa < ACHROMATIC_THRESH;
+    let b_achromatic = sb < ACHROMATIC_THRESH;
+
+    if a_achromatic && !b_achromatic {
+        ha = hb;
+    } else if b_achromatic && !a_achromatic {
+        hb = ha;
+    }
+
     // shortest signed hue delta in (-180, 180], so we cross the nearer arc of the wheel.
     let mut dh = hb - ha;
     if dh > 180.0 {
@@ -694,6 +770,71 @@ fn hsv_lerp_short(a: Rgb, b: Rgb, f: f32) -> Rgb {
     let s = sa + (sb - sa) * f;
     let v = va + (vb - va) * f;
     Rgb::from_hsv(h, s, v)
+}
+
+/// Convert an [`Rgb`] to OKLab (L, a, b) colour space coordinates.
+#[must_use]
+pub fn rgb_to_oklab(c: Rgb) -> (f32, f32, f32) {
+    let [r, g, b] = c.to_linear();
+    let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    (
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    )
+}
+
+/// Convert OKLab (L, a, b) to sRGB with hue-preserving chroma reduction for out-of-gamut colours.
+#[must_use]
+pub fn oklab_to_rgb(l: f32, a: f32, b: f32) -> Rgb {
+    let l_clamped = l.clamp(0.0, 1.0);
+    let l_ = (l_clamped + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m_ = (l_clamped - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s_ = (l_clamped - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+
+    let mut r_lin = 4.076_741_7 * l_ - 3.307_711_6 * m_ + 0.230_969_93 * s_;
+    let mut g_lin = -1.268_438 * l_ + 2.609_757_4 * m_ - 0.341_319_4 * s_;
+    let mut b_lin = -0.004_196_086_3 * l_ - 0.703_418_6 * m_ + 1.707_614_7 * s_;
+
+    // Fast gamut mapping: reduce chroma (a, b) towards 0 while preserving Lightness and Hue
+    if r_lin < 0.0 || r_lin > 1.0 || g_lin < 0.0 || g_lin > 1.0 || b_lin < 0.0 || b_lin > 1.0 {
+        let mut lo = 0.0f32;
+        let mut hi = 1.0f32;
+        for _ in 0..5 {
+            let mid = (lo + hi) * 0.5;
+            let a_test = a * mid;
+            let b_test = b * mid;
+            let tl_ = (l_clamped + 0.396_337_78 * a_test + 0.215_803_76 * b_test).powi(3);
+            let tm_ = (l_clamped - 0.105_561_346 * a_test - 0.063_854_17 * b_test).powi(3);
+            let ts_ = (l_clamped - 0.089_484_18 * a_test - 1.291_485_5 * b_test).powi(3);
+            let tr = 4.076_741_7 * tl_ - 3.307_711_6 * tm_ + 0.230_969_93 * ts_;
+            let tg = -1.268_438 * tl_ + 2.609_757_4 * tm_ - 0.341_319_4 * ts_;
+            let tb = -0.004_196_086_3 * tl_ - 0.703_418_6 * tm_ + 1.707_614_7 * ts_;
+            if (0.0..=1.0).contains(&tr) && (0.0..=1.0).contains(&tg) && (0.0..=1.0).contains(&tb) {
+                lo = mid;
+                r_lin = tr;
+                g_lin = tg;
+                b_lin = tb;
+            } else {
+                hi = mid;
+            }
+        }
+    }
+
+    Rgb::from_linear([r_lin, g_lin, b_lin])
+}
+
+/// Interpolate two colours in OKLab colour space (perceptually linear lightness and uniform chroma).
+fn oklab_lerp(a: Rgb, b: Rgb, f: f32) -> Rgb {
+    let f = f.clamp(0.0, 1.0);
+    let (la, aa, ba) = rgb_to_oklab(a);
+    let (lb, ab, bb) = rgb_to_oklab(b);
+    let l = la + (lb - la) * f;
+    let a_val = aa + (ab - aa) * f;
+    let b_val = ba + (bb - ba) * f;
+    oklab_to_rgb(l, a_val, b_val)
 }
 
 /// The even 0..1 position of stop `i` of `n` (stop 0 at 0.0, stop n-1 at 1.0; a lone stop at 0.0).
@@ -828,7 +969,8 @@ fn stop_to_repr(s: &Stop) -> StopRepr {
 fn interp_tag(i: Interp) -> Option<String> {
     match i {
         Interp::Rgb => None,
-        Interp::Hsv => Some(i.as_str().to_string()),
+        Interp::Hsv => Some("hsv".to_string()),
+        Interp::Oklab => Some("oklab".to_string()),
     }
 }
 
