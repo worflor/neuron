@@ -2810,8 +2810,21 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let w = app.as_weak();
             let sh = sh.clone();
             app.global::<State>().on_set_motion_speed(move |v| {
+                if !v.is_finite() { return; }
                 if let Some(app) = w.upgrade() {
-                    app.global::<State>().set_light_motion_speed(v);
+                    app.global::<State>().set_light_motion_speed(v.abs());
+                    rebuild_motion(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_reverse_motion(move || {
+                if let Some(app) = w.upgrade() {
+                    let st = app.global::<State>();
+                    if !matches!(st.get_light_motion().as_str(), "drift" | "cycle" | "breathe" | "flow") { return; }
+                    st.set_light_motion_reversed(!st.get_light_motion_reversed());
                     rebuild_motion(&app, &sh);
                 }
             });
@@ -10653,7 +10666,8 @@ fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_fra
         Motion::Flow { speed, chaos } => ("flow", speed, 0.5, chaos),
     };
     st.set_light_motion(kind.into());
-    st.set_light_motion_speed(speed);
+    st.set_light_motion_speed(speed.abs());
+    st.set_light_motion_reversed(speed.is_sign_negative());
     st.set_light_motion_depth(depth);
     st.set_light_motion_chaos(chaos);
     // gradient interpolation space (rgb default | hsv perceptual)
@@ -10773,7 +10787,7 @@ fn edit_active_palette(app: &AppWindow, sh: &SharedRt, f: impl FnOnce(&mut neuro
 fn rebuild_motion(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     let kind = st.get_light_motion().to_string();
-    let speed = st.get_light_motion_speed();
+    let speed = if st.get_light_motion_reversed() { -st.get_light_motion_speed() } else { st.get_light_motion_speed() };
     let depth = st.get_light_motion_depth();
     let chaos = st.get_light_motion_chaos();
     edit_active_palette(app, sh, |pal| {
