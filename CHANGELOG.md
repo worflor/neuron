@@ -2,19 +2,22 @@
 
 ## Unreleased
 
+## v0.1.5
+
+- Made the lighting editor more responsive: pattern simulation, thumbnail rendering and saved-effect file operations run off the UI thread; offscreen catalogue tiles sleep, and live models retain their identity during updates.
 - Tightened the lighting inspector with a colour-mix dropdown, a colour-motion picker with reversible direction, compact timeline actions and inline effect property pickers. Existing authored motion and gradient interpolation remain intact.
-
 - Lighting layers now have an ordered, scrollable stack with visibility, duplication, per-layer opacity and a blend dropdown (Normal, Screen, Add, Multiply, Cutout). A covered-layer shortcut points to an opaque effect hiding the selection. Existing scenes retain full opacity by default.
-
-- Keep running layer state during palette edits and stack rearrangement, and dissolve authored scene changes through the same bounded transition in local and hosted lighting. Continuous edits publish immediately; the live preview observes generated base frames. Explicitly clearing the final layer saves a managed black scene. Physical LED transitions remain hardware-unverified.
+- Preserved running layer state during palette edits and stack rearrangement, and added dissolves for authored scene changes through the same bounded transition in local and hosted lighting. Continuous edits publish immediately; the live preview observes generated base frames. Explicitly clearing the final layer saves a managed black scene. Physical LED transitions remain hardware-unverified.
 - Added a hover-only layer insertion capsule with above/below choices. Centred its labels and improved palette names: stock ramps retain their names, recognizable altered ramps show an edited suffix, and unrelated palettes remain custom.
-
 - Added gradient presets to the spectrum editor: rainbow, fire, aurora, thermal, sunset, meadow, ice and bubble (a soap-film ramp computed from thin-film interference). One click swaps a layer's stops and keeps its motion and blend; the editor header names the current palette in its own colours.
 - Added suggested pairings on effect tiles. A small chip opens in place to apply an effect with another gradient or mode, such as Comet with sunset and light painting, or Cascade in matrix mode with bubble. Hand-picked pairings come first and the rest are scored from the gradient's lightness, hue spread and contrast; an effect is never offered its own gradient.
 - Gave Typing Heat and Fire a dark foot on bright gradients so heat still reads dim to bright in the gradient's own hue.
 - Lengthened Comet's light-painting fade to about 30 s (was 2.6 s) so repeated passes stack.
 - Switched palette motion to high-precision timing, and added an offline key script so input-driven patterns can be rendered without synthesizing input.
+- Corrected same-length effect replacement and held-key Comet retriggering. Centralized palette boundary sampling, removed arbitrary animation-clock wraps, fixed repeated-timestamp Heat advancement, and smoothed the breathing cycle join.
+- Refined material responses: event colours can stay attached to their particles, heat extinguishes cleanly, and carried emission resolves in linear light without changing existing layer blend semantics.
 - Added a render smoke test that draws the lighting page, hovers a pairing chip and fails on Slint binding loops.
+- Refreshed the front-page documentation and effect clips, and added reproducible offline effect and promo rendering tools. These tools are separate from live device input.
 
 ## v0.1.4
 
