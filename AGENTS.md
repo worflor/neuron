@@ -132,6 +132,21 @@ pwsh ./validate.ps1 -Mode lint
 - **Do not leave the tray app running during a release build.** Windows locks the
   live `.exe` and the build fails.
 
+### Launching the Windows desktop app
+
+For a requested visible launch, use the exact executable on the user's interactive
+desktop, without `--tray`, `--safe`, or `-WindowStyle Hidden`. `start_minimized`
+only applies with `--tray`; it does not explain an invisible normal launch.
+Normal startup enables live dispatch; `--safe` is a deliberately different mode.
+Before restarting, use `neuron-app.exe --shutdown-existing` and verify the old
+process has exited rather than starting a second device owner.
+
+With Computer Use's `sky.launch_app`, use `app: "process:<absolute exe path>"`.
+A bare path selected the installed app instead of the requested build in a verified
+Windows run. Confirm the running executable path, then inspect the returned Neuron
+window: a PID, Session 1, host log, or `MainWindowHandle` alone does not prove the
+desktop UI is visible. See [the launch procedure](skills/neuron-lazy-update/issues.md#windows-app-launch-verification).
+
 ## The invariants, spelled out
 
 **The arm gate.** Every synthesized keystroke, click, and process spawn goes through
