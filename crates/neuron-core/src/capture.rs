@@ -112,10 +112,10 @@ thread_local! {
 
 /// RAII guard returned by [`suppress_key_reads`]: live key reads on THIS thread report UP until it
 /// drops (panic-safe). Scope it around a hot render that does not need real key state.
-pub struct KeyReadGuard(());
+pub struct KeyReadGuard(bool, std::marker::PhantomData<std::rc::Rc<()>>);
 impl Drop for KeyReadGuard {
     fn drop(&mut self) {
-        SUPPRESS_KEY_READS.with(|s| s.set(false));
+        SUPPRESS_KEY_READS.with(|s| s.set(self.0));
     }
 }
 
@@ -124,12 +124,15 @@ impl Drop for KeyReadGuard {
 /// syscalls entirely. See [`SUPPRESS_KEY_READS`].
 #[must_use]
 pub fn suppress_key_reads() -> KeyReadGuard {
-    SUPPRESS_KEY_READS.with(|s| s.set(true));
-    KeyReadGuard(())
+    KeyReadGuard(SUPPRESS_KEY_READS.with(|s| s.replace(true)), std::marker::PhantomData)
 }
 
 pub(crate) fn key_reads_suppressed() -> bool {
     SUPPRESS_KEY_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn key_reads_scripted() -> bool {
+    SCRIPTED_KEYS.with(|s| s.borrow().is_some())
 }
 
 thread_local! {
@@ -581,5 +584,20 @@ mod tests {
             assert_eq!(WaitForSingleObject(first.handle(), 0), WAIT_OBJECT_0);
             assert_eq!(WaitForSingleObject(second.handle(), 0), WAIT_OBJECT_0);
         }
+    }
+}
+
+#[cfg(test)]
+mod scoped_key_read_tests {
+    use super::*;
+    #[test]
+    fn nested_suppression_restores_the_outer_guard_after_unwind() {
+        let script = script_key_reads(); script.set(0x41, true);
+        assert!(key_down(0x41));
+        let outer = suppress_key_reads();
+        let _ = std::panic::catch_unwind(|| { let _inner = suppress_key_reads(); panic!("failed preview"); });
+        assert!(!key_down(0x41));
+        drop(outer);
+        assert!(key_down(0x41));
     }
 }

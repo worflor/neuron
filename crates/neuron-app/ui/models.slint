@@ -211,13 +211,12 @@ export struct PairChip {
     pair: int,           // index into pairing::pairings_for(slug)
 }
 
-export struct EffectTile {
+export struct EffectTileMeta {
     name: string,        // human label ("Breathing", "Vitals")
     slug: string,        // generator/data id ("breathing", "vitals")
     kind: string,        // the shelf group: "effect" | "input" | "data" | "stub"
     blurb: string,       // one plain-words line: what this look IS / what feeds it
     source: string,      // the named real-world feed ("keys", "audio", "battery", …; "" = none)
-    swatch: image,       // a live (or demo) preview of this tile, rendered Rust-side
     pairs: [PairChip],   // suggested gradients for this effect (pins first); empty = none
 }
 

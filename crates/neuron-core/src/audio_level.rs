@@ -117,6 +117,7 @@ const IDLE_STOP_MS: u64 = 2000; // stop the thread if no `level()` read in ~2s
 /// repoint a running sampler to it. Idempotent: a call on the already-running source is a no-op.
 /// Cheap to call every frame.
 pub fn ensure(source: &str) {
+    if !crate::pattern::may_start_provider() { return; }
     let mut st = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if st.running {
         if st.source != source {
@@ -132,7 +133,9 @@ pub fn ensure(source: &str) {
     st.running = true;
     let start_gen = st.gen;
     let start_source = st.source.clone();
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if crate::pattern::may_start_provider() {
+        LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    }
     drop(st);
     // The latch is cleared by the release — which runs on completion, panic, OR a spawn refusal —
     // so a failed spawn can never leave `running` stuck true and block every later `ensure`.
@@ -146,7 +149,10 @@ pub fn ensure(source: &str) {
 /// The latest smoothed level (0.0..=1.0). Lock-free and cheap. Reading it also keeps the sampler
 /// alive (resets the idle timer), so a consumer that stops reading lets the thread auto-stop.
 pub fn level() -> f32 {
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if !crate::pattern::may_read_provider() { return 0.0; }
+    if crate::pattern::may_start_provider() {
+        LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    }
     f32::from_bits(LEVEL_BITS.load(Ordering::Relaxed))
 }
 

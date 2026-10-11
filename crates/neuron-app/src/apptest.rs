@@ -964,7 +964,7 @@ fn find_mark(shot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>) -> Option<(u32,
 #[test]
 #[ignore = "run by gui_tests_in_fresh_processes"]
 fn lighting_page_draws_pairing_chips_hovered_and_not() {
-    use crate::ui::EffectTile;
+    use crate::ui::EffectTileMeta;
     use slint::platform::WindowEvent;
     use slint::{LogicalPosition, ModelRc, VecModel};
     // the GPU renderer cannot snapshot without a running event loop; the software one can. Each GUI
@@ -973,13 +973,12 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
     std::env::set_var("SLINT_SCALE_FACTOR", "1");
     let Some(app) = try_window() else { return };
     let st = app.global::<State>();
-    let tile = |slug: &str, names: &[&str]| EffectTile {
+    let tile = |slug: &str, names: &[&str]| EffectTileMeta {
         name: slug.into(),
         slug: slug.into(),
         kind: "effect".into(),
         blurb: "a look".into(),
         source: "".into(),
-        swatch: slint::Image::default(),
         pairs: ModelRc::new(VecModel::from(
             names.iter().enumerate().map(|(i, n)| marked_chip(n, i as i32)).collect::<Vec<_>>(),
         )),
@@ -999,7 +998,25 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
     app.window().set_size(slint::LogicalSize::new(1240.0, 1100.0));
     app.show().expect("show the window");
     let cold = app.window().take_snapshot().expect("a frame is drawn");
+    let demands = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = demands.clone();
+    st.on_tile_demand(move |shelf, start, end, warm_start, warm_end| {
+        observed.borrow_mut().push((shelf, start, end, warm_start, warm_end));
+    });
+    app.invoke_sample_light_demand();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    slint::platform::update_timers_and_animations();
+    app.window().take_snapshot().expect("viewport geometry is sampled after layout");
+    assert!(demands.borrow().iter().any(|&(shelf, start, end, _, _)| shelf == 0 && start == 0 && end == 2), "{:#?}", demands.borrow());
+    assert!(demands.borrow().iter().all(|&(_, start, end, warm_start, warm_end)|
+        warm_start <= start && start <= end && end <= warm_end));
     let (x, y) = find_mark(&cold).expect("a chip is on the page");
+    for dy in (20..160).step_by(10) {
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(x as f32, y as f32 - dy as f32),
+        });
+        app.window().take_snapshot().expect("the tile and its layer control draw while hovered");
+    }
     let at = |dx: f32| WindowEvent::PointerMoved { position: LogicalPosition::new(x as f32 + dx, y as f32 + 3.0) };
     // onto the first capsule, then across the drawer as it opens (the drawer animates, so a few
     // frames), then back out
@@ -1010,4 +1027,225 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
     app.window().dispatch_event(WindowEvent::PointerExited);
     let after = app.window().take_snapshot().expect("a frame after the pointer leaves");
     assert!(after.as_bytes().len() == cold.as_bytes().len());
+    st.set_light_user_tiles(ModelRc::new(VecModel::from(vec![tile("user:late", &["ice"])])));
+    app.window().set_size(slint::LogicalSize::new(920.0, 900.0));
+    app.window().take_snapshot().expect("late metadata and a reflow draw without eager geometry recursion");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    slint::platform::update_timers_and_animations();
+    app.window().take_snapshot().expect("reflow demand is sampled after layout");
+    assert!(demands.borrow().iter().any(|&(shelf, _, _, _, _)| shelf == 3));
+}
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn lighting_parameter_drags_preserve_live_models_and_latest_value() {
+    let _cwd = crate::testsupport::cwd_guard("lighting_parameter_drags");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers = vec![neuron::pattern::preset_by_slug("wave").unwrap().to_layer()];
+        state.selected_layer = 0;
+        state.layers_rev += 1;
+    }
+    glue::refresh_layers(&app, &shared);
+    let params = st.get_light_params();
+    let sequence = st.get_light_seq();
+    let stops = st.get_light_stops();
+    let layer_choices = st.get_lighting_layer_choices();
+    let layer_labels = st.get_lighting_layer_labels();
+    let preset_choices = st.get_lighting_preset_choices();
+    let preset_labels = st.get_lighting_preset_labels();
+    for i in 0..100 {
+        st.invoke_set_param_range("speed".into(), i as f32 / 25.0);
+        assert!(params == st.get_light_params(), "a numeric edit must retain its rendered parameter rows");
+        assert!(sequence == st.get_light_seq(), "unchanged palettes must retain timeline images");
+        assert!(stops == st.get_light_stops());
+        assert!(layer_choices == st.get_lighting_layer_choices());
+        assert!(layer_labels == st.get_lighting_layer_labels());
+        assert!(preset_choices == st.get_lighting_preset_choices());
+        assert!(preset_labels == st.get_lighting_preset_labels());
+    }
+    assert_eq!(shared.borrow().light_layers[0].params.f32("speed", 0.0), 3.96);
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.push(neuron::pattern::preset_by_slug("wave").unwrap().to_layer());
+        state.layers_rev += 1;
+    }
+    glue::refresh_layers(&app, &shared);
+    let first_id = shared.borrow().light_layers[0].id;
+    let second_id = shared.borrow().light_layers[1].id;
+    assert!(first_id.is_some() && second_id.is_some());
+    assert_ne!(first_id, second_id);
+    shared.borrow_mut().selected_layer = 1;
+    glue::refresh_layers(&app, &shared);
+    assert!(params != st.get_light_params(), "switching layers must end the previous control's edit identity");
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.swap(0, 1);
+        state.selected_layer = 0;
+        state.layers_rev += 1;
+    }
+    let second_params = st.get_light_params();
+    glue::refresh_layers(&app, &shared);
+    assert_eq!(shared.borrow().light_layers[0].id, second_id);
+    assert!(second_params == st.get_light_params(), "reordering the selected layer preserves its identity");
+    st.invoke_set_param_range("speed".into(), 2.0);
+    assert_eq!(shared.borrow().light_layers[0].params.f32("speed", 0.0), 2.0);
+    assert_eq!(shared.borrow().light_layers[1].params.f32("speed", 0.0), 3.96);
+}
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn catalog_layer_insertion_keeps_existing_identity_and_orders_above_below() {
+    let _cwd = crate::testsupport::cwd_guard("catalog_layer_insertion");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    shared.borrow_mut().light_layers = vec![neuron::pattern::preset_layer("wave").unwrap()];
+    shared.borrow_mut().selected_layer = 0;
+    glue::refresh_layers(&app, &shared);
+    let existing = shared.borrow().light_layers[0].clone();
+    st.invoke_stack_tile("fire".into(), true);
+    assert_eq!(shared.borrow().light_layers.len(), 2);
+    assert_eq!(shared.borrow().light_layers[0], existing);
+    assert_eq!(shared.borrow().light_layers[1].pattern, "heat");
+    assert_ne!(shared.borrow().light_layers[1].id, existing.id);
+    shared.borrow_mut().selected_layer = 0;
+    st.invoke_stack_tile("comet".into(), false);
+    assert_eq!(shared.borrow().light_layers.len(), 3);
+    assert_eq!(shared.borrow().light_layers[0].pattern, "comet");
+    assert_eq!(shared.borrow().light_layers[1], existing);
+    st.invoke_stack_tile("missing-preset".into(), true);
+    assert_eq!(shared.borrow().light_layers.len(), 3);
+    let ids: std::collections::HashSet<_> = shared.borrow().light_layers.iter().map(|d| d.id).collect();
+    assert_eq!(ids.len(), 3);
+}
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn hero_publication_rejects_wrong_units_and_preserves_then_releases_paint_drafts() {
+    use crate::light_render::{CompletedFrame, DesiredSurfaceState, SurfaceId, Target};
+    use neuron::lighting::Rgb;
+    use slint::Model;
+    let _cwd = crate::testsupport::cwd_guard("hero_publication");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    {
+        let mut state = shared.borrow_mut();
+        state.rt.selected_pid = 0x0226;
+        state.rt.selected_unit = "first".into();
+    }
+    let st = app.global::<State>();
+    st.set_page(0);
+    st.set_writes_paused(true);
+    st.set_grid_rows(1);
+    st.set_grid_cols(2);
+    st.set_grid_px(slint::ModelRc::new(slint::VecModel::from(vec![slint::Color::from_rgb_u8(0, 0, 0); 2])));
+    let grid = st.get_grid_px();
+    let desired = DesiredSurfaceState { active: true, hero: true, dims: (1, 2), content_rev: 42,
+        target: Target { pid: 0x0226, unit: "first".into(), epoch: 5 }, ..Default::default() };
+    let frame = |target: Target, content_rev: u64, color: Rgb| CompletedFrame {
+        id: SurfaceId::Hero, target, content_rev, dims: (1, 2), layout_generation: 0,
+        rgb: vec![color; 2].into(), swatch: None, requested: std::time::Instant::now(), render_time: std::time::Duration::ZERO,
+    };
+    let red = Rgb::new(255, 0, 0);
+    let green = Rgb::new(0, 255, 0);
+    glue::apply_preview_test_frames(&app, &desired, vec![frame(desired.target.clone(), 42, red)]);
+    let published = grid.row_data(0).unwrap();
+    for (target, revision) in [
+        (Target { unit: "second".into(), ..desired.target.clone() }, 42),
+        (Target { epoch: 4, ..desired.target.clone() }, 42),
+        (desired.target.clone(), 41),
+    ] {
+        glue::apply_preview_test_frames(&app, &desired, vec![frame(target, revision, green)]);
+        assert_eq!(grid.row_data(0).unwrap(), published);
+    }
+    st.invoke_toggle_brush();
+    assert!(st.get_light_brush_on());
+    st.set_brush_color(slint::Color::from_rgb_u8(0, 0, 255));
+    st.invoke_paint_cell(0);
+    let painted = grid.row_data(0).unwrap();
+    assert_ne!(painted, published);
+    glue::apply_preview_test_frames(&app, &desired, vec![frame(desired.target.clone(), 42, green)]);
+    assert_eq!(grid.row_data(0).unwrap(), painted, "an in-flight frame cannot overwrite the brush");
+    st.invoke_toggle_brush();
+    assert!(!st.get_light_brush_on());
+    glue::apply_preview_test_frames(&app, &desired, vec![frame(desired.target.clone(), 42, red)]);
+    assert_eq!(grid.row_data(0).unwrap(), published, "even an unchanged static frame must restore the live canvas");
+    assert!(grid == st.get_grid_px(), "publication keeps keycap rows in place");
+}
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn live_preview_observes_complete_frames_without_advancing_or_crossing_units() {
+    use neuron::pattern::{LiveComposite, SurfaceIdentity, LayerDef, TransitionHint};
+    use neuron::lighting::Rgb;
+    use slint::Model;
+    use std::time::Duration;
+    let _cwd = crate::testsupport::cwd_guard("live_preview_observer");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true); st.set_window_shown(true); st.set_page(1);
+    st.set_light_hero_visible(true); st.set_grid_rows(1); st.set_grid_cols(2);
+    st.set_grid_px(slint::ModelRc::new(slint::VecModel::from(vec![slint::Color::from_rgb_u8(0, 0, 0); 2])));
+    let model = st.get_grid_px();
+    let target = SurfaceIdentity { pid: 0x0226, unit: "first".into(), plane: "base".into(), dimensions: (1, 2) };
+    let mut live = LiveComposite::new(target, vec![LayerDef { spectrum: neuron::spectrum::Spectrum::solid(Rgb::new(255, 0, 0)), ..Default::default() }]).unwrap();
+    let first = live.render_cycle(Duration::ZERO, Duration::ZERO, Duration::ZERO).unwrap();
+    {
+        let mut state = shared.borrow_mut(); state.rt.selected_pid = 0x0226; state.rt.selected_unit = "first".into();
+        state.rt.install_live_fixture(&live);
+    }
+    for _ in 0..30 { st.invoke_preview_tick(); }
+    assert_eq!(live.handle().latest().unwrap().frame_id, first.frame_id);
+    let red = model.row_data(0).unwrap(); assert_eq!(red.red(), 255);
+    shared.borrow_mut().rt.selected_unit = "second".into();
+    live.handle().publish(vec![LayerDef { spectrum: neuron::spectrum::Spectrum::solid(Rgb::new(0, 255, 0)), ..Default::default() }], TransitionHint::Immediate).unwrap();
+    let time = Duration::from_millis(33); live.render_cycle(time, time, time).unwrap();
+    let time = Duration::from_millis(66); live.render_cycle(time, time, time).unwrap();
+    st.invoke_preview_tick(); assert_eq!(model.row_data(0).unwrap(), red);
+    shared.borrow_mut().rt.selected_unit = "first".into();
+    st.invoke_preview_tick(); assert_eq!(model.row_data(0).unwrap().green(), 255);
+    assert_eq!(st.get_grid_px(), model);
+    assert_eq!(live.handle().latest().unwrap().frame_id, 3);
+}
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn scene_restore_waits_for_the_ownership_handoff_barrier() {
+    use neuron::pattern::{LiveComposite, SurfaceIdentity, LayerDef};
+    use neuron::lighting::Rgb;
+    use std::time::Duration;
+    let _cwd = crate::testsupport::cwd_guard("lighting_handoff_restore");
+    let Some(app) = try_window() else { return };
+    crate::prefs::set_device_light(0x0226, crate::prefs::DeviceLight {
+        scene_set: true, fps: 30, layers: vec![LayerDef {
+            spectrum: neuron::spectrum::Spectrum::solid(Rgb::new(0, 0, 255)), ..Default::default()
+        }], ..Default::default()
+    }).unwrap();
+    let shared = glue::install(&app);
+    app.global::<State>().set_writes_paused(false);
+    let target = SurfaceIdentity { pid: 0x0226, unit: "handoff-fixture".into(), plane: "base".into(), dimensions: (1, 2) };
+    let mut live = LiveComposite::new(target, vec![LayerDef {
+        spectrum: neuron::spectrum::Spectrum::solid(Rgb::new(255, 0, 0)), ..Default::default()
+    }]).unwrap();
+    live.render_cycle(Duration::ZERO, Duration::ZERO, Duration::ZERO).unwrap();
+    {
+        let mut state = shared.borrow_mut();
+        state.rt.selected_pid = 0x0226; state.rt.selected_unit = "handoff-fixture".into();
+        state.rt.install_live_fixture(&live);
+    }
+    assert_eq!(glue::restore_during_handoff_for_test(&app, &shared), "lighting ownership handoff pending");
+    let time = Duration::from_millis(33);
+    let blocked = live.render_cycle(time, time, time).unwrap();
+    assert_eq!(blocked.accepted_scene_revision, 0);
+    assert_eq!(blocked.pixels.as_ref(), &[Rgb::new(255, 0, 0); 2]);
+    glue::restore_lighting(&app, &shared);
+    let time = Duration::from_millis(66);
+    assert_eq!(live.render_cycle(time, time, time).unwrap().accepted_scene_revision, 1);
 }

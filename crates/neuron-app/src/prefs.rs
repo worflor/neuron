@@ -21,6 +21,9 @@ use std::sync::{Mutex, OnceLock};
 /// still loads (a pre-unification `data` mode migrates via [`DeviceLight::migrated`]).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceLight {
+    /// Explicitly authored empty scenes remain managed black; old FPS-only records stay unmanaged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scene_set: bool,
     /// The chosen streaming fps for this board (the user's pick — restored verbatim on launch, so the
     /// per-device default only applies when nothing's saved). 0 = unset (fall back to the default).
     #[serde(default)]
@@ -40,7 +43,13 @@ pub struct DeviceLight {
     pub layers: Vec<neuron::pattern::LayerDef>,
 }
 
+// Serde's skip predicate receives a reference to the field.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool { !*value }
+
 impl DeviceLight {
+    pub fn has_managed_scene(&self) -> bool { self.scene_set || !self.layers.is_empty() }
+
     /// Fold a LEGACY data-mode save into the unified layer stack: an old `data = "mouse-battery"` record
     /// becomes a `vitals` LAYER appended to `layers` (unless one's already present), so a pre-unification
     /// save resumes as the vitals surface with no user action. One-way + idempotent; the `legacy_data`
@@ -409,6 +418,9 @@ impl Default for Prefs {
 
 // Cached prefs for the hot read path (the notif engine reads these every animation tick). Invalidated
 // by `save()`; see `Prefs::load_cached`.
+static PREFS_TRANSACTION: Mutex<()> = Mutex::new(());
+static LIGHTING_SNAPSHOT: OnceLock<Mutex<std::collections::BTreeMap<String, DeviceLight>>> = OnceLock::new();
+
 static PREFS_CACHE: OnceLock<Mutex<Prefs>> = OnceLock::new();
 static PREFS_DIRTY: AtomicBool = AtomicBool::new(true);
 
@@ -504,7 +516,11 @@ impl Prefs {
     pub fn save(&self) -> Result<(), String> {
         let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         neuron::salvage::atomic_write(&Self::path(), body.as_bytes()).map_err(|e| e.to_string())?;
-        PREFS_DIRTY.store(true, Ordering::Release); // invalidate the load_cached() copy
+        *LIGHTING_SNAPSHOT.get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock().unwrap_or_else(std::sync::PoisonError::into_inner) = self.lighting.clone();
+        *PREFS_CACHE.get_or_init(|| Mutex::new(self.clone()))
+            .lock().unwrap_or_else(std::sync::PoisonError::into_inner) = self.clone();
+        PREFS_DIRTY.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -619,6 +635,7 @@ pub fn start_minimized() -> bool {
 
 /// Convenience: persist the start-minimized flag, returning a user-facing status line.
 pub fn set_start_minimized(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.start_minimized = v;
     match p.save() {
@@ -650,6 +667,7 @@ pub fn ui_accent() -> String {
 /// Persist the interface accent (bare RRGGBB), returning a user-facing status line.
 pub fn set_ui_accent(hex: &str) -> String {
     let v = normalize_hex(hex);
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.ui_accent.clone_from(&v);
     match p.save() {
@@ -666,6 +684,7 @@ pub fn weave_accent() -> String {
 /// Persist the weave accent (bare RRGGBB), returning a user-facing status line.
 pub fn set_weave_accent(hex: &str) -> String {
     let v = normalize_hex(hex);
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.weave_accent.clone_from(&v);
     match p.save() {
@@ -681,6 +700,7 @@ pub fn weave_material() -> String {
 
 /// Persist the spellweaving material slug, returning a user-facing status line.
 pub fn set_weave_material(slug: &str) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.weave_material = slug.to_string();
     match p.save() {
@@ -696,6 +716,7 @@ pub fn phoenix() -> bool {
 
 /// Persist the PHOENIX preference, returning a user-facing status line.
 pub fn set_phoenix(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.phoenix = v;
     match p.save() {
@@ -714,6 +735,7 @@ pub fn notif_enabled() -> bool {
 
 /// Persist the notifications master switch, returning a user-facing status line.
 pub fn set_notif_enabled(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.notif_enabled = v;
     match p.save() {
@@ -737,6 +759,7 @@ pub fn set_notif_placement(slug: &str) -> String {
     if !NOTIF_PLACEMENTS.contains(&slug) {
         return format!("invalid placement '{slug}'");
     }
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.notif_placement = slug.to_string();
     // a named preset also pins the free anchor to its canonical spot, so "off" remembers a real
@@ -757,6 +780,7 @@ pub fn set_notif_placement(slug: &str) -> String {
 pub fn set_notif_pos(x: f32, y: f32) -> String {
     let x = x.clamp(0.0, 1.0);
     let y = y.clamp(0.0, 1.0);
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.notif_placement = notif_preset_slug(x, y).unwrap_or("custom").to_string();
     p.notif_x = x;
@@ -784,6 +808,7 @@ pub fn notif_audio() -> bool {
 
 /// Persist the notification audio-cue flag, returning a user-facing status line.
 pub fn set_notif_audio(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.notif_audio = v;
     match p.save() {
@@ -794,6 +819,7 @@ pub fn set_notif_audio(v: bool) -> String {
 
 /// Persist one per-event gate by slug, returning a user-facing status line.
 pub fn set_notif_event(slug: &str, v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     match slug {
         "dpi" => p.notif_dpi = v,
@@ -825,6 +851,7 @@ pub fn set_notif_stack(mode: &str) -> String {
     if !matches!(mode, "stack" | "latest" | "digest") {
         return format!("unknown stack mode '{mode}'");
     }
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.notif_stack = mode.to_string();
     match p.save() {
@@ -841,6 +868,7 @@ pub fn notif_volume() -> f32 {
 /// Persist the audio-cue volume, returning a user-facing status line.
 pub fn set_notif_volume(v: f32) -> String {
     let v = v.clamp(0.0, 1.0);
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.notif_volume = v;
     match p.save() {
@@ -864,6 +892,7 @@ pub fn set_notif_sound(slug: &str) -> String {
     if !NOTIF_VOICES.contains(&slug) {
         return format!("unknown voice '{slug}'");
     }
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.notif_sound = slug.to_string();
     match p.save() {
@@ -879,6 +908,7 @@ pub fn notif_panel() -> bool {
 
 /// Persist the card-background flag, returning a user-facing status line.
 pub fn set_notif_panel(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.notif_panel = v;
     match p.save() {
@@ -894,6 +924,7 @@ pub fn host_enabled() -> bool {
 
 /// Persist the CONNECTIONS master switch, returning a user-facing status line.
 pub fn set_host_enabled(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_enabled = v;
     match p.save() {
@@ -909,6 +940,7 @@ pub fn host_chroma() -> bool {
 
 /// Persist the Chroma protocol gate, returning a user-facing status line.
 pub fn set_host_chroma(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_chroma = v;
     match p.save() {
@@ -924,6 +956,7 @@ pub fn host_openrgb() -> bool {
 
 /// Persist the `OpenRGB` protocol gate, returning a user-facing status line.
 pub fn set_host_openrgb(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_openrgb = v;
     match p.save() {
@@ -939,6 +972,7 @@ pub fn host_obs() -> bool {
 
 /// Persist the OBS connect gate, returning a user-facing status line.
 pub fn set_host_obs(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_obs = v;
     match p.save() {
@@ -963,6 +997,7 @@ pub fn host_obs_password_saved() -> String {
 
 /// Persist the OBS server password, returning a user-facing status line (never echoes the secret).
 pub fn set_host_obs_password(v: &str) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_obs_password = v.to_string();
     match p.save() {
@@ -1007,6 +1042,7 @@ pub fn host_chroma_paint_mode_index() -> i32 {
 }
 
 pub fn set_host_chroma_paint_mode(v: &str) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     let mode = normalize_paint_mode(v);
     p.host_chroma_paint_mode = mode.to_string();
@@ -1021,6 +1057,7 @@ pub fn host_chroma_paint_strength() -> u8 {
 }
 
 pub fn set_host_chroma_paint_strength(v: u8) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_chroma_paint_strength = v.clamp(0, 100);
     match p.save() {
@@ -1034,6 +1071,7 @@ pub fn host_chroma_paint_fade_ms() -> u32 {
 }
 
 pub fn set_host_chroma_paint_fade_ms(v: u32) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_chroma_paint_fade_ms = v.clamp(0, 2500);
     match p.save() {
@@ -1053,6 +1091,7 @@ pub fn host_chroma_lens() -> (i16, u8, u8) {
 }
 
 pub fn set_host_chroma_lens(hue: i16, saturation: u8, brightness: u8) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_chroma_lens_hue = hue.clamp(-180, 180);
     p.host_chroma_lens_saturation = saturation.min(200);
@@ -1076,6 +1115,7 @@ pub fn host_openrgb_paint_mode_index() -> i32 {
 }
 
 pub fn set_host_openrgb_paint_mode(v: &str) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     let mode = normalize_paint_mode(v);
     p.host_openrgb_paint_mode = mode.to_string();
@@ -1090,6 +1130,7 @@ pub fn host_openrgb_paint_strength() -> u8 {
 }
 
 pub fn set_host_openrgb_paint_strength(v: u8) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_openrgb_paint_strength = v.clamp(0, 100);
     match p.save() {
@@ -1103,6 +1144,7 @@ pub fn host_openrgb_paint_fade_ms() -> u32 {
 }
 
 pub fn set_host_openrgb_paint_fade_ms(v: u32) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_openrgb_paint_fade_ms = v.clamp(0, 2500);
     match p.save() {
@@ -1121,6 +1163,7 @@ pub fn host_paint_device_enabled(id: &str) -> bool {
 }
 
 pub fn set_host_paint_device(id: &str, enabled: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     if enabled {
         p.host_paint_disabled_devices.retain(|x| x != id);
@@ -1141,6 +1184,7 @@ pub fn host_base_always_wins() -> bool {
 }
 
 pub fn set_host_base_always_wins(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.host_base_always_wins = v;
     match p.save() {
@@ -1160,12 +1204,33 @@ pub fn light_key(pid: u16) -> String {
 }
 
 /// Read the saved lighting state for a device pid, or `None` if nothing's persisted for it.
+#[cfg(test)]
 pub fn device_light(pid: u16) -> Option<DeviceLight> {
     if pid == 0 {
         return None;
     }
     Prefs::load().lighting.get(&light_key(pid)).cloned()
 }
+
+/// GUI restore reads the snapshot loaded before the event loop; no disk access on a device switch.
+pub fn device_light_snapshot(pid: u16) -> Option<DeviceLight> {
+    LIGHTING_SNAPSHOT.get()?.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&light_key(pid)).cloned()
+}
+
+/// Refresh off the UI thread, serialized with every preference read/modify/write transaction.
+pub fn refresh_lighting_snapshot() {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fresh = Prefs::load();
+    *LIGHTING_SNAPSHOT.get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner) = fresh.lighting.clone();
+    let cell = PREFS_CACHE.get_or_init(|| Mutex::new(fresh.clone()));
+    *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+    PREFS_DIRTY.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+pub fn invalidate_cache() { PREFS_DIRTY.store(true, Ordering::Release); }
 
 /// Persist a device's lighting state (upsert by pid), preserving every sibling pref. Pid `0` is a
 /// no-op (nothing selected). Cheap by design — call it on user lighting changes, NEVER per animation
@@ -1174,6 +1239,7 @@ pub fn set_device_light(pid: u16, state: DeviceLight) -> Result<(), String> {
     if pid == 0 {
         return Ok(());
     }
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut p = Prefs::load();
     p.lighting.insert(light_key(pid), state);
     p.save()
@@ -1182,6 +1248,35 @@ pub fn set_device_light(pid: u16, state: DeviceLight) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_save_publishes_cached_preferences_without_a_followup_disk_read() {
+        let _cwd = cwd_guard();
+        let mut saved = Prefs::load();
+        saved.host_base_always_wins = true;
+        saved.save().unwrap();
+        std::fs::remove_file(Prefs::path()).unwrap();
+        assert!(Prefs::load_cached().host_base_always_wins);
+    }
+
+    #[test]
+    fn concurrent_lighting_and_other_preferences_preserve_siblings() {
+        let _cwd = cwd_guard();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for fps in 1..=30 {
+                    set_device_light(0x0226, DeviceLight { fps, ..Default::default() }).unwrap();
+                }
+            });
+            scope.spawn(|| {
+                for value in [false, true, false] { let _ = set_host_base_always_wins(value); }
+            });
+        });
+        let saved = Prefs::load();
+        assert_eq!(saved.lighting[&light_key(0x0226)].fps, 30);
+        assert!(!saved.host_base_always_wins);
+        assert_eq!(device_light_snapshot(0x0226).unwrap().fps, 30);
+    }
 
     // cwd isolation: the prefs file is run-directory-relative. cwd is a process-global, so ALL
     // cwd-mutating tests across the crate share ONE lock (see `testsupport`) and serialize.
@@ -1278,6 +1373,20 @@ mod tests {
 
     /// Lighting state persists per-device and reloads losslessly (fps + a multi-layer stack).
     #[test]
+    fn explicit_empty_scene_is_distinct_from_old_empty_and_fps_only_records() {
+        for text in ["", "fps = 30\n", "layers = []\n"] {
+            let old: DeviceLight = toml::from_str(text).unwrap();
+            assert!(!old.has_managed_scene());
+            assert!(!toml::to_string(&old).unwrap().contains("scene_set"));
+        }
+        let managed = DeviceLight { scene_set: true, fps: 30, ..Default::default() };
+        let restored: DeviceLight = toml::from_str(&toml::to_string(&managed).unwrap()).unwrap();
+        assert!(restored.has_managed_scene()); assert!(restored.layers.is_empty());
+        let nonempty = DeviceLight { layers: vec![neuron::pattern::LayerDef::default()], ..Default::default() };
+        assert!(nonempty.has_managed_scene());
+    }
+
+    #[test]
     fn device_light_round_trips() {
         let _g = cwd_guard();
         let pid = 0x0226u16;
@@ -1285,6 +1394,7 @@ mod tests {
         params.set("speed", 2.0);
         let state = DeviceLight {
             fps: 12,
+            scene_set: false,
             legacy_data: None,
             layers: vec![
                 neuron::pattern::LayerDef {
@@ -1352,6 +1462,7 @@ mod tests {
         ));
         let state = DeviceLight {
             fps: 30,
+            scene_set: false,
             legacy_data: None,
             layers: vec![
                 neuron::pattern::LayerDef {

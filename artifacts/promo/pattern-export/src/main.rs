@@ -61,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     fs::create_dir_all(&out_dir)?;
+    let _providers = neuron::pattern::ProviderPolicy::InjectedDeterministic.enter();
     let scripted = neuron::capture::script_key_reads();
     let mut outs: Vec<Vec<u8>> = grids.iter().map(|(_, r, c)| Vec::with_capacity(frames * *r as usize * *c as usize * 3)).collect();
     let mut comps: Vec<Option<neuron::pattern::Compositor>> = grids.iter().map(|_| None).collect();

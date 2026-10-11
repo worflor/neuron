@@ -13,6 +13,62 @@ use crate::lighting::Rgb;
 use crate::pattern::{self, LayerDef};
 use crate::spectrum::{Motion, Palette, Spectrum};
 
+/// Assign missing document identities once, rejecting duplicate explicit identities.
+pub fn normalize_ids(stack: &mut [LayerDef]) -> Result<(), String> {
+    let mut used = std::collections::HashSet::new();
+    for layer in stack.iter() {
+        if let Some(id) = layer.id {
+            if !used.insert(id) { return Err(format!("duplicate layer id: {}", id.0)); }
+        }
+    }
+    let mut next = used.iter().map(|id| id.0).max().unwrap_or(0);
+    next.checked_add(stack.iter().filter(|l| l.id.is_none()).count() as u64).ok_or("layer identity space exhausted")?;
+    for layer in stack {
+        if layer.id.is_none() {
+            next = next.checked_add(1).ok_or("layer identity space exhausted")?;
+            layer.id = Some(pattern::LayerInstanceId(next));
+        }
+    }
+    Ok(())
+}
+
+/// Continue an explicitly bound document without guessing between identical ID-less layers.
+pub fn normalize_against(stack: &mut [LayerDef], previous: &[LayerDef]) -> Result<(), String> {
+    let mut reserved: std::collections::HashSet<_> = stack.iter().filter_map(|d| d.id).collect();
+    let mut counts = std::collections::HashMap::new();
+    for layer in stack.iter() {
+        if let Some(kind) = pattern::pattern_def(&layer.pattern) { *counts.entry(kind.key).or_insert(0usize) += 1; }
+    }
+    let mut next = previous.iter().filter_map(|d| d.id).chain(reserved.iter().copied()).map(|id| id.0).max().unwrap_or(0);
+    for layer in stack.iter_mut().filter(|d| d.id.is_none()) {
+        let key = pattern::pattern_def(&layer.pattern).map(|p| p.key);
+        let mut candidates = previous.iter().filter(|d| d.id.is_some_and(|id| !reserved.contains(&id)) && pattern::pattern_def(&d.pattern).map(|p| p.key) == key);
+        let first = candidates.next().and_then(|d| d.id);
+        if candidates.next().is_none() && key.is_some_and(|k| counts.get(k) == Some(&1)) && stack_pattern_count(previous, key) == 1 {
+            layer.id = first;
+        }
+        if layer.id.is_none() {
+            next = next.checked_add(1).ok_or("layer identity space exhausted")?;
+            layer.id = Some(pattern::LayerInstanceId(next));
+        }
+        if let Some(id) = layer.id { reserved.insert(id); }
+    }
+    normalize_ids(stack)
+}
+
+fn stack_pattern_count(stack: &[LayerDef], key: Option<&str>) -> usize {
+    stack.iter().filter(|d| pattern::pattern_def(&d.pattern).map(|p| p.key) == key).count()
+}
+
+/// Instantiate reusable content without adopting any identities embedded in its template.
+pub fn instantiate(stack: &[LayerDef], template: &[LayerDef]) -> Result<Vec<LayerDef>, String> {
+    let mut combined = stack.to_vec();
+    let start = combined.len();
+    combined.extend(template.iter().cloned().map(|mut layer| { layer.id = None; layer }));
+    normalize_ids(&mut combined)?;
+    Ok(combined.split_off(start))
+}
+
 /// Where a layer stack lives.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LightTarget {
@@ -51,15 +107,18 @@ impl LightTarget {
 
     /// Save the stack, preserving every other setting in the same file.
     pub fn save(&self, stack: &[LayerDef]) -> Result<(), String> {
+        let mut authored = stack.to_vec();
+        normalize_ids(&mut authored)?;
+        pattern::validate_scene(&authored, None).map_err(|error| error.to_string())?;
         match self {
             LightTarget::Profile(name) => {
                 let mut p = crate::profile::Profile::load(name).map_err(|e| e.to_string())?;
-                p.lighting = stack.to_vec();
+                p.lighting = authored;
                 p.save()
             }
             LightTarget::Device(pid) => {
                 let mut t = crate::manage::app_table()?;
-                let layers = toml::Value::try_from(stack.to_vec()).map_err(|e| e.to_string())?;
+                let layers = toml::Value::try_from(authored).map_err(|e| e.to_string())?;
                 let lighting = t
                     .entry("lighting")
                     .or_insert_with(|| toml::Value::Table(toml::Table::new()))
@@ -71,6 +130,7 @@ impl LightTarget {
                     .as_table_mut()
                     .ok_or("app.toml lighting entry is not a table")?;
                 dev.insert("layers".into(), layers);
+                dev.insert("scene_set".into(), toml::Value::Boolean(true));
                 crate::manage::save_app_table(&t)
             }
         }
@@ -342,11 +402,14 @@ pub fn check_layer(l: &LayerDef) -> Vec<Issue> {
         match schema.iter().find(|p| p.key == k) {
             None => out.push(err(format!("pattern '{}' has no knob '{k}'", l.pattern))),
             Some(p) => {
-                if let ParamKind::Range { min, max, .. } = p.kind {
-                    if !(min..=max).contains(v) {
-                        out.push(err(format!("knob '{k}' is {v}, outside {min}..{max}")));
-                    }
-                }
+                let valid = v.is_finite() && match p.kind {
+                    ParamKind::Range { min, max, .. } => (min..=max).contains(v),
+                    ParamKind::Enum { options, .. } => *v >= 0.0 && v.fract() == 0.0 && (*v as usize) < options.len(),
+                    ParamKind::Toggle { .. } => *v == 0.0 || *v == 1.0,
+                    ParamKind::Color => true,
+                };
+                if !valid { out.push(err(format!("knob '{k}' has invalid value {v}"))); }
+
             }
         }
     }
@@ -376,6 +439,7 @@ pub fn check_stack(stack: &[LayerDef]) -> Vec<Issue> {
 pub fn edit_stack(stack: &[LayerDef], edit: &crate::action::LightingLayerOp) -> Result<Vec<LayerDef>, String> {
     use crate::action::LightingLayerOp as Edit;
     let mut next = stack.to_vec();
+    normalize_ids(&mut next)?;
     let at = |i: usize, n: usize| {
         if i < n { Ok(i) } else { Err(format!("no layer {i} ({n} layers)")) }
     };
@@ -389,14 +453,18 @@ pub fn edit_stack(stack: &[LayerDef], edit: &crate::action::LightingLayerOp) -> 
             next[i].enabled = matches!(edit, Edit::Enable { .. });
         }
         Edit::Push { preset, layer } => {
-            next.push(layer_source(preset.as_deref(), layer.as_ref())?);
+            let template = layer_source(preset.as_deref(), layer.as_ref())?;
+            let incoming = instantiate(&next, &[template])?;
+            next.extend(incoming);
         }
         Edit::Pop => {
             next.pop().ok_or("cannot pop an empty lighting stack")?;
         }
         Edit::Replace { index, preset, layer } => {
             let i = at(*index, next.len())?;
+            let id = next[i].id;
             next[i] = layer_source(preset.as_deref(), layer.as_ref())?;
+            next[i].id = id;
         }
         Edit::Move { from, to } => {
             stack_move(&mut next, *from, *to)?;
@@ -419,6 +487,7 @@ pub fn edit_stack(stack: &[LayerDef], edit: &crate::action::LightingLayerOp) -> 
             next[i].region = cells.clone();
         }
     }
+    normalize_ids(&mut next)?;
     let issues = check_stack(&next);
     if let Some(issue) = issues.iter().find(|issue| issue.severity == crate::authoring::Severity::Error) {
         return Err(issue.message.clone());
@@ -443,7 +512,9 @@ pub fn stack_add(stack: &mut Vec<LayerDef>, layer: LayerDef, at: Option<usize>) 
     if i > stack.len() {
         return Err(format!("index {i} is past the top of the {}-layer stack", stack.len()));
     }
-    stack.insert(i, layer);
+    let mut incoming = instantiate(stack, &[layer])?;
+    normalize_ids(stack)?;
+    stack.insert(i, incoming.remove(0));
     Ok(i)
 }
 
@@ -469,6 +540,23 @@ pub fn stack_move(stack: &mut Vec<LayerDef>, from: usize, to: usize) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_normalization_and_template_instantiation_are_stable_and_unique() {
+        let mut scene = vec![LayerDef::default(), LayerDef::default()];
+        normalize_ids(&mut scene).unwrap();
+        let stable = scene.clone(); normalize_ids(&mut scene).unwrap(); assert_eq!(scene, stable);
+        let first = instantiate(&scene, &scene).unwrap();
+        scene.extend(first);
+        let second = instantiate(&scene, &stable).unwrap(); scene.extend(second);
+        assert_eq!(scene.iter().filter_map(|d| d.id).collect::<std::collections::HashSet<_>>().len(), scene.len());
+        let mut duplicate = vec![scene[0].clone(), scene[0].clone()];
+        assert!(normalize_ids(&mut duplicate).is_err());
+        let replace = edit_stack(&stable, &crate::action::LightingLayerOp::Replace { index: 0, preset: Some("comet".into()), layer: None }).unwrap();
+        assert_eq!(replace[0].id, stable[0].id);
+        let pushed = edit_stack(&replace, &crate::action::LightingLayerOp::Push { preset: Some("comet".into()), layer: None }).unwrap();
+        assert_ne!(pushed[2].id, pushed[0].id);
+    }
 
     #[test]
     fn preset_and_pattern_build_valid_layers_with_edits() {
@@ -530,10 +618,12 @@ mod tests {
         assert!(parse_motion("spin").is_err());
 
         let mut stack = Vec::new();
-        let a = build_layer(&LayerMods { preset: Some("static".into()), ..LayerMods::default() }).unwrap();
-        let b = build_layer(&LayerMods { preset: Some("fire".into()), ..LayerMods::default() }).unwrap();
+        let mut a = build_layer(&LayerMods { preset: Some("static".into()), ..LayerMods::default() }).unwrap();
+        let mut b = build_layer(&LayerMods { preset: Some("fire".into()), ..LayerMods::default() }).unwrap();
         stack_add(&mut stack, a.clone(), None).unwrap();
         stack_add(&mut stack, b.clone(), Some(0)).unwrap();
+        a.id = stack[1].id; b.id = stack[0].id;
+        assert_ne!(a.id, b.id);
         assert_eq!(stack[0], b);
         stack_move(&mut stack, 0, 1).unwrap();
         assert_eq!(stack[1], b);
@@ -574,7 +664,8 @@ mod tests {
     #[test]
     fn catalog_carries_saved_effects_and_survives_a_bad_one() {
         let _r = crate::authoring::test_run_root();
-        let layer = build_layer(&LayerMods { preset: Some("aurora".into()), ..LayerMods::default() }).unwrap();
+        let mut layer = build_layer(&LayerMods { preset: Some("aurora".into()), ..LayerMods::default() }).unwrap();
+        normalize_ids(std::slice::from_mut(&mut layer)).unwrap();
         crate::user_effects::save("Shelf Test", &["cool".into()], std::slice::from_ref(&layer)).unwrap();
         let c = catalog_json();
         let found = c["user_effects"].as_array().unwrap();
@@ -596,7 +687,8 @@ mod tests {
     fn stacks_persist_on_a_profile_and_a_device() {
         let _r = crate::authoring::test_run_root();
         crate::manage::create_profile("lit").unwrap();
-        let layer = build_layer(&LayerMods { preset: Some("aurora".into()), ..LayerMods::default() }).unwrap();
+        let mut layer = build_layer(&LayerMods { preset: Some("aurora".into()), ..LayerMods::default() }).unwrap();
+        normalize_ids(std::slice::from_mut(&mut layer)).unwrap();
         let profile = LightTarget::Profile("lit".into());
         profile.save(std::slice::from_ref(&layer)).unwrap();
         assert_eq!(profile.load().unwrap(), vec![layer.clone()]);
@@ -606,6 +698,10 @@ mod tests {
         crate::manage::set_app_pref("phoenix", "false").unwrap();
         dev.save(std::slice::from_ref(&layer)).unwrap();
         assert_eq!(dev.load().unwrap(), vec![layer]);
+        dev.save(&[]).unwrap();
+        assert_eq!(crate::manage::app_table().unwrap()["lighting"]["0221"]["scene_set"].as_bool(), Some(true));
+        assert!(dev.load().unwrap().is_empty());
+        dev.save(&[pattern::preset_layer("aurora").unwrap()]).unwrap();
         assert_eq!(crate::manage::app_table().unwrap()["phoenix"].as_bool(), Some(false), "sibling prefs survive");
         assert_eq!(device_fps(0x0221).unwrap(), 0);
         set_device_fps(0x0221, 24).unwrap();

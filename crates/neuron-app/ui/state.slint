@@ -14,7 +14,7 @@
 import {
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
-    PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
+    PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTileMeta, EffectParam,
     SpectrumStop, SpectrumFrame, GradientPreset, PairChip,
     ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene,
     LightingLayerChoice, LightingPresetChoice
@@ -293,7 +293,7 @@ export global State {
     in-out property <string> light-user-effect: ""; // slug of the saved effect now live ("" = none); lights its tile
     callback save-user-effect(string);               // save the current stack under this name
     callback delete-user-effect(string);             // delete a saved effect by slug
-    in-out property <[EffectTile]> light-user-tiles; // YOUR-EFFECTS shelf — saved by the user
+    in-out property <[EffectTileMeta]> light-user-tiles; // YOUR-EFFECTS shelf — saved by the user
 
     // ── Lighting UNIFIED SURFACE — the render-first, tile-driven page ─────
     // ONE grid of live-preview tiles (effects AND data modes together); picking one plays it on the
@@ -303,9 +303,9 @@ export global State {
     // The catalog is THREE SHELVES, grouped by what feeds each look (the registry's taxonomy):
     // pure light shows / driven by live typing / fed by a real data source. Same tile grammar on
     // every shelf; the split is the information.
-    in-out property <[EffectTile]> light-tiles;        // EFFECTS shelf — light shows on a clock
-    in-out property <[EffectTile]> light-input-tiles;  // REACTS-TO-KEYS shelf — driven by live typing
-    in-out property <[EffectTile]> light-data-tiles;   // LIVE-DATA shelf — audio/screen/battery/OBS/mic/…
+    in-out property <[EffectTileMeta]> light-tiles;        // EFFECTS shelf — light shows on a clock
+    in-out property <[EffectTileMeta]> light-input-tiles;  // REACTS-TO-KEYS shelf — driven by live typing
+    in-out property <[EffectTileMeta]> light-data-tiles;   // LIVE-DATA shelf — audio/screen/battery/OBS/mic/…
     in-out property <string> light-effect: "";        // the active tile's slug (lights the tile, drives the knobs); "" = none
     in-out property <[EffectParam]> light-params;     // the active effect's auto-rendered param controls (range/enum/toggle)
     // STREAM RATE — the frame-rate the live effect runs at, driving BOTH the device stream AND this
@@ -316,6 +316,12 @@ export global State {
     in-out property <bool> light-fps-legacy: false;   // selected board is a slow legacy keyboard (~6 fps)
     in-out property <bool> light-is-readout: false;   // the SELECTED layer is a live device readout (vitals), not a tunable effect
     callback set-light-fps(float);                     // re-pace the live stream + preview together (1–30)
+    in-out property <[image]> light-swatches;
+    in-out property <[image]> light-input-swatches;
+    in-out property <[image]> light-data-swatches;
+    in-out property <[image]> light-user-swatches;
+    in-out property <bool> light-hero-visible;
+    callback tile-demand(int, int, int, int, int);
     callback tile-preview-tick();                     // re-render the grid swatches (animated, ~throttled)
     callback pick-pair(string, int);                  // (effect slug, gradient idx) — pick the tile with that gradient
     callback pick-tile(string);                       // slug → make it the active single effect, play on render + show knobs
@@ -327,6 +333,7 @@ export global State {
     // adds the active effect as another layer; tapping a strip cell selects that layer as the active one.
     in-out property <int> light-stack-count: 0;
     callback stack-current();                          // add the active effect as another layer on top
+    callback stack-tile(string, bool);                 // insert a catalog look above/below the selected layer
     callback select-stack(int);                        // make stack layer `i` the active (knobs follow it)
     callback remove-stack(int);                        // drop stack layer `i`
     callback move-stack(int, int);                     // reorder layer `i` in the stack (dir -1 down / +1 up)

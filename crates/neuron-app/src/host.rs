@@ -58,13 +58,13 @@ use neuron::pattern::LayerDef;
 /// The app's base lighting on one surface: its arbiter layer, the band it's
 /// pinned at, and the layer stack it was built from.
 struct BaseLayer {
-    layer: LayerId,
+    layer: Option<LayerId>,
     band: i32,
-    /// The stack this base renders. Retained so a kernel rebirth (which sweeps
-    /// every lease — base is never reborn) can be recovered by re-claiming fresh
-    /// `Content::Live` from the SAME defs, without the app's higher layers having
-    /// to re-drive it. See [`heartbeat`].
-    defs: Vec<LayerDef>,
+    content: CompositorContent,
+}
+
+impl BaseLayer {
+    fn has_claim(&self) -> bool { self.layer.is_some() && self.content.healthy() }
 }
 
 struct HostState {
@@ -1505,7 +1505,7 @@ pub fn has_lighting(pid: u16, unit: &str) -> bool {
     let Some(s) = g.as_ref() else { return false };
     surface_keys(&s.bridge, pid, unit)
         .iter()
-        .any(|key| s.base.contains_key(key))
+        .any(|key| s.base.get(key).is_some_and(BaseLayer::has_claim))
 }
 
 /// Who is actually in control of a board right now — the ownership truth no
@@ -1649,23 +1649,29 @@ pub fn io_gate_all() -> Vec<IoGate> {
         .collect()
 }
 
-/// Push the app's lighting stack as the animated base layer, at `fps`. `unit` names the ONE
-/// physical board the stack targets (the app's device model is unit-keyed; each board's stream is
-/// applied to exactly that board's surface). An empty unit is the pid-level form — per-model
-/// config with no unit in hand — and fans the SAME stack out to every surface the pid maps to,
-/// each unit claimed explicitly. Set-or-claim per surface so re-applying re-uses the same layer
-/// (no flicker); each surface's fps atomic is its own shared writer pace — one knob drives render
-/// AND write cadence, exactly like the app's own streams. `false` only if the host is inactive or
-/// the addressed board isn't bridged (caller falls back to a local stream); a partial failure
-/// across a pid-level fan-out still returns true if at least one landed.
-pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32) -> bool {
-    let mut g = guard();
-    let Some(s) = g.as_mut() else { return false };
-    let keys: Vec<String> = surface_keys(&s.bridge, pid, unit);
-    if keys.is_empty() {
-        return false;
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightingRoute { Hosted, LocalEligible, HostOwnedUnavailable }
 
+pub fn owns_surface(pid: u16, unit: &str) -> bool {
+    guard().as_ref().is_some_and(|s| !surface_keys(&s.bridge, pid, unit).is_empty())
+}
+
+pub fn base_scene(pid: u16, unit: &str) -> Option<neuron::pattern::LiveSceneHandle> {
+    let g = guard();
+    let s = g.as_ref()?;
+    surface_keys(&s.bridge, pid, unit).iter().find_map(|key| {
+        let base = s.base.get(key)?;
+        base.has_claim().then(|| base.content.handle())
+    })
+}
+
+/// Route a scene per physical surface. A failed hosted claim never permits a local writer.
+pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32, hint: neuron::pattern::TransitionHint) -> LightingRoute {
+    let mut g = guard();
+    let Some(s) = g.as_mut() else { return LightingRoute::LocalEligible };
+    let keys: Vec<String> = surface_keys(&s.bridge, pid, unit);
+    if keys.is_empty() { return LightingRoute::LocalEligible; }
+    let total = keys.len();
     // Normally the user's lighting is the BASE layer and games sit above it at SESSION. When
     // "my lighting always wins" is on, the base claims the OVERRIDE band instead, outranking every
     // visitor (they keep painting underneath but never show — the suppressed case). A live toggle
@@ -1677,7 +1683,7 @@ pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32) -> bool
         band::BASE
     };
     let now = Instant::now();
-    let mut any = false;
+    let mut accepted = 0;
     for key in keys {
         let Some((rows, cols)) = s.bridge.grid_of(&key) else {
             continue;
@@ -1689,50 +1695,40 @@ pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32) -> bool
             fps.clamp(1, neuron::lighting::MAX_STREAM_FPS),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let content = Content::Live(Box::new(CompositorContent::new(
-            defs.clone(),
-            rows,
-            cols,
-            pace,
-        )));
         let mut h = s.handle.clone();
         if let Some(existing) = s.base.get(&key) {
             // Reuse the layer (no flicker) only if it's already at the right band;
             // a band change or a vanished layer (kernel rebirth) falls through to
             // a fresh claim.
-            if existing.band == want_band && h.set_content(existing.layer, content.clone(), now) {
-                // Keep the retained defs current with what's actually rendering,
-                // so a later rebirth recovery rebuilds THIS stack, not a stale one.
-                if let Some(base) = s.base.get_mut(&key) {
-                    base.defs.clone_from(&defs);
+            // Heartbeat checks claim liveness; ordinary edits never wait on the actor's render work.
+            if existing.band == want_band && existing.content.healthy() {
+                if let Err(error) = existing.content.update_scene(defs.clone(), hint) {
+                    eprintln!("neuron-host: scene rejected for {key}: {error}");
+                    continue;
                 }
-                any = true;
+                if existing.layer.is_some() { accepted += 1; }
                 continue;
             }
-            if let Some(old) = s.base.remove(&key) {
-                h.release(old.layer);
-            }
         }
-        if let Some(layer) = h.claim(
+        let target = neuron::pattern::SurfaceIdentity { pid, unit: unit.to_string(), plane: key.clone(), dimensions: (rows, cols) };
+        let live = match CompositorContent::new_bound(defs.clone(), target, pace) {
+            Ok(live) => live,
+            Err(error) => { eprintln!("neuron-host: invalid scene for {key}: {error:?}"); continue; }
+        };
+        if let Some(layer) = s.base.remove(&key).and_then(|old| old.layer) { h.release(layer); }
+        let content = Content::Live(Box::new(live.clone()));
+        let layer = h.claim(
             &key,
             s.base_owner,
             want_band,
             LeaseSpec::Pinned,
             content,
             now,
-        ) {
-            s.base.insert(
-                key,
-                BaseLayer {
-                    layer,
-                    band: want_band,
-                    defs: defs.clone(),
-                },
-            );
-            any = true;
-        }
+        );
+        if layer.is_some() { accepted += 1; }
+        s.base.insert(key, BaseLayer { layer, band: want_band, content: live });
     }
-    any
+    if accepted == total { LightingRoute::Hosted } else { LightingRoute::HostOwnedUnavailable }
 }
 
 /// Live re-pace a board's base (the fps slider), no restart. `unit` names the board; empty
@@ -1756,9 +1752,7 @@ pub fn clear_lighting(pid: u16, unit: &str) {
     let Some(s) = g.as_mut() else { return };
     let keys: Vec<String> = surface_keys(&s.bridge, pid, unit);
     for key in keys {
-        if let Some(b) = s.base.remove(&key) {
-            s.handle.clone().release(b.layer);
-        }
+        if let Some(layer) = s.base.remove(&key).and_then(|b| b.layer) { s.handle.clone().release(layer); }
     }
 }
 
@@ -1772,13 +1766,11 @@ pub fn clear_all_lighting() {
     let Some(s) = g.as_mut() else { return };
     let mut h = s.handle.clone();
     for (_key, b) in s.base.drain() {
-        h.release(b.layer);
+        if let Some(layer) = b.layer { h.release(layer); }
     }
 }
 
-/// Does the host hold a base-lighting layer for ANY board? The global twin of [`has_lighting`],
-/// so [`crate::runtime::AppRuntime::any_animating`] can count host-composited boards as live even
-/// though the app owns no local writer for them.
+/// Includes pending base claims so a safety stop also cancels their recovery intent.
 pub fn any_lighting() -> bool {
     let g = guard();
     g.as_ref().is_some_and(|s| !s.base.is_empty())
@@ -1823,7 +1815,7 @@ pub fn heartbeat() {
     let dead: Vec<String> = s
         .base
         .iter()
-        .filter(|(_, b)| !h.refresh(b.layer, now))
+        .filter(|(_, b)| !b.content.healthy() || b.layer.is_none_or(|layer| !h.refresh(layer, now)))
         .map(|(k, _)| k.clone())
         .collect();
     for key in dead {
@@ -1831,23 +1823,20 @@ pub fn heartbeat() {
         // defs — same stack, same band, a fresh compositor. Reuses the exact
         // claim path `set_lighting` uses; the per-surface fps atomic persists in
         // the bridge, so pace carries across the rebirth untouched.
-        let Some(old) = s.base.remove(&key) else { continue };
-        let Some((rows, cols)) = s.bridge.grid_of(&key) else { continue };
-        let Some(pace) = s.bridge.pace(&key) else { continue };
-        let content = Content::Live(Box::new(CompositorContent::new(
-            old.defs.clone(),
-            rows,
-            cols,
-            pace,
-        )));
-        if let Some(layer) =
-            h.claim(&key, s.base_owner, old.band, LeaseSpec::Pinned, content, now)
-        {
-            s.base.insert(
-                key,
-                BaseLayer { layer, band: old.band, defs: old.defs },
-            );
-        }
+        let Some(mut old) = s.base.remove(&key) else { continue };
+        if let Some(layer) = old.layer.take() { h.release(layer); }
+        let Some((rows, cols)) = s.bridge.grid_of(&key) else { s.base.insert(key, old); continue };
+        let Some(pace) = s.bridge.pace(&key) else { s.base.insert(key, old); continue };
+        let defs = old.content.handle().desired_definitions().to_vec();
+        let mut target = old.content.handle().target().clone();
+        target.dimensions = (rows, cols);
+        let live = match CompositorContent::new_bound(defs.clone(), target, pace) {
+            Ok(live) => live,
+            Err(error) => { eprintln!("neuron-host: recovery scene failed: {error}"); s.base.insert(key, old); continue; }
+        };
+        let content = Content::Live(Box::new(live.clone()));
+        let layer = h.claim(&key, s.base_owner, old.band, LeaseSpec::Pinned, content, now);
+        s.base.insert(key, BaseLayer { layer, band: old.band, content: live });
     }
     // The native-Chroma game layers ride the SAME tick: refresh their Heartbeat leases while a
     // game is live (or fading out), re-claim any a rebirth swept, and let them lapse — base back —
@@ -1859,6 +1848,24 @@ pub fn heartbeat() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_base_retains_desired_scene_without_claiming_live_output() {
+        let content = CompositorContent::new(vec![LayerDef::default()], 1, 2,
+            Arc::new(std::sync::atomic::AtomicU32::new(30))).unwrap();
+        let pending = BaseLayer { layer: None, band: band::BASE, content };
+        let handle = pending.content.handle();
+        assert!(!pending.has_claim());
+        assert!(handle.latest().is_none());
+        let scene = vec![LayerDef { spectrum: neuron::spectrum::Spectrum::solid(
+            neuron::lighting::Rgb::new(0, 150, 100)), ..Default::default() }];
+        pending.content.update_scene(scene.clone(), neuron::pattern::TransitionHint::Edit).unwrap();
+        assert!(!pending.has_claim());
+        assert!(neuron::pattern::same_scene_contents(&handle.desired_definitions(), &scene));
+        let restored = CompositorContent::new_bound(handle.desired_definitions().to_vec(),
+            handle.target().clone(), Arc::new(std::sync::atomic::AtomicU32::new(30))).unwrap();
+        assert!(neuron::pattern::same_scene_contents(&restored.handle().accepted_definitions(), &scene));
+    }
 
     /// The one blend mapping both paint lanes share (Chroma games + OpenRGB tools).
     #[test]

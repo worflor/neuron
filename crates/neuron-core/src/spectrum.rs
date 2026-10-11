@@ -134,6 +134,8 @@ pub enum BoundaryMode {
     Clamp,
     /// Reflect back and forth smoothly across boundaries.
     PingPong,
+    /// A periodic reflection with zero velocity at either endpoint.
+    SmoothMirror,
     /// Wrap periodically in [0, 1) (modulo 1.0).
     Wrap,
 }
@@ -144,14 +146,17 @@ impl BoundaryMode {
         match self {
             BoundaryMode::Clamp => "clamp",
             BoundaryMode::PingPong => "pingpong",
+            BoundaryMode::SmoothMirror => "smoothmirror",
             BoundaryMode::Wrap => "wrap",
         }
     }
 
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // Unknown names preserve the default boundary mode.
     pub fn from_str(s: &str) -> BoundaryMode {
         match s.to_ascii_lowercase().as_str() {
             "pingpong" | "ping-pong" => BoundaryMode::PingPong,
+            "smoothmirror" | "smooth-mirror" => BoundaryMode::SmoothMirror,
             "wrap" => BoundaryMode::Wrap,
             _ => BoundaryMode::Clamp,
         }
@@ -163,6 +168,7 @@ impl BoundaryMode {
         match self {
             BoundaryMode::Clamp => u.clamp(0.0, 1.0),
             BoundaryMode::Wrap => u.rem_euclid(1.0),
+            BoundaryMode::SmoothMirror => (1.0 - (u.rem_euclid(1.0) * std::f32::consts::TAU).cos()) * 0.5,
             BoundaryMode::PingPong => {
                 let u2 = u.rem_euclid(2.0);
                 if u2 > 1.0 {
@@ -173,6 +179,13 @@ impl BoundaryMode {
             }
         }
     }
+}
+
+/// Coordinate topology and an optional explicit palette boundary policy.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PaletteSampling {
+    pub cyclic: bool,
+    pub boundary: Option<BoundaryMode>,
 }
 
 /// How a [`Palette`] interpolates COLOUR between its stops. The default is raw RGB (predictable,
@@ -385,27 +398,41 @@ impl Palette {
     /// Sample the palette at `(t, u)` with high-precision [`Duration`] timing, applying its [`Motion`].
     #[must_use]
     pub fn at_time(&self, t: Duration, u: f32) -> Rgb {
+        self.at_time_sampled(t, u, false, None)
+    }
+
+    /// Apply motion before resolving the coordinate's topology and optional boundary override.
+    #[must_use]
+    pub fn at_time_sampled(&self, t: Duration, u: f32, cyclic: bool, boundary: Option<BoundaryMode>) -> Rgb {
         let t_sec = t.as_secs_f64();
+        let moving = matches!(self.motion, Motion::Drift { .. } | Motion::Flow { .. });
+        let closed = self.stops.first().zip(self.stops.last()).is_some_and(|(a, b)| a.col == b.col);
+        let mode = boundary.unwrap_or(if cyclic || moving {
+            if closed { BoundaryMode::Wrap } else { BoundaryMode::PingPong }
+        } else { BoundaryMode::Clamp });
+        let sample = |coordinate| self.sample(mode.map(if cyclic && boundary.is_none() && mode == BoundaryMode::PingPong {
+            coordinate * 2.0
+        } else { coordinate }));
         match self.motion {
-            Motion::Hold => self.sample(u),
+            Motion::Hold => sample(u),
             Motion::Drift { speed } => {
-                let offset = (t_sec * (speed as f64)).rem_euclid(1.0) as f32;
-                self.sample((u + offset).rem_euclid(1.0))
+                let offset = (t_sec * (speed as f64)).rem_euclid(2.0) as f32;
+                sample(u + offset)
             }
             Motion::Cycle { speed } => {
-                let col = self.sample(u);
+                let col = sample(u);
                 let deg = (t_sec * (speed as f64) * 360.0).rem_euclid(360.0) as f32;
                 crate::effects::jitter_hue(col, deg)
             }
             Motion::Breathe { speed, depth } => {
-                let col = self.sample(u);
+                let col = sample(u);
                 let d = depth.clamp(0.0, 1.0);
                 let tau = std::f64::consts::TAU;
                 let phase = (t_sec * tau * (speed as f64) + tau / 3.0).rem_euclid(tau) as f32;
                 let f = 1.0 - d * 0.5 * (1.0 - crate::effects::breathe_shape(phase));
                 col.scale_f(f)
             }
-            Motion::Flow { speed, chaos } => self.sample(flow_u_time(u, t, speed, chaos)),
+            Motion::Flow { speed, chaos } => sample(flow_u_time(u, t, speed, chaos)),
         }
     }
 
@@ -496,6 +523,28 @@ pub struct Spectrum {
     pub play: Loop,
 }
 
+/// Borrowed timeline selection; sampling preserves the spectrum's exact interpolation order.
+pub struct PreparedSpectrumContext<'a> {
+    current: Option<&'a Palette>,
+    previous: Option<&'a Palette>,
+    t: Duration,
+    mix: f32,
+}
+
+impl PreparedSpectrumContext<'_> {
+    #[must_use]
+    pub fn at(&self, u: f32) -> Rgb {
+        self.at_with_sampling(u, false, None)
+    }
+
+    #[must_use]
+    pub fn at_with_sampling(&self, u: f32, cyclic: bool, boundary: Option<BoundaryMode>) -> Rgb {
+        let Some(current) = self.current else { return Rgb::BLACK; };
+        let this = current.at_time_sampled(self.t, u, cyclic, boundary);
+        self.previous.map_or(this, |previous| Rgb::lerp(previous.at_time_sampled(self.t, u, cyclic, boundary), this, self.mix))
+    }
+}
+
 impl Default for Spectrum {
     fn default() -> Self {
         Spectrum::solid(Rgb::new(0x4A, 0xF2, 0xB0))
@@ -569,19 +618,25 @@ impl Spectrum {
     /// Sample the spectrum program at `(t, u)` with high-precision [`Duration`] timing.
     #[must_use]
     pub fn at_time(&self, t: Duration, u: f32) -> Rgb {
+        self.prepare(t).at(u)
+    }
+
+    /// Resolve the timeline once for all cells in a presentation frame.
+    #[must_use]
+    pub fn prepare(&self, t: Duration) -> PreparedSpectrumContext<'_> {
         let n = self.seq.len();
         if n == 0 {
-            return Rgb::BLACK;
+            return PreparedSpectrumContext { current: None, previous: None, t, mix: 1.0 };
         }
         if n == 1 {
-            return self.seq[0].palette.at_time(t, u);
+            return PreparedSpectrumContext { current: Some(&self.seq[0].palette), previous: None, t, mix: 1.0 };
         }
         // total cycle duration (each frame occupies hold + fade seconds)
         let dur = |f: &Frame| (f.hold.max(0.0) + f.fade.max(0.0)) as f64;
         let total: f64 = self.seq.iter().map(dur).sum();
         if total <= 1e-6 {
             // degenerate timing (all-zero durations) — nothing to advance through; show the first frame.
-            return self.seq[0].palette.at_time(t, u);
+            return PreparedSpectrumContext { current: Some(&self.seq[0].palette), previous: None, t, mix: 1.0 };
         }
         let t_sec = t.as_secs_f64();
         // map t -> a forward position p in [0, total]
@@ -612,7 +667,7 @@ impl Spectrum {
             acc += d;
         }
         let frame = &self.seq[i];
-        let this = frame.palette.at_time(t, u);
+        let mut prepared = PreparedSpectrumContext { current: Some(&frame.palette), previous: None, t, mix: 1.0 };
         let fade = frame.fade.max(0.0) as f64;
         if fade > 1e-6 && local < fade {
             // the previous frame to crossfade in FROM. Loop wraps (frame 0's prev is the last frame) so
@@ -622,12 +677,11 @@ impl Spectrum {
                 Loop::Once | Loop::PingPong => i.checked_sub(1),
             };
             if let Some(pi) = prev_idx {
-                let prev = self.seq[pi].palette.at_time(t, u);
-                let f = frame.ease.apply((local / fade) as f32);
-                return Rgb::lerp(prev, this, f);
+                prepared.previous = Some(&self.seq[pi].palette);
+                prepared.mix = frame.ease.apply((local / fade) as f32);
             }
         }
-        this
+        prepared
     }
 
     /// Sample the spectrum program at `(t, u)`. If `seq` has 1 frame, its palette is sampled with its
@@ -659,7 +713,9 @@ pub fn rainbow() -> Spectrum {
 /// is the same fire the patterns ship; `meadow` is Wildlife's meadow palette; `bubble` is a soap film,
 /// the colours of thin-film interference (n = 1.33, thickness 100-330 nm, normal incidence, CIE 1931
 /// observer, saturation x0.8).
-pub const GRADIENT_PRESETS: &[(&str, &[(u8, u8, u8)])] = &[
+/// A named, immutable RGB stop list used by the gradient catalog.
+pub type GradientPreset = (&'static str, &'static [(u8, u8, u8)]);
+pub const GRADIENT_PRESETS: &[GradientPreset] = &[
     ("rainbow", &[(255, 0, 0), (255, 255, 0), (0, 255, 0), (0, 255, 255), (0, 0, 255), (255, 0, 255), (255, 0, 0)]),
     ("fire", &[(180, 0, 0), (255, 90, 0), (255, 210, 40), (255, 255, 220)]),
     ("aurora", &[(0, 200, 120), (0, 180, 200), (40, 80, 255), (150, 60, 220)]),
@@ -695,29 +751,71 @@ const COLOUR_NAMES: &[(&str, (u8, u8, u8))] = &[
     ("pink", (255, 90, 150)), ("brown", (120, 70, 30)),
 ];
 
-/// A short human name for a palette: its preset's name when the stops match one, the nearest named
-/// colour for a solid, else `"custom"`.
+/// A short palette label, including stock effect ramps and close edits of named gradients.
+/// Motion does not change the colour name; modified gradients retain an explicit edited suffix.
 #[must_use]
-pub fn palette_name(p: &Palette) -> &'static str {
-    let near = |a: Rgb, b: (u8, u8, u8)| {
-        (i32::from(a.r) - i32::from(b.0)).abs().max((i32::from(a.g) - i32::from(b.1)).abs()).max((i32::from(a.b) - i32::from(b.2)).abs()) <= 2
+pub fn palette_name(p: &Palette) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
+    let distance = |a: Rgb, b: (u8, u8, u8)| {
+        (i32::from(a.r) - i32::from(b.0)).abs().max((i32::from(a.g) - i32::from(b.1)).abs()).max((i32::from(a.b) - i32::from(b.2)).abs())
     };
-    if let [only] = p.stops.as_slice() {
+    if let Some(only) = p.stops.first().filter(|first| p.stops.iter().all(|s| s.col == first.col)) {
         let d = |n: &(u8, u8, u8)| {
             let (dr, dg, db) = (i32::from(only.col.r) - i32::from(n.0), i32::from(only.col.g) - i32::from(n.1), i32::from(only.col.b) - i32::from(n.2));
             dr * dr + dg * dg + db * db
         };
-        return COLOUR_NAMES.iter().min_by_key(|(_, c)| d(c)).map_or("custom", |(n, _)| n);
+        return Cow::Borrowed(COLOUR_NAMES.iter().min_by_key(|(_, c)| d(c)).map_or("custom", |(n, _)| n));
     }
+    // Effect ramps are established palettes too, including heat's dark foot and nonuniform stops.
+    static STOCK_RAMPS: std::sync::OnceLock<Vec<(&'static str, Palette)>> = std::sync::OnceLock::new();
+    let stock_ramps = STOCK_RAMPS.get_or_init(|| {
+        [("fire", "fire"), ("typingheat", "thermal"), ("cascade", "cascade"),
+            ("comet", "comet"), ("audiometer", "meter"), ("pulse", "pulse")].into_iter().filter_map(|(slug, name)| {
+            let def = crate::pattern::preset_by_slug(slug)?;
+            (def.spectrum)().seq.into_iter().next().map(|frame| (name, frame.palette))
+        }).collect()
+    });
+    for (name, palette) in stock_ramps {
+        if p.stops == palette.stops && p.interp == palette.interp {
+            return Cow::Borrowed(name);
+        }
+    }
+    let mut closest: Option<(&str, i32)> = None;
     for (name, cols) in GRADIENT_PRESETS {
         let n = cols.len();
         if p.stops.len() == n
-            && p.stops.iter().enumerate().all(|(i, s)| near(s.col, cols[i]) && (s.at - even_pos(i, n)).abs() < 0.01)
+            && p.stops.iter().enumerate().all(|(i, s)| distance(s.col, cols[i]) <= 2 && (s.at - even_pos(i, n)).abs() < 0.01)
+            && p.interp == Interp::Rgb
         {
-            return name;
+            return Cow::Borrowed(name);
+        }
+        let stops = if p.stops.len() == n + 1 && p.stops[0].col.r.max(p.stops[0].col.g).max(p.stops[0].col.b) <= 24 {
+            &p.stops[1..]
+        } else {
+            p.stops.as_slice()
+        };
+        if stops.len() == n {
+            let (largest, score) = stops.iter().zip(*cols).fold((0, 0), |(largest, score), (s, &c)| {
+                let d = distance(s.col, c);
+                (largest.max(d), score + d)
+            });
+            if largest <= 48 && closest.is_none_or(|(_, best)| score < best) {
+                closest = Some((name, score));
+            }
         }
     }
-    "custom"
+    for (name, reference) in stock_ramps {
+        if p.stops.len() == reference.stops.len() {
+            let (largest, score) = p.stops.iter().zip(&reference.stops).fold((0, 0), |(largest, score), (s, r)| {
+                let d = distance(s.col, (r.col.r, r.col.g, r.col.b));
+                (largest.max(d), score + d)
+            });
+            if largest <= 48 && closest.is_none_or(|(_, best)| score < best) {
+                closest = Some((name, score));
+            }
+        }
+    }
+    closest.map_or(Cow::Borrowed("custom"), |(name, _)| Cow::Owned(format!("{name} · edited")))
 }
 
 // ─────────────────────────────────────── helpers ─────────────────────────────────────────
@@ -788,6 +886,7 @@ pub fn rgb_to_oklab(c: Rgb) -> (f32, f32, f32) {
 
 /// Convert OKLab (L, a, b) to sRGB with hue-preserving chroma reduction for out-of-gamut colours.
 #[must_use]
+#[allow(clippy::manual_range_contains)] // Explicit comparisons preserve the existing NaN behavior.
 pub fn oklab_to_rgb(l: f32, a: f32, b: f32) -> Rgb {
     let l_clamped = l.clamp(0.0, 1.0);
     let l_ = (l_clamped + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
@@ -847,7 +946,7 @@ fn even_pos(i: usize, n: usize) -> f32 {
 }
 
 /// Organic multi-octave `u`-drift for [`Motion::Flow`]: one base octave (always on) plus two finer
-/// octaves scaled by `chaos`, wrapped into 0..1. Bounded so it stays a gentle wander, not a jump.
+/// octaves scaled by `chaos`. Boundary resolution runs after this continuous displacement.
 fn flow_u_time(u: f32, t: Duration, speed: f32, chaos: f32) -> f32 {
     let c = chaos.clamp(0.0, 1.0);
     let t_sec = t.as_secs_f64();
@@ -858,7 +957,7 @@ fn flow_u_time(u: f32, t: Duration, speed: f32, chaos: f32) -> f32 {
     let o2 = ((t_sec * s * tau * 1.13 + uf * tau * 2.0).rem_euclid(tau)).sin() as f32;
     let o3 = ((t_sec * s * tau * 0.27 + uf * tau * 3.0).rem_euclid(tau)).sin() as f32;
     let drift = (o1 * 0.5 + o2 * 0.3 * c + o3 * 0.2 * c) * 0.5; // ~±0.5
-    (u + drift).rem_euclid(1.0)
+    u + drift
 }
 
 #[allow(dead_code)]
@@ -1165,6 +1264,49 @@ impl<'de> Deserialize<'de> for Spectrum {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn moving_open_palette_reflects_without_an_endpoint_snap() {
+        let mut palette = super::Palette::gradient(vec![super::Rgb::new(255, 0, 0), super::Rgb::new(0, 0, 255)]);
+        palette.motion = super::Motion::Drift { speed: 1.0 };
+        let before = palette.at_time(std::time::Duration::from_micros(999_999), 0.0);
+        let after = palette.at_time(std::time::Duration::from_micros(1_000_001), 0.0);
+        assert_eq!(before, after);
+        assert_eq!(after, super::Rgb::new(0, 0, 255));
+        assert_eq!(palette.at_time_sampled(std::time::Duration::from_secs(1), 0.0, false,
+            Some(super::BoundaryMode::Wrap)), super::Rgb::new(255, 0, 0));
+    }
+
+    #[test]
+    fn cyclic_open_palette_has_a_seam_and_measurements_stay_clamped() {
+        let palette = super::Palette::gradient(vec![super::Rgb::new(255, 0, 0), super::Rgb::new(0, 0, 255)]);
+        assert_eq!(palette.at_time_sampled(std::time::Duration::ZERO, 0.0, true, None),
+            palette.at_time_sampled(std::time::Duration::ZERO, 1.0, true, None));
+        assert_eq!(palette.at_time_sampled(std::time::Duration::ZERO, 1.0, true,
+            Some(super::BoundaryMode::PingPong)), super::Rgb::new(0, 0, 255));
+        assert_eq!(palette.at_time(std::time::Duration::ZERO, 1.5), super::Rgb::new(0, 0, 255));
+        assert_eq!(palette.at_time(std::time::Duration::ZERO, -0.5), super::Rgb::new(255, 0, 0));
+    }
+
+    #[test]
+    fn smooth_mirror_is_periodic_and_has_flat_turnarounds() {
+        let mode = super::BoundaryMode::SmoothMirror;
+        assert_eq!(mode.map(0.0), 0.0);
+        assert_eq!(mode.map(0.5), 1.0);
+        assert_eq!(mode.map(1.0), 0.0);
+        assert!((mode.map(0.001) / 0.001).abs() < 0.02);
+        assert_eq!(super::BoundaryMode::from_str(mode.as_str()), mode);
+    }
+
+    #[test]
+    fn hue_motion_keeps_its_phase_across_4096_seconds() {
+        let mut palette = super::Palette::solid(super::Rgb::new(255, 0, 0));
+        palette.motion = super::Motion::Cycle { speed: 0.15 };
+        let before = palette.at_time(std::time::Duration::from_millis(4_095_999), 0.0);
+        let after = palette.at_time(std::time::Duration::from_millis(4_096_001), 0.0);
+        assert!(approx(before, after, 1));
+        assert_ne!(after, palette.at_time(std::time::Duration::from_millis(1), 0.0));
+    }
+
     use super::*;
 
     /// A holder so a Spectrum (which can serialise to a bare string/array) can sit at a TOML field.
@@ -1695,9 +1837,9 @@ mod tests {
 
     #[test]
     fn gradient_presets_are_real_ramps() {
-        for i in 0..GRADIENT_PRESETS.len() {
+        for (i, preset) in GRADIENT_PRESETS.iter().enumerate() {
             let p = gradient_preset(i).expect("in range");
-            assert!(p.stops.len() >= 3, "{} is a ramp", GRADIENT_PRESETS[i].0);
+            assert!(p.stops.len() >= 3, "{} is a ramp", preset.0);
             assert_eq!(p.stops[0].at, 0.0);
             assert_eq!(p.stops.last().unwrap().at, 1.0);
         }
@@ -1709,5 +1851,135 @@ mod tests {
         assert_eq!(palette_name(&gradient_preset(1).unwrap()), "fire");
         assert_eq!(palette_name(&Palette::solid(Rgb::new(0x4A, 0xF2, 0xB0))), "mint");
         assert_eq!(palette_name(&Palette::gradient(vec![Rgb::new(1, 2, 3), Rgb::new(9, 9, 9)])), "custom");
+    }
+
+    #[test]
+    fn palette_names_recognize_stock_ramps_and_repeated_solid_stops() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Saved { spectrum: Spectrum }
+        for (slug, name) in [("fire", "fire"), ("typingheat", "thermal"), ("cascade", "cascade"),
+            ("comet", "comet"), ("audiometer", "meter"), ("pulse", "pulse")] {
+            let layer = crate::pattern::preset_layer(slug).unwrap();
+            assert_eq!(palette_name(&layer.spectrum.seq[0].palette), name);
+        }
+        for (i, (name, _)) in GRADIENT_PRESETS.iter().enumerate() {
+            let palette = gradient_preset(i).unwrap();
+            let saved = Saved { spectrum: Spectrum::from_palette(palette) };
+            let restored: Saved = toml::from_str(&toml::to_string(&saved).unwrap()).unwrap();
+            assert_eq!(palette_name(&restored.spectrum.seq[0].palette), *name);
+        }
+        assert_eq!(palette_name(&Palette::gradient(vec![Rgb::new(74, 242, 176); 3])), "mint");
+    }
+
+    #[test]
+    fn palette_names_distinguish_close_edits_from_unrelated_gradients() {
+        let mut palette = gradient_preset(2).unwrap();
+        palette.stops[1].at = 0.618;
+        palette.stops[2].at = 0.775;
+        palette.stops[3] = Stop::new(Rgb::new(191, 90, 242), 0.919);
+        palette.stops.insert(0, Stop::new(Rgb::new(0, 16, 9), 0.0));
+        assert_eq!(palette_name(&palette), "aurora · edited");
+        palette.stops[2].col = Rgb::new(255, 120, 0);
+        assert_eq!(palette_name(&palette), "custom");
+        let mut fire = gradient_preset(1).unwrap();
+        fire.stops[1].at = 0.2;
+        assert_eq!(palette_name(&fire), "fire · edited");
+        let mut cascade = crate::pattern::preset_layer("cascade").unwrap().spectrum.seq.remove(0).palette;
+        cascade.stops[0].at = 0.2;
+        assert_eq!(palette_name(&cascade), "cascade · edited");
+        let mut aurora = gradient_preset(2).unwrap();
+        aurora.interp = Interp::Hsv;
+        assert_eq!(palette_name(&aurora), "aurora · edited");
+        aurora.motion = Motion::Cycle { speed: 0.15 };
+        aurora.interp = Interp::Rgb;
+        assert_eq!(palette_name(&aurora), "aurora");
+        assert_eq!(palette_name(&Palette::gradient(Vec::new())), "custom");
+    }
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+    fn reference_at_time(spectrum: &Spectrum, t: Duration, u: f32) -> Rgb {
+        let n = spectrum.seq.len();
+        if n == 0 {
+            return Rgb::BLACK;
+        }
+        if n == 1 {
+            return spectrum.seq[0].palette.at_time(t, u);
+        }
+        // total cycle duration (each frame occupies hold + fade seconds)
+        let dur = |f: &Frame| (f.hold.max(0.0) + f.fade.max(0.0)) as f64;
+        let total: f64 = spectrum.seq.iter().map(dur).sum();
+        if total <= 1e-6 {
+            // degenerate timing (all-zero durations) — nothing to advance through; show the first frame.
+            return spectrum.seq[0].palette.at_time(t, u);
+        }
+        let t_sec = t.as_secs_f64();
+        // map t -> a forward position p in [0, total]
+        let p = match spectrum.play {
+            Loop::Once => t_sec.clamp(0.0, total),
+            Loop::Loop => t_sec.rem_euclid(total),
+            Loop::PingPong => {
+                let q = t_sec.rem_euclid(2.0 * total);
+                if q <= total {
+                    q
+                } else {
+                    2.0 * total - q
+                }
+            }
+        };
+        // find the active frame i and the local time within it. p == total (Once at the end) falls
+        // through the loop to the last frame, fully held (local = its duration), so no crossfade.
+        let mut acc = 0.0;
+        let mut i = n - 1;
+        let mut local = dur(&spectrum.seq[n - 1]);
+        for (idx, f) in spectrum.seq.iter().enumerate() {
+            let d = dur(f);
+            if p < acc + d {
+                i = idx;
+                local = p - acc;
+                break;
+            }
+            acc += d;
+        }
+        let frame = &spectrum.seq[i];
+        let this = frame.palette.at_time(t, u);
+        let fade = frame.fade.max(0.0) as f64;
+        if fade > 1e-6 && local < fade {
+            // the previous frame to crossfade in FROM. Loop wraps (frame 0's prev is the last frame) so
+            // the loop seam is seamless; Once/PingPong have no wrap at frame 0 (it simply appears).
+            let prev_idx = match spectrum.play {
+                Loop::Loop => Some((i + n - 1) % n),
+                Loop::Once | Loop::PingPong => i.checked_sub(1),
+            };
+            if let Some(pi) = prev_idx {
+                let prev = spectrum.seq[pi].palette.at_time(t, u);
+                let f = frame.ease.apply((local / fade) as f32);
+                return Rgb::lerp(prev, this, f);
+            }
+        }
+        this
+    }
+
+    #[test]
+    fn prepared_timeline_is_byte_identical_to_reference() {
+        let mut spectra: Vec<_> = crate::pattern::presets().iter().map(|p| crate::pattern::preset_layer(p.slug).unwrap().spectrum).collect();
+        for play in [Loop::Once, Loop::Loop, Loop::PingPong] {
+            let mut frames = vec![Frame::solid(Rgb::new(10, 80, 230)), Frame::new(Palette::gradient(vec![Rgb::new(255, 0, 0), Rgb::new(0, 255, 20)]))];
+            frames[0].hold = 0.4; frames[0].fade = 0.25;
+            frames[1].hold = 0.7; frames[1].fade = 0.35;
+            spectra.push(Spectrum::sequence(frames, play));
+        }
+        for spectrum in spectra {
+            for sec in [0.0, 0.001, 0.249, 0.25, 0.65, 1.0, 1.7, 60.125, 3600.123456] {
+                let t = Duration::from_secs_f64(sec);
+                let prepared = spectrum.prepare(t);
+                for i in 0..257 {
+                    let u = i as f32 / 256.0;
+                    assert_eq!(prepared.at(u), reference_at_time(&spectrum, t, u), "{sec} {u}");
+                }
+            }
+        }
     }
 }

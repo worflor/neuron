@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep running layer state during palette edits and stack rearrangement, and dissolve authored scene changes through the same bounded transition in local and hosted lighting. Continuous edits publish immediately; the live preview observes generated base frames. Explicitly clearing the final layer saves a managed black scene. Physical LED transitions remain hardware-unverified.
+- Added a hover-only layer insertion capsule with above/below choices. Centred its labels and improved palette names: stock ramps retain their names, recognizable altered ramps show an edited suffix, and unrelated palettes remain custom.
+
 - Added gradient presets to the spectrum editor: rainbow, fire, aurora, thermal, sunset, meadow, ice and bubble (a soap-film ramp computed from thin-film interference). One click swaps a layer's stops and keeps its motion and blend; the editor header names the current palette in its own colours.
 - Added suggested pairings on effect tiles. A small chip opens in place to apply an effect with another gradient or mode, such as Comet with sunset and light painting, or Cascade in matrix mode with bubble. Hand-picked pairings come first and the rest are scored from the gradient's lightness, hue spread and contrast; an effect is never offered its own gradient.
 - Gave Typing Heat and Fire a dark foot on bright gradients so heat still reads dim to bright in the gradient's own hue.

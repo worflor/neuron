@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::api::{Grid, HostApi, SurfaceInfo, SurfaceKind};
@@ -44,62 +44,74 @@ use crate::writer::{FrameSink, Writer, WriterPauser};
 
 use neuron::device::Device;
 use neuron::lighting::{changed_rows_into, LightingDef, Lights, Protocol, Rgb as CoreRgb};
-use neuron::pattern::{quantized_t, render_elapsed, Compositor, LayerDef};
+use neuron::pattern::{quantized_time, render_epoch, BaseFrame, LiveComposite, LiveSceneHandle, SurfaceIdentity, TransitionHint, LayerDef};
 use neuron::registry::{Capability, DeviceDef, Registry};
 use neuron::transport::{self, DevicePath, HidDeviceInfo};
 
 /// The translation layer that makes the integration feel native: the app's
 /// own `Vec<LayerDef>` lighting stack (what the GUI edits, what profiles
 /// carry, what prefs persist) rendered as LIVE arbiter content — through the
-/// SAME `Compositor`, the SAME process-global render epoch, and the SAME
-/// quantized clock as the app's preview, so "the preview provably matches the
-/// board" keeps holding when frames flow through the arbiter instead of a
-/// per-pid anim thread. The fps atomic is shared with the device's writer:
+/// same compositor semantics and process-global epoch as the app's preview.
+/// Each content owner retains its simulation across coalesced edits. The fps atomic is shared with the device's writer:
 /// one knob paces both the render quantization and the write cadence, exactly
 /// like the app's streams.
+#[derive(Clone)]
 pub struct CompositorContent {
-    defs: Vec<LayerDef>,
-    rows: u8,
-    cols: u8,
     fps: Arc<AtomicU32>,
-    comp: Compositor,
+    comp: Arc<Mutex<LiveComposite>>,
+    control: LiveSceneHandle,
 }
 
 impl CompositorContent {
-    pub fn new(defs: Vec<LayerDef>, rows: u8, cols: u8, fps: Arc<AtomicU32>) -> CompositorContent {
-        let comp = Compositor::from_defs(&defs);
-        CompositorContent {
-            defs,
-            rows,
-            cols,
-            fps,
-            comp,
+    pub fn new(defs: Vec<LayerDef>, rows: u8, cols: u8, fps: Arc<AtomicU32>) -> Result<Self, neuron::pattern::ApplyError> {
+        Self::new_bound(defs, SurfaceIdentity { pid: 0, unit: String::new(), plane: "base".into(), dimensions: (rows, cols) }, fps)
+    }
+
+    pub fn new_bound(defs: Vec<LayerDef>, target: SurfaceIdentity, fps: Arc<AtomicU32>) -> Result<Self, neuron::pattern::ApplyError> {
+        let live = LiveComposite::new(target, defs)?;
+        let control = live.handle();
+        Ok(Self { fps, comp: Arc::new(Mutex::new(live)), control })
+    }
+
+    pub fn healthy(&self) -> bool { !self.comp.is_poisoned() }
+    pub fn handle(&self) -> LiveSceneHandle { self.control.clone() }
+    pub fn latest_frame(&self) -> Option<Arc<BaseFrame>> { self.control.latest() }
+
+    /// Publish a complete scene without taking render ownership.
+    pub fn update_defs(&self, defs: Vec<LayerDef>) -> Result<u64, String> {
+        self.update_scene(defs, TransitionHint::Edit)
+    }
+
+    pub fn update_scene(&self, defs: Vec<LayerDef>, hint: TransitionHint) -> Result<u64, String> {
+        self.control.publish(defs, hint)
+    }
+
+    fn render_cycle(&mut self, cycle: std::time::Duration, now: std::time::Duration) -> Vec<Option<Rgb>> {
+        let Ok(mut live) = self.comp.lock() else {
+            // A compromised generator is recovered by the owner as a fresh generation.
+            return vec![None; usize::from(self.control.target().dimensions.0) * usize::from(self.control.target().dimensions.1)];
+        };
+        if let Some(frame) = self.control.latest().filter(|frame| frame.rendered_at == now) {
+            return frame.pixels.iter().map(|c| Some(Rgb(c.r, c.g, c.b))).collect();
+        }
+        match live.render_cycle(cycle, now, cycle) {
+            Ok(frame) => frame.pixels.iter().map(|c| Some(Rgb(c.r, c.g, c.b))).collect(),
+            Err(error) => { eprintln!("neuron-host: base renderer failed: {error}"); Vec::new() }
         }
     }
+
+    #[cfg(test)]
+    fn render_at_time(&mut self, t: std::time::Duration) -> Vec<Option<Rgb>> { self.render_cycle(t, t) }
 }
 
 impl LiveContent for CompositorContent {
-    fn render(&mut self, _now: Instant) -> Vec<Option<Rgb>> {
-        let fps = self
-            .fps
-            .load(Ordering::Relaxed)
-            .clamp(1, neuron::lighting::MAX_STREAM_FPS);
-        let t = quantized_t(render_elapsed(), fps);
-        self.comp
-            .render(self.rows, self.cols, t)
-            .into_iter()
-            .map(|c| Some(Rgb(c.r, c.g, c.b)))
-            .collect()
+    fn render(&mut self, now: Instant) -> Vec<Option<Rgb>> {
+        let fps = self.fps.load(Ordering::Relaxed).clamp(1, neuron::lighting::MAX_STREAM_FPS);
+        let now = now.saturating_duration_since(render_epoch());
+        self.render_cycle(quantized_time(now, fps), now)
     }
 
-    fn boxed_clone(&self) -> Box<dyn LiveContent> {
-        Box::new(CompositorContent::new(
-            self.defs.clone(),
-            self.rows,
-            self.cols,
-            self.fps.clone(),
-        ))
-    }
+    fn boxed_clone(&self) -> Box<dyn LiveContent> { Box::new(self.clone()) }
 }
 
 /// Stable surface key for the common case: codename + the link-mode PID (wired
@@ -609,10 +621,134 @@ pub fn attach(reg: &Registry, host: &HostHandle, fps: u32) -> std::io::Result<Br
 mod tests {
     use super::*;
 
-    /// The kernel builds pure-std, so `writer.rs` MIRRORS neuron-core's stream ceiling and pure
-    /// pacing math instead of importing them. This test — in the one module that sees BOTH crates
-    /// — is what makes that mirroring safe: any drift in the constant or the pacing behaviour
-    /// fails here instead of shipping as a silent cadence divergence.
+    #[test]
+    fn production_resolves_share_the_producer_timestamp_across_clones_and_rate_edits() {
+        let fps = Arc::new(AtomicU32::new(30));
+        let mut content = CompositorContent::new(vec![LayerDef::default()], 1, 2, fps.clone()).unwrap();
+        let mut copy = content.clone();
+        let now = Instant::now();
+        let first = content.render(now);
+        let frame_id = content.latest_frame().unwrap().frame_id;
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert_eq!(copy.render(now), first);
+        assert_eq!(copy.latest_frame().unwrap().frame_id, frame_id);
+        fps.store(6, Ordering::Relaxed);
+        copy.update_defs(vec![LayerDef { spectrum: neuron::spectrum::Spectrum::solid(CoreRgb::BLACK), ..Default::default() }]).unwrap();
+        assert_eq!(copy.render(now), first);
+        assert_eq!(copy.latest_frame().unwrap().accepted_scene_revision, 0);
+        assert_eq!(copy.latest_frame().unwrap().frame_id, frame_id);
+        content.render(now + std::time::Duration::from_millis(200));
+        assert_eq!(content.latest_frame().unwrap().accepted_scene_revision, 1);
+        assert_eq!(content.latest_frame().unwrap().frame_id, frame_id + 1);
+    }
+
+    #[test]
+    fn live_content_updates_are_latest_value_and_clones_share_state() {
+        let fps = Arc::new(AtomicU32::new(30));
+        let mut content = CompositorContent::new(vec![LayerDef::default()], 1, 2, fps.clone()).unwrap();
+        let mut copy = content.clone();
+        assert!(Arc::ptr_eq(&content.comp, &copy.comp));
+        for red in 0..100 {
+            let def = LayerDef { spectrum: neuron::spectrum::Spectrum::solid(CoreRgb::new(red, 0, 0)), ..Default::default() };
+            content.update_defs(vec![def]).unwrap();
+        }
+        assert_eq!(copy.render_at_time(std::time::Duration::ZERO), vec![Some(Rgb(99, 0, 0)); 2]);
+        assert_eq!(content.latest_frame().unwrap().accepted_scene_revision, 100);
+        assert_eq!(content.render_at_time(std::time::Duration::ZERO), copy.render_at_time(std::time::Duration::ZERO));
+        let other_unit = CompositorContent::new(vec![LayerDef::default()], 1, 2, fps).unwrap();
+        assert!(!Arc::ptr_eq(&content.comp, &other_unit.comp));
+    }
+
+    #[test]
+    fn live_content_edit_preserves_animated_layer_phase() {
+        let mut def = neuron::pattern::preset_layer("fire").unwrap();
+        def.id = Some(neuron::pattern::LayerInstanceId(77));
+        let mut content = CompositorContent::new(vec![def.clone()], 6, 22, Arc::new(AtomicU32::new(30))).unwrap();
+        let t = std::time::Duration::from_secs(1);
+        content.render_at_time(std::time::Duration::ZERO);
+        let before = content.render_at_time(t);
+        let mut restarted = CompositorContent::new(vec![def.clone()], 6, 22, Arc::new(AtomicU32::new(30))).unwrap();
+        assert_ne!(restarted.render_at_time(t), before, "the fixture must distinguish a restart");
+        def.region = (0..132).collect();
+        content.update_defs(vec![def]).unwrap();
+        assert_eq!(content.render_at_time(t), before);
+    }
+
+    #[test]
+    fn hosted_and_local_adapters_publish_the_same_complete_base_during_edit_storms() {
+        use std::time::Duration;
+        let target = SurfaceIdentity { pid: 0x0226, unit: "board-a".into(), plane: "base".into(), dimensions: (1, 2) };
+        let defs = vec![LayerDef { spectrum: neuron::spectrum::Spectrum::solid(CoreRgb::BLACK), ..Default::default() }];
+        let mut local = LiveComposite::new(target.clone(), defs.clone()).unwrap();
+        let mut hosted = CompositorContent::new_bound(defs, target, Arc::new(AtomicU32::new(30))).unwrap();
+        let mut clone = hosted.clone();
+        for tick in 0..40 {
+            let time = Duration::from_millis(tick * 33);
+            let expected = local.render_cycle(time, time, time).unwrap();
+            assert_eq!(hosted.render_at_time(time), expected.pixels.iter().map(|c| Some(Rgb(c.r, c.g, c.b))).collect::<Vec<_>>());
+            let host_frame = hosted.latest_frame().unwrap();
+            assert_eq!(clone.render_at_time(time), hosted.render_at_time(time));
+            assert_eq!(hosted.latest_frame().unwrap().frame_id, host_frame.frame_id);
+            if tick < 20 {
+                let scene = vec![LayerDef { spectrum: neuron::spectrum::Spectrum::solid(CoreRgb::new(0, 0, 200)), ..Default::default() }];
+                local.handle().publish(scene.clone(), TransitionHint::Edit).unwrap();
+                hosted.update_scene(scene, TransitionHint::Edit).unwrap();
+            }
+        }
+        assert_eq!(hosted.latest_frame().unwrap().pixels.as_ref(), &[CoreRgb::new(0, 0, 200); 2]);
+        assert!(!hosted.latest_frame().unwrap().transition_active);
+    }
+
+    #[test]
+    fn base_edits_retain_the_claim_and_never_capture_game_pixels() {
+        use crate::arbiter::{Arbiter, Content, Lease, SourceId, band};
+        use std::time::Duration;
+        #[derive(Clone)]
+        struct TimedContent { content: CompositorContent, origin: Instant }
+        impl LiveContent for TimedContent {
+            fn render(&mut self, now: Instant) -> Vec<Option<Rgb>> {
+                self.content.render_at_time(now.saturating_duration_since(self.origin))
+            }
+            fn boxed_clone(&self) -> Box<dyn LiveContent> { Box::new(self.clone()) }
+        }
+        let origin = Instant::now();
+        let content = CompositorContent::new(vec![LayerDef {
+            spectrum: neuron::spectrum::Spectrum::solid(CoreRgb::new(255, 0, 0)), ..Default::default()
+        }], 1, 2, Arc::new(AtomicU32::new(30))).unwrap();
+        let generation = content.handle().generation();
+        let renderer = content.comp.clone();
+        let mut arbiter = Arbiter::new();
+        arbiter.declare_surface("board", 2);
+        let base = arbiter.claim("board", SourceId(1), band::BASE, Lease::Pinned,
+            Content::Live(Box::new(TimedContent { content: content.clone(), origin }))).unwrap();
+        arbiter.resolve("board", origin).unwrap();
+        let game = arbiter.claim("board", SourceId(2), band::SESSION,
+            Lease::heartbeat(Duration::from_secs(15), origin), Content::Fill(Rgb(0, 255, 0))).unwrap();
+        for tick in 1..=100u64 {
+            content.update_scene(vec![LayerDef {
+                spectrum: neuron::spectrum::Spectrum::solid(CoreRgb::new(0, 0, 100 + tick as u8)), ..Default::default()
+            }], TransitionHint::Edit).unwrap();
+            let now = origin + Duration::from_millis(tick * 33);
+            assert_eq!(arbiter.resolve("board", now).unwrap(), vec![Some(Rgb(0, 255, 0)); 2]);
+            assert!(content.latest_frame().unwrap().pixels.iter().all(|p| p.g == 0));
+            assert_eq!(content.handle().generation(), generation);
+            assert!(Arc::ptr_eq(&content.comp, &renderer));
+            assert_eq!(arbiter.claims("board", now).len(), 2);
+            assert!(arbiter.refresh(base, now));
+        }
+        content.update_scene(Vec::new(), TransitionHint::Switch).unwrap();
+        let boundary = origin + Duration::from_millis(3333);
+        arbiter.resolve("board", boundary).unwrap();
+        let settled = boundary + Duration::from_millis(350);
+        arbiter.resolve("board", settled).unwrap();
+        assert_eq!(content.latest_frame().unwrap().pixels.as_ref(), &[CoreRgb::BLACK; 2]);
+        arbiter.release(game).unwrap();
+        assert_eq!(arbiter.resolve("board", settled).unwrap(), vec![Some(Rgb(0, 0, 0)); 2]);
+        assert_eq!(arbiter.claims("board", settled).len(), 1);
+        assert!(arbiter.refresh(base, settled));
+    }
+
+    /// The pure-std host mirrors core's stream ceiling and pacing; keep both contracts aligned.
     #[test]
     fn writer_mirrors_neuron_cores_ceiling_and_pacing() {
         assert_eq!(

@@ -164,6 +164,7 @@ fn inner() -> &'static Mutex<Inner> {
 /// Start the analyser on `source` ("speakers" = loopback on the default output [default], "mic" =
 /// the capture endpoint), or repoint a running one. Idempotent; cheap to call every frame.
 pub fn ensure(source: &str) {
+    if !crate::pattern::may_start_provider() { return; }
     let mut st = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if st.running {
         if st.source != source {
@@ -177,7 +178,9 @@ pub fn ensure(source: &str) {
     st.running = true;
     let start_gen = st.gen;
     let start_source = st.source.clone();
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if crate::pattern::may_start_provider() {
+        LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    }
     drop(st);
     // The latch is cleared by the release — which runs on completion, panic, OR a spawn refusal —
     // so a failed spawn can never leave `running` stuck true and block every later `ensure`.
@@ -200,7 +203,10 @@ pub struct Signal {
 /// The latest [`Signal`], or `None` when no real PCM stream is live (fall back to the peak meter).
 /// Lock-free; reading keeps the analyser alive.
 pub fn signal() -> Option<Signal> {
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if !crate::pattern::may_read_provider() { return None; }
+    if crate::pattern::may_start_provider() {
+        LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    }
     LIVE.load(Ordering::Relaxed).then(|| {
         let mut levels = [0f32; REGIONS];
         for (l, bits) in levels.iter_mut().zip(LEVEL_BITS.iter()) {
