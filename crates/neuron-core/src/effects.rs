@@ -64,6 +64,7 @@ pub enum Blend {
     Normal, // opaque over (within the region)
     Add,    // additive — stacked glows brighten
     Screen, // lighten — softer than add, never clips ugly
+    Multiply,
     /// Sprite/cutout: an unlit (pure-black) cell falls THROUGH to the layer beneath; a lit cell
     /// REPLACES it at true colour. The readout blend: a data layer (vitals gauge, on-air light)
     /// must vanish where it has nothing to say AND read its exact colour where it does — Normal
@@ -79,6 +80,7 @@ impl Blend {
         match s.to_lowercase().as_str() {
             "add" => Blend::Add,
             "screen" => Blend::Screen,
+            "multiply" => Blend::Multiply,
             "cut" | "cutout" => Blend::Cut,
             _ => Blend::Normal,
         }
@@ -88,6 +90,7 @@ impl Blend {
         match self {
             Blend::Add => "add",
             Blend::Screen => "screen",
+            Blend::Multiply => "multiply",
             Blend::Cut => "cut",
             Blend::Normal => "normal",
         }
@@ -108,6 +111,10 @@ pub fn blend_px(under: Rgb, over: Rgb, mode: Blend) -> Rgb {
             let s = |a: u8, b: u8| (255 - ((255 - u16::from(a)) * (255 - u16::from(b)) / 255)) as u8;
             Rgb::new(s(under.r, over.r), s(under.g, over.g), s(under.b, over.b))
         }
+        Blend::Multiply => {
+            let m = |a: u8, b: u8| ((u16::from(a) * u16::from(b) + 127) / 255) as u8;
+            Rgb::new(m(under.r, over.r), m(under.g, over.g), m(under.b, over.b))
+        }
         // Cutout: black = "nothing to say" (fall through); anything lit replaces at true colour.
         Blend::Cut => {
             if over == Rgb::BLACK {
@@ -117,6 +124,15 @@ pub fn blend_px(under: Rgb, over: Rgb, mode: Blend) -> Rgb {
             }
         }
     }
+}
+
+/// Apply layer coverage to its blend result, preserving the established opaque endpoints.
+#[must_use]
+pub fn blend_px_opacity(under: Rgb, over: Rgb, mode: Blend, opacity: f32) -> Rgb {
+    if opacity <= 0.0 { return under; }
+    let blended = blend_px(under, over, mode);
+    if opacity >= 1.0 { return blended; }
+    Rgb::lerp(under, blended, opacity)
 }
 
 // ── breathe shape — the shared "living light" envelope ─────────────────────────────────────
@@ -211,10 +227,25 @@ mod tests {
 
     #[test]
     fn blend_tag_round_trips() {
-        for m in [Blend::Normal, Blend::Add, Blend::Screen] {
+        for m in [Blend::Normal, Blend::Add, Blend::Screen, Blend::Multiply, Blend::Cut] {
             assert_eq!(Blend::from_str(m.as_str()), m);
         }
         assert_eq!(Blend::from_str("nonsense"), Blend::Normal);
+    }
+
+    #[test]
+    fn layer_opacity_reveals_the_underlying_light_for_every_mode() {
+        let under = Rgb::new(40, 120, 200);
+        let over = Rgb::new(200, 80, 20);
+        for mode in [Blend::Normal, Blend::Add, Blend::Screen, Blend::Multiply, Blend::Cut] {
+            let blended = blend_px(under, over, mode);
+            assert_eq!(blend_px_opacity(under, over, mode, 0.0), under);
+            assert_eq!(blend_px_opacity(under, over, mode, 1.0), blended);
+            assert_eq!(blend_px_opacity(under, over, mode, 0.5), Rgb::lerp(under, blended, 0.5));
+        }
+        assert_eq!(blend_px(under, Rgb::new(255, 255, 255), Blend::Multiply), under);
+        assert_eq!(blend_px_opacity(under, Rgb::BLACK, Blend::Cut, 0.5), under);
+        assert_eq!(blend_px_opacity(under, Rgb::BLACK, Blend::Normal, 0.5), Rgb::lerp(under, Rgb::BLACK, 0.5));
     }
 
     #[test]

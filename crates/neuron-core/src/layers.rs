@@ -216,7 +216,7 @@ pub fn catalog_json() -> serde_json::Value {
         "presets": presets,
         "patterns": patterns,
         "user_effects": user_effects,
-        "blends": ["normal", "add", "screen", "cut"],
+        "blends": ["normal", "add", "screen", "multiply", "cut"],
         "motions": ["hold", "drift", "cycle", "breathe", "flow"],
     })
 }
@@ -261,8 +261,9 @@ fn parse_blend(s: &str) -> Result<Blend, String> {
         "normal" => Ok(Blend::Normal),
         "add" => Ok(Blend::Add),
         "screen" => Ok(Blend::Screen),
+        "multiply" => Ok(Blend::Multiply),
         "cut" => Ok(Blend::Cut),
-        other => Err(format!("blend '{other}' must be normal, add, screen or cut")),
+        other => Err(format!("blend '{other}' must be normal, add, screen, multiply or cut")),
     }
 }
 
@@ -393,6 +394,9 @@ pub fn build_layer(mods: &LayerMods) -> Result<LayerDef, String> {
 pub fn check_layer(l: &LayerDef) -> Vec<Issue> {
     let mut out = Vec::new();
     let err = Issue::error;
+    if !l.opacity.is_finite() || !(0.0..=1.0).contains(&l.opacity) {
+        out.push(err("layer opacity must be between 0 and 1".into()));
+    }
     let Some(def) = pattern::pattern_def(&l.pattern) else {
         out.push(err(format!("unknown pattern '{}' (patterns: {})", l.pattern, pattern::pattern_keys().join(", "))));
         return out;
@@ -614,7 +618,8 @@ mod tests {
         assert_eq!(l.spectrum.seq[0].palette.motion, Motion::Drift { speed: 0.4 });
         assert_eq!(l.region, vec![0, 1, 2, 22, 23, 24]);
         assert!(!l.enabled);
-        assert!(parse_blend("multiply").is_err());
+        assert_eq!(parse_blend("multiply").unwrap(), Blend::Multiply);
+        assert!(parse_blend("unknown").is_err());
         assert!(parse_motion("spin").is_err());
 
         let mut stack = Vec::new();

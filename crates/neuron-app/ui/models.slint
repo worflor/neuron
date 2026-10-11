@@ -6,6 +6,14 @@
 // types closely enough that the Rust glue is a thin map (Profile, Rule, DeviceDef, LightingDef)
 // — no serde-over-IPC, just direct field copies into Slint models.
 
+// Inspector rows carry authored bottom-to-top indices, independent of their display order.
+export struct LightingStackRow {
+    index: int,
+    name: string,
+    summary: string,
+    enabled: bool,
+}
+
 // One enumerated device on the Device panel.
 export struct DeviceRow {
     name: string,

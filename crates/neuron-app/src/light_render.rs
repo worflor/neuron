@@ -432,9 +432,9 @@ fn specs(layers: &[LayerDef]) -> Vec<SceneLayerSpec> {
 }
 
 fn same_definition(a: &LayerDef, b: &LayerDef) -> bool {
-    let LayerDef { id: _, pattern, params, spectrum, region, blend, enabled, frame, attachment, boundary } = a;
-    (pattern, params, spectrum, region, blend, enabled, frame, attachment, boundary)
-        == (&b.pattern, &b.params, &b.spectrum, &b.region, &b.blend, &b.enabled, &b.frame, &b.attachment, &b.boundary)
+    let LayerDef { id: _, pattern, params, spectrum, region, blend, opacity, enabled, frame, attachment, boundary } = a;
+    (pattern, params, spectrum, region, blend, opacity, enabled, frame, attachment, boundary)
+        == (&b.pattern, &b.params, &b.spectrum, &b.region, &b.blend, &b.opacity, &b.enabled, &b.frame, &b.attachment, &b.boundary)
 }
 
 pub(crate) fn same_configuration(a: &[LayerDef], b: &[LayerDef]) -> bool {

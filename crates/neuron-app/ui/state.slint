@@ -12,6 +12,7 @@
 // Actions), Radial (folded into Spellweaving), and Import (a wizard flow) aren't top-level seats.
 
 import {
+    LightingStackRow,
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTileMeta, EffectParam,
@@ -328,15 +329,21 @@ export global State {
     callback set-param-range(string, float);          // (param key, value) — a slider edit
     callback set-param-enum(string, int);             // (param key, index) — a segment edit
     callback set-param-toggle(string, bool);          // (param key, on) — a switch edit
-    // STACK — the optional spatial composite. `light-stack-count` is how many effects are layered
-    // (1 = the simple single-effect default; >1 = you stacked). A light strip shows the stack; +stack
-    // adds the active effect as another layer; tapping a strip cell selects that layer as the active one.
+    // Stack callbacks use authored bottom-to-top indices; the inspector lists the topmost row first.
     in-out property <int> light-stack-count: 0;
     callback stack-current();                          // add the active effect as another layer on top
     callback stack-tile(string, bool);                 // insert a catalog look above/below the selected layer
     callback select-stack(int);                        // make stack layer `i` the active (knobs follow it)
     callback remove-stack(int);                        // drop stack layer `i`
     callback move-stack(int, int);                     // reorder layer `i` in the stack (dir -1 down / +1 up)
+    callback set-layer-blend(int);
+    callback set-layer-opacity(float);
+    callback toggle-stack(int);
+    in-out property <int> light-layer-blend: 0;
+    in-out property <float> light-layer-opacity: 100;
+    in-out property <[LightingStackRow]> light-stack-rows;
+    in-out property <int> light-cover-index: -1;
+    in-out property <string> light-cover-name;
     // PAINT — a brush you pick up ON the render (not a top-level mode). Off = effects play; on = your
     // pointer paints cells in the brush colour over the current frame.
     in-out property <bool> light-brush-on: false;     // is the per-key brush picked up?

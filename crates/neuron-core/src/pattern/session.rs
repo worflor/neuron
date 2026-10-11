@@ -133,6 +133,7 @@ pub struct PresentationLayer {
     pub sampling: crate::spectrum::PaletteSampling,
     pub region: Vec<u32>,
     pub blend: Blend,
+    pub opacity: f32,
     pub enabled: bool,
 }
 
@@ -267,6 +268,9 @@ impl LightingSession {
 
         let mut seen = std::collections::HashSet::new();
         for s in next_specs {
+            if !s.def.opacity.is_finite() || !(0.0..=1.0).contains(&s.def.opacity) {
+                return Err(ApplyError::InvalidSpec("layer opacity must be between 0 and 1".into()));
+            }
             if !seen.insert(s.id) {
                 return Err(ApplyError::InvalidSpec(format!("duplicate layer id: {}", s.id.0)));
             }
@@ -349,6 +353,7 @@ impl LightingSession {
                     sampling: crate::pattern::palette_sampling(&s.def),
                     region,
                     blend: s.def.blend,
+                    opacity: s.def.opacity,
                     enabled: s.def.enabled,
                 }
             })
@@ -603,7 +608,7 @@ impl LightingSession {
                 if rendered_px.len() == n {
                     for (i, &pixel) in rendered_px.iter().enumerate() {
                         if pres.region.is_empty() || pres.region.binary_search(&(i as u32)).is_ok() {
-                            scratch.output[i] = crate::effects::blend_px(scratch.output[i], pixel, pres.blend);
+                            scratch.output[i] = crate::effects::blend_px_opacity(scratch.output[i], pixel, pres.blend, pres.opacity);
                         }
                     }
                 }

@@ -24,7 +24,7 @@ use crate::ui::{
     AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, ClipboardOperationRow, ClipboardVariable, DeviceRow, DiagRow, EffectParam,
     EffectRow, EffectTileMeta, GlyphChip, ImportLine, KnobRow, LightingLayerChoice, LightingPresetChoice, MacroBlock, MacroCard, MaterialCard, OrganRow,
     PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame, GradientPreset, PairChip,
-    SpectrumStop,
+    SpectrumStop, LightingStackRow,
     State, Theme,
 };
 use neuron::macros::{document_to_source, value_to_source, MacroDocument, MacroMode, MacroNode, Value};
@@ -2545,6 +2545,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             };
                             s.light_layers[sel] = neuron::pattern::LayerDef {
                                 id: s.light_layers[sel].id,
+                                opacity: s.light_layers[sel].opacity,
                                 region,
                                 blend,
                                 enabled,
@@ -3034,8 +3035,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 flush_lighting_save();
             });
         }
-        // + stack: layer the active effect AGAIN on top (a new layer, screen-blended so it reads as
-        // added light), and select it so the knobs follow the new top.
+        // A duplicate keeps authored presentation settings but receives an independent identity.
         {
             let w = app.as_weak();
             let sh = sh.clone();
@@ -3048,7 +3048,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             let sel = s.selected_layer.min(s.light_layers.len() - 1);
                             let mut d = s.light_layers[sel].clone();
                             d.id = None;
-                            d.blend = neuron::effects::Blend::Screen;
                             s.light_layers.push(d);
                             s.selected_layer = s.light_layers.len() - 1;
                             s.layers_rev += 1;
@@ -3142,6 +3141,54 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         refresh_layers(&app, &sh);
                         flush_lighting_save(); // reordering layers is structural — persist it immediately
                     }
+                }
+            });
+        }
+        {
+            let w = app.as_weak(); let sh = sh.clone();
+            app.global::<State>().on_set_layer_blend(move |index| {
+                let modes = [neuron::effects::Blend::Normal, neuron::effects::Blend::Screen,
+                    neuron::effects::Blend::Add, neuron::effects::Blend::Multiply, neuron::effects::Blend::Cut];
+                if let (Some(app), Some(&mode)) = (w.upgrade(), modes.get(index as usize)) {
+                    {
+                        let mut s = sh.borrow_mut(); let sel = s.selected_layer;
+                        if let Some(layer) = s.light_layers.get_mut(sel) {
+                            if layer.blend == mode { return; }
+                            layer.blend = mode; s.layers_rev += 1;
+                        }
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak(); let sh = sh.clone();
+            app.global::<State>().on_set_layer_opacity(move |percent| {
+                if !percent.is_finite() { return; }
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut(); let sel = s.selected_layer;
+                        if let Some(layer) = s.light_layers.get_mut(sel) {
+                            let opacity = percent.clamp(0.0, 100.0) / 100.0;
+                            if layer.opacity.to_bits() == opacity.to_bits() { return; }
+                            layer.opacity = opacity; s.layers_rev += 1;
+                        }
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak(); let sh = sh.clone();
+            app.global::<State>().on_toggle_stack(move |index| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        if let Some(layer) = s.light_layers.get_mut(index as usize) {
+                            layer.enabled = !layer.enabled; s.layers_rev += 1;
+                        } else { return; }
+                    }
+                    refresh_layers(&app, &sh);
                 }
             });
         }
@@ -10495,6 +10542,8 @@ fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
         st.set_light_has_spectrum(false);
         st.set_light_is_readout(false); // no selection → not a readout (the RATE control always applies now)
         st.set_light_stack_count(0);
+        st.set_light_stack_rows(ModelRc::new(VecModel::from(Vec::<LightingStackRow>::new())));
+        st.set_light_cover_index(-1);
         st.set_light_stack_labels(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
         project_placement(app, &[], 0, 0); // no layer → full-board readout, no outline
         clear_spectrum_surface(app);
@@ -10502,6 +10551,23 @@ fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
     }
     let sel = sel.min(defs.len() - 1);
     let active = &defs[sel];
+    st.set_light_layer_blend(match active.blend {
+        neuron::effects::Blend::Normal => 0, neuron::effects::Blend::Screen => 1,
+        neuron::effects::Blend::Add => 2, neuron::effects::Blend::Multiply => 3, neuron::effects::Blend::Cut => 4,
+    });
+    st.set_light_layer_opacity(active.opacity * 100.0);
+    let rows = defs.iter().enumerate().rev().map(|(index, layer)| LightingStackRow {
+        index: index as i32, name: layer_label(layer).into(), enabled: layer.enabled,
+        summary: format!("{} · {}% · {}", if layer.blend == neuron::effects::Blend::Cut { "cutout" } else { layer.blend.as_str() },
+            (layer.opacity * 100.0).round() as u32, if layer.region.is_empty() { "full board" } else { "placed" }).into(),
+    }).collect();
+    update_value_model(st.get_light_stack_rows(), rows, |model| st.set_light_stack_rows(model));
+    let cover = defs.iter().enumerate().skip(sel + 1).rev().find(|(_, layer)| {
+        layer.enabled && layer.opacity >= 1.0 && layer.blend == neuron::effects::Blend::Normal
+            && (layer.region.is_empty() || (!active.region.is_empty() && active.region.iter().all(|cell| layer.region.contains(cell))))
+    });
+    st.set_light_cover_index(cover.map_or(-1, |(index, _)| index as i32));
+    st.set_light_cover_name(cover.map_or_else(SharedString::default, |(_, layer)| layer_label(layer).into()));
     st.set_light_effect(tile_slug_for_layer(active).into());
     // the selected layer's honesty flag: a READOUT (vitals) is a live device gauge, not a tunable light
     // show — the inspector swaps the tunable-effect knobs for a short "what this is" note. Registry-driven
