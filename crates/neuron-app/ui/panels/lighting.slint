@@ -4,7 +4,8 @@
 
 import { Theme, Signal } from "../theme.slint";
 import { ChromaLab } from "chromalab.slint";
-import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow } from "../widgets/controls.slint";
+import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Picker } from "../widgets/controls.slint";
+import { ListView } from "std-widgets.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
 import { EffectTileMeta, EffectParam } from "../models.slint";
@@ -18,7 +19,7 @@ import { EffectTileMeta, EffectParam } from "../models.slint";
 // pattern — the effect's schema is DATA, the UI renders a control per row, zero per-effect UI code).
 //
 // Depth is spatial, not a menu. A single effect is the default (no layer ceremony). STACKING another
-// effect is an optional, visible act — a light composite strip, never an add/select/restack list.
+// effect is an optional, visible act; its ordered layers stay beside the live subject.
 // PER-KEY PAINT is a brush you pick up ON the render (a gesture), never a top-level mode. There is no
 // EFFECTS/PAINT toggle and no "advanced" drawer — knobs appear by relevance, not behind a reveal.
 //
@@ -28,6 +29,30 @@ import { EffectTileMeta, EffectParam } from "../models.slint";
 // a tile is picked, that effect's CONTEXTUAL controls slide in on the RIGHT (a fixed inspector column).
 // With nothing picked the inspector takes no width at all and the gallery owns the whole row — so the
 // page is a composed gallery, never a sparse one with a stranded empty third.
+
+component LayerVisibility inherits Rectangle {
+    in property <bool> shown;
+    callback clicked();
+    width: 22px; height: 22px;
+    border-radius: Theme.radius-sm;
+    background: eye-ta.has-hover ? Theme.well : transparent;
+    animate background { duration: eye-ta.has-hover ? Theme.hover-in : Theme.hover-out; }
+    property <color> ink: eye-ta.has-hover ? Theme.text : root.shown ? Theme.text-dim : Theme.text-faint;
+    Path {
+        x: 3px; y: 5px; width: 16px; height: 12px;
+        viewbox-width: 16; viewbox-height: 12;
+        fill: transparent; stroke: root.ink; stroke-width: 1.2px;
+        commands: "M1 6 C4 0 12 0 15 6 C12 12 4 12 1 6 Z";
+    }
+    Rectangle { x: 9px; y: 9px; width: 4px; height: 4px; border-radius: 2px; background: root.ink; }
+    if !root.shown : Path {
+        x: 3px; y: 3px; width: 16px; height: 16px;
+        viewbox-width: 16; viewbox-height: 16;
+        stroke: root.ink; stroke-width: 1.2px;
+        commands: "M1 1 L15 15";
+    }
+    eye-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+}
 
 // One TILE in the grid — a live (or representative) preview swatch + its name, the MATERIAL-card
 // pattern. `data` tiles (mouse battery) and the `stub` (notifications, future) read as first-class
@@ -1099,63 +1124,79 @@ export component LightingPanel inherits VerticalLayout {
 
                 Divider {}
 
-                // ── STACK — the optional spatial composite (light, not a list) ──
+                // Topmost rows appear first; model indices retain the authored composition order.
                 VerticalLayout {
                     spacing: 8px;
                     HorizontalLayout {
                         SectionTitle { text: "STACK"; }
                         Rectangle {}
                         Mono {
-                            text: State.light-stack-count <= 1 ? "single" : State.light-stack-count + " layers";
+                            text: State.light-stack-count + (State.light-stack-count == 1 ? " layer" : " layers");
                             color: Theme.text-faint;
                         }
                     }
-                    // the composite strip — one cell per stacked effect, bottom→top left→right. The
-                    // active cell is lit; tapping a cell makes it the active effect (knobs follow); ✕ drops
-                    // it. Shown at >=1 layer (not just >1) so it doubles as the layer SELECTOR the PLACE
-                    // gesture needs — the user picks which layer (an effect OR the vitals readout) to place.
-                    if State.light-stack-count >= 1 : HorizontalLayout {
-                        spacing: 6px;
-                        // each stacked effect is a pick-one SelectableRow — the shared atom now owns the
-                        // frame / hover / accent-select / tick; the layer's display name is the label
-                        // ("Vitals", "Heat"), falling back to L{n} until the labels model catches up. The
-                        // ✕ rides the row's trailing slot (declared after the row's own pick TouchArea, so
-                        // its touch wins the corner — the "can't remove" bug can't return).
-                        for li in State.light-stack-count : SelectableRow {
-                            min-width: 60px; horizontal-stretch: 1;
-                            label: li < State.light-stack-labels.length ? State.light-stack-labels[li] : "L" + (li + 1);
-                            selected: li == State.selected-layer;
-                            clicked => { State.select-stack(li); }
+                    if State.light-stack-count > 0 : HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout { alignment: center; Mono { text: "blend"; color: Theme.text-dim; } }
+                        Picker {
+                            horizontal-stretch: 1;
+                            options: ["Normal", "Screen", "Add", "Multiply", "Cutout"];
+                            index: State.light-layer-blend;
+                            changed(index) => { State.set-layer-blend(index); }
+                        }
+                    }
+                    if State.light-stack-count > 0 : FaderRow {
+                        label: "opacity"; label-w: 55px; readout-w: 40px;
+                        value: State.light-layer-opacity; unit: "%";
+                        changed(value) => { State.set-layer-opacity(value); }
+                    }
+                    if State.light-cover-index >= 0 : Button {
+                        text: "covered by " + State.light-cover-name + " \u{2191}";
+                        clicked => { State.select-stack(State.light-cover-index); }
+                    }
+                    if State.light-stack-count > 0 : layer-list := ListView {
+                        property <int> active-row: State.light-stack-count - 1 - State.selected-layer;
+                        changed active-row => {
+                            if (self.active-row * 44px + self.viewport-y < 0px) {
+                                self.viewport-y = -self.active-row * 44px;
+                            } else if ((self.active-row + 1) * 44px + self.viewport-y > self.height) {
+                                self.viewport-y = self.height - (self.active-row + 1) * 44px;
+                            }
+                        }
+                        height: min(State.light-stack-count, 6) * 44px;
+                        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                        for row in State.light-stack-rows : SelectableRow {
+                            height: 44px;
+                            label: row.name; desc: row.summary;
+                            selected: row.index == State.selected-layer;
+                            clicked => { State.select-stack(row.index); }
                             VerticalLayout {
                                 alignment: center;
-                                IconButton {
-                                    glyph: "\u{00d7}";
-                                    danger: true;
-                                    clicked => { State.remove-stack(li); }
+                                LayerVisibility {
+                                    shown: row.enabled;
+                                    clicked => { State.toggle-stack(row.index); }
                                 }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                IconButton { glyph: "\u{00d7}"; danger: true; clicked => { State.remove-stack(row.index); } }
                             }
                         }
                     }
-                    // reorder the SELECTED layer up/down the stack — the ◂|▸ deck TIMELINE also wears, per-
-                    // half gated at the ends. Shown only when there's a stack to reorder (>1 layer).
-                    if State.light-stack-count > 1 : HorizontalLayout {
-                        VerticalLayout { alignment: center; Mono { text: "reorder layer"; color: Theme.text-faint; } }
-                        Rectangle { horizontal-stretch: 1; }
-                        SplitButton {
-                            left-text: "\u{25c2}"; right-text: "\u{25b8}";
-                            enabled: State.light-stack-count > 1;
-                            left-enabled: State.selected-layer > 0;
-                            right-enabled: State.selected-layer < State.light-stack-count - 1;
-                            left-clicked => { State.move-stack(State.selected-layer, -1); }
-                            right-clicked => { State.move-stack(State.selected-layer, 1); }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            horizontal-stretch: 1; text: "+ duplicate";
+                            enabled: State.light-stack-count > 0;
+                            clicked => { State.stack-current(); }
                         }
-                    }
-                    Button {
-                        text: "+ stack this effect";
-                        // an empty stack has nothing to stack ONTO — picking a tile seeds the first layer
-                        // instead, so this stays disabled until at least one layer exists.
-                        enabled: State.light-stack-count >= 1;
-                        clicked => { State.stack-current(); }
+                        SplitButton {
+                            left-text: "\u{2191}"; right-text: "\u{2193}";
+                            left-enabled: State.selected-layer >= 0 && State.selected-layer < State.light-stack-count - 1;
+                            right-enabled: State.selected-layer > 0;
+                            left-clicked => { State.move-stack(State.selected-layer, 1); }
+                            right-clicked => { State.move-stack(State.selected-layer, -1); }
+                        }
                     }
                 }
 

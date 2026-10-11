@@ -2221,7 +2221,7 @@ mod tests {
                 spectrum: super::super::life_spectrum(),
                 palette_addressing: super::super::PaletteAddressing::Field,
                 region: Vec::new(),
-                blend: crate::effects::Blend::Normal,
+                blend: crate::effects::Blend::Normal, opacity: 1.0,
                 enabled: true,
             }],
             ..Default::default()
@@ -2378,7 +2378,7 @@ mod tests {
             spectrum: super::super::life_spectrum(),
             palette_addressing: super::super::PaletteAddressing::Field,
             region: vec![1, 2, 3],
-            blend: crate::effects::Blend::Normal,
+            blend: crate::effects::Blend::Normal, opacity: 1.0,
             enabled: true,
         };
         let mut compositor = super::super::Compositor {
@@ -2406,7 +2406,7 @@ mod tests {
                 spectrum: super::super::life_spectrum(),
                 palette_addressing: super::super::PaletteAddressing::Field,
                 region: Vec::new(),
-                blend: crate::effects::Blend::Normal,
+                blend: crate::effects::Blend::Normal, opacity: 1.0,
                 enabled: true,
             }],
             ..Default::default()

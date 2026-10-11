@@ -61,7 +61,7 @@ pub struct LayerArgs {
     /// a whole spectrum as JSON/TOML
     #[arg(long)]
     spectrum: Option<String>,
-    /// normal | add | screen | cut
+    /// normal | add | screen | multiply | cut
     #[arg(long)]
     blend: Option<String>,
     /// explicit LED cells, row-major indexes: 0,1,2

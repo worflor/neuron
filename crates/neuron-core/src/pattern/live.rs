@@ -152,6 +152,7 @@ impl Compositor {
             layer.spectrum.clone_from(&def.spectrum);
             layer.region.clone_from(&def.region);
             layer.blend = def.blend;
+            layer.opacity = def.opacity;
             layer.enabled = def.enabled;
             layer.palette_addressing = pattern_def(&def.pattern).expect("validated pattern").palette_addressing;
             next.push(layer);
@@ -344,6 +345,7 @@ mod tests {
             let identity = pointer(&comp, 0);
             def.spectrum = crate::spectrum::Spectrum::solid(Rgb::new(50, 120, 220));
             def.blend = crate::effects::Blend::Add;
+            def.opacity = 0.35;
             let plan = comp.plan_update(&[def.clone()], Some((1, 2))).unwrap();
             comp.commit_update(plan);
             assert_eq!(pointer(&comp, 0), identity, "{} replaced on presentation edit", kind.key);

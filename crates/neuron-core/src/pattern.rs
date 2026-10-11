@@ -404,6 +404,9 @@ pub struct LayerDef {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub region: Vec<u32>,
     pub blend: Blend,
+    /// Coverage of the blended result, from transparent (0) to opaque (1).
+    #[serde(default = "full_opacity", skip_serializing_if = "is_full_opacity")]
+    pub opacity: f32,
     pub enabled: bool,
     /// Raw per-LED cells for a `custom` (hand-painted / imported) static-frame layer — one `[R, G, B]`
     /// per LED, row-major. Empty (and omitted from TOML) for every procedural pattern; the `custom`
@@ -426,6 +429,7 @@ impl Default for LayerDef {
             spectrum: Spectrum::solid(Rgb::new(0x4A, 0xF2, 0xB0)),
             region: Vec::new(),
             blend: Blend::Normal,
+            opacity: 1.0,
             enabled: true,
             frame: Vec::new(),
             attachment: None,
@@ -433,6 +437,10 @@ impl Default for LayerDef {
         }
     }
 }
+
+fn full_opacity() -> f32 { 1.0 }
+#[allow(clippy::trivially_copy_pass_by_ref)] // Serde skip predicates receive references.
+fn is_full_opacity(value: &f32) -> bool { *value == 1.0 }
 
 impl LayerDef {
     /// Build the live, configured [`Pattern`] for this layer (or `None` if the pattern key is unknown).
@@ -4145,6 +4153,7 @@ pub struct Layer {
     /// Sorted, de-duplicated row-major cell indices the layer paints; empty = the whole board.
     pub region: Vec<u32>,
     pub blend: Blend,
+    pub opacity: f32,
     pub enabled: bool,
 }
 
@@ -4203,6 +4212,7 @@ impl Compositor {
                         .map_or(PaletteAddressing::Field, |def| def.palette_addressing),
                     region,
                     blend: d.blend,
+                    opacity: d.opacity,
                     enabled: d.enabled,
                 }
             })
@@ -4253,7 +4263,7 @@ impl Compositor {
             let px = &scratch.layer;
             for i in 0..n {
                 if layer.covers(i) {
-                    out[i] = crate::effects::blend_px(out[i], px[i], layer.blend);
+                    out[i] = crate::effects::blend_px_opacity(out[i], px[i], layer.blend, layer.opacity);
                 }
             }
         }
@@ -4286,7 +4296,7 @@ impl Compositor {
                 (bbox, cols), self.definitions.get(index).map_or_else(Default::default, palette_sampling), &mut px);
             for i in 0..n {
                 if layer.covers(i) {
-                    out[i] = crate::effects::blend_px(out[i], px[i], layer.blend);
+                    out[i] = crate::effects::blend_px_opacity(out[i], px[i], layer.blend, layer.opacity);
                 }
             }
         }
@@ -4493,6 +4503,7 @@ mod tests {
                 palette_addressing: pattern_def(key).unwrap().palette_addressing,
                 region: Vec::new(),
                 blend: Blend::Normal,
+                opacity: 1.0,
                 enabled: true,
             }],
             ..Default::default()
@@ -5597,6 +5608,7 @@ mod tests {
                 palette_addressing: PaletteAddressing::Field,
                 region: vec![5, 6, 9, 10],
                 blend: Blend::Normal,
+                opacity: 1.0,
                 enabled: true,
             }],
             ..Default::default()
@@ -5613,6 +5625,7 @@ mod tests {
                 palette_addressing: PaletteAddressing::Field,
                 region: Vec::new(),
                 blend: Blend::Normal,
+                opacity: 1.0,
                 enabled: true,
             }],
             ..Default::default()
@@ -5622,6 +5635,35 @@ mod tests {
     }
 
     // ── capability flags (registry-driven; no app-side key string-matching) ───────────────────────
+
+    #[test]
+    fn layer_opacity_round_trips_and_matches_session_and_legacy_composition() {
+        let _no_keys = crate::capture::suppress_key_reads();
+        let mut defs = vec![LayerDef { id: Some(LayerInstanceId(1)), spectrum: Spectrum::solid(Rgb::new(0, 0, 240)), ..Default::default() },
+            LayerDef { id: Some(LayerInstanceId(2)), spectrum: Spectrum::solid(Rgb::new(240, 0, 0)), region: vec![0], opacity: 0.5, ..Default::default() }];
+        let expected = vec![Rgb::new(120, 0, 120), Rgb::new(0, 0, 240)];
+        let mut comp = Compositor::from_defs(&defs);
+        assert_eq!(comp.render_at_time(1, 2, Duration::ZERO), expected);
+        assert_eq!(comp.render_legacy(1, 2, 0.0), expected);
+        let encoded = toml::to_string(&defs[1]).unwrap();
+        assert_eq!(toml::from_str::<LayerDef>(&encoded).unwrap(), defs[1]);
+        assert_eq!(toml::from_str::<LayerDef>("pattern = 'uniform'").unwrap().opacity, 1.0);
+        assert!(!toml::to_string(&LayerDef::default()).unwrap().contains("opacity"));
+        let specs = defs.iter().map(|def| SceneLayerSpec { id: def.id.unwrap(), def: def.clone() }).collect::<Vec<_>>();
+        let mut session = LightingSession::from_specs((1, 2), &specs).unwrap();
+        let hub = ProcessInputHub::new();
+        session.advance_tick(&hub, std::time::Instant::now());
+        assert_eq!(session.resolve_presentation(Duration::ZERO).pixels.as_ref(), expected.as_slice());
+        let identity = &*comp.layers[1].pattern as *const dyn Pattern as *const ();
+        defs[1].opacity = 0.0;
+        comp.commit_update(comp.plan_update(&defs, Some((1, 2))).unwrap());
+        assert_eq!(&*comp.layers[1].pattern as *const dyn Pattern as *const (), identity);
+        assert_eq!(comp.render_at_time(1, 2, Duration::ZERO), vec![Rgb::new(0, 0, 240); 2]);
+        for invalid in [f32::NAN, -0.1, 1.1] {
+            defs[1].opacity = invalid;
+            assert!(comp.plan_update(&defs, Some((1, 2))).is_err());
+        }
+    }
 
     #[test]
     fn capability_flags_are_registry_driven() {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Lighting layers now have an ordered, scrollable stack with visibility, duplication, per-layer opacity and a blend dropdown (Normal, Screen, Add, Multiply, Cutout). A covered-layer shortcut points to an opaque effect hiding the selection. Existing scenes retain full opacity by default.
+
 - Keep running layer state during palette edits and stack rearrangement, and dissolve authored scene changes through the same bounded transition in local and hosted lighting. Continuous edits publish immediately; the live preview observes generated base frames. Explicitly clearing the final layer saves a managed black scene. Physical LED transitions remain hardware-unverified.
 - Added a hover-only layer insertion capsule with above/below choices. Centred its labels and improved palette names: stock ramps retain their names, recognizable altered ramps show an edited suffix, and unrelated palettes remain custom.
 

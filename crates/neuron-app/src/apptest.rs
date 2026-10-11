@@ -1217,6 +1217,62 @@ fn live_preview_observes_complete_frames_without_advancing_or_crossing_units() {
 
 #[test]
 #[ignore = "run by gui_tests_in_fresh_processes"]
+fn layer_stack_controls_preserve_identity_and_draw_a_large_scrollable_stack() {
+    use crate::ui::LightingStackRow;
+    use slint::{Model, ModelRc, VecModel};
+    let _cwd = crate::testsupport::cwd_guard("lighting_stack_controls");
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers = vec![neuron::pattern::preset_layer("wave").unwrap(), neuron::pattern::preset_layer("wildlife").unwrap()];
+        state.selected_layer = 0;
+    }
+    glue::refresh_layers(&app, &shared);
+    let ids = shared.borrow().light_layers.iter().map(|l| l.id).collect::<Vec<_>>();
+    let rows = st.get_light_stack_rows();
+    assert_eq!(rows.row_data(0).unwrap().index, 1, "topmost layer is first");
+    assert_eq!(st.get_light_cover_index(), 1);
+    st.invoke_select_stack(1);
+    st.invoke_set_layer_blend(1);
+    st.invoke_set_layer_opacity(37.0);
+    assert!(rows == st.get_light_stack_rows(), "edits retain row models");
+    assert_eq!(shared.borrow().light_layers[1].blend, neuron::effects::Blend::Screen);
+    assert_eq!(shared.borrow().light_layers[1].opacity, 0.37);
+    assert_eq!(shared.borrow().light_layers[0].opacity, 1.0);
+    assert_eq!(shared.borrow().light_layers.iter().map(|l| l.id).collect::<Vec<_>>(), ids);
+    st.invoke_toggle_stack(1);
+    assert!(!shared.borrow().light_layers[1].enabled);
+    st.invoke_move_stack(1, -1);
+    assert_eq!(shared.borrow().light_layers[0].id, ids[1]);
+    assert_eq!(st.get_selected_layer(), 0);
+    assert_eq!(st.get_light_layer_opacity(), 37.0);
+    st.invoke_stack_current();
+    let state = shared.borrow();
+    assert_ne!(state.light_layers[2].id, ids[1]);
+    assert_eq!(state.light_layers[2].opacity, 0.37);
+    assert_eq!(state.light_layers[2].blend, neuron::effects::Blend::Screen);
+    drop(state);
+    st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
+    st.set_sel_can_light(true); st.set_grid_rows(1); st.set_grid_cols(2);
+    st.set_page(1); st.set_window_shown(true); st.set_light_stack_count(1000);
+    st.set_light_stack_rows(ModelRc::new(VecModel::from((0..1000).rev().map(|index| LightingStackRow {
+        index, name: format!("Layer {index}").into(), summary: "screen · 37% · full board".into(), enabled: true,
+    }).collect::<Vec<_>>())));
+    app.window().set_size(slint::LogicalSize::new(1000.0, 1400.0));
+    app.show().unwrap();
+    app.window().take_snapshot().expect("large stack draws in a bounded list");
+    for index in [999, 500, 0] {
+        st.set_selected_layer(index);
+        app.window().take_snapshot().expect("selection scrolls into view without binding loops");
+    }
+}
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn scene_restore_waits_for_the_ownership_handoff_barrier() {
     use neuron::pattern::{LiveComposite, SurfaceIdentity, LayerDef};
     use neuron::lighting::Rgb;
