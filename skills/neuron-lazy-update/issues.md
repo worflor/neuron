@@ -3,6 +3,38 @@
 Investigate the user's symptom, explain the evidence, and identify a useful
 next step. Offer an issue draft when the findings support one.
 
+## Windows app launch verification
+
+When the user asks to open the app, launch the intended executable on the active
+user's interactive desktop at normal privilege. Do not change preferences or use
+`--tray`, `--safe`, or `-WindowStyle Hidden` to make it appear launched. `--tray`
+honours `start_minimized`; an ordinary launch shows the window regardless of that
+preference. Normal startup enables live dispatch; safe mode is not equivalent.
+
+1. Inspect existing `neuron-app.exe` processes and their executable paths. To
+   restart, invoke the intended executable with `--shutdown-existing`, then wait
+   for the old process to exit. If it does not exit, diagnose rather than launching
+   a duplicate owner or assuming shutdown succeeded.
+2. With Computer Use, pass an explicit process identifier, not a bare path:
+
+   ```javascript
+   await sky.launch_app({ app: "process:C:\\absolute\\path\\neuron-app.exe" });
+   ```
+
+   A bare build-tree path selected the installed Neuron app in a verified Windows
+   run. For a manual launch from a normal interactive PowerShell, use
+   `Start-Process -FilePath (Resolve-Path .\target\release\neuron-app.exe).Path`
+   from the repository, without hidden-window options.
+3. Confirm the running process's executable path matches the requested build.
+   Refresh `sky.list_windows()` and select the returned Neuron window; inspect
+   it with `sky.get_window_state` and bring it forward with `sky.activate_window`.
+   Startup can outlast the launch tool's initial window wait: re-enumerate before
+   retrying the launch. Report success only after seeing the rendered window or
+   receiving the user's confirmation. A PID, Session 1, host connections, or a
+   zero/nonzero `MainWindowHandle` is not sufficient visibility evidence.
+
+Leave a working app running. Do not rebuild a release executable while it is open.
+
 ## 1. Research first
 
 Before saying anything about bugs, find out whether it's already known or intended:
