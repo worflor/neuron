@@ -396,21 +396,23 @@ export global State {
     // MOTION row — the active palette's intra-frame animation. `speed` always applies; `depth` only to
     // breathe, `chaos` only to flow (the UI shows the relevant knob by `light-motion`).
     in-out property <string> light-motion: "hold";     // hold | drift | cycle | breathe | flow
-    in-out property <float> light-motion-speed: 1.0;
+    in-out property <float> light-motion-speed: 1.0;  // magnitude; direction is projected separately
+    in-out property <bool> light-motion-reversed: false;
     in-out property <float> light-motion-depth: 0.5;   // breathe dip 0..1
     in-out property <float> light-motion-chaos: 0.5;   // flow octaves 0..1
     callback set-motion(string);                       // kind — keeps speed/depth/chaos across a switch
     callback set-motion-speed(float);
+    callback reverse-motion();
     callback set-motion-depth(float);
     callback set-motion-chaos(float);
     // GRADIENT INTERPOLATION — how colour blends between stops. "rgb" (default, predictable) | "hsv"
     // (perceptual: the shortest hue path, so 2-stop+ gradients stay vivid). Per active-frame palette.
-    in-out property <string> light-interp: "rgb";      // rgb | hsv
+    in-out property <string> light-interp: "rgb";      // rgb | hsv | oklab
     in-out property <[GradientPreset]> gradient-presets;   // the base-colour gradient chips (built once at startup)
     in-out property <[string]> light-name-chars;           // the palette's name, one string per character
     in-out property <[color]> light-name-ramp;             // the palette sampled forward-then-back (a seamless loop) for the name's flow
     callback apply-gradient(int);                      // preset idx — swap the active palette's stops, keep motion + blend
-    callback set-interp(string);                        // rgb | hsv — the gradient colour space
+    callback set-interp(string);                        // rgb | hsv | oklab — the gradient colour space
     // TIMELINE / sequencer — the keyframe track. The model `light-seq` is the SINGLE source of truth for
     // the frame count: `light-seq.length` 1 = no sequence (the timeline collapses); >1 = a sequence, with
     // `light-active-frame` the frame the strip + motion above are editing (the scrubber). (There is no

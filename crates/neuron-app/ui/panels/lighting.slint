@@ -403,15 +403,33 @@ component VisitorLane inherits VerticalLayout {
 // speed/depth/chaos, frame hold/fade) AND the auto-rendered TUNE param ranges (via ParamControl).
 // `label-w` sizes the label cell (wider for the longer TUNE param names); the change is live.
 component SpecSlider inherits FaderRow {
-    label-w: 66px;
+    label-w: 78px;
     readout-w: 48px;
     step: 0.02;
     decimals: 2;
     spacing: 9px;
 }
 
+component EditorChoice inherits HorizontalLayout {
+    in property <string> label;
+    in property <[string]> options;
+    in property <int> index;
+    callback changed(int);
+    spacing: 9px;
+    VerticalLayout {
+        width: 78px; alignment: center;
+        Mono { text: root.label; color: Theme.text-dim; }
+    }
+    Picker {
+        horizontal-stretch: 1;
+        options: root.options; index: root.index;
+        changed(index) => { root.changed(index); }
+    }
+    @children
+}
+
 // One auto-rendered PARAM control. The effect's schema declares the row's `kind`; this renders the
-// matching control (range→slider, enum→segment, color→swatch+field, toggle→switch). Adding a knob to
+// matching control (range→slider, enum→picker, color→swatch+field, toggle→switch). Adding a knob to
 // an effect is DATA in effects::schema — never new UI here.
 component ParamControl inherits VerticalLayout {
     in property <EffectParam> p;
@@ -427,18 +445,12 @@ component ParamControl inherits VerticalLayout {
         value: root.p.fval;
         changed(v) => { State.set-param-range(root.p.key, v); }
     }
-    // ENUM → a pick-one fused rail (direction, breath flavour)
-    if root.p.kind == "enum" : VerticalLayout {
-        spacing: 6px;
-        Mono { text: root.p.label; color: Theme.text-dim; }
-        HorizontalLayout {
-            SplitToggle {
-                options: root.p.options;
-                index: root.p.ival;
-                min-cell: 52px;
-                picked(i) => { State.set-param-enum(root.p.key, i); }
-            }
-            Rectangle { horizontal-stretch: 1; }
+    if root.p.kind == "enum" : EditorChoice {
+        label: root.p.label; options: root.p.options; index: root.p.ival;
+        changed(i) => { State.set-param-enum(root.p.key, i); }
+        if root.p.key == "direction" && root.p.options.length == 4 : Button {
+            text: "reverse";
+            clicked => { State.set-param-enum(root.p.key, root.p.ival == 0 ? 1 : root.p.ival == 1 ? 0 : root.p.ival == 2 ? 3 : 2); }
         }
     }
     // TOGGLE → a switch
@@ -482,7 +494,7 @@ component SpectrumEditor inherits VerticalLayout {
     property <int> loop-idx:
         State.light-loop == "once" ? 0 :
         State.light-loop == "pingpong" ? 2 : 1;
-    property <int> interp-idx: State.light-interp == "hsv" ? 1 : 0;
+    property <int> interp-idx: State.light-interp == "hsv" ? 1 : State.light-interp == "oklab" ? 2 : 0;
     // gated on a non-empty sequence so the index is never dereferenced on an empty model (stated
     // invariant, not Slint's silent default-struct fallback). Empty → linear (0), the harmless default.
     property <int> ease-idx: State.light-seq.length > 0
@@ -626,21 +638,12 @@ component SpectrumEditor inherits VerticalLayout {
             }
             Rectangle {}
         }
-        // BLEND — how colour interpolates between stops. Only meaningful with 2+ stops (a gradient to
-        // blend): RGB is predictable, HSV takes the shortest hue path so the blend stays vivid (no muddy
-        // midpoint). Defaults to RGB, so no existing preset's look changes unless the user opts in.
-        if State.light-stops.length > 1 : VerticalLayout {
-            spacing: 6px;
-            Mono { text: "blend"; color: Theme.text-dim; }
-            HorizontalLayout {
-                SplitToggle {
-                    options: ["RGB", "HSV"];
-                    index: root.interp-idx;
-                    min-cell: 52px;
-                    picked(i) => { State.set-interp(i == 1 ? "hsv" : "rgb"); }
-                }
-                Rectangle { horizontal-stretch: 1; }
-            }
+        // Gradient interpolation is independent of the layer blend in Stack.
+        if State.light-stops.length > 1 : EditorChoice {
+            label: "colour mix";
+            options: ["Direct", "Via hue", "Balanced"];
+            index: root.interp-idx;
+            changed(i) => { State.set-interp(i == 1 ? "hsv" : i == 2 ? "oklab" : "rgb"); }
         }
     }
 
@@ -649,17 +652,21 @@ component SpectrumEditor inherits VerticalLayout {
     // ── MOTION ROW — the palette's intra-frame animation ─────────────────
     VerticalLayout {
         spacing: 9px;
-        SectionTitle { text: "MOTION"; }
+        SectionTitle { text: "COLOUR MOTION"; }
         HorizontalLayout {
-            SplitToggle {
-                options: ["HOLD", "DRIFT", "CYCLE", "BREATHE", "FLOW"];
+            spacing: 8px;
+            Picker {
+                horizontal-stretch: 1;
+                options: ["Still", "Slide colours", "Hue cycle", "Breathe", "Organic flow"];
                 index: root.motion-idx;
-                min-cell: 52px;
-                picked(i) => {
+                changed(i) => {
                     State.set-motion(i == 1 ? "drift" : i == 2 ? "cycle" : i == 3 ? "breathe" : i == 4 ? "flow" : "hold");
                 }
             }
-            Rectangle { horizontal-stretch: 1; }
+            if State.light-motion != "hold" : Button {
+                text: "reverse"; primary: State.light-motion-reversed;
+                clicked => { State.reverse-motion(); }
+            }
         }
         // speed paces every motion but Hold (which has nothing to move) — hidden honestly for Hold.
         if State.light-motion != "hold" : SpecSlider {
@@ -675,7 +682,7 @@ component SpectrumEditor inherits VerticalLayout {
         }
         // chaos only shapes the flow octaves
         if State.light-motion == "flow" : SpecSlider {
-            label: "chaos"; minimum: 0; maximum: 1; step: 0.02; has-home: true; home: 0.5;
+            label: "detail"; minimum: 0; maximum: 1; step: 0.02; has-home: true; home: 0.5;
             value: State.light-motion-chaos;
             changed(v) => { State.set-motion-chaos(v); }
         }
@@ -687,17 +694,14 @@ component SpectrumEditor inherits VerticalLayout {
     VerticalLayout {
         spacing: 9px;
         HorizontalLayout {
+            spacing: 8px;
             SectionTitle { text: "TIMELINE"; }
             Rectangle {}
             Mono {
-                text: State.light-seq.length <= 1 ? "single frame" : State.light-seq.length + " frames";
+                text: State.light-seq.length + (State.light-seq.length == 1 ? " frame" : " frames");
                 color: Theme.text-faint;
             }
-        }
-        // collapsed (a single palette): the one affordance that turns it into a sequence.
-        if State.light-seq.length <= 1 && !root.tl-open : HorizontalLayout {
-            Button { text: "+ sequence this palette"; clicked => { State.add-frame(); root.tl-open = true; } }
-            Rectangle {}
+            Button { text: "+ frame"; clicked => { State.add-frame(); root.tl-open = true; } }
         }
         // DISCLOSURE only — `tl-open` (manual open) or an existing sequence (auto-open) decides whether the
         // expanded track shows. It does NOT guard indexing: every `light-seq[frame-idx]` reader inside is
@@ -751,16 +755,6 @@ component SpectrumEditor inherits VerticalLayout {
                     cta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.select-frame(i); } }
                 }
             }
-            // add a keyframe (a clone of the active) / delete the active one — the coupled pair fused
-            // into one full-width deck: DELETE (left), constructive + keyframe (right).
-            // The delete half goes visibly DEAD at the last frame (left-enabled), never a silent no-op.
-            SplitButton {
-                left-text: "delete frame";
-                left-enabled: State.light-seq.length > 1;
-                right-text: "+ keyframe";
-                left-clicked => { State.remove-frame(root.frame-idx); }
-                right-clicked => { State.add-frame(); }
-            }
             // the active frame's timing — dwell (hold) → crossfade-in (fade) → the fade ease — with the
             // reorder arrows on its header so a frame moves earlier/later in the sequence. INDEX GUARD:
             // gated on `light-seq.length > 0` (the SAME guard the strip Image + ease-idx use) — these
@@ -769,7 +763,8 @@ component SpectrumEditor inherits VerticalLayout {
             if State.light-seq.length > 0 : VerticalLayout {
                 spacing: 9px;
                 HorizontalLayout {
-                    Mono { text: "frame " + (root.frame-idx + 1); color: Theme.text-dim; }
+                    spacing: 8px;
+                    Mono { text: "frame " + (root.frame-idx + 1) + " of " + State.light-seq.length; color: Theme.text-dim; }
                     Rectangle { horizontal-stretch: 1; }
                     // reorder ◂ ▸ fused into one deck (hugs right). The whole rail dies for a single
                     // frame; each arrow goes visibly dead at its end of the sequence (per-half enables),
@@ -782,44 +777,32 @@ component SpectrumEditor inherits VerticalLayout {
                         left-clicked => { State.move-frame(root.frame-idx, -1); }
                         right-clicked => { State.move-frame(root.frame-idx, 1); }
                     }
+                    IconButton {
+                        glyph: "×"; danger: true; enabled: State.light-seq.length > 1;
+                        clicked => { State.remove-frame(root.frame-idx); }
+                    }
                 }
                 SpecSlider {
-                    label: "hold"; minimum: 0; maximum: 10; step: 0.1; decimals: 1; unit: "s";
+                    label: "stay"; minimum: 0; maximum: 10; step: 0.1; decimals: 1; unit: "s";
                     value: State.light-seq[root.frame-idx].hold;
                     changed(v) => { State.set-frame-hold(root.frame-idx, v); }
                 }
                 SpecSlider {
-                    label: "crossfade"; minimum: 0; maximum: 5; step: 0.1; decimals: 1; unit: "s";
+                    label: "fade in"; minimum: 0; maximum: 5; step: 0.1; decimals: 1; unit: "s";
                     value: State.light-seq[root.frame-idx].fade;
                     changed(v) => { State.set-frame-fade(root.frame-idx, v); }
                 }
-                VerticalLayout {
-                    spacing: 6px;
-                    Mono { text: "fade ease"; color: Theme.text-dim; }
-                    HorizontalLayout {
-                        SplitToggle {
-                            options: ["LINEAR", "SMOOTH", "SNAP"];
-                            index: root.ease-idx;
-                            min-cell: 52px;
-                            picked(i) => { State.set-frame-ease(root.frame-idx, i == 1 ? "smooth" : i == 2 ? "snap" : "linear"); }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
+                if State.light-seq[root.frame-idx].fade > 0 : EditorChoice {
+                    label: "curve"; options: ["Linear", "Smooth", "Instant"];
+                    index: root.ease-idx;
+                    changed(i) => { State.set-frame-ease(root.frame-idx, i == 1 ? "smooth" : i == 2 ? "snap" : "linear"); }
                 }
             }
             // playback mode — how the scrubber runs the sequence at render time.
-            VerticalLayout {
-                spacing: 6px;
-                Mono { text: "playback"; color: Theme.text-dim; }
-                HorizontalLayout {
-                    SplitToggle {
-                        options: ["ONCE", "LOOP", "PINGPONG"];
-                        index: root.loop-idx;
-                        min-cell: 52px;
-                        picked(i) => { State.set-loop(i == 0 ? "once" : i == 2 ? "pingpong" : "loop"); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
+            EditorChoice {
+                label: "playback"; options: ["Once", "Repeat", "Back & forth"];
+                index: root.loop-idx;
+                changed(i) => { State.set-loop(i == 0 ? "once" : i == 2 ? "pingpong" : "loop"); }
             }
         }
     }
@@ -1103,7 +1086,16 @@ export component LightingPanel inherits VerticalLayout {
                 // (mouse battery) declares none, so this whole block simply doesn't appear — honest.
                 if State.light-params.length > 0 : VerticalLayout {
                     spacing: 9px;
-                    SectionTitle { text: "TUNE"; }
+                    Divider {}
+                    HorizontalLayout {
+                        SectionTitle { text: "EFFECT"; }
+                        Rectangle {}
+                        Mono {
+                            text: State.selected-layer >= 0 && State.selected-layer < State.light-stack-labels.length
+                                ? State.light-stack-labels[State.selected-layer] : "";
+                            color: Theme.text-faint; overflow: elide;
+                        }
+                    }
                     for cp in State.light-params : VerticalLayout {
                         // skip colour (rendered above); render every other declared param
                         if cp.kind != "color" : ParamControl { p: cp; }

@@ -1273,6 +1273,73 @@ fn layer_stack_controls_preserve_identity_and_draw_a_large_scrollable_stack() {
 
 #[test]
 #[ignore = "run by gui_tests_in_fresh_processes"]
+fn spectrum_controls_reverse_only_the_active_frame_and_draw_relevant_properties() {
+    use neuron::spectrum::{Interp, Motion};
+    let _cwd = crate::testsupport::cwd_guard("spectrum_controls");
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    shared.borrow_mut().light_layers = vec![neuron::pattern::preset_layer("wave").unwrap()];
+    glue::refresh_layers(&app, &shared);
+    let id = shared.borrow().light_layers[0].id;
+    st.invoke_set_motion("drift".into());
+    st.invoke_reverse_motion();
+    assert_eq!(shared.borrow().light_layers[0].spectrum.seq[0].palette.motion, Motion::Drift { speed: -1.0 });
+    assert!(st.get_light_motion_reversed());
+    assert_eq!(st.get_light_motion_speed(), 1.0);
+    st.invoke_set_motion_speed(0.0);
+    assert!(st.get_light_motion_reversed(), "direction survives a stopped slider");
+    st.invoke_set_motion_speed(0.8);
+    assert_eq!(shared.borrow().light_layers[0].spectrum.seq[0].palette.motion, Motion::Drift { speed: -0.8 });
+    st.invoke_add_frame();
+    st.invoke_reverse_motion();
+    st.invoke_set_interp("oklab".into());
+    {
+        let state = shared.borrow();
+        assert_eq!(state.light_layers[0].id, id);
+        assert_eq!(state.light_layers[0].spectrum.seq[0].palette.motion, Motion::Drift { speed: -0.8 });
+        assert_eq!(state.light_layers[0].spectrum.seq[1].palette.motion, Motion::Drift { speed: 0.8 });
+        assert_eq!(state.light_layers[0].spectrum.seq[1].palette.interp, Interp::Oklab);
+    }
+    assert_eq!(st.get_light_interp(), "oklab");
+    st.invoke_set_motion_speed(f32::NAN);
+    assert_eq!(st.get_light_motion_speed(), 0.8);
+    st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
+    st.set_sel_can_light(true); st.set_grid_rows(1); st.set_grid_cols(2);
+    st.set_page(1); st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(1000.0, 1600.0));
+    app.show().unwrap();
+    let capture = |name: &str| {
+        let frame = app.window().take_snapshot().expect("inspector controls draw without binding loops");
+        // Optional artifacts inspect the complete editor without changing a live device's scene.
+        if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            image::save_buffer(dir.join(format!("{name}.png")), frame.as_bytes(), frame.width(), frame.height(), image::ColorType::Rgba8).unwrap();
+        }
+    };
+    st.invoke_set_frame_fade(1, 0.5);
+    for kind in ["hold", "drift", "cycle", "breathe", "flow"] {
+        st.invoke_set_motion(kind.into());
+        capture(kind);
+    }
+    st.invoke_set_motion("breathe".into());
+    st.invoke_reverse_motion();
+    assert!(shared.borrow().light_layers[0].spectrum.seq[1].palette.motion.speed().is_sign_negative());
+    capture("reversed-breathe");
+    st.invoke_set_motion("hold".into());
+    let still = shared.borrow().light_layers.clone();
+    st.invoke_reverse_motion();
+    assert_eq!(shared.borrow().light_layers, still, "still colours have no reverse action");
+    assert_eq!(still[0].id, id);
+    st.invoke_remove_frame(1);
+    capture("single-frame");
+}
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn scene_restore_waits_for_the_ownership_handoff_barrier() {
     use neuron::pattern::{LiveComposite, SurfaceIdentity, LayerDef};
     use neuron::lighting::Rgb;
