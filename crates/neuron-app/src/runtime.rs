@@ -98,9 +98,27 @@ pub struct DeviceState {
 /// is just a `vitals` LAYER in the stack, not a bespoke paint-on-demand surface), so the fps slider
 /// always applies to whatever board is streaming.
 pub struct AnimStream {
+    target_pid: u16,
     pub stop: Arc<AtomicBool>,
     pub fps: Arc<AtomicU32>,
-    pub update_defs: Arc<Mutex<Option<Vec<neuron::pattern::LayerDef>>>>,
+    pub scene: Arc<Mutex<LocalSceneControl>>,
+    pub finished: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+pub struct LocalSceneControl {
+    handle: Option<neuron::pattern::LiveSceneHandle>,
+    pending: Option<(Vec<neuron::pattern::LayerDef>, neuron::pattern::TransitionHint)>,
+}
+
+/// Wait for device-owning workers to leave their device scopes before a new owner starts.
+pub fn await_lighting_stop(tokens: &[Arc<AtomicBool>]) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokens.iter().any(|done| !done.load(Ordering::Acquire)) {
+        if std::time::Instant::now() >= deadline { return Err("lighting owner did not acknowledge stop".into()); }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
 }
 
 /// Re-probe cadence for a pid that stayed unknown (e.g. a mouse deep-asleep at first probe — it
@@ -141,6 +159,7 @@ pub struct AppRuntime {
     /// another's — including its identical twin on the same pid — and switching which board you're
     /// editing leaves the others streaming.
     pub anim: HashMap<String, AnimStream>,
+    retiring_lighting: HashMap<String, Vec<Arc<AtomicBool>>>,
     /// The fps the GUI slider shows for the SELECTED board (seeded on selection: legacy → 6, matrix →
     /// 30). On apply it SEEDS that board's stream fps; moving the slider re-paces the selected board's
     /// live stream. Each running stream owns its own fps copy (in `anim`), so re-pacing or selecting a
@@ -288,6 +307,7 @@ impl AppRuntime {
             selected_unit: String::new(),
             selected_dialect: String::new(),
             anim: HashMap::new(),
+            retiring_lighting: HashMap::new(),
             light_fps: Arc::new(AtomicU32::new(30)),
             gaming_mode,
             synth_attempted: HashMap::new(),
@@ -1084,61 +1104,62 @@ impl AppRuntime {
         defs: Vec<neuron::pattern::LayerDef>,
         pid: u16,
         unit: &str,
+        hint: neuron::pattern::TransitionHint,
         on_done: impl FnOnce(Option<String>, Arc<AtomicBool>) + Send + 'static,
     ) -> String {
         if self.writes_paused() {
             return "writes paused".into();
         }
-        if defs.is_empty() {
-            return "no layers".into();
-        }
-        // If THIS board is already streaming locally and the host does not own it, update its
-        // compositor in-place without restarting the thread, dropping custody, or re-opening the USB device.
-        if !crate::host::active() {
+        if !crate::host::owns_surface(pid, unit) {
             if let Some(existing) = self.anim.get(unit) {
-                if !existing.stop.load(Ordering::SeqCst) {
-                    if let Ok(mut slot) = existing.update_defs.lock() {
-                        *slot = Some(defs);
-                        return "compositing".into();
+                if existing.target_pid == pid && !existing.stop.load(Ordering::SeqCst) {
+                    let Ok(mut scene) = existing.scene.lock() else { return "lighting control unavailable".into(); };
+                    if let Some(handle) = &scene.handle {
+                        return match handle.publish(defs, hint) {
+                            Ok(_) => "compositing".into(), Err(error) => format!("scene rejected: {error}"),
+                        };
                     }
+                    scene.pending = Some((defs, hint));
+                    return "compositing".into();
                 }
             }
         }
-        // Stop THIS board's prior LOCAL stream first — before EITHER pipe below — so a board that
-        // was streaming app-side when the host came up (the runtime host toggle) can't end up with
-        // both the old anim thread AND the host writer painting it: the exact double-writer race
-        // the host exists to kill. Other boards keep streaming.
         if let Some(a) = self.anim.remove(unit) {
             a.stop.store(true, Ordering::SeqCst);
+            self.retiring_lighting.entry(unit.into()).or_default().push(a.finished);
         }
-        // HOST INTEGRATION: when the protocol host owns this device's writer,
-        // the app must NOT stream on its own thread. Push the stack as the
-        // host's animated BASE layer instead — games/tools paint above it and
-        // it returns when they release. No app-side stream to reconcile, so
-        // on_done is skipped; the "compositing" indicator reads host::has_lighting.
-        if crate::host::active() {
-            let fps = self.light_fps.load(Ordering::Relaxed);
-            if crate::host::set_lighting(pid, unit, defs.clone(), fps) {
-                return "compositing (host)".into();
+        if crate::host::owns_surface(pid, unit) {
+            // Starting a hosted writer is prohibited until the previous local owner has ceased.
+            if self.retiring_lighting.get(unit).is_some_and(|tokens| tokens.iter().any(|done| !done.load(Ordering::Acquire))) {
+                return "lighting ownership handoff pending".into();
             }
-            // Device not bridged by the host — fall through to a local stream
-            // (defs still owned; the clone above is only spent on the host path).
+            return match crate::host::set_lighting(pid, unit, defs, self.light_fps.load(Ordering::Relaxed), hint) {
+                crate::host::LightingRoute::Hosted => "compositing (host)".into(),
+                _ => "host-owned lighting unavailable".into(),
+            };
         }
+        self.retiring_lighting.retain(|_, tokens| {
+            tokens.retain(|done| !done.load(Ordering::Acquire)); !tokens.is_empty()
+        });
+        let prior = self.retiring_lighting.get(unit).cloned().unwrap_or_default();
         let stop = Arc::new(AtomicBool::new(false));
         // this stream's OWN fps copy, seeded from the GUI's current value — so re-pacing or selecting
         // another board can never change THIS stream's speed.
         let fps_src = Arc::new(AtomicU32::new(self.light_fps.load(Ordering::Relaxed)));
-        let update_defs = Arc::new(Mutex::new(None));
+        let scene = Arc::new(Mutex::new(LocalSceneControl::default()));
+        let finished = Arc::new(AtomicBool::new(false));
         self.anim.insert(
             unit.to_string(),
             AnimStream {
+                target_pid: pid,
                 stop: stop.clone(),
                 fps: fps_src.clone(),
-                update_defs: update_defs.clone(),
+                scene: scene.clone(),
+                finished: finished.clone(),
             },
         );
         let unit = unit.to_string();
-        let update_slot = update_defs.clone();
+        let scene_control = scene;
         // `on_done` (glue) is the SOLE cleanup authority: it removes this board's `anim` entry and
         // clears the "compositing" indicator. The worker returns its outcome and `done` calls
         // `on_done` exactly once — with the real error, a synthesized error on spawn refusal, or
@@ -1150,6 +1171,9 @@ impl AppRuntime {
             "neuron-runtime-anim",
             move || {
             let outcome: Result<(), String> = (|| {
+                await_lighting_stop(&prior)?;
+                if stop.load(Ordering::SeqCst) || neuron::writes::writes_paused() { return Ok(()); }
+                if crate::host::owns_surface(pid, &unit) { return Err("surface ownership changed before local start".into()); }
                 let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
                 let infos = transport::enumerate().map_err(|e| format!("enumerate: {e}"))?;
                 for i in &infos {
@@ -1166,20 +1190,20 @@ impl AppRuntime {
                                 .lighting
                                 .clone()
                                 .ok_or_else(|| "device has no lighting".to_string())?;
-                            let mut comp = neuron::pattern::Compositor::from_defs(&defs);
+                            let target = neuron::pattern::SurfaceIdentity { pid: i.pid, unit: i.instance(), plane: "base".into(), dimensions: (ldef.rows, ldef.cols) };
+                            let mut live = neuron::pattern::LiveComposite::new(target, defs.clone()).map_err(|e| format!("scene: {e:?}"))?;
+                            {
+                                let mut scene = scene_control.lock().map_err(|_| "lighting control unavailable")?;
+                                if let Some((pending, hint)) = scene.pending.take() { live.handle().publish(pending, hint)?; }
+                                scene.handle = Some(live.handle());
+                            }
                             let lights = Lights::new(&d, ldef);
                             let streamed = lights
-                                // LIVE fps: read the shared atomic each frame so the GUI's fps
-                                // control re-paces this running composite without a restart.
-                                .animate_with_updates(
-                                    &mut comp,
+                                .animate_frames(
                                     || fps_src.load(Ordering::Relaxed),
-                                    |c| {
-                                        if let Ok(mut slot) = update_slot.lock() {
-                                            if let Some(new_defs) = slot.take() {
-                                                c.update_defs(&new_defs);
-                                            }
-                                        }
+                                    |now, fps| {
+                                        let cycle = neuron::pattern::quantized_time(now, fps);
+                                        live.render_cycle(cycle, now, cycle).map(|frame| frame.pixels.clone()).map_err(anyhow::Error::msg)
                                     },
                                     86_400,
                                     || {
@@ -1202,7 +1226,7 @@ impl AppRuntime {
                             // painting it. Also skipped under the writes-paused kill-switch — the
                             // stream ALSO exits on pause, and a paused state must freeze every device
                             // write (exit-restore + the next wake-reassert still cover the lease).
-                            if !crate::host::active() && !neuron::writes::writes_paused() {
+                            if !crate::host::owns_surface(pid, &unit) && !neuron::writes::writes_paused() {
                                 let _ = d.release_custody();
                             }
                             return streamed;
@@ -1215,6 +1239,7 @@ impl AppRuntime {
             },
             move |res| {
                 // res: Some(err_opt) = worker ran; None = thread refused or panicked.
+                finished.store(true, Ordering::Release);
                 let err = res.unwrap_or_else(|| Some("lighting thread could not start".into()));
                 on_done(err, stop_for_done);
             },
@@ -1235,19 +1260,47 @@ impl AppRuntime {
         }
         if let Some(a) = self.anim.remove(unit) {
             a.stop.store(true, Ordering::SeqCst);
+            self.retiring_lighting.entry(unit.into()).or_default().push(a.finished);
         }
     }
 
     /// Stop EVERY live lighting stream (the writes-paused kill-switch / shutdown).
     pub fn stop_all_animation(&mut self) {
-        for (_, a) in self.anim.drain() {
+        for (unit, a) in self.anim.drain() {
             a.stop.store(true, Ordering::SeqCst);
+            self.retiring_lighting.entry(unit).or_default().push(a.finished);
         }
         // Host-owned base layers are streams too — composited through the arbiter, not this map —
         // so the global stop must drop them as well, or a host-managed board would sail through
         // the kill-switch/Observe transition with its last frame latched while every local stream
         // was cut. Mirrors `stop_animation`'s per-board `clear_lighting`; no-op when host inactive.
         crate::host::clear_all_lighting();
+    }
+
+    #[cfg(test)]
+    pub fn install_live_fixture(&mut self, live: &neuron::pattern::LiveComposite) {
+        let handle = live.handle();
+        let unit = handle.target().unit.clone();
+        self.anim.insert(unit, AnimStream {
+            target_pid: handle.target().pid,
+            stop: Arc::new(AtomicBool::new(false)), fps: Arc::new(AtomicU32::new(30)),
+            scene: Arc::new(Mutex::new(LocalSceneControl { handle: Some(handle), pending: None })),
+            finished: Arc::new(AtomicBool::new(true)),
+        });
+    }
+
+    pub fn lighting_stop_tokens(&self) -> Vec<Arc<AtomicBool>> {
+        self.retiring_lighting.values().flatten().cloned().collect()
+    }
+
+    pub fn base_scene(&self, pid: u16, unit: &str) -> Option<neuron::pattern::LiveSceneHandle> {
+        if let Some(scene) = crate::host::base_scene(pid, unit) { return Some(scene); }
+        self.anim.get(unit)?.scene.lock().ok()?.handle.clone()
+    }
+
+    #[cfg(test)]
+    pub fn base_frame(&self, pid: u16, unit: &str) -> Option<Arc<neuron::pattern::BaseFrame>> {
+        self.base_scene(pid, unit)?.latest()
     }
 
     /// Is this board's lighting stream currently live? (Host base counts — the app
@@ -2434,6 +2487,34 @@ fn snapshot_device(def: &DeviceDef, pid: u16, path: &transport::DevicePath) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_scene_edits_reuse_controls_and_preview_reads_never_drive_simulation() {
+        let _cwd = crate::testsupport::cwd_guard("local_scene_updates");
+        let mut rt = AppRuntime::load();
+        let target = neuron::pattern::SurfaceIdentity { pid: 0x0226, unit: "fixture-unit".into(), plane: "base".into(), dimensions: (1, 2) };
+        let mut live = neuron::pattern::LiveComposite::new(target, vec![neuron::pattern::LayerDef::default()]).unwrap();
+        let handle = live.handle();
+        let stop = Arc::new(AtomicBool::new(false));
+        let fps = Arc::new(AtomicU32::new(30));
+        let scene = Arc::new(Mutex::new(LocalSceneControl { handle: Some(handle), pending: None }));
+        rt.anim.insert("fixture-unit".into(), AnimStream { target_pid: 0x0226, stop: stop.clone(), fps: fps.clone(), scene: scene.clone(), finished: Arc::new(AtomicBool::new(false)) });
+        for blue in 1..100 {
+            let defs = vec![neuron::pattern::LayerDef { spectrum: neuron::spectrum::Spectrum::solid(Rgb::new(0, 0, blue)), ..Default::default() }];
+            assert_eq!(rt.start_layers(defs, 0x0226, "fixture-unit", neuron::pattern::TransitionHint::Edit, |_, _| panic!("ordinary update started a worker")), "compositing");
+        }
+        assert!(Arc::ptr_eq(&rt.anim["fixture-unit"].stop, &stop));
+        assert!(Arc::ptr_eq(&rt.anim["fixture-unit"].fps, &fps));
+        assert!(Arc::ptr_eq(&rt.anim["fixture-unit"].scene, &scene));
+        let t = std::time::Duration::ZERO;
+        let emitted = live.render_cycle(t, t, t).unwrap();
+        assert_eq!(emitted.accepted_scene_revision, 99);
+        for _ in 0..100 { assert_eq!(rt.base_frame(0x0226, "fixture-unit").unwrap().frame_id, 1); }
+        assert!(rt.base_frame(0x0226, "other-unit").is_none());
+        assert_eq!(emitted.pixels[0], Rgb::new(0, 0, 99));
+        let done = Arc::new(AtomicBool::new(true));
+        assert!(await_lighting_stop(&[done]).is_ok());
+    }
 
     /// The stale-rows race (review finding, 2026-07-09): an adoption finishing while a background
     /// scan is in flight sets `synth_dirty` AFTER the worker resolved its rows against the old

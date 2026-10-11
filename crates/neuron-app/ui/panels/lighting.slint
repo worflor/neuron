@@ -7,7 +7,7 @@ import { ChromaLab } from "chromalab.slint";
 import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow } from "../widgets/controls.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
-import { EffectTile, EffectParam } from "../models.slint";
+import { EffectTileMeta, EffectParam } from "../models.slint";
 
 // LIGHTING — ONE spatial surface. The render IS the page: the live device picture is the calm centre,
 // the truth, and the paint surface. Everything orbits it.
@@ -33,7 +33,8 @@ import { EffectTile, EffectParam } from "../models.slint";
 // pattern. `data` tiles (mouse battery) and the `stub` (notifications, future) read as first-class
 // siblings of the effects; picking any of them is the SAME gesture.
 component EffectTileCard inherits Rectangle {
-    in property <EffectTile> tile;
+    in property <EffectTileMeta> tile;
+    in property <image> swatch;
     in property <bool> selected;
     in property <bool> dimmed;       // a stub (future) — shown, but visibly not-yet-wired
     // Saved effects require a second click to delete. The trailing TouchArea owns the corner
@@ -42,19 +43,21 @@ component EffectTileCard inherits Rectangle {
     property <bool> delete-armed: false;
     callback picked();
     callback delete-requested();
+    callback layer-added(bool);
+    property <bool> card-hovered: ta.has-hover || add-ta.has-hover;
     border-radius: Theme.radius;
     // ACTIVE > hover > rest. The selected tile wears a clear accent ground + line; a hovered tile
     // lifts to the well with a faint ink edge; everything else rests on the bezel plane.
     background: root.selected ? Theme.accent-glow
-        : (ta.has-hover && !root.dimmed ? Theme.well-hi : Theme.bg-2);
+        : (root.card-hovered && !root.dimmed ? Theme.well-hi : Theme.bg-2);
     border-width: Theme.hair;
     border-color: root.selected ? Theme.accent-line
-        : (ta.has-hover && !root.dimmed ? Theme.text-faint : Theme.line);
+        : (root.card-hovered && !root.dimmed ? Theme.text-faint : Theme.line);
     animate background, border-color { duration: Theme.quick; }
     clip: true;
     opacity: root.dimmed ? 0.55 : 1.0;
     // a hovered tile rises a hair — a tactile pickup cue, settled not bouncy
-    property <length> lift: (ta.has-hover && !root.dimmed && !root.selected) ? 1px : 0px;
+    property <length> lift: (root.card-hovered && !root.dimmed && !root.selected) ? 1px : 0px;
     VerticalLayout {
         padding: 6px;
         spacing: 5px;
@@ -72,7 +75,7 @@ component EffectTileCard inherits Rectangle {
             animate border-color { duration: Theme.quick; }
             clip: true;
             Image {
-                source: root.tile.swatch;
+                source: root.swatch;
                 width: parent.width; height: parent.height;
                 image-fit: fill;
             }
@@ -118,6 +121,46 @@ component EffectTileCard inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: root.dimmed ? MouseCursor.default : MouseCursor.pointer;
         clicked => { if (!root.dimmed) { root.picked(); } }
+    }
+    layer-add := Rectangle {
+        property <bool> open: add-ta.has-hover;
+        property <length> choice-w: (root.width - 42px) / 2;
+        x: 10px; y: 10px;
+        width: self.open ? root.width - 20px : 18px;
+        height: 20px;
+        visible: root.card-hovered && !root.dimmed;
+        background: Theme.bg.with-alpha(0.88);
+        border-radius: 3px;
+        border-width: Theme.hair;
+        border-color: self.open ? Theme.text-faint : Theme.line;
+        clip: true;
+        animate width { duration: 200ms; easing: ease-out; }
+        Path {
+            x: 2px; y: 2px; width: 14px; height: 16px;
+            viewbox-width: 16; viewbox-height: 16;
+            fill: transparent;
+            stroke: Theme.text-mid;
+            stroke-width: 1.2px;
+            commands: "M1 6 L6 3 L11 6 L6 9 Z M1 10 L6 13 L11 10 M12 1 V5 M10 3 H14";
+        }
+        Rectangle {
+            x: 22px; width: layer-add.choice-w; height: 100%;
+            background: layer-add.open && add-ta.mouse-x >= 22px && add-ta.mouse-x < 22px + layer-add.choice-w ? Theme.well-hi : transparent;
+            Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "above this"; font-size: Theme.fs-small; color: Theme.text-mid; }
+        }
+        Rectangle {
+            x: 22px + layer-add.choice-w; width: layer-add.choice-w; height: 100%;
+            background: layer-add.open && add-ta.mouse-x >= self.x ? Theme.well-hi : transparent;
+            Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "below this"; font-size: Theme.fs-small; color: Theme.text-mid; }
+        }
+        add-ta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => {
+                if (self.mouse-x >= 22px) {
+                    root.layer-added(self.mouse-x < 22px + layer-add.choice-w);
+                }
+            }
+        }
     }
     // SUGGESTED GRADIENTS — a capsule on the art that opens in place into the rest of its pairings.
     // The pill's left edge never moves; it only grows rightward, so hovering never shifts the first
@@ -219,7 +262,33 @@ component EffectTileCard inherits Rectangle {
 component TileShelf inherits VerticalLayout {
     in property <string> title;
     in property <string> caption;
-    in property <[EffectTile]> tiles;
+    in property <[EffectTileMeta]> tiles;
+    in property <[image]> swatches;
+    in property <int> shelf;
+    in property <length> viewport-top;
+    in property <length> viewport-bottom;
+    property <length> previous-top: 0px;
+    property <bool> forward: true;
+    Timer {
+        interval: 16ms;
+        running: State.window-shown && State.page == 1;
+        triggered => { root.sample-demand(); }
+    }
+    callback sample-demand();
+    sample-demand => {
+        let top = shelfgrid.absolute-position.y;
+        let pitch = shelfgrid.th + shelfgrid.gap;
+        if (top != root.previous-top) { root.forward = top < root.previous-top; }
+        let forward = root.forward;
+        let ahead = clamp(pitch + 6 * abs(top - root.previous-top), pitch, 3 * pitch);
+        root.previous-top = top;
+        let start = min(root.tiles.length, max(0, (floor((root.viewport-top - top - shelfgrid.th) / pitch) + 1)) * shelfgrid.cols);
+        let end = max(start, min(root.tiles.length, max(0, ceil((root.viewport-bottom - top) / pitch)) * shelfgrid.cols));
+        let warm-start = min(root.tiles.length, max(0, (floor((root.viewport-top - (forward ? 0.5 * shelfgrid.th : ahead) - top - shelfgrid.th) / pitch) + 1)) * shelfgrid.cols);
+        let warm-end = max(warm-start, min(root.tiles.length, max(0, ceil((root.viewport-bottom + (forward ? ahead : 0.5 * shelfgrid.th) - top) / pitch)) * shelfgrid.cols));
+        State.tile-demand(root.shelf, start, end, warm-start, warm-end);
+    }
+
     // A second selection id this shelf also honours. The built-in shelves leave it empty and light off
     // `State.light-effect` alone; the YOUR-EFFECTS shelf passes the loaded saved-effect slug, because a
     // loaded user effect reports `light-effect` as its TOP LAYER's preset — which is a different tile.
@@ -248,6 +317,7 @@ component TileShelf inherits VerticalLayout {
         height: self.nrows * self.th + max(0, self.nrows - 1) * self.gap;
         for t[i] in root.tiles : EffectTileCard {
             tile: t;
+            swatch: root.swatches[i];
             selected: t.slug == State.light-effect || t.slug == root.selected-extra;
             dimmed: t.kind == "stub";
             deletable: root.deletable;
@@ -256,6 +326,7 @@ component TileShelf inherits VerticalLayout {
             width: shelfgrid.cw;
             height: shelfgrid.th;
             picked => { State.pick-tile(t.slug); }
+            layer-added(above) => { State.stack-tile(t.slug, above); }
             delete-requested => { root.delete-requested(t.slug); }
         }
     }
@@ -730,6 +801,26 @@ component SpectrumEditor inherits VerticalLayout {
 }
 
 export component LightingPanel inherits VerticalLayout {
+    in property <length> viewport-top;
+    in property <length> viewport-bottom;
+    property <bool> render-hero: false;
+    changed render-hero => { State.light-hero-visible = root.render-hero; State.preview-tick(); }
+    property <bool> render-active: State.window-shown && State.page == 1;
+    changed render-active => { State.tile-preview-tick(); }
+    callback sample-demand();
+    sample-demand => {
+        root.render-hero = root.has-surface && !State.light-brush-on
+            && hero_render.absolute-position.y < root.viewport-bottom
+            && hero_render.absolute-position.y + hero_render.height > root.viewport-top;
+    }
+    // Geometry is sampled after layout: evaluating absolute positions during construction recurses.
+    Timer {
+        interval: 16ms;
+        running: root.render-active;
+        triggered => { root.sample-demand(); }
+    }
+
+
     spacing: 0;
 
     property <bool> has-target: State.selected-device >= 0 && State.selected-device-name != "—";
@@ -770,7 +861,7 @@ export component LightingPanel inherits VerticalLayout {
         // so without `window-shown && page == 1` this hero render ran every frame even while you were on
         // another tab or the window was hidden in the tray. Render nothing you can't see.
         running: State.window-shown && State.page == 1
-            && !State.light-brush-on && root.has-surface && State.light-effect != "";
+            && root.render-hero;
         triggered => { State.preview-tick(); }
     }
     // the GRID swatches animate a touch slower still (each tile is a Rust-side render — cheap but not
@@ -813,7 +904,7 @@ export component LightingPanel inherits VerticalLayout {
                     drop-shadow-color: State.light-foreign ? Theme.accent.with-alpha(0.22) : transparent;
                     drop-shadow-blur: State.light-foreign ? 10px : 0px;
                     animate drop-shadow-color, drop-shadow-blur { duration: Theme.settle; }
-                    DeviceRender {
+                    hero_render := DeviceRender {
                         width: 100%; height: 100%;
                         rows: root.has-surface ? State.grid-rows : 0;
                         cols: root.has-surface ? State.grid-cols : 0;
@@ -904,23 +995,39 @@ export component LightingPanel inherits VerticalLayout {
                     title: "EFFECTS";
                     caption: "pure light shows, running on a clock";
                     tiles: State.light-tiles;
+                    swatches: State.light-swatches;
+                    shelf: 0;
+                    viewport-top: root.viewport-top;
+                    viewport-bottom: root.viewport-bottom;
                 }
                 TileShelf {
                     title: "REACTS TO KEYS";
                     caption: "driven by your live typing · tiles loop a demo";
                     tiles: State.light-input-tiles;
+                    swatches: State.light-input-swatches;
+                    shelf: 1;
+                    viewport-top: root.viewport-top;
+                    viewport-bottom: root.viewport-bottom;
                 }
                 TileShelf {
                     title: "LIVE DATA";
                     caption: "each one reads a real feed, named on the chip · tiles loop a demo";
                     tiles: State.light-data-tiles;
+                    swatches: State.light-data-swatches;
+                    shelf: 2;
+                    viewport-top: root.viewport-top;
+                    viewport-bottom: root.viewport-bottom;
                 }
                 TileShelf {
                     title: "YOUR EFFECTS";
                     caption: State.light-user-tiles.length == 0 ? "save a look above to keep it here"
                         : "saved by you · click to load, \u{00d7} to delete";
                     tiles: State.light-user-tiles;
-                    selected-extra: State.light-user-effect;
+                    swatches: State.light-user-swatches;
+                    shelf: 3;
+                    viewport-top: root.viewport-top;
+                    viewport-bottom: root.viewport-bottom;
+                    selected-extra: State.light-user-effect == "" ? "" : "user:" + State.light-user-effect;
                     deletable: true;
                     delete-requested(slug) => { State.delete-user-effect(slug); }
                 }

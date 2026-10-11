@@ -169,12 +169,13 @@ const IDLE_STOP_MS: u64 = 2000;
 
 /// Start the sampler (idempotent, cheap to call every frame — the `miclight` pattern does).
 pub fn ensure() {
+    if !crate::pattern::may_start_provider() { return; }
     let mut on = running().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if *on {
         return;
     }
     *on = true;
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if crate::pattern::may_start_provider() { LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed); }
     drop(on);
     // The latch is cleared by the release — which runs on completion, panic, OR a spawn refusal —
     // so a failed spawn can never leave the sampler latched "on" and block every later `ensure`.
@@ -188,7 +189,8 @@ pub fn ensure() {
 /// The latest mute state: `None` = unknown (no mic resolved, or nothing sampled yet),
 /// `Some(true)` = muted, `Some(false)` = live. Reading it keeps the sampler alive.
 pub fn muted() -> Option<bool> {
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if !crate::pattern::may_read_provider() { return None; }
+    if crate::pattern::may_start_provider() { LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed); }
     // Under test, a set override WINS over whatever the (possibly live, possibly real-mic)
     // sampler publishes — pattern tests must be deterministic on any machine.
     #[cfg(test)]

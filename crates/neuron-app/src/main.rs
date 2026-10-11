@@ -40,6 +40,8 @@ mod filedlg;
 mod flight;
 mod glance;
 mod glue;
+mod light_metadata;
+mod light_render;
 mod hidwatch;
 mod host;
 mod knockback;
@@ -51,6 +53,7 @@ mod overlay;
 mod prefs;
 mod lat_log;
 mod prof_log;
+mod ui_prof;
 #[cfg(windows)]
 mod purge;
 mod raster;
@@ -94,6 +97,12 @@ struct Resident {
     window: Option<AppWindow>,
     shared: Option<glue::SharedRt>,
     live: Option<dispatch::LiveRuntime>,
+    ui_profile: Option<slint::Timer>,
+}
+
+fn effect_names(st: &State) -> Vec<String> {
+    use slint::Model;
+    st.get_effects().iter().map(|effect| effect.name.to_string()).collect()
 }
 
 /// Resolve process authority before any startup path can restore a device stream.
@@ -149,6 +158,13 @@ fn arm_live_dispatch(safe: bool, input_supported: bool) -> bool {
 fn main() {
     if std::env::args().any(|a| a == "--shutdown-existing") {
         std::process::exit(i32::from(!shutdown::signal_existing()));
+    }
+    if std::env::var_os("NEURON_LIGHT_BENCH").is_some() {
+        if let Err(error) = light_render::render_latency_bench() {
+            eprintln!("neuron lighting benchmark failed: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
     #[cfg(windows)]
     let shutdown_listener = match shutdown::Listener::new() {
@@ -368,6 +384,7 @@ fn main() {
         window: None,
         shared: None,
         live: None,
+        ui_profile: None,
     }));
 
     // Select before the first Slint window. Keep software compiled for hosts with no GPU context.
@@ -432,6 +449,8 @@ fn main() {
     // Hidden start is an AUTOSTART behaviour: `--tray` (the Run-key launch) honours the persisted
     // start-minimized preference. A deliberate double-click ALWAYS shows the window — a brand-new
     // user must never be greeted by nothing but a tray icon they don't know exists.
+    // Seed lighting restore before any Slint callbacks can run.
+    prefs::refresh_lighting_snapshot();
     let start_hidden = std::env::args().any(|a| a == "--tray") && prefs::start_minimized();
     // An OS-relaunch after a crash announces itself honestly (and lands in the flight record).
     if respawned {
@@ -600,6 +619,7 @@ fn main() {
             // ring) and the NEXT tick runs anyway — the heartbeat of the app must not be the
             // app's weakest point.
             let tick = std::panic::AssertUnwindSafe(|| {
+                let _timing = ui_prof::Scope::new("resident_tick");
                 let mut acted = false;
                 for action in poll_tray.poll() {
                     acted = true;
@@ -796,7 +816,7 @@ fn main() {
                         let s = shared.borrow();
                         TraySnapshot {
                             profiles: s.rt.profiles.iter().map(|p| p.name.clone()).collect(),
-                            effects: s.rt.effects().into_iter().map(|(n, _, _)| n).collect(),
+                            effects: effect_names(&st),
                             active: s.rt.active_profile.clone(),
                             paused: neuron::writes::writes_paused(),
                             hyper: st.get_hypershift_on(),
@@ -820,10 +840,13 @@ fn main() {
     // can fire during it — its RefCell borrow is uncontended. Dropping the tick timer here is belt-
     // and-suspenders, making the no-tick-during-flush invariant structural rather than incidental.
     drop(timer);
+    drop(resident.borrow_mut().ui_profile.take());
     // Flush any still-debounced lighting save before teardown — a quit must never strand the last
     // edit. Structural edits (stack/remove/tile-pick) already persist immediately; this catches a
     // knob (speed/stop/timing) tweaked within the 400ms debounce window right before quitting.
     glue::flush_lighting_save();
+    light_render::shutdown();
+    light_metadata::shutdown();
     // ── DEVICE-MODE RESTORE (the DPI-16000 trap) ──────────────────────────
     // Driver mode is a scoped LEASE (streams/writes), never a permanent state: while a device is held
     // in it, its onboard buttons/FN defer to software and it wakes with a stale factory volatile plane
@@ -935,16 +958,7 @@ fn build_window(resident: &Rc<RefCell<Resident>>) -> bool {
             return false;
         }
     };
-    #[cfg(feature = "wgpu-renderer")]
-    if std::env::var("NEURON_RENDERER").as_deref() == Ok("wgpu") {
-        if let Err(err) = app.window().set_rendering_notifier(|state, api| {
-            if matches!(state, slint::RenderingState::RenderingSetup) {
-                eprintln!("neuron: UI renderer initialized with {api:?}");
-            }
-        }) {
-            eprintln!("neuron: renderer diagnostics unavailable ({err})");
-        }
-    }
+    let ui_profile = ui_prof::install(&app);
     let shared = glue::install(&app);
 
     // DEV: `NEURON_START_PAGE=<n>` opens directly on that page (0 = bindings, 1 = lighting, …) —
@@ -969,6 +983,7 @@ fn build_window(resident: &Rc<RefCell<Resident>>) -> bool {
     });
 
     let mut r = resident.borrow_mut();
+    r.ui_profile = ui_profile;
     r.window = Some(app);
     r.shared = Some(shared);
     true

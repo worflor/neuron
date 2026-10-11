@@ -113,6 +113,9 @@ component PanelPage inherits Flickable {
 }
 
 export component AppWindow inherits Window {
+    callback sample-light-demand();
+    sample-light-demand => { lighting_panel.sample-demand(); }
+
     title: "Neuron";
     // Pages scroll (see PanelPage), so the minimum is "still comfortable", not "fits everything".
     min-width: 900px;
@@ -274,7 +277,7 @@ export component AppWindow inherits Window {
                         // two nested Flickables break hit-testing on the inner's scrolled content (clicking
                         // ▸ advanced / sniper / persist did nothing once scrolled). One Flickable only.
                         PanelSlot { active: State.page == 0; DevicePanel {} }
-                        PanelSlot { active: State.page == 1; PanelPage { LightingPanel {} } }
+                        PanelSlot { active: State.page == 1; lighting_page := PanelPage { lighting_panel := LightingPanel { viewport-top: lighting_page.absolute-position.y; viewport-bottom: lighting_page.absolute-position.y + lighting_page.height; } } }
                         // INPUT — one section, two depths: DIRECT (plain binds) / WEAVE (the
                         // held-stroke engine). Same spine, same action palette, one home.
                         PanelSlot { active: State.page == 2 && State.input-view == 0; bp_page := PanelPage { bp := BindingsPanel {} } }

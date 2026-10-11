@@ -123,8 +123,11 @@ const IDLE_STOP_MS: u64 = 4000; // stop the thread if no getter read in ~4s
 /// — so it's cheap to call every frame. Refreshes the idle timer so a brand-new thread doesn't
 /// immediately auto-stop before the first getter read lands.
 pub fn ensure() {
+    if !crate::pattern::may_start_provider() { return; }
     let mut running = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if crate::pattern::may_start_provider() {
+        LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    }
     if *running {
         return;
     }
@@ -142,13 +145,19 @@ pub fn ensure() {
 /// The latest smoothed CPU load (0.0..=1.0). Lock-free and cheap. Reading it keeps the sampler
 /// alive (resets the idle timer), so a consumer that stops reading lets the thread auto-stop.
 pub fn cpu() -> f32 {
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if !crate::pattern::may_read_provider() { return 0.0; }
+    if crate::pattern::may_start_provider() {
+        LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    }
     f32::from_bits(CPU_BITS.load(Ordering::Relaxed))
 }
 
 /// The latest RAM load (0.0..=1.0). Lock-free and cheap; also keeps the sampler alive.
 pub fn ram() -> f32 {
-    LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    if !crate::pattern::may_read_provider() { return 0.0; }
+    if crate::pattern::may_start_provider() {
+        LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
+    }
     f32::from_bits(RAM_BITS.load(Ordering::Relaxed))
 }
 

@@ -47,6 +47,7 @@ impl Default for Life {
 }
 
 impl Pattern for Life {
+    preserve_legacy_config!();
     fn configure(&mut self, params: &Params) {
         self.speed = params.f32("speed", 1.0).clamp(0.25, 4.0);
         self.density = params.f32("density", 1.0).clamp(0.25, 3.0);
@@ -2223,6 +2224,7 @@ mod tests {
                 blend: crate::effects::Blend::Normal,
                 enabled: true,
             }],
+            ..Default::default()
         };
         let first = compositor.render(1, 6, 0.0);
         let repeated = compositor.render(1, 6, 0.0);
@@ -2381,6 +2383,7 @@ mod tests {
         };
         let mut compositor = super::super::Compositor {
             layers: vec![comp_layer],
+            ..Default::default()
         };
         let px = compositor.render(1, 4, 0.0);
         let low = px.iter().map(|c| c.scale_f(0.16)).collect::<Vec<_>>();
@@ -2406,6 +2409,7 @@ mod tests {
                 blend: crate::effects::Blend::Normal,
                 enabled: true,
             }],
+            ..Default::default()
         };
         let frame = wildlife.render(1, 5, 0.0);
         let low = frame.iter().map(|c| c.scale_f(0.16)).collect::<Vec<_>>();

@@ -137,7 +137,9 @@ pub fn breathe_shape(phase: f32) -> f32 {
     const REST: f32 = 1.0 - INHALE - CREST;
     let theta = if t < INHALE {
         let u = t / INHALE;
-        let e = u * u * (3.0 - 2.0 * u); // smooth in, so the crest lands full, not peaked
+        // Match the returning exhale's velocity at the cycle join, and settle at the crest.
+        let m = 3.0 * INHALE / REST;
+        let e = u * (m + u * (3.0 - 2.0 * m + u * (m - 2.0)));
         std::f32::consts::FRAC_PI_2 * e
     } else if t < INHALE + CREST {
         std::f32::consts::FRAC_PI_2 // the dwell
@@ -236,6 +238,11 @@ mod tests {
 
     #[test]
     fn breathe_shape_is_an_asymmetric_1_2_breath() {
+        let epsilon = 0.001;
+        let tau = std::f32::consts::TAU;
+        let left = (breathe_shape(tau) - breathe_shape(tau - epsilon)) / epsilon;
+        let right = (breathe_shape(epsilon) - breathe_shape(0.0)) / epsilon;
+        assert!((left - right).abs() < 0.01, "cycle velocity: {left} vs {right}");
         let n = 240;
         let vals: Vec<f32> = (0..=n)
             .map(|k| breathe_shape(std::f32::consts::TAU * k as f32 / n as f32))

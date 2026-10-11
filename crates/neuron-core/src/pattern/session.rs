@@ -130,6 +130,7 @@ pub struct PresentationLayer {
     pub id: LayerInstanceId,
     pub spectrum: Spectrum,
     pub palette_addressing: PaletteAddressing,
+    pub sampling: crate::spectrum::PaletteSampling,
     pub region: Vec<u32>,
     pub blend: Blend,
     pub enabled: bool,
@@ -198,6 +199,29 @@ impl LightingSession {
     #[must_use]
     pub fn board_dims(&self) -> (u8, u8) {
         self.board_dims
+    }
+
+    /// Move live instances into the compatibility producer. The caller carries the returned input
+    /// cursor and anchors transferred clocks at its first presentation; no simulation is replayed.
+    pub fn into_compositor(self, specs: &[SceneLayerSpec]) -> (crate::pattern::Compositor, u64) {
+        let defs: Vec<_> = specs.iter().map(|spec| {
+            let mut def = spec.def.clone();
+            def.id = Some(spec.id);
+            def
+        }).collect();
+        let mut compositor = crate::pattern::Compositor::from_defs(&defs);
+        let mut previous: std::collections::HashMap<_, _> = self.layers.into_iter()
+            .map(|layer| (layer.id, layer)).collect();
+        for (layer, def) in compositor.layers.iter_mut().zip(&defs) {
+            if let Some(mut previous) = def.id.and_then(|id| previous.remove(&id)) {
+                if previous.pattern_key == def.pattern {
+                    if previous.params != def.params { previous.pattern.configure(&def.params); }
+                    if previous.frame != def.frame { previous.pattern.set_frame(&def.frame); }
+                    layer.pattern = previous.pattern;
+                }
+            }
+        }
+        (compositor, self.last_input_generation)
     }
 
     #[must_use]
@@ -274,9 +298,10 @@ impl LightingSession {
             };
 
             if let Some(existing) = self.layers.iter().find(|l| l.id == s.id) {
-                if existing.pattern_key == s.def.pattern {
+                if pattern_def(&existing.pattern_key).map(|p| p.key) == pattern_def(&s.def.pattern).map(|p| p.key) {
                     let view = owned_delta.as_view(&existing.geometry);
-                    if existing.pattern.reconfigure_policy(&view) == ReconfigurePolicy::Preserve {
+                    if (existing.params == s.def.params && existing.frame == s.def.frame && existing.geometry == geometry)
+                        || existing.pattern.reconfigure_policy(&view) == ReconfigurePolicy::Preserve {
                         steps.push(ReconcileStep::Preserve {
                             id: s.id,
                             delta: owned_delta,
@@ -295,7 +320,7 @@ impl LightingSession {
 
             steps.push(ReconcileStep::Replace {
                 id: s.id,
-                pattern_key: s.def.pattern.clone(),
+                pattern_key: pattern_def(&s.def.pattern).map_or(s.def.pattern.as_str(), |p| p.key).into(),
                 new_pattern: new_p,
                 geometry,
                 params: s.def.params.clone(),
@@ -321,6 +346,7 @@ impl LightingSession {
                     id: s.id,
                     spectrum: s.def.spectrum.clone(),
                     palette_addressing: addressing,
+                    sampling: crate::pattern::palette_sampling(&s.def),
                     region,
                     blend: s.def.blend,
                     enabled: s.def.enabled,
@@ -345,7 +371,9 @@ impl LightingSession {
                 ReconcileStep::Preserve { id, delta } => {
                     if let Some(layer) = self.layers.iter_mut().find(|l| l.id == id) {
                         let view = delta.as_view(&layer.geometry);
-                        layer.pattern.apply_reconfigure(&view);
+                        if layer.params != delta.params || layer.frame != delta.frame || layer.geometry != delta.geometry {
+                            layer.pattern.apply_reconfigure(&view);
+                        }
                         layer.params = delta.params;
                         layer.frame = delta.frame;
                         layer.geometry = delta.geometry;
@@ -402,6 +430,17 @@ impl LightingSession {
         });
 
         self.presentation = plan.presentation;
+        self.latest_resolved_frame = None;
+        if let Some(previous) = self.latest_sim_snapshot.as_ref() {
+            let context = EmitContext { elapsed: self.elapsed };
+            let layer_fields = self.layers.iter_mut().map(|layer| {
+                layer.cached_field = Arc::new(layer.pattern.emit(&context, &layer.geometry));
+                (layer.id, layer.cached_field.clone())
+            }).collect();
+            // A configuration barrier refreshes pure fields without advancing time, input or RNG.
+            self.latest_sim_snapshot = Some(Arc::new(SimulationSnapshot { tick: self.tick,
+                elapsed: self.elapsed, dt: previous.dt, layer_fields }));
+        }
     }
 
     /// Explicitly restart a single layer instance fresh, reapplying saved configuration.
@@ -428,13 +467,20 @@ impl LightingSession {
         Ok(())
     }
 
+    /// Rebaseline an attached input source without replaying transitions from before attachment.
+    pub fn rebaseline_input(&mut self, input_hub: &ProcessInputHub) {
+        self.last_input_generation = input_hub.current_generation();
+    }
+
     /// Advance authoritative logical tick at pinned 60 Hz cadence.
     pub fn advance_tick(
         &mut self,
         input_hub: &ProcessInputHub,
         wall_now: Instant,
     ) -> Arc<SimulationSnapshot> {
-        let is_discontinuity = self
+        let (input, next_gen) =
+            input_hub.snapshot_for_matrix(self.last_input_generation, default_control_to_matrix);
+        let is_discontinuity = input.input_gap || self
             .last_wall_time
             .is_some_and(|last| wall_now.duration_since(last) > Duration::from_secs(2));
         self.last_wall_time = Some(wall_now);
@@ -454,18 +500,13 @@ impl LightingSession {
         self.tick = self.tick.wrapping_add(1);
         self.elapsed += dt;
 
-        let (input, next_gen) =
-            input_hub.snapshot_for_matrix(self.last_input_generation, default_control_to_matrix);
         self.last_input_generation = next_gen;
 
         let mut snapshot_fields = Vec::with_capacity(self.layers.len());
 
-        for layer in &mut self.layers {
-            let enabled = self
-                .presentation
-                .layers
-                .iter()
-                .find(|pl| pl.id == layer.id)
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            let enabled = self.presentation.layers.get(index).filter(|pl| pl.id == layer.id)
+                .or_else(|| self.presentation.layers.iter().find(|pl| pl.id == layer.id))
                 .is_none_or(|pl| pl.enabled);
 
             if !enabled {
@@ -515,50 +556,60 @@ impl LightingSession {
     /// Resolve simulation fields against presentation revision at high-precision presentation time.
     /// Pure presentation mapping — zero mutation of simulation ticks or RNG state.
     pub fn resolve_presentation(&mut self, presentation_elapsed: Duration) -> Arc<ResolvedFrame> {
+        let mut scratch = crate::pattern::RenderScratch::default();
+        self.resolve_into(presentation_elapsed, &mut scratch);
+        let frame = Arc::new(ResolvedFrame {
+            tick: self.tick,
+            presentation_rev: self.presentation.revision,
+            presentation_elapsed,
+            pixels: Arc::from(scratch.output),
+        });
+
+        self.latest_resolved_frame = Some(Arc::clone(&frame));
+        frame
+    }
+
+    /// Resolve without changing simulation or allocating compositor/layer RGB buffers after warmup.
+    pub fn resolve_into(&self, presentation_elapsed: Duration, scratch: &mut crate::pattern::RenderScratch) {
         let (rows, cols) = self.board_dims;
         let n = rows as usize * cols as usize;
-        let mut pixels = vec![Rgb::BLACK; n];
+        scratch.output.resize(n, Rgb::BLACK);
+        scratch.output.fill(Rgb::BLACK);
 
         let sim_opt = self.latest_sim_snapshot.clone();
 
         if let Some(sim) = sim_opt {
-            for pres in &self.presentation.layers {
+            for (index, pres) in self.presentation.layers.iter().enumerate() {
                 if !pres.enabled {
                     continue;
                 }
-                let Some((_, field)) = sim.layer_fields.iter().find(|(id, _)| *id == pres.id) else {
+                let Some((_, field)) = sim.layer_fields.get(index).filter(|(id, _)| *id == pres.id)
+                    .or_else(|| sim.layer_fields.iter().find(|(id, _)| *id == pres.id)) else {
                     continue;
                 };
 
                 let bounds = Bounds::from_region(&pres.region, rows, cols);
-                let rendered_px = render_palette_addressing_time(
+                render_palette_sampled_into(
                     field,
                     &pres.spectrum,
                     presentation_elapsed,
                     pres.palette_addressing,
-                    bounds,
-                    cols,
+                    (bounds, cols),
+                    pres.sampling,
+                    &mut scratch.layer,
                 );
+                let rendered_px = &scratch.layer;
 
                 if rendered_px.len() == n {
-                    for i in 0..n {
+                    for (i, &pixel) in rendered_px.iter().enumerate() {
                         if pres.region.is_empty() || pres.region.binary_search(&(i as u32)).is_ok() {
-                            pixels[i] = crate::effects::blend_px(pixels[i], rendered_px[i], pres.blend);
+                            scratch.output[i] = crate::effects::blend_px(scratch.output[i], pixel, pres.blend);
                         }
                     }
                 }
             }
         }
 
-        let frame = Arc::new(ResolvedFrame {
-            tick: self.tick,
-            presentation_rev: self.presentation.revision,
-            presentation_elapsed,
-            pixels: Arc::from(pixels),
-        });
-
-        self.latest_resolved_frame = Some(Arc::clone(&frame));
-        frame
     }
 
     /// Access live layer pattern by id (for inspecting internal state in tests).
@@ -585,30 +636,47 @@ pub fn render_palette_addressing_time(
     bounds: Bounds,
     cols: u8,
 ) -> Vec<Rgb> {
+    let mut pixels = Vec::with_capacity(field.len());
+    render_palette_addressing_into(field, spectrum, t, addressing, bounds, cols, &mut pixels);
+    pixels
+}
+
+/// Resolve into a reusable output buffer without allocating a per-layer RGB array.
+pub fn render_palette_addressing_into(
+    field: &Field,
+    spectrum: &Spectrum,
+    t: Duration,
+    addressing: PaletteAddressing,
+    bounds: Bounds,
+    cols: u8,
+    pixels: &mut Vec<Rgb>,
+) {
+    render_palette_sampled_into(field, spectrum, t, addressing, (bounds, cols), Default::default(), pixels);
+}
+
+/// Resolve boundaries after pattern and palette motion, shared by every render producer.
+pub fn render_palette_sampled_into(
+    field: &Field,
+    spectrum: &Spectrum,
+    t: Duration,
+    addressing: PaletteAddressing,
+    geometry: (Bounds, u8),
+    sampling: crate::spectrum::PaletteSampling,
+    pixels: &mut Vec<Rgb>,
+) {
+    let (bounds, cols) = geometry;
+    pixels.clear();
     match field {
-        Field::Color(px) => px.clone(),
-        Field::Emissive(lights) => lights
-            .iter()
-            .map(|&lin| Rgb::from_linear(lin))
-            .collect(),
+        Field::Color(colors) => pixels.extend_from_slice(colors),
+        Field::Emissive(lights) => pixels.extend(lights.iter().map(|&lin| Rgb::from_linear(lin))),
         Field::Scalar(cells) => {
-            if addressing == PaletteAddressing::Field {
-                cells
-                    .iter()
-                    .map(|c| spectrum.at_time(t, c.u).scale_f(c.intensity))
-                    .collect()
-            } else {
-                cells
-                    .iter()
-                    .enumerate()
-                    .map(|(i, cell)| {
-                        let row = i / cols.max(1) as usize;
-                        let col = i % cols.max(1) as usize;
-                        let u = crate::pattern::placement_coordinate(bounds, row, col);
-                        spectrum.at_time(t, u).scale_f(cell.intensity)
-                    })
-                    .collect()
-            }
+            let prepared = spectrum.prepare(t);
+            pixels.extend(cells.iter().enumerate().map(|(i, cell)| {
+                let u = if addressing == PaletteAddressing::Field { cell.u } else {
+                    crate::pattern::placement_coordinate(bounds, i / cols.max(1) as usize, i % cols.max(1) as usize)
+                };
+                prepared.at_with_sampling(u, sampling.cyclic, sampling.boundary).scale_f(cell.intensity)
+            }));
         }
     }
 }

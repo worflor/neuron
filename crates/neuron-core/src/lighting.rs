@@ -1390,6 +1390,20 @@ impl<'a> Lights<'a> {
         fps: impl Fn() -> u32,
         mut update_comp: impl FnMut(&mut crate::pattern::Compositor),
         secs: u64,
+        stop: impl FnMut() -> bool,
+    ) -> anyhow::Result<()> {
+        self.animate_frames(fps, |now, rate| {
+            update_comp(comp);
+            Ok(comp.render_at_time(self.def.rows, self.def.cols, crate::pattern::quantized_time(now, rate)).into())
+        }, secs, stop)
+    }
+
+    /// Pace an I/O-free frame producer through the existing transport and row-dedup path.
+    pub fn animate_frames(
+        &self,
+        fps: impl Fn() -> u32,
+        mut produce: impl FnMut(std::time::Duration, u32) -> anyhow::Result<std::sync::Arc<[Rgb]>>,
+        secs: u64,
         mut stop: impl FnMut() -> bool,
     ) -> anyhow::Result<()> {
         use std::time::{Duration, Instant};
@@ -1409,40 +1423,26 @@ impl<'a> Lights<'a> {
         // unchanged needn't be re-sent — it keeps displaying. We cache the last frame we actually
         // SENT and each tick push only the rows that changed (and latch only then). A static effect
         // collapses to ~zero HID traffic after the first paint; a partial-change effect pushes just
-        // the moving rows. `last_frame = None` until the first paint (and on any fps change, which
-        // re-quantizes the phase) forces a FULL resend so the board is never left partially stale.
+        // the moving rows. Only first paint or an uncertain send invalidates the comparison baseline.
         // Both work buffers (`changed`, the cache) are reused across ticks — the only per-frame
         // Vec<Rgb> we can't avoid is the Compositor's `render()` output (it owns the composited frame).
         let mut last_frame: Option<Vec<Rgb>> = None;
         let mut changed: Vec<usize> = Vec::new();
-        let mut last_fps: u32 = 0; // fps is clamped to 1..=30, so 0 forces a full first paint.
         let run_start = Instant::now();
         let mut next = run_start; // deadline-pacing anchor (separate from the wall-clock phase).
         while !stop() && run_start.elapsed().as_secs_f64() < secs as f64 {
-            update_comp(comp);
             let fps = fps().clamp(1, MAX_STREAM_FPS);
             let dt = Duration::from_millis(1000 / u64::from(fps));
-            // Quantize the SHARED render clock to 1/fps steps via the ONE helper the GUI preview also
-            // calls (`quantized_t` off the process-global `render_epoch`), so the on-screen mirror steps
-            // in the identical discrete frames the device does (chunky at 6fps, smooth at 30) — same
-            // epoch + same formula ⇒ the preview provably matches the board. Wall-clock (not
-            // frame_index/fps) keeps the phase CONTINUOUS when fps is re-tuned mid-stream, and the shared
-            // epoch (not this stream's start) means a restart can't jump it.
-            // `render_elapsed()` wraps at 4096s in the duration domain, so the f32 phase stays frame-precise
-            // at any uptime (a raw `.as_secs_f32()` decays to a stutter after ~a day).
-            let elapsed = crate::pattern::quantized_t(crate::pattern::render_elapsed(), fps);
-            let frame = comp.render(self.def.rows, self.def.cols, elapsed);
-
-            // Which rows differ from what's already on the board? A live fps change re-quantizes the
-            // phase, so drop the cache (prev = None) → resend everything that tick.
-            let prev = if fps == last_fps { last_frame.as_deref() } else { None };
-            changed_rows_into(prev, &frame, cols, &mut changed);
-            last_fps = fps;
+            let frame = produce(crate::pattern::render_elapsed_time(), fps)?;
+            anyhow::ensure!(frame.len() == usize::from(self.def.rows) * cols, "producer frame shape mismatch");
+            if stop() { break; }
+            changed_rows_into(last_frame.as_deref(), &frame, cols, &mut changed);
 
             // Push only the changed rows; LATCH (commit the frame) only if we actually wrote ≥1 row.
             let mut sent_any = false;
             let mut frame_complete = true;
             for &row in &changed {
+                if stop() { frame_complete = false; break; }
                 if let Some(rep) = self.def.row_report(&frame, row) {
                     if !self.dev.send_lighting_fast(&rep) {
                         frame_complete = false;
@@ -1451,7 +1451,7 @@ impl<'a> Lights<'a> {
                     sent_any = true;
                 }
             }
-            if sent_any && frame_complete && !self.dev.send_lighting_fast(&display) {
+            if sent_any && frame_complete && (stop() || !self.dev.send_lighting_fast(&display)) {
                 frame_complete = false;
             }
 
@@ -1788,6 +1788,40 @@ mod tests {
     }
 
     // ── DEADLINE PACING: `pace` ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn paced_producer_preserves_row_cache_across_fps_changes_and_uses_only_frame_reports() {
+        use std::sync::{Arc, Mutex};
+        use std::cell::Cell;
+        struct Trace(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl crate::transport::Transport for Trace {
+            fn set_feature(&self, bytes: &[u8]) -> anyhow::Result<()> { self.0.lock().unwrap().push(bytes.to_vec()); Ok(()) }
+            fn get_feature(&self, bytes: &mut [u8]) -> anyhow::Result<usize> {
+                let trace = self.0.lock().unwrap();
+                let raw: [u8; crate::protocol::BUF_LEN] = trace.last().unwrap().as_slice().try_into().unwrap();
+                let mut reply = crate::protocol::Report::from_buf(&raw); reply.status = 0x02;
+                bytes.copy_from_slice(&reply.to_buf()); Ok(bytes.len())
+            }
+        }
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let def: crate::registry::DeviceDef = toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml")).unwrap();
+        let device = crate::device::Device::with_transport(def, 0x0226, Box::new(Trace(reports.clone())));
+        let mut grid = matrix_def(); grid.rows = 2;
+        let lights = Lights::new(&device, grid.clone());
+        lights.controlled.set(true); // The trace begins after initial safe takeover.
+        let tick = Cell::new(0);
+        lights.animate_frames(|| if tick.get() == 0 { 30 } else { 29 }, |_, _| {
+            let mut frame = vec![Rgb::new(50, 60, 70); 4];
+            if tick.get() >= 2 { frame[2] = Rgb::new(70, 80, 90); }
+            tick.set(tick.get() + 1);
+            Ok(frame.into())
+        }, 1, || tick.get() >= 4).unwrap();
+        let trace = reports.lock().unwrap();
+        let rows = trace.iter().filter(|r| r[7] == grid.custom_frame.as_ref().unwrap().class && r[8] == grid.custom_frame.as_ref().unwrap().id).count();
+        assert_eq!(rows, 3, "two initial rows, no static FPS resend, then only the changed row");
+        assert!(trace.iter().all(|r| (r[7], r[8]) == (0x0F, 0x03) || (r[7], r[8]) == (0x0F, 0x02)));
+        assert_eq!(trace.iter().filter(|r| r[8] == 0x02).count(), 2);
+    }
 
     #[test]
     fn pace_ahead_sleeps_the_remainder() {

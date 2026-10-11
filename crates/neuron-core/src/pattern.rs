@@ -34,22 +34,38 @@ use crate::lighting::Rgb;
 use crate::spectrum::{self, Ease, Loop, Motion, Palette, Spectrum, Stop, Frame};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+macro_rules! preserve_legacy_config {
+    () => {
+        fn reconfigure_policy(&self, _delta: &crate::pattern::PatternReconfigure) -> crate::pattern::ReconfigurePolicy { crate::pattern::ReconfigurePolicy::Preserve }
+        fn apply_reconfigure(&mut self, delta: &crate::pattern::PatternReconfigure) {
+            self.configure(delta.params);
+            self.set_frame(delta.frame);
+        }
+    };
+}
 
 mod input;
 mod life;
 mod session;
+mod provider;
+mod transition;
+mod live;
 
 pub use input::*;
 pub use session::*;
+pub use provider::*;
+pub use transition::*;
+pub use live::*;
 use life::Life;
 
 // ─────────────────────────────────────── Field & Pattern ─────────────────────────────────
 
-/// One cell's sample from a [`Pattern`]: a spectrum lookup coordinate `u` (0..1) and a brightness
-/// `intensity` (0..1). Colour is resolved later from the layer's spectrum.
+/// One cell's sample from a [`Pattern`]: a spectrum lookup coordinate `u` (bounded or unwrapped
+/// cyclic) and brightness `intensity` (0..1). Colour and boundaries resolve through the spectrum.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cell {
     pub u: f32,
@@ -224,6 +240,16 @@ pub fn region_from_rect(r0: i32, c0: i32, r1: i32, c1: i32, rows: u8, cols: u8) 
 /// per-board anim threads today, the protocol host's writer/kernel threads too) — patterns are plain
 /// data plus atomic reads, so this states a fact rather than adding a burden.
 pub trait Pattern: Send {
+    #[cfg(test)]
+    fn state_witness(&self) -> String { String::new() }
+
+    /// High-precision entry point; legacy patterns retain their existing field implementation.
+    fn field_at_time(&mut self, rows: u8, cols: u8, t: Duration) -> Field {
+        self.field(rows, cols, t.as_secs_f32())
+    }
+
+    /// Anchor the compatibility clock after a session handoff without advancing simulation.
+    fn rebase_legacy_clock(&mut self, _t: Duration) {}
     /// Apply the layer's param values. Called once when the layer is built and again when a knob
     /// changes. The default ignores params (for patterns that declare none).
     fn configure(&mut self, _params: &Params) {}
@@ -421,6 +447,13 @@ impl LayerDef {
 
 // ───────────────────────────────────────── the registry ──────────────────────────────────
 
+pub(crate) fn palette_sampling(def: &LayerDef) -> crate::spectrum::PaletteSampling {
+    crate::spectrum::PaletteSampling {
+        cyclic: matches!(def.pattern.as_str(), "axis" | "radial"),
+        boundary: def.boundary,
+    }
+}
+
 /// Tile / catalog metadata for a pattern — the behavioural flags the preset grid derives from.
 /// User-facing COPY does not live here: each [`Preset`] carries its own `blurb`/`source`, because
 /// copy is per-LOOK (Audio Meter and Pulse share the `meter` pattern but read different worlds) —
@@ -466,6 +499,30 @@ pub struct PatternDef {
     /// `true` only for `vitals`. Lets the app surface / group it distinctly without string-matching keys.
     pub readout: bool,
 }
+
+impl PatternDef {
+    /// Only implementations with verified pure emission enter a lighting session.
+    #[must_use]
+    pub fn session_capable(&self) -> bool {
+        matches!(self.key, "uniform" | "axis" | "radial" | "comet" | "flow" | "custom")
+    }
+
+    /// Provider dependencies are explicit; an unclassified future pattern fails closed.
+    #[must_use]
+    pub fn input_dependencies(&self) -> InputDependencies {
+        match self.key {
+            "uniform" | "axis" | "radial" | "heat" | "rain" | "sparkle" | "flow" | "custom" => InputDependencies::None,
+            "comet" | "ignite" | "ring" | "thermal" | "life" => InputDependencies::Keys,
+            "meter" | "miclight" => InputDependencies::Audio,
+            "screen" => InputDependencies::Desktop,
+            "vitals" | "onair" | "modeheld" | "gamelight" | "signal" => InputDependencies::Shared,
+            _ => InputDependencies::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputDependencies { None, Keys, Audio, Desktop, Shared, Unknown }
 
 /// The registry — the SINGLE source of truth for every pattern. The factory ([`make_pattern`]), the
 /// inspector schema ([`pattern_params`]), the default spectra and the tile catalog ALL derive from
@@ -819,11 +876,8 @@ pub fn pattern_is_readout(key: &str) -> bool {
 
 // ─────────────────────────────────── the render clock (one epoch, one formula) ─────────────
 
-/// The process-global RENDER CLOCK epoch — one shared `Instant` every animated surface quantises
-/// against, so the GUI preview and the device stream advance in the SAME discrete frames (the preview
-/// provably mirrors the board). Both read the elapsed via [`render_elapsed`] (the wrapped, precision-safe
-/// f32) and quantise it with [`quantized_t`]; a device stream keeps its own start only for the run-duration
-/// bound + pacing, never for the phase. Shared and unchanging, so a stream restart can't jump the phase.
+/// Shared monotonic animation epoch. Duration-aware renderers retain precision without resetting
+/// phase; legacy callers use the unwrapped f32 compatibility clock.
 pub fn render_epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     *EPOCH.get_or_init(Instant::now)
@@ -838,18 +892,22 @@ pub fn quantized_t(elapsed_secs: f32, fps: u32) -> f32 {
     (elapsed_secs * fps).floor() / fps
 }
 
-/// The render clock's elapsed seconds, WRAPPED at 4096s so the f32 keeps frame-level precision at any
-/// uptime — the ONE choke point every surface reads instead of `render_epoch().elapsed().as_secs_f32()`.
-/// The wrap MUST happen in the integer/duration domain: `elapsed().as_secs_f32() % 4096.0` is already
-/// broken, because after ~a day the f32 has shed sub-frame bits BEFORE the modulo (patterns stutter, then
-/// freeze). We fold in MILLIS (u128, exact) and only then scale to seconds, so the result carries full
-/// ms precision forever. Sibling of weave.rs `seconds()`. The noise/absolute-`t` fields are periodic, so
-/// the one reseed per ~68min is imperceptible; speed-scaled motion now rides dt accumulators (Axis/Radial/
-/// Flow/Meter) and never sees the reseed at all.
+/// Monotonic presentation time shared by previews and live content.
 #[must_use]
-pub fn render_elapsed() -> f32 {
-    (render_epoch().elapsed().as_millis() % 4_096_000) as f32 * 1e-3
+pub fn render_elapsed_time() -> Duration { render_epoch().elapsed() }
+
+/// Quantize in the integer time domain without resetting the animation epoch.
+#[must_use]
+pub fn quantized_time(elapsed: Duration, fps: u32) -> Duration {
+    let fps = u128::from(fps.max(1));
+    let frames = elapsed.as_nanos() * fps / 1_000_000_000;
+    let nanos = frames * 1_000_000_000 / fps;
+    Duration::new((nanos / 1_000_000_000) as u64, (nanos % 1_000_000_000) as u32)
 }
+
+/// Compatibility clock for legacy f32 callers; duration-aware producers retain sub-frame precision.
+#[must_use]
+pub fn render_elapsed() -> f32 { render_elapsed_time().as_secs_f32() }
 
 // shared param-schema constructors (reused across pattern defs so the ranges read consistently)
 
@@ -1124,6 +1182,15 @@ fn style_param() -> Param {
 pub struct Uniform;
 
 impl Pattern for Uniform {
+    fn reconfigure_policy(&self, _delta: &PatternReconfigure) -> ReconfigurePolicy {
+        ReconfigurePolicy::Preserve
+    }
+
+    fn apply_reconfigure(&mut self, delta: &PatternReconfigure) {
+        self.configure(delta.params);
+        self.set_frame(delta.frame);
+    }
+
     fn advance(&mut self, _ctx: &FrameContext, _geom: &LayerGeometry) {}
 
     fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
@@ -1148,26 +1215,36 @@ pub struct Axis {
     // integrated SCROLL phase (Sparkle idiom). The old `t * speed` slid the gradient by the never-reset
     // epoch × the LIVE speed — so editing speed rescaled the whole accrued shift and TELEPORTED the wave
     // (a jump proportional to uptime). We integrate speed·dt instead; the value wraps naturally in [0,1).
-    shift_phase: f32,
-    last_t: f32,
+    shift_phase: f64,
+    last_t: Duration,
 }
 
 impl Pattern for Axis {
+    fn rebase_legacy_clock(&mut self, t: Duration) { self.last_t = t; }
+    fn reconfigure_policy(&self, _delta: &PatternReconfigure) -> ReconfigurePolicy {
+        ReconfigurePolicy::Preserve
+    }
+
+    fn apply_reconfigure(&mut self, delta: &PatternReconfigure) {
+        self.configure(delta.params);
+        self.set_frame(delta.frame);
+    }
+
     fn configure(&mut self, p: &Params) {
         self.direction = p.u8("direction", 0);
         self.speed = p.f32("speed", 1.0);
     }
 
     fn advance(&mut self, ctx: &FrameContext, _geom: &LayerGeometry) {
-        const SCROLL_RATE: f32 = 0.2;
-        let dt = ctx.dt.as_secs_f32();
-        self.shift_phase = (self.shift_phase + dt * self.speed * SCROLL_RATE).rem_euclid(1.0);
+        const SCROLL_RATE: f64 = 0.2;
+        let dt = ctx.dt.as_secs_f64();
+        self.shift_phase = (self.shift_phase + dt * f64::from(self.speed) * SCROLL_RATE).rem_euclid(2.0);
     }
 
     fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
         let (r, c) = (geom.board_dims.0 as usize, geom.board_dims.1 as usize);
         let mut cells = vec![Cell::default(); r * c];
-        let shift = self.shift_phase;
+        let shift = self.shift_phase as f32;
         let cf = c.max(1) as f32;
         let rf = r.max(1) as f32;
         for y in 0..r {
@@ -1178,38 +1255,23 @@ impl Pattern for Axis {
                     3 => y as f32 / rf,
                     _ => x as f32 / cf,
                 };
-                cells[y * c + x] = Cell::new((pos + shift).rem_euclid(1.0), 1.0);
+                cells[y * c + x] = Cell::new(pos + shift, 1.0);
             }
         }
         Field::Scalar(cells)
     }
 
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
-        let (r, c) = (rows as usize, cols as usize);
-        let mut cells = vec![Cell::default(); r * c];
-        // SCROLL_RATE: spectrum-spans per second at speed 1.0 (a calm travelling gradient).
-        const SCROLL_RATE: f32 = 0.2;
-        // integrate the shift so a live speed edit can't rescale the accrued phase (a `t * speed` jump).
-        let dt = (t - self.last_t).max(0.0);
-        self.last_t = t;
-        self.shift_phase = (self.shift_phase + dt * self.speed * SCROLL_RATE).rem_euclid(1.0);
-        let shift = self.shift_phase;
-        // Half-open [0,1) positions (x/c, not x/(c-1)) so the gradient TILES seamlessly under the
-        // scroll wrap — no endpoint collides at exactly 1.0 (which `rem_euclid` would fold to 0.0).
-        let cf = c.max(1) as f32;
-        let rf = r.max(1) as f32;
-        for y in 0..r {
-            for x in 0..c {
-                let pos = match self.direction {
-                    1 => (c - 1 - x) as f32 / cf,  // ← (decreasing left→right)
-                    2 => (r - 1 - y) as f32 / rf,  // ↑ (decreasing top→bottom)
-                    3 => y as f32 / rf,            // ↓
-                    _ => x as f32 / cf,            // → (increasing left→right)
-                };
-                cells[y * c + x] = Cell::new((pos + shift).rem_euclid(1.0), 1.0);
-            }
-        }
-        Field::Scalar(cells)
+        self.field_at_time(rows, cols, Duration::from_secs_f32(t.max(0.0)))
+    }
+
+    fn field_at_time(&mut self, rows: u8, cols: u8, t: Duration) -> Field {
+        let dt = t.saturating_sub(self.last_t).as_secs_f64();
+        self.last_t = self.last_t.max(t);
+        self.shift_phase = (self.shift_phase + dt * f64::from(self.speed) * 0.2).rem_euclid(2.0);
+        self.emit(&EmitContext { elapsed: t }, &LayerGeometry {
+            bounds: Bounds::board(rows, cols), region: Vec::new(), board_dims: (rows, cols),
+        })
     }
 }
 
@@ -1224,21 +1286,31 @@ pub struct Radial {
     // integrated SPIN phase (Sparkle idiom). `t * speed` spun by the never-reset epoch × the LIVE speed,
     // so a speed edit rescaled the accrued angle and JUMPED the wheel (proportional to uptime). Integrate
     // speed·dir·dt; wraps naturally in [0,1). A live direction flip just reverses the increment (no jump).
-    spin_phase: f32,
-    last_t: f32,
+    spin_phase: f64,
+    last_t: Duration,
 }
 
 impl Pattern for Radial {
+    fn rebase_legacy_clock(&mut self, t: Duration) { self.last_t = t; }
+    fn reconfigure_policy(&self, _delta: &PatternReconfigure) -> ReconfigurePolicy {
+        ReconfigurePolicy::Preserve
+    }
+
+    fn apply_reconfigure(&mut self, delta: &PatternReconfigure) {
+        self.configure(delta.params);
+        self.set_frame(delta.frame);
+    }
+
     fn configure(&mut self, p: &Params) {
         self.direction = p.u8("direction", 0);
         self.speed = p.f32("speed", 1.0);
     }
 
     fn advance(&mut self, ctx: &FrameContext, _geom: &LayerGeometry) {
-        const SPIN_RATE: f32 = 0.15;
+        const SPIN_RATE: f64 = 0.15;
         let dir = if matches!(self.direction, 1 | 2) { -1.0 } else { 1.0 };
-        let dt = ctx.dt.as_secs_f32();
-        self.spin_phase = (self.spin_phase + dt * self.speed * SPIN_RATE * dir).rem_euclid(1.0);
+        let dt = ctx.dt.as_secs_f64();
+        self.spin_phase = (self.spin_phase + dt * f64::from(self.speed) * SPIN_RATE * dir).rem_euclid(2.0);
     }
 
     fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
@@ -1247,13 +1319,13 @@ impl Pattern for Radial {
         let cx = (c as f32 - 1.0) / 2.0;
         let cy = (r as f32 - 1.0) / 2.0;
         let max_rad = (cx * cx + cy * cy).sqrt().max(1.0);
-        let spin = self.spin_phase;
+        let spin = self.spin_phase as f32;
         for y in 0..r {
             for x in 0..c {
                 let dx = x as f32 - cx;
                 let dy = y as f32 - cy;
                 let ang = dy.atan2(dx) / (2.0 * std::f32::consts::PI) + 0.5;
-                let u = (ang + spin).rem_euclid(1.0);
+                let u = (ang + spin).rem_euclid(2.0);
                 let rad = (dx * dx + dy * dy).sqrt() / max_rad;
                 let intensity = 1.0 - 0.30 * rad;
                 cells[y * c + x] = Cell::new(u, intensity.clamp(0.0, 1.0));
@@ -1263,34 +1335,16 @@ impl Pattern for Radial {
     }
 
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
-        let (r, c) = (rows as usize, cols as usize);
-        let mut cells = vec![Cell::default(); r * c];
-        let cx = (c as f32 - 1.0) / 2.0;
-        let cy = (r as f32 - 1.0) / 2.0;
-        let max_rad = (cx * cx + cy * cy).sqrt().max(1.0);
-        // SPIN_RATE: turns per second at speed 1.0. DIRECTION sets the spin SIGN — →/↓ (0/3) turn one
-        // way, ←/↑ (1/2) the other (a radial wheel has no L/R/U/D axis, so direction reads as cw vs ccw).
-        const SPIN_RATE: f32 = 0.15;
-        let dir = if matches!(self.direction, 1 | 2) { -1.0 } else { 1.0 };
-        // integrate the spin so a live speed edit can't rescale the accrued angle (a `t * speed` jump).
-        let dt = (t - self.last_t).max(0.0);
-        self.last_t = t;
-        self.spin_phase = (self.spin_phase + dt * self.speed * SPIN_RATE * dir).rem_euclid(1.0);
-        let spin = self.spin_phase;
-        for y in 0..r {
-            for x in 0..c {
-                let dx = x as f32 - cx;
-                let dy = y as f32 - cy;
-                // angle 0..1 around the centre, advanced by the spin
-                let ang = dy.atan2(dx) / (2.0 * PI) + 0.5; // 0..1
-                let u = (ang + spin).rem_euclid(1.0);
-                // soft dome: 1.0 at the hub easing to 0.7 at the rim — rounded depth, never dark.
-                let rad = (dx * dx + dy * dy).sqrt() / max_rad;
-                let intensity = 1.0 - 0.30 * rad;
-                cells[y * c + x] = Cell::new(u, intensity.clamp(0.0, 1.0));
-            }
-        }
-        Field::Scalar(cells)
+        self.field_at_time(rows, cols, Duration::from_secs_f32(t.max(0.0)))
+    }
+
+    fn field_at_time(&mut self, rows: u8, cols: u8, t: Duration) -> Field {
+        let dt = t.saturating_sub(self.last_t).as_secs_f64();
+        self.last_t = self.last_t.max(t);
+        self.spin_phase = (self.spin_phase + dt * f64::from(self.speed) * 0.15 * if matches!(self.direction, 1 | 2) { -1.0 } else { 1.0 }).rem_euclid(2.0);
+        self.emit(&EmitContext { elapsed: t }, &LayerGeometry {
+            bounds: Bounds::board(rows, cols), region: Vec::new(), board_dims: (rows, cols),
+        })
     }
 }
 
@@ -1347,6 +1401,26 @@ fn scan_key_contacts(
     count_unmapped: bool,
     mut on_press: impl FnMut(usize, usize),
 ) -> u32 {
+    if let Some(input) = input::render_input() {
+        prev.fill(false);
+        for held in &input.held {
+            let slot = match held.control {
+                ControlId::Key(KeyId(vk)) => usize::from(vk),
+                ControlId::VendorMacro { index, .. } => 256 + usize::from(index),
+            };
+            if let Some(previous) = prev.get_mut(slot) { *previous = true; }
+            let (row, col) = (usize::from(held.row), usize::from(held.col));
+            if row < r && col < c {
+                if let Some(cell) = held_cells.get_mut(row * c + col) { *cell = true; }
+            }
+        }
+        let mut mapped = 0;
+        for press in &input.pressed {
+            let (row, col) = (usize::from(press.row), usize::from(press.col));
+            if row < r && col < c { on_press(row, col); mapped += 1; }
+        }
+        return if count_unmapped { input.total_press_edges } else { mapped };
+    }
     let mut presses = 0u32;
     for (vk, was_down) in prev.iter_mut().take(256).enumerate().skip(1) {
         let cell = crate::lighting::vk_to_key_cell(vk as i32);
@@ -1404,6 +1478,7 @@ fn key_scan_due(
     generation: u64,
     since_scan: f32,
 ) -> bool {
+    if input::render_input().is_some() { return true; }
     // A transient capture can redirect Raw Input away from the resident listener; the fallback
     // eventually reconciles the actual OS key state. Standalone renderers have no edge source and
     // retain frame-rate polling so a complete tap between reconciliation scans cannot disappear.
@@ -1463,6 +1538,7 @@ impl Heat {
 }
 
 impl Pattern for Heat {
+    preserve_legacy_config!();
     fn configure(&mut self, p: &Params) {
         self.speed = p.f32("speed", 1.0);
         self.density = p.f32("density", 1.0);
@@ -1471,7 +1547,8 @@ impl Pattern for Heat {
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
         let (r, c) = (rows as usize, cols as usize);
         let n = r * c;
-        if self.dims != (rows, cols) {
+        let new_grid = self.dims != (rows, cols);
+        if new_grid {
             self.heat = vec![0.0; n];
             self.rng = 0x9E37_79B9;
             self.dims = (rows, cols);
@@ -1481,18 +1558,15 @@ impl Pattern for Heat {
         if n == 0 {
             return Field::Scalar(Vec::new());
         }
-        // SPEED drives the sim from elapsed time: ~18 steps/sec at speed 1.0, accumulating the fraction.
-        // An advancing clock runs exactly what wall-time bought — zero steps on most frames when the
-        // rate sits below the render fps (the old ≥1-per-frame floor tied the flicker to the frame rate
-        // and deadened the knob's low end). A static `t` / time reset (dt ≤ 0) still steps once (never
-        // freezes); the burst is capped so a long stall can't run thousands of steps in one frame.
+        if new_grid { self.step(r, c, self.weather_t); }
+        // Only elapsed simulation time buys steps; attachment seeds once.
         const BASE_STEPS_PER_SEC: f32 = 18.0;
         let dt = (t - self.last_t).max(0.0);
         self.last_t = t;
         let spd = self.speed.clamp(0.1, 6.0);
         self.weather_t += dt * 0.05 * spd.sqrt();
         self.step_acc += dt * BASE_STEPS_PER_SEC * spd;
-        let mut steps = if dt > 0.0 { self.step_acc.floor() as u32 } else { 1 };
+        let mut steps = self.step_acc.floor() as u32;
         self.step_acc -= self.step_acc.floor();
         steps = steps.min(8);
         for _ in 0..steps {
@@ -1753,6 +1827,10 @@ impl Rain {
 }
 
 impl Pattern for Rain {
+    fn reconfigure_policy(&self, delta: &PatternReconfigure) -> ReconfigurePolicy {
+        if self.mode == delta.params.u8("mode", 0) { ReconfigurePolicy::Preserve } else { ReconfigurePolicy::Rebuild }
+    }
+    fn apply_reconfigure(&mut self, delta: &PatternReconfigure) { self.configure(delta.params); }
     fn configure(&mut self, p: &Params) {
         self.mode = p.u8("mode", 0);
         self.speed = p.f32("speed", 1.0);
@@ -1821,7 +1899,9 @@ pub struct Comet {
     comets: Vec<CometBody>,
     burst: Vec<f32>,
     trail_field: Vec<Cell>,
-    last_field_t: f32,
+    last_field_t: Option<f32>,
+    field_input: ProcessInputHub,
+    field_input_generation: u64,
 }
 
 impl Default for Comet {
@@ -1836,7 +1916,9 @@ impl Default for Comet {
             comets: Vec::new(),
             burst: Vec::new(),
             trail_field: Vec::new(),
-            last_field_t: 0.0,
+            last_field_t: None,
+            field_input: ProcessInputHub::new(),
+            field_input_generation: 0,
         }
     }
 }
@@ -2150,6 +2232,16 @@ impl Comet {
 }
 
 impl Pattern for Comet {
+    #[cfg(test)]
+    fn state_witness(&self) -> String {
+        format!("{:?}|{:?}|{:?}|{:?}|{:?}", self.rng, self.comets, self.burst, self.trail_field, self.last_field_t)
+    }
+
+    fn rebase_legacy_clock(&mut self, t: Duration) {
+        self.last_field_t = Some(t.as_secs_f32());
+        self.field_input = ProcessInputHub::new();
+        self.field_input_generation = 0;
+    }
     fn configure(&mut self, p: &Params) {
         self.speed = p.f32("speed", 1.0);
         self.density = p.f32("density", 1.0);
@@ -2277,19 +2369,29 @@ impl Pattern for Comet {
             region: Vec::new(),
             board_dims: (rows, cols),
         };
-        let mut hub = ProcessInputHub::new();
-        hub.poll_system_keys(Duration::from_secs_f32(t.max(0.0)));
-        let _ = hub.publish_tick();
-        let (input, _) = hub.snapshot_for_matrix(0, default_control_to_matrix);
-
-        let dt = if self.last_field_t > 0.0 && t > self.last_field_t {
-            (t - self.last_field_t).min(0.25)
-        } else if self.last_field_t == 0.0 {
-            1.0 / 60.0
+        if self.last_field_t.is_some_and(|last| t < last || t - last > 2.0) {
+            self.on_discontinuity();
+            self.field_input = ProcessInputHub::new();
+            self.field_input_generation = 0;
+        }
+        let input = if let Some(input) = input::render_input() {
+            (*input).clone()
         } else {
-            0.0
+            self.field_input.poll_system_keys(Duration::from_secs_f32(t.max(0.0)));
+            let _ = self.field_input.publish_tick();
+            let (input, generation) = self.field_input.snapshot_for_matrix(
+                self.field_input_generation, default_control_to_matrix,
+            );
+            self.field_input_generation = generation;
+            input
         };
-        self.last_field_t = t;
+
+        let dt = match self.last_field_t {
+            Some(last) if t > last => (t - last).min(0.25),
+            Some(_) => 0.0,
+            None => 1.0 / 60.0,
+        };
+        self.last_field_t = Some(t);
 
         let ctx = FrameContext {
             session_epoch: 0,
@@ -2382,6 +2484,7 @@ pub struct Sparkle {
 }
 
 impl Pattern for Sparkle {
+    preserve_legacy_config!();
     fn configure(&mut self, p: &Params) {
         self.speed = p.f32("speed", 1.0);
         self.density = p.f32("density", 1.0);
@@ -2493,6 +2596,7 @@ pub struct Ignite {
 }
 
 impl Pattern for Ignite {
+    preserve_legacy_config!();
     fn configure(&mut self, p: &Params) {
         self.fade = p.f32("fade", 1.0);
         self.glow = p.bool("glow", false);
@@ -2639,6 +2743,7 @@ impl Ring {
 }
 
 impl Pattern for Ring {
+    preserve_legacy_config!();
     fn configure(&mut self, p: &Params) {
         self.speed = p.f32("speed", 1.0);
         self.fade = p.f32("fade", 1.0);
@@ -2782,35 +2887,63 @@ impl Pattern for Ring {
 #[derive(Default)]
 pub struct Flow {
     speed: f32,
-    // ONE integrated flow phase (Sparkle idiom). Every drift term is linear in ∫speed·dt, so a single
-    // accumulator feeds all three: the old `t * 0.10 * speed` etc. multiplied the never-reset epoch by the
-    // LIVE speed, so editing speed rescaled every accrued flow and JOLTED the whole field. We wrap `flow_t`
-    // at 1000.0 — where the primary drift terms (×0.10/0.067/0.041) all land on integer sine-cycles, a
-    // seamless reseed — which also keeps `flow_t` from the f32 precision death an unbounded integral hits.
-    flow_t: f32,
-    last_t: f32,
+    // Each oscillator wraps at its own period, including the separate luminance frequencies.
+    phases: [f64; 5],
+    last_t: Duration,
 }
 
 impl Pattern for Flow {
+    fn rebase_legacy_clock(&mut self, t: Duration) { self.last_t = t; }
+    fn reconfigure_policy(&self, _delta: &PatternReconfigure) -> ReconfigurePolicy {
+        ReconfigurePolicy::Preserve
+    }
+
+    fn apply_reconfigure(&mut self, delta: &PatternReconfigure) {
+        self.configure(delta.params);
+        self.set_frame(delta.frame);
+    }
+
     fn configure(&mut self, p: &Params) {
         self.speed = p.f32("speed", 1.0);
     }
 
+    fn advance(&mut self, ctx: &FrameContext, _geom: &LayerGeometry) {
+        self.advance_phases(ctx.dt.as_secs_f64());
+    }
+
+    fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
+        self.emit_field(geom.board_dims.0, geom.board_dims.1)
+    }
+
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
+        self.field_at_time(rows, cols, Duration::from_secs_f32(t.max(0.0)))
+    }
+
+    fn field_at_time(&mut self, rows: u8, cols: u8, t: Duration) -> Field {
+        self.advance_phases(t.saturating_sub(self.last_t).as_secs_f64());
+        self.last_t = self.last_t.max(t);
+        self.emit_field(rows, cols)
+    }
+}
+
+impl Flow {
+    fn advance_phases(&mut self, dt: f64) {
+        let amount = dt * f64::from(self.speed.clamp(0.1, 6.0));
+        for (phase, frequency) in self.phases.iter_mut().zip([0.10, 0.067, 0.041, 0.0536, 0.0533]) {
+            *phase = (*phase + amount * frequency).rem_euclid(1.0);
+        }
+    }
+
+    fn emit_field(&self, rows: u8, cols: u8) -> Field {
         let (r, c) = (rows as usize, cols as usize);
         let n = r * c;
         let mut cells = vec![Cell::new(0.0, 0.0); n];
         if n == 0 {
             return Field::Scalar(cells);
         }
-        let spd = self.speed.clamp(0.1, 6.0);
-        // integrate one base phase so a live speed edit can't rescale the accrued flows (a `t * spd` jolt).
-        let dt = (t - self.last_t).max(0.0);
-        self.last_t = t;
-        self.flow_t = (self.flow_t + dt * spd).rem_euclid(1000.0);
-        let t1 = self.flow_t * 0.10;
-        let t2 = self.flow_t * 0.067;
-        let t3 = self.flow_t * 0.041;
+        let t1 = self.phases[0] as f32;
+        let t2 = self.phases[1] as f32;
+        let t3 = self.phases[2] as f32;
         for y in 0..r {
             let ny = if r > 1 { y as f32 / (r as f32 - 1.0) } else { 0.5 };
             for x in 0..c {
@@ -2822,8 +2955,8 @@ impl Pattern for Flow {
                 let drift = h1 * 0.5 + h2 * 0.3 + h3 * 0.2; // -1..1
                 let u = (0.5 + 0.5 * drift).clamp(0.0, 1.0);
                 // intensity: a SEPARATE, slower luminance undulation so bands stand out in depth.
-                let b1 = (nx * 1.1 - t2 * TAU * 0.8).sin();
-                let b2 = (ny * 1.7 + t3 * TAU * 1.3).sin();
+                let b1 = (nx * 1.1 - self.phases[3] as f32 * TAU).sin();
+                let b2 = (ny * 1.7 + self.phases[4] as f32 * TAU).sin();
                 let lum = 0.5 + 0.5 * (b1 * 0.6 + b2 * 0.4);
                 let v = (0.30 + 0.70 * lum).clamp(0.0, 1.0);
                 cells[y * c + x] = Cell::new(u, v);
@@ -2859,6 +2992,7 @@ pub struct Thermal {
 }
 
 impl Pattern for Thermal {
+    preserve_legacy_config!();
     fn configure(&mut self, p: &Params) {
         self.sensitivity = p.f32("sensitivity", 1.0);
         self.fade = p.f32("fade", 1.0);
@@ -3125,6 +3259,10 @@ pub struct Meter {
 }
 
 impl Pattern for Meter {
+    fn reconfigure_policy(&self, delta: &PatternReconfigure) -> ReconfigurePolicy {
+        if self.source == delta.params.u8("source", 0) { ReconfigurePolicy::Preserve } else { ReconfigurePolicy::Rebuild }
+    }
+    fn apply_reconfigure(&mut self, delta: &PatternReconfigure) { self.configure(delta.params); }
     fn configure(&mut self, p: &Params) {
         self.source = p.u8("source", 0);
         self.speed = p.f32("speed", 1.0);
@@ -3250,6 +3388,7 @@ pub struct Screen {
 }
 
 impl Pattern for Screen {
+    preserve_legacy_config!();
     fn configure(&mut self, p: &Params) {
         self.speed = p.f32("speed", 1.0);
         self.saturation = p.f32("saturation", 1.0);
@@ -3293,16 +3432,34 @@ struct StaticFrame {
 }
 
 impl Pattern for StaticFrame {
+    fn reconfigure_policy(&self, _delta: &PatternReconfigure) -> ReconfigurePolicy {
+        ReconfigurePolicy::Preserve
+    }
+
+    fn apply_reconfigure(&mut self, delta: &PatternReconfigure) {
+        self.configure(delta.params);
+        self.set_frame(delta.frame);
+    }
+
     fn set_frame(&mut self, cells: &[[u8; 3]]) {
         self.cells = cells.iter().map(|c| Rgb::new(c[0], c[1], c[2])).collect();
     }
 
-    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+    fn emit(&self, _ctx: &EmitContext, geom: &LayerGeometry) -> Field {
+        let (rows, cols) = geom.board_dims;
         let n = rows as usize * cols as usize;
-        let mut px = self.cells.clone();
+        let mut px = Vec::with_capacity(n);
+        px.extend(self.cells.iter().take(n).copied());
         px.resize(n, Rgb::new(0, 0, 0));
         Field::Color(px)
     }
+
+    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+        self.emit(&EmitContext { elapsed: Duration::ZERO }, &LayerGeometry {
+            bounds: Bounds::board(rows, cols), region: vec![], board_dims: (rows, cols),
+        })
+    }
+
 }
 
 /// The pure Ambient renderer (no capture I/O) — maps each board cell to its matching SCREEN ZONE and
@@ -3364,6 +3521,7 @@ struct Vitals {
 }
 
 impl Pattern for Vitals {
+    preserve_legacy_config!();
     fn set_bounds(&mut self, b: Bounds) {
         self.bounds = Some(b);
     }
@@ -3374,7 +3532,7 @@ impl Pattern for Vitals {
         // the audio meter, which idles at its spectrum's LOW colour — that's a Scalar field; vitals is a
         // Color field of black.) When this layer is OVERLAID its preset defaults to `Blend::Cut`, for
         // which black falls THROUGH to the effect beneath (and lit cells replace at true colour).
-        let v = match crate::lighting::latest_vitals() {
+        let v = match may_read_provider().then(crate::lighting::latest_vitals).flatten() {
             Some(v) => v,
             None => return Field::Color(vec![Rgb::BLACK; n]),
         };
@@ -3456,6 +3614,7 @@ struct OnAir {
 }
 
 impl Pattern for OnAir {
+    preserve_legacy_config!();
     fn configure(&mut self, params: &Params) {
         self.signal = params.u8("signal", 0);
         self.standby = params.bool("standby", false);
@@ -3466,7 +3625,7 @@ impl Pattern for OnAir {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        let b = crate::lighting::latest_broadcast();
+        let b = may_read_provider().then(crate::lighting::latest_broadcast).flatten();
         let connected = b.is_some_and(|b| b.connected);
         let live = b.is_some_and(|b| {
             b.connected
@@ -3523,6 +3682,7 @@ struct MicLight {
 }
 
 impl Pattern for MicLight {
+    preserve_legacy_config!();
     fn configure(&mut self, params: &Params) {
         self.show_hot = params.u8("show", 0) == 1;
     }
@@ -3560,6 +3720,7 @@ struct ModeHeld {
 }
 
 impl Pattern for ModeHeld {
+    preserve_legacy_config!();
     fn configure(&mut self, params: &Params) {
         self.signal = params.u8("signal", 0);
     }
@@ -3569,7 +3730,7 @@ impl Pattern for ModeHeld {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        let lit = crate::lighting::latest_hold().is_some_and(|h| match self.signal {
+        let lit = may_read_provider().then(crate::lighting::latest_hold).flatten().is_some_and(|h| match self.signal {
             1 => h.sniper,
             2 => h.layer || h.sniper,
             _ => h.layer,
@@ -3614,6 +3775,7 @@ fn game_light_color(f: Option<crate::lighting::GameFeed>, show: u8, level: u8) -
 }
 
 impl Pattern for GameLightLayer {
+    preserve_legacy_config!();
     fn configure(&mut self, params: &Params) {
         self.show = params.u8("show", 0);
         self.level = params.u8("level", 1);
@@ -3624,7 +3786,8 @@ impl Pattern for GameLightLayer {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        let c = game_light_color(crate::lighting::latest_game_feed(), self.show, self.level);
+        let feed = may_read_provider().then(crate::lighting::latest_game_feed).flatten();
+        let c = game_light_color(feed, self.show, self.level);
         let (br, bc) = (rows as usize, cols as usize);
         let b = self.bounds.unwrap_or_else(|| Bounds::board(rows, cols));
         let mut f = vec![Rgb::BLACK; br * bc];
@@ -3658,6 +3821,7 @@ struct SignalLight {
 }
 
 impl Pattern for SignalLight {
+    preserve_legacy_config!();
     fn configure(&mut self, params: &Params) {
         self.channel = params.u8("channel", 0) as usize;
         self.glow = params.u8("style", 0) == 1;
@@ -3668,7 +3832,7 @@ impl Pattern for SignalLight {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        let v = crate::lighting::signal(self.channel);
+        let v = if may_read_provider() { crate::lighting::signal(self.channel) } else { 0.0 };
         if v <= 0.0 {
             return placement_field(self.bounds, rows, cols, 0.0);
         }
@@ -3991,11 +4155,35 @@ impl Layer {
 }
 
 /// The layer stack. `layers[0]` is the bottom; later layers composite on top.
+#[derive(Default)]
 pub struct Compositor {
     pub layers: Vec<Layer>,
+    definitions: Vec<LayerDef>,
 }
 
+/// RGB work buffers retained by a render producer across frames.
+#[derive(Default)]
+pub struct RenderScratch {
+    pub output: Vec<Rgb>,
+    layer: Vec<Rgb>,
+}
+
+impl RenderScratch {
+    /// Bytes retained by the reusable RGB buffers, excluding pattern-owned simulation fields.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        (self.output.capacity() + self.layer.capacity()) * std::mem::size_of::<Rgb>()
+    }
+}
+
+
 impl Compositor {
+    /// Anchor a transferred pattern's clock only while its identity and type still match.
+    pub fn rebase_pattern_clock(&mut self, id: LayerInstanceId, key: &str, t: Duration) {
+        if let Some(index) = self.definitions.iter().position(|def| def.id == Some(id) && def.pattern == key) {
+            if let Some(layer) = self.layers.get_mut(index) { layer.pattern.rebase_legacy_clock(t); }
+        }
+    }
     /// Build the live stack from serialisable [`LayerDef`]s — resolves + configures each pattern (an
     /// unknown key falls back to a benign `uniform`) and sorts each region mask for the binary-search test.
     #[must_use]
@@ -4019,64 +4207,56 @@ impl Compositor {
                 }
             })
             .collect();
-        Compositor { layers }
+        Compositor { layers, definitions: defs.to_vec() }
     }
 
-    /// Update existing layers in-place from updated layer definitions without reconstructing
-    /// stateful pattern instances (retaining temperatures, sediment, velocities, etc.).
+    /// Reconcile checked definitions without changing the running scene on rejection.
     pub fn update_defs(&mut self, defs: &[LayerDef]) {
-        if self.layers.len() == defs.len() {
-            for (layer, d) in self.layers.iter_mut().zip(defs.iter()) {
-                layer.spectrum = d.spectrum.clone();
-                layer.blend = d.blend;
-                layer.enabled = d.enabled;
-                layer.palette_addressing = pattern_def(&d.pattern)
-                    .or_else(|| pattern_def("uniform"))
-                    .map_or(PaletteAddressing::Field, |def| def.palette_addressing);
-                let mut region = d.region.clone();
-                region.sort_unstable();
-                region.dedup();
-                layer.region = region;
-                layer.pattern.configure(&d.params);
-                layer.pattern.set_frame(&d.frame);
-            }
-        } else {
-            *self = Self::from_defs(defs);
-        }
+        if let Ok(plan) = self.plan_update(defs, None) { self.commit_update(plan); }
     }
 
     /// Render one composited frame (`rows*cols`, row-major) at elapsed time `t`. Per layer: the pattern's
     /// field → resolved through the spectrum (× intensity) → region mask → blend over the layers below.
     #[must_use]
     pub fn render_at_time(&mut self, rows: u8, cols: u8, t: std::time::Duration) -> Vec<Rgb> {
+        let mut scratch = RenderScratch::default();
+        self.render_into(rows, cols, t, &mut scratch);
+        scratch.output
+    }
+
+    /// Render with reusable compositor and per-layer RGB buffers; pattern state stays owned here.
+    pub fn render_into(&mut self, rows: u8, cols: u8, t: Duration, scratch: &mut RenderScratch) {
         let n = rows as usize * cols as usize;
-        let mut out = vec![Rgb::BLACK; n];
-        for layer in &mut self.layers {
+        let out = &mut scratch.output;
+        out.resize(n, Rgb::BLACK);
+        out.fill(Rgb::BLACK);
+        for (index, layer) in self.layers.iter_mut().enumerate() {
             if !layer.enabled {
                 continue;
             }
             let bbox = Bounds::from_region(&layer.region, rows, cols);
             layer.pattern.set_bounds(bbox);
             layer.pattern.set_visible_region(&layer.region, rows, cols);
-            let field = layer.pattern.field(rows, cols, t.as_secs_f32());
+            let field = layer.pattern.field_at_time(rows, cols, t);
             if field.len() != n {
                 continue;
             }
-            let px = render_palette_addressing_time(
+            render_palette_sampled_into(
                 &field,
                 &layer.spectrum,
                 t,
                 layer.palette_addressing,
-                bbox,
-                cols,
+                (bbox, cols),
+                self.definitions.get(index).map_or_else(Default::default, palette_sampling),
+                &mut scratch.layer,
             );
+            let px = &scratch.layer;
             for i in 0..n {
                 if layer.covers(i) {
                     out[i] = crate::effects::blend_px(out[i], px[i], layer.blend);
                 }
             }
         }
-        out
     }
 
     pub fn render(&mut self, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
@@ -4086,7 +4266,7 @@ impl Compositor {
     pub fn render_legacy(&mut self, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
         let n = rows as usize * cols as usize;
         let mut out = vec![Rgb::BLACK; n];
-        for layer in &mut self.layers {
+        for (index, layer) in self.layers.iter_mut().enumerate() {
             if !layer.enabled {
                 continue;
             }
@@ -4096,11 +4276,14 @@ impl Compositor {
             let bbox = Bounds::from_region(&layer.region, rows, cols);
             layer.pattern.set_bounds(bbox);
             layer.pattern.set_visible_region(&layer.region, rows, cols);
-            let field = layer.pattern.field(rows, cols, t);
+            let time = Duration::from_secs_f32(t.max(0.0));
+            let field = layer.pattern.field_at_time(rows, cols, time);
             if field.len() != n {
                 continue; // a misbehaving pattern can't corrupt the stack
             }
-            let px = render_palette_addressing(&field, &layer.spectrum, t, layer.palette_addressing, bbox, cols);
+            let mut px = Vec::new();
+            render_palette_sampled_into(&field, &layer.spectrum, time, layer.palette_addressing,
+                (bbox, cols), self.definitions.get(index).map_or_else(Default::default, palette_sampling), &mut px);
             for i in 0..n {
                 if layer.covers(i) {
                     out[i] = crate::effects::blend_px(out[i], px[i], layer.blend);
@@ -4111,6 +4294,7 @@ impl Compositor {
     }
 }
 
+#[cfg(test)]
 fn render_palette_addressing(
     field: &Field,
     spectrum: &Spectrum,
@@ -4310,7 +4494,9 @@ mod tests {
                 region: Vec::new(),
                 blend: Blend::Normal,
                 enabled: true,
-            }] };
+            }],
+            ..Default::default()
+        };
             let mut reached_other_stops = false;
             for tick in 0..60 {
                 let t = tick as f32 / 30.0;
@@ -4895,8 +5081,8 @@ mod tests {
             p.set("density", dens);
             h.configure(&p);
             let mut f = Field::Scalar(Vec::new());
-            for _ in 0..40 {
-                f = h.field(8, 10, 0.0);
+            for i in 0..40 {
+                f = h.field(8, 10, i as f32 * 0.05);
             }
             match f {
                 Field::Scalar(c) => heat_top(&c, 8, 10),
@@ -5413,6 +5599,7 @@ mod tests {
                 blend: Blend::Normal,
                 enabled: true,
             }],
+            ..Default::default()
         };
         let _ = comp.render(4, 4, 0.0);
         assert_eq!(*seen.lock().unwrap(), Some(Bounds { row0: 1, col0: 1, rows: 2, cols: 2 }));
@@ -5428,6 +5615,7 @@ mod tests {
                 blend: Blend::Normal,
                 enabled: true,
             }],
+            ..Default::default()
         };
         let _ = comp2.render(4, 4, 0.0);
         assert_eq!(*seen2.lock().unwrap(), Some(Bounds::board(4, 4)));
@@ -5830,6 +6018,7 @@ mod tests {
 
     #[test]
     fn ring_ripple_single_wave_numerical_identity_and_overlap_gain() {
+        let _quiet = crate::capture::suppress_key_reads();
         // (1) Solitary wave is 100% numerically identical to baseline Ring
         let val = 0.72f32;
         let base = val;
@@ -5888,5 +6077,239 @@ mod tests {
         let f_dead = scalar(ring.field(6, 22, 4.0));
         assert_eq!(f_dead[cell].intensity, 0.0, "released key decays fully to zero");
         crate::capture::set_macro_held(0);
+    }
+}
+
+#[cfg(test)]
+mod render_facade_contract_tests {
+    use super::*;
+
+    #[test]
+    fn injected_legacy_contacts_preserve_short_press_multiplicity_without_polling() {
+        let mut hub = ProcessInputHub::new();
+        let key = ControlId::Key(KeyId(65));
+        for (down, millis) in [(true, 1), (false, 2), (true, 3), (false, 4)] {
+            hub.enqueue_event(key, down, Duration::from_millis(millis));
+        }
+        hub.publish_tick();
+        let (sampled, cursor) = hub.snapshot_for_matrix(0, default_control_to_matrix);
+        let inputs = RenderInputs { sampled: std::sync::Arc::new(sampled), policy: ProviderPolicy::InjectedDeterministic };
+        let _scope = inputs.enter();
+        let _quiet = crate::capture::suppress_key_reads();
+        let mut prev = vec![false; KEY_SCAN_SLOTS];
+        let mut observed = Vec::new();
+        assert_eq!(scan_key_presses(&mut prev, 6, 22, false, |r, c| observed.push((r, c))), 2);
+        assert_eq!(observed.len(), 2);
+        assert_eq!(cursor, 1);
+        assert!(hub.snapshot_for_matrix(cursor, default_control_to_matrix).0.pressed.is_empty());
+    }
+
+    #[test]
+    fn every_registry_pattern_declares_provider_dependencies() {
+        for pattern in registry() {
+            assert_ne!(pattern.input_dependencies(), InputDependencies::Unknown, "{}", pattern.key);
+        }
+    }
+
+    #[test]
+    fn flow_and_custom_session_emission_match_the_reference_fields() {
+        for key in ["flow", "custom"] {
+            let mut legacy = make_pattern(key).unwrap();
+            let mut session = make_pattern(key).unwrap();
+            let params = Params::defaults_for(key);
+            legacy.configure(&params);
+            session.configure(&params);
+            let geom = LayerGeometry { bounds: Bounds::board(6, 22), region: vec![], board_dims: (6, 22) };
+            let input = MatrixInputSnapshot::empty();
+            let mut last = Duration::ZERO;
+            for tick in 0..240 {
+                let t = Duration::from_secs_f64(tick as f64 / 60.0);
+                let expected = legacy.field_at_time(6, 22, t);
+                session.advance(&FrameContext { session_epoch: 0, tick, elapsed: t,
+                    dt: t - last, discontinuity: false, input: &input }, &geom);
+                last = t;
+                let context = EmitContext { elapsed: t };
+                assert_eq!(session.emit(&context, &geom), expected, "{key} at {tick}");
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_patterns_emit_complete_pure_fields_for_every_shape() {
+        for def in registry().iter().filter(|p| p.session_capable()) {
+            for dims in [(1, 1), (1, 4), (6, 22), (12, 30)] {
+                let mut pattern = (def.make)();
+                let geom = LayerGeometry { bounds: Bounds::board(dims.0, dims.1), region: vec![], board_dims: dims };
+                let input = MatrixInputSnapshot::empty();
+                pattern.advance(&FrameContext { session_epoch: 1, tick: 1, elapsed: LOGICAL_TICK_DT, dt: LOGICAL_TICK_DT, discontinuity: false, input: &input }, &geom);
+                let context = EmitContext { elapsed: LOGICAL_TICK_DT };
+                let first = pattern.emit(&context, &geom);
+                assert_eq!(first.len(), dims.0 as usize * dims.1 as usize, "{}", def.key);
+                assert_eq!(first, pattern.emit(&context, &geom), "{} mutates on emission", def.key);
+            }
+        }
+        assert!(!pattern_def("heat").unwrap().session_capable());
+    }
+
+    #[test]
+    fn legacy_comet_retains_held_state_between_presentations() {
+        let keys = crate::capture::script_key_reads();
+        let mut comet = Comet::default();
+        keys.set(0x41, true);
+        comet.field(6, 22, 1.0);
+        for i in 1..10 { comet.field(6, 22, 1.0 + i as f32 / 30.0); }
+        let (input, _) = comet.field_input.snapshot_for_matrix(0, default_control_to_matrix);
+        assert!(input.pressed.is_empty(), "attachment baselines an already held key");
+        keys.set(0x41, false); comet.field(6, 22, 1.4);
+        keys.set(0x41, true); comet.field(6, 22, 1.5);
+        comet.field(6, 22, 1.6);
+        let (input, _) = comet.field_input.snapshot_for_matrix(0, default_control_to_matrix);
+        assert_eq!(input.pressed.len(), 1, "one new press, no held-key retriggers");
+    }
+
+    #[test]
+    fn reconfiguration_refreshes_fields_without_advancing_time_or_restarting_phase() {
+        let _quiet = crate::capture::suppress_key_reads();
+        let _policy = ProviderPolicy::InjectedDeterministic.enter();
+        let mut def = preset_layer("wave").unwrap();
+        let id = LayerInstanceId(42);
+        let mut session = LightingSession::from_specs((6, 22), &[SceneLayerSpec { id, def: def.clone() }]).unwrap();
+        let mut reference = def.make_pattern().unwrap();
+        let geom = LayerGeometry { bounds: Bounds::board(6, 22), region: vec![], board_dims: (6, 22) };
+        let hub = ProcessInputHub::new();
+        let now = std::time::Instant::now();
+        let input = MatrixInputSnapshot::empty();
+        for tick in 0..60 {
+            let snapshot = session.advance_tick(&hub, now + LOGICAL_TICK_DT * tick);
+            reference.advance(&FrameContext { session_epoch: 0, tick: u64::from(tick), elapsed: snapshot.elapsed,
+                dt: snapshot.dt, discontinuity: false, input: &input }, &geom);
+        }
+        let tick = session.tick();
+        let elapsed = session.elapsed();
+        def.params.0.insert("direction".into(), 2.0);
+        let delta = PatternReconfigure { params: &def.params, frame: &def.frame, next_geometry: &geom, geometry_changed: false };
+        reference.apply_reconfigure(&delta);
+        let plan = session.plan_reconcile(&[SceneLayerSpec { id, def }]).unwrap();
+        assert!(matches!(plan.steps[0], ReconcileStep::Preserve { .. }));
+        session.commit_reconcile(plan);
+        assert_eq!(session.tick(), tick);
+        assert_eq!(session.elapsed(), elapsed);
+        assert_eq!(*session.latest_sim_snapshot().unwrap().layer_fields[0].1,
+            reference.emit(&EmitContext { elapsed }, &geom));
+    }
+
+    #[test]
+    fn imported_custom_frames_allocate_for_the_device_not_unused_source_cells() {
+        let mut frame = StaticFrame::default();
+        frame.set_frame(&vec![[9, 10, 11]; 10000]);
+        let geom = LayerGeometry { bounds: Bounds::board(6, 22), region: vec![], board_dims: (6, 22) };
+        let Field::Color(pixels) = frame.emit(&EmitContext { elapsed: Duration::ZERO }, &geom) else { panic!() };
+        assert_eq!(pixels, vec![Rgb::new(9, 10, 11); 132]);
+        assert_eq!(pixels.capacity(), 132);
+    }
+
+    #[test]
+    fn scratch_render_keeps_reference_rgb_and_buffer_capacity() {
+        let _quiet = crate::capture::suppress_key_reads();
+        let _providers = ProviderPolicy::InjectedDeterministic.enter();
+        for preset in presets() {
+            let layers = [preset_layer(preset.slug).unwrap()];
+            let mut reference = Compositor::from_defs(&layers);
+            let mut reused = Compositor::from_defs(&layers);
+            let mut scratch = RenderScratch::default();
+            for frame in 0..120 {
+                let t = Duration::from_secs_f32(frame as f32 / 60.0);
+                let expected = reference.render_legacy(6, 22, t.as_secs_f32());
+                reused.render_into(6, 22, t, &mut scratch);
+                assert_eq!(scratch.output, expected, "{} at {}", preset.slug, frame);
+                assert_eq!(scratch.output.capacity(), 132);
+            }
+        }
+    }
+
+    #[test]
+    fn reconciliation_preserves_identity_and_replaces_changed_pattern() {
+        let mut axis = preset_layer("wave").unwrap();
+        axis.id = Some(LayerInstanceId(71));
+        let mut uniform = LayerDef { id: Some(LayerInstanceId(72)), ..Default::default() };
+        let mut comp = Compositor::from_defs(&[axis.clone(), uniform.clone()]);
+        let first = &*comp.layers[0].pattern as *const dyn Pattern as *const ();
+        let second = &*comp.layers[1].pattern as *const dyn Pattern as *const ();
+        comp.update_defs(&[uniform.clone(), axis.clone()]);
+        assert_eq!(&*comp.layers[1].pattern as *const dyn Pattern as *const (), first);
+        assert_eq!(&*comp.layers[0].pattern as *const dyn Pattern as *const (), second);
+        uniform.pattern = "radial".into();
+        comp.update_defs(&[uniform.clone(), axis]);
+        let actual = comp.layers[0].pattern.field_at_time(6, 22, Duration::ZERO);
+        let mut radial = make_pattern("radial").unwrap();
+        assert_eq!(actual, radial.field_at_time(6, 22, Duration::ZERO));
+        assert_eq!(&*comp.layers[1].pattern as *const dyn Pattern as *const (), first);
+    }
+
+    #[test]
+    fn heat_duplicate_timestamp_does_not_advance_random_state() {
+        let mut heat = Heat::default();
+        let seeded = heat.field(6, 22, 0.0);
+        assert_eq!(heat.field(6, 22, 0.0), seeded);
+        let advanced = heat.field(6, 22, 0.1);
+        assert_eq!(heat.field(6, 22, 0.1), advanced);
+        assert_ne!(advanced, seeded);
+    }
+
+    #[test]
+    fn duration_quantization_does_not_reset_at_old_clock_boundary() {
+        let before = quantized_time(Duration::from_millis(4_095_990), 30);
+        let after = quantized_time(Duration::from_millis(4_096_040), 30);
+        assert!(after > before);
+        assert!(after - before < Duration::from_millis(100));
+        assert!(after.as_secs() >= 4096);
+    }
+
+    #[test]
+    fn aurora_luminance_is_continuous_across_the_old_phase_reset() {
+        let mut flow = Flow { speed: 1.0, ..Default::default() };
+        flow.advance_phases(999.999);
+        let Field::Scalar(before) = flow.emit_field(6, 22) else { unreachable!() };
+        flow.advance_phases(0.002);
+        let Field::Scalar(after) = flow.emit_field(6, 22) else { unreachable!() };
+        for (a, b) in before.iter().zip(after) {
+            assert!((a.u - b.u).abs() < 0.005);
+            assert!((a.intensity - b.intensity).abs() < 0.005);
+        }
+    }
+
+    #[test]
+    fn retuning_presentation_quantization_cannot_double_advance_phase() {
+        for key in ["axis", "radial", "flow"] {
+            let mut pattern = make_pattern(key).unwrap();
+            pattern.configure(&Params::defaults_for(key));
+            let t = Duration::from_secs(1);
+            let before = pattern.field_at_time(6, 22, t);
+            assert_eq!(pattern.field_at_time(6, 22, Duration::from_millis(990)), before, "{key}");
+            assert_eq!(pattern.field_at_time(6, 22, t), before, "{key} advanced twice");
+        }
+    }
+
+    #[test]
+    fn session_handoff_preserves_rgb_for_every_qualified_pattern() {
+        let _quiet = crate::capture::suppress_key_reads();
+        let _policy = ProviderPolicy::InjectedDeterministic.enter();
+        for registered in registry().iter().filter(|def| def.session_capable()) {
+            let def = LayerDef { pattern: registered.key.into(), params: Params::defaults_for(registered.key),
+                ..Default::default() };
+            let id = LayerInstanceId(501);
+            let specs = [SceneLayerSpec { id, def }];
+            let mut session = LightingSession::from_specs((6, 22), &specs).unwrap();
+            let hub = ProcessInputHub::new();
+            let now = Instant::now();
+            for tick in 0..240 { session.advance_tick(&hub, now + LOGICAL_TICK_DT * tick); }
+            let elapsed = Duration::from_secs(4);
+            let before = session.resolve_presentation(elapsed).pixels.clone();
+            let (mut compositor, cursor) = session.into_compositor(&specs);
+            assert_eq!(cursor, hub.current_generation());
+            compositor.rebase_pattern_clock(id, registered.key, elapsed);
+            assert_eq!(compositor.render_at_time(6, 22, elapsed).as_slice(), before.as_ref(), "{}", registered.key);
+            assert_eq!(compositor.render_at_time(6, 22, elapsed).as_slice(), before.as_ref(), "{} repeated time", registered.key);
+        }
     }
 }

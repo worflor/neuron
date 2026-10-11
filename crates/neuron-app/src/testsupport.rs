@@ -50,11 +50,15 @@ pub struct CwdGuard {
 
 impl Drop for CwdGuard {
     fn drop(&mut self) {
+        crate::glue::flush_lighting_save();
+        crate::light_metadata::shutdown();
+        crate::glue::reset_lighting_cache();
         let _ = std::env::set_current_dir(&self.prev);
         match self.prev_run_dir.take() {
             Some(v) => std::env::set_var("NEURON_RUN_DIR", v),
             None => std::env::remove_var("NEURON_RUN_DIR"),
         }
+        crate::prefs::invalidate_cache();
         let _ = std::fs::remove_dir_all(&self.tmp);
     }
 }
@@ -80,6 +84,7 @@ pub fn cwd_guard(tag: &str) -> CwdGuard {
     let _ = std::fs::create_dir_all(&tmp);
     std::env::set_current_dir(&tmp).unwrap();
     std::env::set_var("NEURON_RUN_DIR", &tmp);
+    crate::prefs::refresh_lighting_snapshot();
     CwdGuard {
         _lock: lock,
         prev,

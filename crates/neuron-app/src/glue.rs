@@ -22,7 +22,7 @@ use crate::migrate;
 use crate::runtime::AppRuntime;
 use crate::ui::{
     AppRuleRow, AppWindow, BadgeView, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, ClipboardOperationRow, ClipboardVariable, DeviceRow, DiagRow, EffectParam,
-    EffectRow, EffectTile, GlyphChip, ImportLine, KnobRow, LightingLayerChoice, LightingPresetChoice, MacroBlock, MacroCard, MaterialCard, OrganRow,
+    EffectRow, EffectTileMeta, GlyphChip, ImportLine, KnobRow, LightingLayerChoice, LightingPresetChoice, MacroBlock, MacroCard, MaterialCard, OrganRow,
     PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame, GradientPreset, PairChip,
     SpectrumStop,
     State, Theme,
@@ -76,6 +76,45 @@ fn update_grid_model(state: &State, px: Vec<slint::Color>) {
         }
     }
     state.set_grid_px(ModelRc::new(VecModel::from(px)));
+}
+
+/// Preserve rendered row identity while changing values; replace only a structural shape change.
+fn update_value_model<T: Clone + PartialEq + 'static>(existing: ModelRc<T>, rows: Vec<T>, install: impl FnOnce(ModelRc<T>)) {
+    if let Some(model) = existing.as_any().downcast_ref::<VecModel<T>>() {
+        if model.row_count() == rows.len() {
+            for (index, row) in rows.into_iter().enumerate() {
+                if model.row_data(index).as_ref() != Some(&row) { model.set_row_data(index, row); }
+            }
+            return;
+        }
+    }
+    install(ModelRc::new(VecModel::from(rows)));
+}
+
+thread_local! {
+    static PARAM_TARGET: RefCell<Option<(crate::light_render::Target, neuron::pattern::LayerInstanceId)>> = const { RefCell::new(None) };
+}
+
+fn update_param_model(st: &State, mut rows: Vec<EffectParam>, target: Option<(crate::light_render::Target, neuron::pattern::LayerInstanceId)>) {
+    let existing = st.get_light_params();
+    let same_target = PARAM_TARGET.with(|previous| {
+        let same = *previous.borrow() == target;
+        *previous.borrow_mut() = target;
+        same
+    });
+    let same_schema = same_target && existing.row_count() == rows.len() && rows.iter().enumerate().all(|(i, row)| {
+        existing.row_data(i).is_some_and(|old| old.key == row.key && old.kind == row.kind)
+    });
+    if !same_schema { st.set_light_params(ModelRc::new(VecModel::from(rows))); return; }
+    for (i, row) in rows.iter_mut().enumerate() {
+        if let Some(old) = existing.row_data(i) {
+            if old.options.row_count() == row.options.row_count()
+                && (0..old.options.row_count()).all(|j| old.options.row_data(j) == row.options.row_data(j)) {
+                row.options = old.options;
+            }
+        }
+    }
+    update_value_model(existing, rows, |model| st.set_light_params(model));
 }
 
 /// The app's weak handle, installed ONCE at startup — the reach-back a non-UI subsystem
@@ -352,84 +391,6 @@ fn publish_scroll_stage(truth: crate::reconcile::Truth<String>) {
     });
 }
 
-/// Whether the lighting-page render profiler is on (env `NEURON_PROF`). Cached once — env reads lock
-/// an internal mutex, and the tile tick is hot. INERT in prod (the env var is unset), so the per-tick
-/// `Instant` calls below are skipped entirely; this is pure diagnostics, gone the moment the var is.
-fn tile_prof_on() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NEURON_PROF").is_some())
-}
-
-/// Rolling 1 Hz accumulator for the tile-render tick — only ever touched when `NEURON_PROF` is set.
-/// Per-tile gen + preview-convert microseconds, the model-upload cost, and the whole-tick total,
-/// summed across a second then printed to stderr as per-tick AVERAGES (so the log is one line/sec,
-/// not a flood). This is how Part B reports the REAL page cost the data indicts.
-struct TileProfAcc {
-    ticks: u32,
-    tick_total_us: f64,
-    upload_us: f64,
-    gen: std::collections::HashMap<&'static str, f64>,
-    prev: std::collections::HashMap<&'static str, f64>,
-    last_print: std::time::Instant,
-}
-impl TileProfAcc {
-    fn new() -> Self {
-        TileProfAcc {
-            ticks: 0,
-            tick_total_us: 0.0,
-            upload_us: 0.0,
-            gen: std::collections::HashMap::new(),
-            prev: std::collections::HashMap::new(),
-            last_print: std::time::Instant::now(),
-        }
-    }
-    fn flush(&mut self) {
-        let secs = self.last_print.elapsed().as_secs_f64().max(1e-6);
-        let n = f64::from(self.ticks.max(1));
-        let gen_total: f64 = self.gen.values().sum::<f64>() / n;
-        eprintln!(
-            "PROF: tick_total={:.3}ms tiles={} rate≈{:.1}Hz gen_total={:.3}ms preview_total={:.3}ms upload={:.3}ms",
-            self.tick_total_us / n / 1000.0,
-            self.gen.len(),
-            f64::from(self.ticks) / secs,
-            gen_total / 1000.0,
-            self.prev.values().sum::<f64>() / n / 1000.0,
-            self.upload_us / n / 1000.0,
-        );
-        let mut rows: Vec<(&'static str, f64, f64)> = self
-            .gen
-            .iter()
-            .map(|(&k, &g)| (k, g / n, self.prev.get(k).copied().unwrap_or(0.0) / n))
-            .collect();
-        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for (slug, g, p) in rows {
-            eprintln!("PROF:   tile={slug:<12} gen_us={g:>8.1} preview_us={p:>6.1}");
-        }
-        *self = TileProfAcc::new();
-    }
-}
-
-/// Fold one tile-tick's measurements into the rolling accumulator, flushing once per second. Called
-/// only under `NEURON_PROF`.
-fn tile_prof_accumulate(tick_us: f64, upload_us: f64, rows: &[(&'static str, f64, f64)]) {
-    thread_local! {
-        static ACC: RefCell<TileProfAcc> = RefCell::new(TileProfAcc::new());
-    }
-    ACC.with(|a| {
-        let mut a = a.borrow_mut();
-        a.ticks += 1;
-        a.tick_total_us += tick_us;
-        a.upload_us += upload_us;
-        for &(slug, gen_us, prev_us) in rows {
-            *a.gen.entry(slug).or_insert(0.0) += gen_us;
-            *a.prev.entry(slug).or_insert(0.0) += prev_us;
-        }
-        if a.last_print.elapsed() >= std::time::Duration::from_secs(1) {
-            a.flush();
-        }
-    });
-}
 const DPI_MIN: u16 = 100;
 const DPI_MAX: u16 = 30_000;
 const DPI_STAGE_CAPACITY: usize = 5;
@@ -445,6 +406,10 @@ pub struct Shared {
     /// this. `layers_rev` bumps on any change so the live preview rebuilds its cached `Compositor`
     /// (stateful patterns like fire keep their state across ticks otherwise).
     pub light_layers: Vec<neuron::pattern::LayerDef>,
+    light_scene_set: bool,
+    light_transition: neuron::pattern::TransitionHint,
+    projected_scene: Vec<neuron::pattern::LayerDef>,
+    lighting_id_highwater: u64,
     pub selected_layer: usize,
     /// Which FRAME of the selected layer's spectrum the editor is shaping (the timeline scrubber). 0
     /// for the common single-frame (non-sequenced) case; clamped to the active spectrum's length.
@@ -1495,6 +1460,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         // the keyboard was mint when another app (Synapse) actually owned its lighting. Empty = the
         // honest "Neuron isn't driving this device yet" until the user builds a composite.
         light_layers: Vec::new(),
+        light_scene_set: false,
+        light_transition: neuron::pattern::TransitionHint::Edit,
+        projected_scene: Vec::new(),
+        lighting_id_highwater: 0,
         selected_layer: 0,
         active_frame: 0,
         layers_rev: 0,
@@ -2264,119 +2233,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
         let sh = sh.clone();
-        // THE LIVE COMPOSITE MIRROR: composite the whole layer stack onto the render at ~20Hz with
-        // the SAME math the device path runs (`Compositor::frame`). A reconstruction, not a
-        // read-back — badged "~ live". The Compositor is cached and rebuilt when the stack changes
-        // (`layers_rev`) OR the grid DIMS change, so stateful effects (fire's heat map) keep state
-        // across ticks — and switching to a same-stack different-dims device rebuilds the generators
-        // (a stale-dim generator emits the wrong frame length and the layer goes dark via the
-        // `Compositor::frame` length-skip). The cache key is `(rev, rows, cols)`.
-        let cache: Rc<RefCell<Option<(u64, i32, i32, neuron::pattern::Compositor)>>> =
-            Rc::new(RefCell::new(None));
-        // FOREIGN-OWNER strip cadence: the preview ticks ~20Hz while the page is open — poll the
-        // arbiter's claims every ~24th tick (~1s) so "a game is painting this board" appears and
-        // clears without a dedicated timer. A kernel round-trip is microseconds; 1Hz is plenty.
-        // EVENT-DRIVEN TOP-UP: also poll immediately whenever the host bus has fired a
-        // `host.*` signal (a session opened/closed, a client connected, a layer released) since
-        // this poller last looked — `take_host_events_dirty` keeps ITS OWN last-seen stamp, so it
-        // can't race the SYSTEM page's independent read of the same counter. This is what makes a
-        // foreign paint appear/clear on the frame it actually happened, not up to a second later.
-        let foreign_tick: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
-        let host_events_seen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         app.global::<State>().on_preview_tick(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                {
-                    let mut t = foreign_tick.borrow_mut();
-                    *t += 1;
-                    let host_dirty = crate::host::take_host_events_dirty(&host_events_seen);
-                    if host_dirty || *t % 24 == 1 {
-                        let (pid, unit) = {
-                            let s = sh.borrow();
-                            (s.rt.selected_pid, s.rt.selected_unit.clone())
-                        };
-                        // The arbiter's ownership truth: yours / a named client
-                        // painting on top / a named client connected-but-losing
-                        // (the "my lighting wins" policy). Three honest states,
-                        // one of which no last-writer-wins tool can even see.
-                        use crate::host::BoardOwner::{Yours, Painting, Suppressed};
-                        let (painting, suppressed, app) = match crate::host::board_owner(pid, &unit)
-                        {
-                            Yours => (false, false, String::new()),
-                            Painting(name) => (true, false, name),
-                            Suppressed(name) => (false, true, name),
-                        };
-                        st.set_light_foreign(painting);
-                        st.set_light_suppressed(suppressed);
-                        st.set_light_foreign_app(app.into());
-                    }
-                }
                 let (rows, cols) = (st.get_grid_rows(), st.get_grid_cols());
                 // the BRUSH owns the grid (the per-LED editor) — don't fight it.
                 if st.get_light_brush_on() || rows <= 0 || cols <= 0 {
-                    cache.replace(None);
                     return;
                 }
-                // Read the CHEAP signals first — the stack revision, whether the stack is empty, and the
-                // fps (the shared atomic the device stream seeds from, NOT a separate Slint property read,
-                // so preview + board are paced by the same value). The full `light_layers` clone is
-                // DEFERRED to the rebuild branch below: at ~20Hz it's wasteful to deep-clone every layer's
-                // spectrum/params each frame when the compositor is cached and only rebuilds on a change.
-                let (rev, is_empty, fps) = {
-                    let s = sh.borrow();
-                    (
-                        s.layers_rev,
-                        s.light_layers.is_empty(),
-                        s.rt.light_fps.load(std::sync::atomic::Ordering::Relaxed),
-                    )
-                };
-                // The vitals readout is no longer a special surface — it's just a `vitals` LAYER in the
-                // stack, so it renders through the SAME compositor path below (reading the live provider
-                // the heartbeat feeds), exactly like every effect.
-                let n = (rows * cols) as usize;
-                if is_empty {
-                    // an empty stack = a dark device; mirror that honestly
-                    update_grid_model(&st, vec![GRID_OFF; n]);
-                    cache.replace(None);
-                    return;
-                }
-                // QUANTIZED SHARED-CLOCK time: the ONE `quantized_t` helper off the process-global
-                // `render_epoch` the device's animate() loop ALSO uses — same epoch + same formula, so
-                // the preview advances in the SAME discrete frames the keyboard does (chunky at 6fps,
-                // smooth at 30), and a restack can't jump the phase. Tuning fps (the shared atomic above)
-                // re-paces the preview and the board together.
-                let t = neuron::pattern::quantized_t(neuron::pattern::render_elapsed(), fps);
-                let mut c = cache.borrow_mut();
-                // rebuild the generators when the stack revision OR the grid dims change (a dims change
-                // needs fresh generators or they emit stale-length frames and the layer goes dark) —
-                // but DRIVE them from the shared quantized clock above, not a reset-on-rebuild anchor.
-                let stale = c
-                    .as_ref()
-                    .is_none_or(|(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols);
-                if stale {
-                    // Rebuild only when grid dims change or first construct; update in place on rev bump
-                    // so stateful simulation (comet trails, thermal fields, rain drops) is preserved seamlessly.
-                    let defs = sh.borrow().light_layers.clone();
-                    if let Some((r, cr, cc, comp)) = c.as_mut() {
-                        if *cr == rows && *cc == cols {
-                            *r = rev;
-                            comp.update_defs(&defs);
-                        } else {
-                            *c = Some((rev, rows, cols, neuron::pattern::Compositor::from_defs(&defs)));
-                        }
-                    } else {
-                        *c = Some((rev, rows, cols, neuron::pattern::Compositor::from_defs(&defs)));
-                    }
-                }
-                let Some((_, _, _, comp)) = c.as_mut() else {
-                    return;
-                };
-                let frame = comp.render(rows as u8, cols as u8, t);
-                let px: Vec<slint::Color> = frame
-                    .iter()
-                    .map(|p| grid_display(p.r, p.g, p.b))
-                    .collect();
-                update_grid_model(&st, px);
+                refresh_live_base(&app, &sh);
+                request_light_render(&app, &sh);
             }
         });
     });
@@ -2483,56 +2349,26 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             st.set_status_line("no file selected".into());
                             return;
                         }
-                        match neuron::import::import_export(std::path::Path::new(&path)) {
-                            Ok(imp) => {
-                                // Lighting now flows as ONE representation: the profile's compositor stack
-                                // (`Vec<LayerDef>`). Import pours that stack straight into the live
-                                // compositor. If the stack carries a `custom` hand-painted/imported frame
-                                // layer, ALSO drop its cells on the paint canvas so the user can edit it.
-                                let layers: Vec<neuron::pattern::LayerDef> =
-                                    imp.profile.lighting.clone();
-                                if layers.is_empty() {
-                                    let note = imp.notes.first().cloned().unwrap_or_default();
-                                    st.set_status_line(
-                                        format!("no lighting in that export{}", if note.is_empty() { String::new() } else { format!(" — {note}") }).into(),
-                                    );
-                                } else {
-                                    let n = layers.len();
-                                    // the raw cells of a `custom` layer, if one rode in (edit on the canvas).
-                                    let custom_cells: Option<Vec<[u8; 3]>> = layers
-                                        .iter()
-                                        .find(|l| l.pattern == "custom")
-                                        .map(|l| l.frame.clone());
-                                    {
-                                        let mut s = sh.borrow_mut();
-                                        s.light_layers = layers;
-                                        s.selected_layer = s.light_layers.len().saturating_sub(1);
-                                        s.active_frame = 0;
-                                        s.layers_rev += 1;
-                                    }
-                                    if let Some(cells) = custom_cells {
-                                        // paint the custom frame onto the canvas + enter paint mode.
-                                        let (rows, cols) = (st.get_grid_rows(), st.get_grid_cols());
-                                        let count = (rows.max(0) * cols.max(0)) as usize;
-                                        let mut px: Vec<slint::Color> = cells
-                                            .iter()
-                                            .take(count)
-                                            .map(|c| grid_display(c[0], c[1], c[2]))
-                                            .collect();
-                                        while px.len() < count {
-                                            px.push(GRID_OFF);
+                        let weak = app.as_weak();
+                        let target = (sh.borrow().rt.selected_pid, sh.borrow().rt.selected_unit.clone(), sh.borrow().layers_rev);
+                        let accepted = crate::light_metadata::submit(
+                            move || neuron::import::import_export(std::path::Path::new(&path)).map_err(|e| e.to_string()),
+                            move |result| {
+                                let Some(app) = weak.upgrade() else { return; };
+                                UI_SHARED.with(|s| {
+                                    if let Some(sh) = s.borrow().as_ref() {
+                                        let current = sh.borrow();
+                                        if (current.rt.selected_pid, current.rt.selected_unit.clone(), current.layers_rev) != target {
+                                            app.global::<State>().set_status_line("import skipped ? the edited lighting target changed".into());
+                                            return;
                                         }
-                                        st.set_grid_px(ModelRc::new(VecModel::from(px)));
-                                        st.set_light_paint_mode(true);
-                                    } else {
-                                        st.set_light_paint_mode(false);
+                                        drop(current);
+                                        apply_imported_lighting(&app, sh, result);
                                     }
-                                    refresh_layers(app, &sh);
-                                    st.set_status_line(format!("imported {n} layer(s)").into());
-                                }
-                            }
-                            Err(e) => st.set_status_line(format!("import failed: {e}").into()),
-                        }
+                                });
+                            },
+                        );
+                        if let Err(e) = accepted { st.set_status_line(format!("import not accepted: {e}").into()); }
                     });
                 }
             });
@@ -2565,43 +2401,66 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         );
                         return;
                     }
-                    match neuron::user_effects::save(&name, &[], &stack) {
-                        Ok(saved) => {
-                            refresh_user_effect_tiles(&app, &sh);
-                            // Re-slugify what actually landed (the name is normalised into a slug), so
-                            // the tile the shelf just grew is the one that reads as selected.
-                            st.set_light_user_effect(saved.slug.clone().into());
-                            st.set_light_effect_name(neuron::user_effects::load(&saved.slug).map_or_else(|_| name.clone(), |e| e.name).into());
-                            st.set_status_line(
-                                if saved.replaced {
-                                    format!("replaced '{name}' ({} layers)", stack.len()).into()
-                                } else {
-                                    format!("saved '{name}' as {} ({} layers)", saved.slug, stack.len()).into()
-                                },
-                            );
-                        }
-                        Err(e) => st.set_status_line(format!("save failed: {e}").into()),
-                    }
+                    let weak = app.as_weak();
+                    let layers = stack.len();
+                    let saved_name = name.clone();
+                    let target = (sh.borrow().rt.selected_pid, sh.borrow().rt.selected_unit.clone(), sh.borrow().layers_rev);
+                    let accepted = crate::light_metadata::submit(
+                        move || neuron::user_effects::save(&saved_name, &[], &stack)
+                            .map(|saved| (saved, crate::light_metadata::catalog_fresh())),
+                        move |result| {
+                            let Some(app) = weak.upgrade() else { return; };
+                            let st = app.global::<State>();
+                            match result {
+                                Ok((saved, catalog)) => {
+                                    install_saved_catalog(&app, catalog);
+                                    UI_SHARED.with(|s| {
+                                        if let Some(sh) = s.borrow().as_ref() {
+                                            let current = sh.borrow();
+                                            if (current.rt.selected_pid, current.rt.selected_unit.clone(), current.layers_rev) == target {
+                                                st.set_light_user_effect(saved.slug.clone().into());
+                                                st.set_light_effect_name(name.clone().into());
+                                            }
+                                        }
+                                    });
+                                    st.set_status_line(if saved.replaced {
+                                        format!("replaced '{name}' ({layers} layers)").into()
+                                    } else { format!("saved '{name}' as {} ({layers} layers)", saved.slug).into() });
+                                }
+                                Err(e) => st.set_status_line(format!("save failed: {e}").into()),
+                            }
+                        },
+                    );
+                    if let Err(e) = accepted { st.set_status_line(format!("save not accepted: {e}").into()); }
                 }
             });
         }
         // DELETE a saved effect by slug. Refuses nothing here: the ✕ is a deliberate act on one tile.
         {
             let w = app.as_weak();
-            let sh = sh.clone();
             app.global::<State>().on_delete_user_effect(move |slug| {
                 if let Some(app) = w.upgrade() {
                     let st = app.global::<State>();
-                    match neuron::user_effects::delete(slug.trim()) {
-                        Ok(()) => {
-                            if st.get_light_user_effect() == slug {
-                                st.set_light_user_effect("".into());
+                    let weak = app.as_weak();
+                    let slug = slug.trim().to_string();
+                    let deleting = slug.clone();
+                    let accepted = crate::light_metadata::submit(
+                        move || neuron::user_effects::delete(&deleting)
+                            .map(|()| crate::light_metadata::catalog_fresh()),
+                        move |result| {
+                            let Some(app) = weak.upgrade() else { return; };
+                            let st = app.global::<State>();
+                            match result {
+                                Ok(catalog) => {
+                                    install_saved_catalog(&app, catalog);
+                                    if st.get_light_user_effect().as_str() == slug { st.set_light_user_effect("".into()); }
+                                    st.set_status_line(format!("deleted {slug}").into());
+                                }
+                                Err(e) => st.set_status_line(format!("delete failed: {e}").into()),
                             }
-                            refresh_user_effect_tiles(&app, &sh);
-                            st.set_status_line(format!("deleted {slug}").into());
-                        }
-                        Err(e) => st.set_status_line(format!("delete failed: {e}").into()),
-                    }
+                        },
+                    );
+                    if let Err(e) = accepted { st.set_status_line(format!("delete not accepted: {e}").into()); }
                 }
             });
         }
@@ -2617,17 +2476,24 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let sh = sh.clone();
             app.global::<State>().on_pick_tile(move |slug| {
                 if let Some(app) = w.upgrade() {
+                    sh.borrow_mut().light_transition = neuron::pattern::TransitionHint::Switch;
                     let slug = slug.to_string();
                     // A SAVED EFFECT is a whole look, not a re-skin: picking one replaces the ENTIRE
                     // stack with the layers it was saved with (that's what "the effect I made" means),
                     // and names the loaded effect so its tile lights. A built-in preset keeps the
                     // re-skin path below unchanged.
                     if let Some(effect_slug) = slug.strip_prefix(USER_TILE_PREFIX) {
-                        match neuron::user_effects::load(effect_slug) {
+                        match LIGHT_PREVIEW.with(|p| p.borrow().saved.iter().find(|(slug, _)| slug == effect_slug)
+                            .map(|(_, effect)| effect.clone()).ok_or_else(|| "saved effect is no longer in the catalog".to_string())) {
                             Ok(effect) => {
                                 {
                                     let mut s = sh.borrow_mut();
-                                    s.light_layers = effect.layers;
+                                    if !neuron::pattern::same_scene_contents(&s.light_layers, &effect.layers) {
+                                        match neuron::layers::instantiate(&s.light_layers, &effect.layers) {
+                                            Ok(layers) => s.light_layers = layers,
+                                            Err(error) => { app.global::<State>().set_status_line(error.into()); return; }
+                                        }
+                                    }
                                     s.selected_layer = s.light_layers.len().saturating_sub(1);
                                     s.active_frame = 0;
                                     s.layers_rev += 1;
@@ -2678,6 +2544,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                 s.light_layers[sel].blend
                             };
                             s.light_layers[sel] = neuron::pattern::LayerDef {
+                                id: s.light_layers[sel].id,
                                 region,
                                 blend,
                                 enabled,
@@ -3138,6 +3005,35 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
             });
         }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_stack_tile(move |slug, above| {
+                let Some(app) = w.upgrade() else { return; };
+                let slug = slug.as_str();
+                let incoming = if let Some(saved) = slug.strip_prefix(USER_TILE_PREFIX) {
+                    LIGHT_PREVIEW.with(|p| p.borrow().saved.iter().find(|(name, _)| name == saved)
+                        .map(|(_, effect)| effect.layers.to_vec()))
+                } else { neuron::pattern::preset_layer(slug).map(|layer| vec![layer]) };
+                let Some(mut incoming) = incoming.filter(|layers| !layers.is_empty()) else { return; };
+                for layer in &mut incoming { layer.id = None; }
+                incoming[0].blend = neuron::effects::Blend::Screen;
+                {
+                    let mut s = sh.borrow_mut();
+                    let position = if s.light_layers.is_empty() { 0 } else {
+                        s.selected_layer.min(s.light_layers.len() - 1) + usize::from(above)
+                    };
+                    s.selected_layer = position + incoming.len() - 1;
+                    s.light_layers.splice(position..position, incoming);
+                    s.active_frame = 0;
+                    s.layers_rev = s.layers_rev.wrapping_add(1);
+                }
+                app.global::<State>().set_light_user_effect("".into());
+                app.global::<State>().set_light_sel_stop(0);
+                refresh_layers(&app, &sh);
+                flush_lighting_save();
+            });
+        }
         // + stack: layer the active effect AGAIN on top (a new layer, screen-blended so it reads as
         // added light), and select it so the knobs follow the new top.
         {
@@ -3151,6 +3047,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         if !s.light_layers.is_empty() {
                             let sel = s.selected_layer.min(s.light_layers.len() - 1);
                             let mut d = s.light_layers[sel].clone();
+                            d.id = None;
                             d.blend = neuron::effects::Blend::Screen;
                             s.light_layers.push(d);
                             s.selected_layer = s.light_layers.len() - 1;
@@ -3252,12 +3149,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
         // what's lit (not a blank board); putting it down returns to the effect preview.
         {
             let w = app.as_weak();
-            let _sh = sh.clone();
+            let sh = sh.clone();
             app.global::<State>().on_toggle_brush(move || {
                 if let Some(app) = w.upgrade() {
                     let st = app.global::<State>();
                     let on = !st.get_light_brush_on();
                     st.set_light_brush_on(on);
+                    LIGHT_PREVIEW.with(|preview| { preview.borrow_mut().last_rgb.remove(&crate::light_render::SurfaceId::Hero); });
+                    request_light_render(&app, &sh);
                     // the brush and the PLACE gesture are exclusive render modes — picking up one drops
                     // the other so the render never has two live pointer gestures fighting.
                     if on {
@@ -3278,7 +3177,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         // render defines the selected layer's region; off = normal. Entering place drops the brush.
         {
             let w = app.as_weak();
-            let _sh = sh.clone();
+            let sh = sh.clone();
             app.global::<State>().on_toggle_place(move || {
                 if let Some(app) = w.upgrade() {
                     let st = app.global::<State>();
@@ -3286,6 +3185,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     st.set_light_place_on(on);
                     if on {
                         st.set_light_brush_on(false);
+                        LIGHT_PREVIEW.with(|preview| { preview.borrow_mut().last_rgb.remove(&crate::light_render::SurfaceId::Hero); });
+                        request_light_render(&app, &sh);
                     }
                     st.set_status_line(
                         if on {
@@ -3311,7 +3212,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 if let Some(app) = w.upgrade() {
                     let committed = {
                         let mut s = sh.borrow_mut();
-                        let (rows, cols) = s.rt.grid_dims();
+                        let (rows, cols) = ui_grid_dims(&app.global::<State>());
                         let sel = s.selected_layer;
                         if rows == 0 || cols == 0 || sel >= s.light_layers.len() {
                             None
@@ -3399,17 +3300,40 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
             });
         }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_tile_demand(move |shelf, start, end, warm_start, warm_end| {
+                let changed = LIGHT_PREVIEW.with(|p| {
+                    let mut p = p.borrow_mut();
+                    if let Some(range) = p.desired.demand.get_mut(shelf.max(0) as usize) {
+                        let next = crate::light_render::DemandRange {
+                            start: start.max(0) as usize, end: end.max(0) as usize,
+                            warm_start: warm_start.max(0) as usize, warm_end: warm_end.max(0) as usize,
+                        };
+                        if *range != next {
+                            *range = next;
+                            p.desired.layout_generation = p.desired.layout_generation.wrapping_add(1);
+                            return true;
+                        }
+                    }
+                    false
+                });
+                if changed {
+                    if let Some(app) = w.upgrade() { request_light_render(&app, &sh); }
+                }
+            });
+        }
         // re-render the live tile grid each tick (the MATERIAL-card animation, applied to lighting)
         {
             let w = app.as_weak();
             let sh = sh.clone();
             app.global::<State>().on_tile_preview_tick(move || {
                 if let Some(app) = w.upgrade() {
-                    let t = neuron::pattern::render_elapsed();
-                    render_light_tiles(&app, &sh, t);
-                    // the YOUR-EFFECTS shelf animates on the same tick and the same clock as the built-in
-                    // shelves, so a saved look is seen MOVING in the catalog exactly as it will on the board.
-                    render_user_effect_tiles(&app, &sh, false);
+                    refresh_light_owner(&app, &sh);
+                    refresh_live_base(&app, &sh);
+                    request_light_render(&app, &sh);
+                    poll_saved_effects(&app, &sh, false);
                 }
             });
         }
@@ -5589,23 +5513,32 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let sh = sh.clone();
         app.global::<State>().on_set_host_enabled(move |v| {
             if let Some(app) = w.upgrade() {
-                // Persist INTENT (`v`), never the outcome: the pref records what the user
-                // chose; the toggle shows live truth (`refresh_host_status` reads `active()`).
-                // Bring-up can fail TRANSIENTLY — the election lost to another neuron instance
-                // (a restart overlap, a stray host_serve), a registry hiccup — and persisting
-                // `active()` here silently flipped the opt-in back off, so the next launch
-                // never retried. That contradicted the boot path, which deliberately preserves
-                // the pref on a failed bring-up for exactly this reason (see `host::start`).
-                let msg = crate::host::set_enabled(v);
+                if HOST_SWITCH_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+                let tokens = {
+                    let mut s = sh.borrow_mut();
+                    s.rt.stop_all_animation();
+                    s.rt.lighting_stop_tokens()
+                };
                 crate::prefs::set_host_enabled(v);
-                refresh_host_status(&app);
-                // MIGRATE EVERY board, not just the selected one: bring-up started a host writer for
-                // every bridged device, so any board still on its own local stream would be double-
-                // written until re-applied. Re-establishing all boards through `start_layers` stops
-                // each local stream as it (re)claims via the host — and on teardown, resumes them all
-                // locally. Selected-only would leave the rest racing (on) or dark (off).
-                reapply_all_boards(&app, &sh);
-                app.global::<State>().set_status_line(msg.into());
+                let back = app.as_weak();
+                crate::worker::spawn_notify("neuron-host-switch", move || {
+                    crate::runtime::await_lighting_stop(&tokens).map(|()| crate::host::set_enabled(v))
+                }, move |result| {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        HOST_SWITCH_PENDING.store(false, std::sync::atomic::Ordering::Release);
+                        if let Some(app) = back.upgrade() {
+                            with_shared(|sh| {
+                                refresh_host_status(&app);
+                                let msg = match result {
+                                    Some(Ok(msg)) => { reapply_all_boards(&app, sh); msg },
+                                    Some(Err(error)) => error,
+                                    None => "lighting ownership switch failed".into(),
+                                };
+                                app.global::<State>().set_status_line(msg.into());
+                            });
+                        }
+                    });
+                });
             }
         });
     });
@@ -9169,6 +9102,7 @@ pub fn refresh_effects(app: &AppWindow, sh: &SharedRt) {
 /// Until this flips true at the end of [`restore_lighting`], [`save_lighting`] is a no-op — so the
 /// install sequence (which runs the layer projection before restore) can never clobber a saved state
 /// with the empty startup stack.
+static HOST_SWITCH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LIGHTING_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
@@ -9185,17 +9119,15 @@ thread_local! {
     /// rapid gesture (dragging the speed slider) coalesces into ONE app.toml write ~400ms after the
     /// last edit, instead of one write per emitted value.
     static LIGHT_SAVE_TIMER: slint::Timer = slint::Timer::default();
-    /// The latest pending lighting snapshot the debounce is waiting to write: `(pid, fps, layers)`.
+    /// Latest pending snapshot per device; switching devices cannot discard another board's edit.
     /// Held ALONGSIDE the timer so the write can be FLUSHED early — on a structural edit or app exit —
     /// instead of being lost if the app quits before the 400ms settles (the "stacked layers collapse to
     /// base on relaunch" bug: a stack/re-theme made within the debounce window never reached disk).
     static LIGHT_PENDING: std::cell::RefCell<
-        Option<(u16, u32, Vec<neuron::pattern::LayerDef>)>,
-    > = const { std::cell::RefCell::new(None) };
-    /// Debounce timer for the AUTO-APPLY device re-stream (UI-thread), mirroring `LIGHT_SAVE_TIMER`.
-    /// Restarted on each lighting edit so a burst (a knob drag) coalesces into ONE re-stream ~250ms after
-    /// the last change instead of thrashing the board once per emitted value. See `schedule_lighting_apply`.
-    static LIGHT_APPLY_TIMER: slint::Timer = slint::Timer::default();
+        HashMap<u16, (u64, u32, std::sync::Arc<[neuron::pattern::LayerDef]>, bool)>,
+    > = std::cell::RefCell::new(HashMap::new());
+    static LIGHT_DESIRED: RefCell<HashMap<u16, (u64, u32, std::sync::Arc<[neuron::pattern::LayerDef]>, bool)>> = RefCell::new(HashMap::new());
+    static LIGHT_SAVE_REVISION: Cell<u64> = const { Cell::new(0) };
     /// When set, `refresh_layers` PROJECTS + persists but does NOT schedule an auto-apply. Held by the pure
     /// STATE-LOAD / explicit-stream paths (device switch, profile apply) whose callers stream immediately
     /// themselves — so the debounced re-stream can't fire a redundant second write on top of their direct
@@ -9227,18 +9159,23 @@ fn save_lighting(sh: &SharedRt) {
     if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
-    let (pid, fps, layers) = {
+    let (pid, fps, layers, scene_set) = {
         let s = sh.borrow();
         (
             s.rt.selected_pid,
             s.rt.light_fps.load(std::sync::atomic::Ordering::Relaxed),
             s.light_layers.clone(),
+            s.light_scene_set,
         )
     };
     if pid == 0 {
         return; // nothing selected → no per-device key to write under
     }
-    LIGHT_PENDING.with(|p| *p.borrow_mut() = Some((pid, fps, layers)));
+    if let Err(error) = neuron::pattern::validate_scene(&layers, None) {
+        if let Some(app) = UI.get().and_then(slint::Weak::upgrade) { app.global::<State>().set_status_line(format!("lighting save rejected: {error}").into()); }
+        return;
+    }
+    remember_lighting_scene(pid, fps, layers, scene_set);
     LIGHT_SAVE_TIMER.with(|t| {
         t.start(
             slint::TimerMode::SingleShot,
@@ -9248,21 +9185,60 @@ fn save_lighting(sh: &SharedRt) {
     });
 }
 
-/// Write any pending lighting snapshot to disk IMMEDIATELY and cancel the debounce. Idempotent and
-/// cheap when nothing's pending. Called three ways: by the debounce timer when it settles; by every
-/// STRUCTURAL edit (stack / remove / tile pick) so a layer change persists the instant it's made,
-/// regardless of how the app later exits; and once after the event loop returns (`main`) so a tray-quit
-/// can't drop a still-debounced knob edit. Must run on the UI thread (the snapshot is thread-local).
+#[cfg(test)]
+fn remember_lighting(pid: u16, fps: u32, layers: Vec<neuron::pattern::LayerDef>) -> u64 {
+    remember_lighting_scene(pid, fps, layers, true)
+}
+
+fn remember_lighting_scene(pid: u16, fps: u32, layers: Vec<neuron::pattern::LayerDef>, scene_set: bool) -> u64 {
+    let revision = LIGHT_SAVE_REVISION.with(|r| { let next = r.get().wrapping_add(1); r.set(next); next });
+    let layers: std::sync::Arc<[neuron::pattern::LayerDef]> = layers.into();
+    LIGHT_DESIRED.with(|p| { p.borrow_mut().insert(pid, (revision, fps, layers.clone(), scene_set)); });
+    LIGHT_PENDING.with(|p| { p.borrow_mut().insert(pid, (revision, fps, layers, scene_set)); });
+    revision
+}
+
+fn acknowledge_lighting_save(pid: u16, revision: u64) {
+    LIGHT_DESIRED.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.get(&pid).is_some_and(|(current, _, _, _)| *current == revision) { p.remove(&pid); }
+    });
+}
+
+fn desired_lighting_snapshot(pid: u16) -> Option<crate::prefs::DeviceLight> {
+    let committed = crate::prefs::device_light_snapshot(pid);
+    LIGHT_DESIRED.with(|p| match p.borrow().get(&pid) {
+        Some((_, fps, layers, scene_set)) => Some(crate::prefs::DeviceLight { fps: *fps, scene_set: *scene_set, layers: layers.to_vec(), ..committed.unwrap_or_default() }),
+        None => committed,
+    })
+}
+
+#[cfg(test)]
+pub fn reset_lighting_cache() { LIGHT_DESIRED.with(|p| p.borrow_mut().clear()); }
+
+/// Cancel the UI debounce and enqueue each pending device snapshot for durable serial persistence.
+/// Shutdown joins the metadata service after this UI-thread snapshot has been flushed.
 pub fn flush_lighting_save() {
     LIGHT_SAVE_TIMER.with(slint::Timer::stop);
-    let pending = LIGHT_PENDING.with(|p| p.borrow_mut().take());
-    if let Some((pid, fps, layers)) = pending {
-        if let Err(e) = crate::prefs::set_device_light(
-            pid,
-            crate::prefs::DeviceLight { fps, layers, ..Default::default() },
-        ) {
-            eprintln!("neuron: lighting save failed ({e})");
-        }
+    let pending = LIGHT_PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (pid, (revision, fps, layers, scene_set)) in pending {
+        if let Err(e) = crate::light_metadata::submit(
+            move || {
+                let result = crate::prefs::set_device_light(pid, crate::prefs::DeviceLight { fps, scene_set, layers: layers.to_vec(), ..Default::default() });
+                if let Err(e) = &result { eprintln!("neuron: lighting save failed ({e})"); }
+                result
+            },
+            move |result| {
+                if result.is_ok() {
+                    acknowledge_lighting_save(pid, revision);
+                }
+                if let Err(e) = result {
+                    if let Some(app) = UI.get().and_then(slint::Weak::upgrade) {
+                        app.global::<State>().set_status_line(format!("lighting save failed: {e}").into());
+                    }
+                }
+            },
+        ) { eprintln!("neuron: lighting save not accepted ({e})"); }
     }
 }
 
@@ -9339,9 +9315,10 @@ pub fn edit_selected_lighting(
             if before == after {
                 return Err("lighting edit made no change".into());
             }
-            let mut saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
+            let mut saved = crate::prefs::device_light_snapshot(pid).unwrap_or_default().migrated();
             saved.fps = fps;
             saved.layers.clone_from(&after);
+            saved.scene_set = true;
             crate::prefs::set_device_light(pid, saved)?;
             {
                 let mut s = shared.borrow_mut();
@@ -9383,9 +9360,10 @@ pub fn restore_selected_lighting(
             if selected != pid || selected_unit != unit || current != expected {
                 return Err("selected lighting target changed since the edit".into());
             }
-            let mut saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
+            let mut saved = crate::prefs::device_light_snapshot(pid).unwrap_or_default().migrated();
             saved.fps = fps;
             saved.layers.clone_from(&replacement);
+            saved.scene_set = true;
             crate::prefs::set_device_light(pid, saved)?;
             {
                 let mut s = shared.borrow_mut();
@@ -9406,7 +9384,7 @@ pub fn restore_selected_lighting(
 fn load_lighting_into_state(app: &AppWindow, sh: &SharedRt) -> bool {
     let pid = sh.borrow().rt.selected_pid;
     // `.migrated()` folds a legacy `data = "mouse-battery"` record into a vitals LAYER (one-way compat).
-    let saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
+    let saved = desired_lighting_snapshot(pid).unwrap_or_default().migrated();
     // fps: honour the user's saved pick; fall back to whatever the per-device default already seeded
     // (init_grid) only when nothing's saved (saved.fps == 0).
     if saved.fps >= 1 {
@@ -9421,10 +9399,16 @@ fn load_lighting_into_state(app: &AppWindow, sh: &SharedRt) -> bool {
         .light_fps
         .load(std::sync::atomic::Ordering::Relaxed);
     app.global::<State>().set_light_fps(fps_now as f32);
-    let has_surface = !saved.layers.is_empty();
+    let has_surface = saved.has_managed_scene();
     {
         let mut s = sh.borrow_mut();
         s.light_layers = saved.layers;
+        let previous = s.rt.base_scene(s.rt.selected_pid, &s.rt.selected_unit).map(|handle| handle.accepted_definitions());
+        if let Some(previous) = previous { let _ = neuron::layers::normalize_against(&mut s.light_layers, &previous); }
+        else { let _ = neuron::layers::normalize_ids(&mut s.light_layers); }
+        let Shared { projected_scene, light_layers, .. } = &mut *s;
+        projected_scene.clone_from(light_layers);
+        s.light_scene_set = has_surface;
         s.selected_layer = s.light_layers.len().saturating_sub(1);
         s.layers_rev += 1;
     }
@@ -9448,18 +9432,17 @@ fn apply_current_lighting(app: &AppWindow, sh: &SharedRt) -> String {
     if st.get_writes_paused() {
         return "writes paused — composite not applied".into();
     }
-    if sh.borrow().light_layers.is_empty() {
-        return "nothing to apply".into();
-    }
-    let (pid, unit, defs) = {
-        let s = sh.borrow();
+    if !sh.borrow().light_scene_set && sh.borrow().light_layers.is_empty() { return "nothing to apply".into(); }
+    let (pid, unit, defs, hint) = {
+        let mut s = sh.borrow_mut();
         (
             s.rt.selected_pid,
             s.rt.selected_unit.clone(),
             s.light_layers.clone(),
+            std::mem::take(&mut s.light_transition),
         )
     };
-    let msg = stream_board(app, sh, pid, unit.clone(), defs);
+    let msg = stream_board(app, sh, pid, unit.clone(), defs, hint);
     let animating = sh.borrow().rt.animating(pid, &unit);
     st.set_compositing(animating);
     msg
@@ -9479,11 +9462,15 @@ fn stream_board(
     pid: u16,
     unit: String,
     defs: Vec<neuron::pattern::LayerDef>,
+    hint: neuron::pattern::TransitionHint,
 ) -> String {
+    if HOST_SWITCH_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+        return "lighting ownership handoff pending".into();
+    }
     let back = app.as_weak();
     let mut s = sh.borrow_mut();
     let unit_arg = unit.clone();
-    s.rt.start_layers(defs, pid, &unit_arg, move |reason, token| {
+    s.rt.start_layers(defs, pid, &unit_arg, hint, move |reason, token| {
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = back.upgrade() {
                 with_shared(|sh| {
@@ -9553,10 +9540,8 @@ fn reapply_all_boards(app: &AppWindow, sh: &SharedRt) -> String {
         if unit == selected_unit {
             continue;
         }
-        let saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
-        if saved.layers.is_empty() {
-            continue;
-        }
+        let saved = crate::prefs::device_light_snapshot(pid).unwrap_or_default().migrated();
+        if !saved.has_managed_scene() { continue; }
         // start_layers seeds the new stream's pace from the shared `light_fps` atomic (as a COPY
         // — see start_layers), so pose THIS board's saved pace across the start, then restore the
         // selected board's live pace below. Without this every migrated board would inherit
@@ -9567,7 +9552,7 @@ fn reapply_all_boards(app: &AppWindow, sh: &SharedRt) -> String {
                 .light_fps
                 .store(saved.fps.clamp(1, 30), std::sync::atomic::Ordering::Relaxed);
         }
-        let _ = stream_board(app, sh, pid, unit, saved.layers);
+        let _ = stream_board(app, sh, pid, unit, saved.layers, neuron::pattern::TransitionHint::Switch);
     }
     sh.borrow()
         .rt
@@ -9576,48 +9561,22 @@ fn reapply_all_boards(app: &AppWindow, sh: &SharedRt) -> String {
     msg
 }
 
-/// AUTO-APPLY — the one debounced chokepoint that keeps the board tracking the UI. Every lighting edit
-/// funnels through [`refresh_layers`], which calls this; it (re)starts a single-shot ~250ms timer so a
-/// burst of edits (a knob drag) COALESCES into ONE device re-stream after the quiet settles, instead of
-/// restarting the stream on every emitted value. The fire re-streams the CURRENT stack via the shared
-/// [`apply_current_lighting`] engine (the same one restore + device-switch use), and each re-stream
-/// SUPERSEDES the last — the superseded stream's end callback is swallowed by `anim_is_current`, so a
-/// rapid re-apply never spams "composite ended". Silent by design: it sets the `compositing` indicator
-/// but no status line (the edit handler already narrated the change).
-///
-/// No-op unless lighting has been restored ([`LIGHTING_READY`] — so startup restore, not this, owns the
-/// first apply), writes are armed (`!writes_paused` — the one deliberate "stop"), and the load/profile
-/// paths haven't [`SuppressApply`]-suppressed it. fps is deliberately NOT routed here: it re-paces the
-/// running stream in place (`set_anim_fps`), no restart. The gate is re-checked at fire time (writes may
-/// have paused during the quiet window).
+#[cfg(test)]
+pub(crate) fn restore_during_handoff_for_test(app: &AppWindow, sh: &SharedRt) -> String {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) { HOST_SWITCH_PENDING.store(self.0, std::sync::atomic::Ordering::Release); }
+    }
+    let _reset = Reset(HOST_SWITCH_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel));
+    load_lighting_into_state(app, sh);
+    reapply_all_boards(app, sh)
+}
+
+/// Publish immediately to the selected physical owner; persistence keeps its independent debounce.
 fn schedule_lighting_apply(app: &AppWindow, sh: &SharedRt) {
-    if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    if SUPPRESS_LIGHT_APPLY.with(std::cell::Cell::get) {
-        return;
-    }
-    if app.global::<State>().get_writes_paused() {
-        return;
-    }
-    let back = app.as_weak();
-    let sh = sh.clone();
-    LIGHT_APPLY_TIMER.with(|t| {
-        t.start(
-            slint::TimerMode::SingleShot,
-            std::time::Duration::from_millis(250),
-            move || {
-                if let Some(app) = back.upgrade() {
-                    // re-check the kill-switch: writes may have paused during the debounce window, and
-                    // `apply_current_lighting` also refuses when paused — but bail early to skip the work.
-                    if app.global::<State>().get_writes_paused() {
-                        return;
-                    }
-                    let _ = apply_current_lighting(&app, &sh); // discard the status — auto-apply is silent
-                }
-            },
-        );
-    });
+    if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire)
+        || HOST_SWITCH_PENDING.load(std::sync::atomic::Ordering::Acquire) || SUPPRESS_LIGHT_APPLY.with(std::cell::Cell::get) || app.global::<State>().get_writes_paused() { return; }
+    let _ = apply_current_lighting(app, sh);
 }
 
 /// Restore + RE-APPLY every configured board's persisted lighting ONCE at startup: load the
@@ -9629,8 +9588,8 @@ fn schedule_lighting_apply(app: &AppWindow, sh: &SharedRt) {
 /// the writes-paused gate (the state is still restored; it just isn't streamed until writes
 /// resume — un-pausing re-applies the stack; there is no manual apply now).
 pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
-    let has_surface = load_lighting_into_state(app, sh);
-    if has_surface {
+    load_lighting_into_state(app, sh);
+    {
         let msg = reapply_all_boards(app, sh);
         let (sel, sel_unit) = {
             let s = sh.borrow();
@@ -9655,7 +9614,9 @@ fn commit_custom_layer(sh: &SharedRt, frame: &[Rgb]) {
     let cells: Vec<[u8; 3]> = frame.iter().map(|c| [c.r, c.g, c.b]).collect();
     {
         let mut s = sh.borrow_mut();
+        let id = if s.light_layers.len() == 1 && s.light_layers[0].pattern == "custom" { s.light_layers[0].id } else { None };
         s.light_layers = vec![neuron::pattern::LayerDef {
+            id,
             pattern: "custom".into(),
             frame: cells,
             ..Default::default()
@@ -9673,6 +9634,25 @@ fn commit_custom_layer(sh: &SharedRt, frame: &[Rgb]) {
 /// what makes lighting AUTO-STREAM: no manual apply. Both side effects are debounced + gated (see
 /// `save_lighting` / `schedule_lighting_apply`), so a knob drag collapses to one disk write + one restream.
 pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
+    let edited = {
+        let mut s = sh.borrow_mut();
+        let mut next = s.lighting_id_highwater.max(s.light_layers.iter().filter_map(|d| d.id).map(|id| id.0).max().unwrap_or(0));
+        let missing = s.light_layers.iter().filter(|d| d.id.is_none()).count() as u64;
+        if next.checked_add(missing).is_none() { app.global::<State>().set_status_line("layer identity space exhausted".into()); return; }
+        for layer in s.light_layers.iter_mut().filter(|d| d.id.is_none()) {
+            next += 1; layer.id = Some(neuron::pattern::LayerInstanceId(next));
+        }
+        if let Err(error) = neuron::layers::normalize_ids(&mut s.light_layers) {
+            app.global::<State>().set_status_line(format!("invalid lighting scene: {error}").into());
+            return;
+        }
+        s.lighting_id_highwater = next;
+        let changed = s.projected_scene != s.light_layers;
+        if changed && !SUPPRESS_LIGHT_APPLY.with(std::cell::Cell::get) { s.light_scene_set = true; }
+        let Shared { projected_scene, light_layers, .. } = &mut *s;
+        projected_scene.clone_from(light_layers);
+        changed
+    };
     let (layers, sel) = {
         let s = sh.borrow();
         (s.light_layers.clone(), s.selected_layer)
@@ -9680,17 +9660,19 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
     let n = layers.len();
     let st = app.global::<State>();
     st.set_selected_layer(if n == 0 { -1 } else { sel.min(n - 1) as i32 });
-    st.set_lighting_layer_choices(ModelRc::new(VecModel::from(layers.iter().enumerate().map(|(index, _layer)| {
+    update_value_model(st.get_lighting_layer_choices(), layers.iter().enumerate().map(|(index, _layer)| {
         LightingLayerChoice { index_text: index.to_string().into() }
-    }).collect::<Vec<_>>())));
-    st.set_lighting_layer_labels(ModelRc::new(VecModel::from(layers.iter().enumerate().map(|(index, layer)| {
+    }).collect(), |model| st.set_lighting_layer_choices(model));
+    update_value_model(st.get_lighting_layer_labels(), layers.iter().enumerate().map(|(index, layer)| {
         let name = neuron::pattern::preset_by_slug(&layer.pattern).map_or(layer.pattern.as_str(), |preset| preset.label);
-        format!("{index} · {name}").into()
-    }).collect::<Vec<_>>())));
-    st.set_lighting_preset_choices(ModelRc::new(VecModel::from(neuron::pattern::presets().into_iter().map(|preset| {
-        LightingPresetChoice { slug: preset.slug.into() }
-    }).collect::<Vec<_>>())));
-    st.set_lighting_preset_labels(ModelRc::new(VecModel::from(neuron::pattern::presets().into_iter().map(|preset| preset.label.into()).collect::<Vec<_>>())));
+        format!("{index} \u{00b7} {name}").into()
+    }).collect(), |model| st.set_lighting_layer_labels(model));
+    if st.get_lighting_preset_choices().row_count() == 0 {
+        st.set_lighting_preset_choices(ModelRc::new(VecModel::from(neuron::pattern::presets().into_iter().map(|preset| {
+            LightingPresetChoice { slug: preset.slug.into() }
+        }).collect::<Vec<_>>())));
+        st.set_lighting_preset_labels(ModelRc::new(VecModel::from(neuron::pattern::presets().into_iter().map(|preset| preset.label.into()).collect::<Vec<_>>())));
+    }
     // the unified page + the spectrum editor are projections of the SAME stack — keep them in lockstep.
     refresh_light_unified(app, sh);
     // It's a no-op until restore has run (LIGHTING_READY) and is never reached from the animate loop —
@@ -9698,7 +9680,8 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
     save_lighting(sh);
     // …and push the edit to the physical board — debounced, gated on LIGHTING_READY + !writes_paused, and
     // skipped when a load/profile path suppressed it (those stream explicitly). fps doesn't route here.
-    schedule_lighting_apply(app, sh);
+    if edited { schedule_lighting_apply(app, sh); } else { sh.borrow_mut().light_transition = neuron::pattern::TransitionHint::Edit; }
+    request_light_render(app, sh);
 }
 
 // ── THE UNIFIED LIGHTING SURFACE — tiles + auto-rendered knobs over the layer stack ───────────
@@ -9749,60 +9732,13 @@ fn preset_layer(slug: &str) -> neuron::pattern::LayerDef {
     neuron::pattern::preset_layer(slug).unwrap_or_default()
 }
 
-/// Render a `rows*cols` device frame into a small preview Image at the tile's pixel size — the
-/// MATERIAL-card pattern: each cell becomes a block, lit on the void. Cheap (tiles are ~110px) and
-/// the swatch literally IS the effect running, so the grid reads as a wall of live previews.
-fn frame_to_preview(frame: &[Rgb], rows: usize, cols: usize) -> Image {
-    // a small canvas — block-fill per cell with a 1px gutter so the lattice reads. Kept LEAN: the
-    // tile shows this upscaled (image-fit fills the card), so 6px cells look identical to the old
-    // 9px ones at half the pixel-fill + GPU texture-upload cost — and this runs per-tile per-tick.
-    let (cell, gap, pad) = (6usize, 1usize, 3usize);
-    let w = pad * 2 + cols * cell + cols.saturating_sub(1) * gap;
-    let h = pad * 2 + rows * cell + rows.saturating_sub(1) * gap;
-    let (w, h) = (w.max(1), h.max(1));
-    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
-    {
-        let px = buf.make_mut_slice();
-        // ground = the void
-        for p in px.iter_mut() {
-            *p = Rgba8Pixel {
-                r: 4,
-                g: 5,
-                b: 6,
-                a: 255,
-            };
-        }
-        for r in 0..rows {
-            for c in 0..cols {
-                let col = frame.get(r * cols + c).copied().unwrap_or(Rgb::BLACK);
-                let x0 = pad + c * (cell + gap);
-                let y0 = pad + r * (cell + gap);
-                for yy in y0..y0 + cell {
-                    for xx in x0..x0 + cell {
-                        if xx < w && yy < h {
-                            let i = yy * w + xx;
-                            px[i] = Rgba8Pixel {
-                                r: col.r,
-                                g: col.g,
-                                b: col.b,
-                                a: 255,
-                            };
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Image::from_rgba8(buf)
-}
-
 /// A representative AMBIENT frame for the tile thumbnail when ambient ISN'T the selected effect — a
 /// calm horizontal hue sweep, brighter at the top, so the tile still reads as a screen-mirror. The
 /// LIVE whole-desktop capture (`screen_ambient`, measured at ~41ms PER GRAB, ~450ms/s when always-on)
 /// is then driven ONLY by the selected ambient effect's big preview + the device stream — never by a
 /// postage-stamp thumbnail. Mirrors the `preview_vitals` pattern: the tile shows what the surface
 /// LOOKS like without paying its live cost.
-fn preview_ambient_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+pub(crate) fn preview_ambient_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
     // a slow hue drift sells "mirrors whatever is on screen" without paying the capture cost.
@@ -9823,7 +9759,7 @@ fn preview_ambient_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
 /// The LIVE typing-reactivity plays only on the SELECTED effect's big preview + the device stream (both
 /// read keys live). It samples the SAME thermal spectrum the device renders, across a synthetic heat
 /// field (a warm bed brightest mid-board, with two hot flares).
-fn preview_thermal_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+pub(crate) fn preview_thermal_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = neuron::pattern::default_spectrum("thermal").unwrap_or_default();
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
@@ -9859,7 +9795,7 @@ fn preview_thermal_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
 /// honest live render is a permanently black square in the catalog (it read as a broken tile, not
 /// a quiet one). Same convention as [`preview_thermal_frame`]: the still shows what the effect IS;
 /// the real input-reactivity plays on the selected big preview + the device stream.
-fn preview_reactive_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+pub(crate) fn preview_reactive_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = preset_layer("reactive").spectrum;
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
@@ -9894,7 +9830,7 @@ fn preview_reactive_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
 
 /// A representative RIPPLE frame for the tile thumbnail — one ring caught mid-expansion. Same
 /// input-driven-effect problem and same still-frame convention as [`preview_reactive_frame`].
-fn preview_ripple_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+pub(crate) fn preview_ripple_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = preset_layer("ripple").spectrum;
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
@@ -9921,7 +9857,7 @@ fn preview_ripple_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
 /// A synthetic VITALS story for the data tile's PREVIEW — the gauge drains, then charges back up, on
 /// a slow loop. Demonstrates battery→gauge without polling hardware every tick; the live applied
 /// stream reads the real device's heartbeat feed.
-fn preview_vitals(t: f32) -> neuron::lighting::Vitals {
+pub(crate) fn preview_vitals(t: f32) -> neuron::lighting::Vitals {
     let p = (t / 14.0).fract();
     // first half: draining 90→20 (not charging); second half: charging 20→90.
     let (pct, charging) = if p < 0.5 {
@@ -9942,7 +9878,7 @@ fn preview_vitals(t: f32) -> neuron::lighting::Vitals {
 /// meter does to the device. Synthetic on purpose: the live analyser reads silence as black, and a
 /// black catalog tile reads as broken, not quiet (the honest live render plays on the selected
 /// preview + the device).
-fn preview_meter_demo_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+pub(crate) fn preview_meter_demo_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = preset_layer("audiometer").spectrum;
     let (r, c) = (rows as usize, cols as usize);
     // loudness pumps at roughly a beat; tone wanders slowly across the spectrum.
@@ -9956,7 +9892,7 @@ fn preview_meter_demo_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
 /// that switches on, holds, and drops to a faint standby, looping. Each slug paints a DIFFERENT
 /// patch shape so the three stop being identical solid walls: On Air a centred banner, Mic Light a
 /// bottom-left cluster (where a mute key lives), Mode Held a left-edge column (a held modifier).
-fn preview_indicator_frame(slug: &str, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+pub(crate) fn preview_indicator_frame(slug: &str, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = preset_layer(slug).spectrum;
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
@@ -10000,7 +9936,7 @@ fn preview_indicator_frame(slug: &str, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
 
 /// A demo SIGNAL frame — the level sweeps 0→1 and the board reads it along the urgency ramp
 /// (green → amber → red) while the lit fraction grows with it: a macro-driven gauge, demonstrated.
-fn preview_signal_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+pub(crate) fn preview_signal_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = preset_layer("signal").spectrum;
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
@@ -10015,299 +9951,383 @@ fn preview_signal_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     f
 }
 
-/// Render the whole tile grid — each tile a live (effects) or representative (data) preview at time
-/// `t`. Effects run the SAME `Compositor` the device does (one preset layer); the data tile runs
-/// `render_vitals`; the audiometer tile reads the shared `audio_spectrum` analyser, pointed at the
-/// SAME source as the device/main-preview so the thumbnail matches the board instead of faking it.
-fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
-    let (rows, cols) = sh.borrow().rt.grid_dims();
-    if rows == 0 || cols == 0 {
-        let state = app.global::<State>();
-        state.set_light_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
-        state.set_light_input_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
-        state.set_light_data_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
-        return;
-    }
-    let (ru, cu) = (rows as usize, cols as usize);
-    // The audiometer thumbnail must request the SAME source as the device + big preview, else the two
-    // callers fight over the single global provider (and its focus should show the register the user
-    // actually configured). Resolve both from the configured meter layer in the stack, else the
-    // preset defaults (speakers, auto).
-    let (audio_source, audio_focus): (f32, f32) = sh
-        .borrow()
-        .light_layers
-        .iter()
-        .find(|d| d.pattern == "meter")
-        .map_or((0.0, 0.0), |d| (d.params.f32("source", 0.0), d.params.f32("focus", 0.0)));
-    // cache one COMPOSITOR per effect across ticks so stateful patterns (heat/sparkle/streak — and
-    // the audio meter's per-instance level ballistics) animate; keyed by slug. Rebuilt only when
-    // the grid dims change.
-    thread_local! {
-        static COMPS: RefCell<(u8, u8, std::collections::HashMap<&'static str, neuron::pattern::Compositor>)> =
-            RefCell::new((0, 0, std::collections::HashMap::new()));
-        // the audiometer tile's last-seen (source, focus) — a knob flip drops its cached compositor
-        // so the tile re-points at once instead of animating the stale config.
-        static METER_KNOBS: std::cell::Cell<(f32, f32)> =
-            const { std::cell::Cell::new((f32::NAN, f32::NAN)) };
-    }
-    METER_KNOBS.with(|k| {
-        if k.get() != (audio_source, audio_focus) {
-            k.set((audio_source, audio_focus));
-            COMPS.with(|c| {
-                c.borrow_mut().2.remove("audiometer");
-            });
-        }
-    });
-    let phase = (t * 0.18).rem_euclid(1.0); // for render_vitals' charging crest
-    // which effect is live on the hero render — the only tile that may pay LIVE-input costs. A
-    // thumbnail that isn't the selected effect renders a representative still instead of driving the
-    // heavy provider (the screen capture) — that's the always-on capture this page used to leave
-    // running the whole time the LIGHTING page was open.
-    let selected = app.global::<State>().get_light_effect().to_string();
-    let prof = tile_prof_on();
-    // INERT in prod: when `NEURON_PROF` is unset, `prof` is false and every `Instant::now()` below is
-    // skipped via `bool::then`, so the render path pays nothing for the instrumentation.
-    let tick_start = prof.then(std::time::Instant::now);
-    let mut prof_rows: Vec<(&'static str, f64, f64)> = Vec::new();
-    // SUPPRESS the per-key `GetAsyncKeyState` scan for the whole thumbnail pass: the ignite/ring/
-    // streak/thermal patterns poll all 256 VKs per frame for live reactivity that's invisible at
-    // thumbnail size (and the selected effect's big preview + the device stream still scan live).
-    // Dropped at the end of the tile loop. ~765 syscalls/tick removed.
-    let _no_keys = neuron::capture::suppress_key_reads();
-    // the last frame each tile showed — an unchanged frame skips BOTH the pixel-fill conversion and
-    // the model write (no texture re-upload), which zeroes the steady-state cost of every tile that
-    // isn't actually animating right now (Static, the idle half of an indicator's blink, stubs).
-    thread_local! {
-        static LAST_FRAMES: RefCell<std::collections::HashMap<&'static str, Vec<Rgb>>> =
-            RefCell::new(std::collections::HashMap::new());
-    }
-    struct TileRow {
-        spec: TileSpec,
-        frame: Vec<Rgb>,
-        changed: bool,
-    }
-    let entries: Vec<TileRow> = light_tile_catalog()
-        .into_iter()
-        .map(|spec| {
-            let slug = spec.slug;
-            let g0 = prof.then(std::time::Instant::now);
-            let frame: Vec<Rgb> = match slug {
-                // the VITALS readout tile renders through the SAME proportional renderer the APPLIED layer
-                // uses (`pattern::render_vitals_bounds` over the full board) — NOT the key-anchored
-                // `lighting::render_vitals` — so the swatch matches the composited surface at any grid size
-                // (a zone/mouse grid included) instead of reading ~all-black off a real keyboard's keys.
-                // Fed a SYNTHETIC drain→charge story so the gauge demonstrably tracks a battery without
-                // polling hardware per thumbnail; the live big-preview + device stream read the heartbeat feed.
-                "vitals" => neuron::pattern::render_vitals_bounds(
-                    preview_vitals(t),
-                    rows,
-                    cols,
-                    neuron::pattern::Bounds::board(rows, cols),
-                    phase,
-                ),
-                // the GATED indicator tiles (on air / mic light / mode held): a looping DEMO of the
-                // gate itself — a painted patch switches on, holds, drops to standby. The real
-                // patterns render dark unless their truth is actually on (honest on the device, but
-                // an unreadable black square in a catalog); the applied layer shows the real gate.
-                "onair" | "miclight" | "modeheld" => preview_indicator_frame(slug, rows, cols, t),
-                // SIGNAL: the macro-driven level sweeps the urgency ramp, demonstrated.
-                "signal" => preview_signal_frame(rows, cols, t),
-                // the audiometer thumbnail: run the REAL meter (the shared, fast, idle-auto-stopping
-                // `audio_spectrum` provider) ONLY while audiometer is the selected effect — the hero
-                // preview + device already pay for a live analyser then, and the two stay in step.
-                // Unselected, the tile plays a synthetic loudness/tone demo instead: the live render
-                // reads silence as BLACK, and a black catalog tile reads broken, not quiet.
-                "audiometer" if selected == "audiometer" => COMPS.with(|c| {
-                    let mut c = c.borrow_mut();
-                    if c.0 != rows || c.1 != cols {
-                        *c = (rows, cols, std::collections::HashMap::new());
+fn apply_imported_lighting(app: &AppWindow, sh: &SharedRt, result: Result<neuron::import::Imported, String>) {
+    let st = app.global::<State>();
+    match result {
+        Ok(imp) => {
+            // Lighting now flows as ONE representation: the profile's compositor stack
+            // (`Vec<LayerDef>`). Import pours that stack straight into the live
+            // compositor. If the stack carries a `custom` hand-painted/imported frame
+            // layer, ALSO drop its cells on the paint canvas so the user can edit it.
+            let layers: Vec<neuron::pattern::LayerDef> =
+                imp.profile.lighting.clone();
+            if layers.is_empty() {
+                let note = imp.notes.first().cloned().unwrap_or_default();
+                st.set_status_line(
+                    format!("no lighting in that export{}", if note.is_empty() { String::new() } else { format!(" — {note}") }).into(),
+                );
+            } else {
+                let n = layers.len();
+                // the raw cells of a `custom` layer, if one rode in (edit on the canvas).
+                let custom_cells: Option<Vec<[u8; 3]>> = layers
+                    .iter()
+                    .find(|l| l.pattern == "custom")
+                    .map(|l| l.frame.clone());
+                {
+                    let mut s = sh.borrow_mut();
+                    s.light_layers = neuron::layers::instantiate(&s.light_layers, &layers).unwrap_or(layers);
+                    s.selected_layer = s.light_layers.len().saturating_sub(1);
+                    s.active_frame = 0;
+                    s.layers_rev += 1;
+                }
+                if let Some(cells) = custom_cells {
+                    // paint the custom frame onto the canvas + enter paint mode.
+                    let (rows, cols) = (st.get_grid_rows(), st.get_grid_cols());
+                    let count = (rows.max(0) * cols.max(0)) as usize;
+                    let mut px: Vec<slint::Color> = cells
+                        .iter()
+                        .take(count)
+                        .map(|c| grid_display(c[0], c[1], c[2]))
+                        .collect();
+                    while px.len() < count {
+                        px.push(GRID_OFF);
                     }
-                    let comp = c.2.entry(slug).or_insert_with(|| {
-                        let mut layer = preset_layer("audiometer");
-                        layer.params.set("source", audio_source);
-                        layer.params.set("focus", audio_focus);
-                        neuron::pattern::Compositor::from_defs(&[layer])
-                    });
-                    comp.render(rows, cols, t)
-                }),
-                "audiometer" => preview_meter_demo_frame(rows, cols, t),
-                // TYPING HEAT / REACTIVE / RIPPLE: input-driven, and the thumbnail pass suppresses
-                // live key reads — so each plays a looping phantom-input DEMO of its press→light
-                // story instead of the old frozen still (or worse, permanent black). The real input
-                // reactivity plays on the selected big preview + the device stream.
-                "typingheat" => preview_thermal_frame(rows, cols, t),
-                "reactive" => preview_reactive_frame(rows, cols, t),
-                "ripple" => preview_ripple_frame(rows, cols, t),
-                // AMBIENT thumbnail: render LIVE (driving the whole-desktop capture) ONLY when ambient
-                // is the selected effect — then the big preview + device stream already run the capture.
-                // Otherwise a drifting representative still touches no provider (no ~41ms/grab StretchBlt).
-                "ambient" if selected != "ambient" => preview_ambient_frame(rows, cols, t),
-                _ => COMPS.with(|c| {
-                    let mut c = c.borrow_mut();
-                    if c.0 != rows || c.1 != cols {
-                        *c = (rows, cols, std::collections::HashMap::new());
-                    }
-                    let comp = c
-                        .2
-                        .entry(slug)
-                        .or_insert_with(|| neuron::pattern::Compositor::from_defs(&[preset_layer(slug)]));
-                    comp.render(rows, cols, t)
-                }),
-            };
-            if let Some(g0) = g0 {
-                prof_rows.push((slug, g0.elapsed().as_nanos() as f64 / 1000.0, 0.0));
-            }
-            let changed = LAST_FRAMES.with(|l| {
-                let mut l = l.borrow_mut();
-                if l.get(slug) == Some(&frame) {
-                    false
+                    st.set_grid_px(ModelRc::new(VecModel::from(px)));
+                    st.set_light_paint_mode(true);
                 } else {
-                    l.insert(slug, frame.clone());
-                    true
+                    st.set_light_paint_mode(false);
                 }
-            });
-            TileRow { spec, frame, changed }
-        })
-        .collect();
-    let u0 = prof.then(std::time::Instant::now);
-    let make_tile = |row: &TileRow| EffectTile {
-        name: row.spec.name.into(),
-        slug: row.spec.slug.into(),
-        kind: row.spec.group.into(),
-        blurb: row.spec.blurb.into(),
-        source: row.spec.source.into(),
-        swatch: frame_to_preview(&row.frame, ru, cu),
-        pairs: pair_chips(row.spec.slug),
-    };
-    // THREE shelf models (effects / input-driven / data-fed), each updated the same way. UPDATE rows
-    // IN PLACE, never replace a model: swapping the ModelRc destroys + recreates every `for`-item in
-    // the grid — each tile card and its TouchArea — so `has-hover` reset to false on every 120ms tick
-    // and a hovered card kept dropping its hover/lift until the mouse moved again (the "card
-    // unfocuses after a cycle" bug). A row write updates the LIVE item (only its swatch binding
-    // re-evaluates), an UNCHANGED row isn't written at all, and a model is rebuilt only when its
-    // tile count changes.
-    let state = app.global::<State>();
-    for (group, existing, install) in [
-        ("effect", state.get_light_tiles(), Box::new(|m| state.set_light_tiles(m)) as Box<dyn Fn(ModelRc<EffectTile>)>),
-        ("input", state.get_light_input_tiles(), Box::new(|m| state.set_light_input_tiles(m))),
-        ("data", state.get_light_data_tiles(), Box::new(|m| state.set_light_data_tiles(m))),
-    ] {
-        let shelf: Vec<&TileRow> = entries.iter().filter(|e| e.spec.group == group).collect();
-        match existing.as_any().downcast_ref::<VecModel<EffectTile>>() {
-            Some(vm) if vm.row_count() == shelf.len() => {
-                for (i, row) in shelf.iter().enumerate() {
-                    if row.changed {
-                        vm.set_row_data(i, make_tile(row));
-                    }
-                }
+                refresh_layers(app, sh);
+                st.set_status_line(format!("imported {n} layer(s)").into());
             }
-            _ => install(ModelRc::new(VecModel::from(
-                shelf.iter().map(|r| make_tile(r)).collect::<Vec<_>>(),
-            ))),
+        }
+        Err(e) => st.set_status_line(format!("import failed: {e}").into()),
+    }
+}
+
+fn refresh_user_effect_tiles(app: &AppWindow, sh: &SharedRt) {
+    poll_saved_effects(app, sh, true);
+}
+
+#[derive(Default)]
+struct LightPreview {
+    desired: crate::light_render::DesiredSurfaceState,
+    saved: crate::light_metadata::SavedCatalog,
+    last_rgb: HashMap<crate::light_render::SurfaceId, std::sync::Arc<[Rgb]>>,
+    live_seen: Option<(neuron::pattern::SurfaceIdentity, u64, u64)>,
+    rejected_seen: Option<(u64, u64)>,
+    saved_images: HashMap<crate::light_render::SurfaceId, (usize, std::time::Instant)>,
+    last_catalog_check: Option<std::time::Instant>,
+    catalog_pending: bool,
+}
+
+thread_local! {
+    static LIGHT_PREVIEW: RefCell<LightPreview> = RefCell::new(LightPreview::default());
+}
+
+fn init_light_tile_metadata(app: &AppWindow, _sh: &SharedRt) {
+    let st = app.global::<State>();
+    for (group, existing, swatches, install, install_swatches) in [
+        ("effect", st.get_light_tiles(), st.get_light_swatches(), Box::new(|m| st.set_light_tiles(m)) as Box<dyn Fn(ModelRc<EffectTileMeta>)>, Box::new(|m| st.set_light_swatches(m)) as Box<dyn Fn(ModelRc<Image>)>),
+        ("input", st.get_light_input_tiles(), st.get_light_input_swatches(), Box::new(|m| st.set_light_input_tiles(m)), Box::new(|m| st.set_light_input_swatches(m))),
+        ("data", st.get_light_data_tiles(), st.get_light_data_swatches(), Box::new(|m| st.set_light_data_tiles(m)), Box::new(|m| st.set_light_data_swatches(m))),
+    ] {
+        let rows: Vec<_> = light_tile_catalog().into_iter().filter(|t| t.group == group).collect();
+        if existing.row_count() != rows.len() {
+            install_swatches(ModelRc::new(VecModel::from(vec![Image::default(); rows.len()])));
+            install(ModelRc::new(VecModel::from(rows.iter().map(|t| EffectTileMeta {
+                name: t.name.into(), slug: t.slug.into(), kind: t.group.into(), blurb: t.blurb.into(),
+                source: t.source.into(), pairs: pair_chips(t.slug),
+            }).collect::<Vec<_>>())));
+        } else if swatches.row_count() != rows.len() {
+            install_swatches(ModelRc::new(VecModel::from(vec![Image::default(); rows.len()])));
         }
     }
-    if let (Some(u0), Some(tick_start)) = (u0, tick_start) {
-        let upload_us = u0.elapsed().as_nanos() as f64 / 1000.0;
-        let tick_us = tick_start.elapsed().as_nanos() as f64 / 1000.0;
-        tile_prof_accumulate(tick_us, upload_us, &prof_rows);
-    }
+    LIGHT_PREVIEW.with(|p| rebuild_preview_tiles(&mut p.borrow_mut()));
 }
 
-/// Rebuild the YOUR-EFFECTS shelf — one live tile per saved effect, each rendering its OWN saved stack
-/// through the same [`neuron::pattern::Compositor`] the device does, so the thumbnail is the look
-/// itself rather than a stand-in.
-///
-/// Deliberately its OWN pass, not a fourth arm of [`render_light_tiles`]: the built-in catalog is keyed
-/// by `&'static str` preset slugs and its per-slug match arms are exhaustive over those, whereas a
-/// saved effect's slug is derived from the user's own name and its frame comes from a whole stack.
-/// Keeping it separate leaves that hot path untouched.
-///
-/// The per-effect [`neuron::pattern::Compositor`]s are cached across calls by slug, so stateful patterns
-/// (fire, sparkle) animate instead of restarting each tick, and the cache is dropped wholesale when the
-/// grid's shape changes. Rows are written IN PLACE (never a model swap) for the same reason the preset
-/// shelves do it: replacing the model rebuilds every card and drops its hover state.
-fn refresh_user_effect_tiles(app: &AppWindow, sh: &SharedRt) {
-    render_user_effect_tiles(app, sh, true);
+fn rebuild_preview_tiles(p: &mut LightPreview) {
+    use crate::light_render::{SurfaceId, Tile};
+    let mut counts = [0; 4];
+    let mut tiles: Vec<Tile> = light_tile_catalog().into_iter().map(|t| {
+        let shelf = match t.group { "input" => 1, "data" => 2, _ => 0 };
+        let row = counts[shelf];
+        counts[shelf] += 1;
+        Tile { id: SurfaceId::Preset(t.slug.into()), shelf, row, layers: vec![preset_layer(t.slug)].into() }
+    }).collect();
+    tiles.extend(p.saved.iter().enumerate().map(|(row, (slug, effect))| Tile {
+        id: SurfaceId::Saved(slug.clone()), shelf: 3, row, layers: effect.layers.clone(),
+    }));
+    for tile in tiles.iter_mut().filter(|tile| matches!(tile.id, SurfaceId::Preset(_))) {
+        let previous = p.desired.tiles.iter().find(|old| old.id == tile.id).map_or(&[][..], |old| old.layers.as_ref());
+        tile.layers = crate::light_render::identify_layers(previous, &tile.layers);
+    }
+    p.desired.tiles = tiles.into();
 }
 
-fn render_user_effect_tiles(app: &AppWindow, sh: &SharedRt, reload: bool) {
-    let state = app.global::<State>();
-    let (rows, cols) = sh.borrow().rt.grid_dims();
-    if rows == 0 || cols == 0 {
-        state.set_light_user_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
-        return;
+fn ui_grid_dims(st: &State) -> (u8, u8) {
+    (st.get_grid_rows().clamp(0, i32::from(u8::MAX)) as u8,
+        st.get_grid_cols().clamp(0, i32::from(u8::MAX)) as u8)
+}
+
+fn request_light_render(app: &AppWindow, sh: &SharedRt) {
+    let _timing = crate::ui_prof::Scope::new("light_request");
+    let st = app.global::<State>();
+    let dims = ui_grid_dims(&st);
+    let mut shared = sh.borrow_mut();
+    LIGHT_PREVIEW.with(|p| {
+        let mut p = p.borrow_mut();
+        let target_changed = p.desired.target.pid != shared.rt.selected_pid
+            || p.desired.target.unit != shared.rt.selected_unit || p.desired.dims != dims;
+        if target_changed {
+            p.desired.target = crate::light_render::Target {
+                pid: shared.rt.selected_pid, unit: shared.rt.selected_unit.clone(),
+                epoch: p.desired.target.epoch.wrapping_add(1),
+            };
+            p.desired.dims = dims;
+            p.last_rgb.clear();
+        }
+        if target_changed || p.desired.content_rev != shared.layers_rev || p.desired.layers.len() != shared.light_layers.len() {
+            let old = &p.desired.layers;
+            let next = &shared.light_layers;
+            let identified = crate::light_render::identify_layers(old, next);
+            if !old.iter().map(|d| d.id).eq(identified.iter().map(|d| d.id))
+                || !old.iter().map(|d| &d.pattern).eq(identified.iter().map(|d| &d.pattern)) {
+                p.desired.structure_generation = p.desired.structure_generation.wrapping_add(1);
+            }
+            for (layer, identity) in shared.light_layers.iter_mut().zip(identified.iter()) { layer.id = identity.id; }
+            p.desired.layers = identified;
+            p.desired.content_rev = shared.layers_rev;
+        }
+        p.desired.selected = if !st.get_light_user_effect().is_empty() {
+            Some(crate::light_render::SurfaceId::Saved(st.get_light_user_effect().to_string()))
+        } else if !st.get_light_effect().is_empty() {
+            Some(crate::light_render::SurfaceId::Preset(st.get_light_effect().to_string()))
+        } else { None };
+        p.desired.active = st.get_window_shown() && st.get_page() == 1;
+        p.desired.hero = st.get_light_hero_visible() && !st.get_light_brush_on()
+            && !shared.rt.animating(shared.rt.selected_pid, &shared.rt.selected_unit);
+        p.desired.fps = shared.rt.light_fps.load(std::sync::atomic::Ordering::Relaxed);
+        crate::light_render::request(p.desired.clone());
+    });
+}
+
+fn refresh_live_base(app: &AppWindow, sh: &SharedRt) {
+    let st = app.global::<State>();
+    if !st.get_window_shown() || st.get_page() != 1 || !st.get_light_hero_visible() || st.get_light_brush_on() { return; }
+    let s = sh.borrow();
+    let Some(handle) = s.rt.base_scene(s.rt.selected_pid, &s.rt.selected_unit) else { return; };
+    if let Some((revision, error)) = handle.rejected() {
+        LIGHT_PREVIEW.with(|preview| {
+            let mut p = preview.borrow_mut();
+            if p.rejected_seen != Some((handle.generation(), revision)) {
+                st.set_status_line(format!("lighting scene rejected: {error}").into());
+                p.rejected_seen = Some((handle.generation(), revision));
+            }
+        });
     }
-    struct CachedEffect {
-        slug: String,
-        effect: neuron::user_effects::UserEffect,
-        comp: neuron::pattern::Compositor,
-    }
-    struct Shelf {
-        dims: (u8, u8),
-        checked: Option<std::time::Instant>,
-        entries: Vec<CachedEffect>,
-    }
+    let Some(frame) = handle.latest() else { return; };
+    if frame.target.pid != s.rt.selected_pid || frame.target.unit != s.rt.selected_unit || frame.target.dimensions != ui_grid_dims(&st) { return; }
+    LIGHT_PREVIEW.with(|preview| {
+        let mut p = preview.borrow_mut();
+        let identity = (frame.target.clone(), frame.owner_generation, frame.frame_id);
+        if p.last_rgb.contains_key(&crate::light_render::SurfaceId::Hero)
+            && p.live_seen.as_ref().is_some_and(|old| old.0 == identity.0 && old.1 == identity.1 && old.2 >= identity.2) { return; }
+        let id = crate::light_render::SurfaceId::Hero;
+        if p.last_rgb.get(&id).is_none_or(|old| **old != *frame.pixels) {
+            update_grid_model(&st, frame.pixels.iter().map(|c| grid_display(c.r, c.g, c.b)).collect());
+            p.last_rgb.insert(id, frame.pixels.clone());
+        }
+        p.live_seen = Some(identity);
+    });
+}
+
+/// Ownership maintenance also runs when paint or scrolling suspends the hero.
+fn refresh_light_owner(app: &AppWindow, sh: &SharedRt) {
+    let _timing = crate::ui_prof::Scope::new("light_owner");
     thread_local! {
-        static SHELF: RefCell<Shelf> = const { RefCell::new(Shelf {
-            dims: (0, 0), checked: None, entries: Vec::new(),
-        }) };
+        static LAST: RefCell<Option<std::time::Instant>> = const { RefCell::new(None) };
+        static SEEN: Cell<u64> = const { Cell::new(0) };
     }
-    // ONE clock for the whole pass, so every user tile is a frame of the same instant (a shelf whose
-    // tiles drift out of step with each other reads as several unrelated clocks).
-    let t = neuron::pattern::render_elapsed();
-    let mut built: Vec<EffectTile> = Vec::new();
-    SHELF.with(|c| {
-        let mut c = c.borrow_mut();
-        let resized = c.dims != (rows, cols);
-        // External CLI edits are picked up without putting filesystem reads on every animation tick.
-        if reload || resized || c.checked.is_none_or(|t| t.elapsed().as_secs() >= 2) {
-            if let Ok(saved) = neuron::user_effects::list() {
-                let mut old = std::mem::take(&mut c.entries);
-                c.entries = saved.into_iter().filter_map(|(slug, _, _)| {
-                    let effect = neuron::user_effects::load(&slug).ok()?;
-                    if !resized {
-                        if let Some(i) = old.iter().position(|e| e.slug == slug && e.effect == effect) {
-                            return Some(old.remove(i));
+    let dirty = SEEN.with(crate::host::take_host_events_dirty);
+    let due = LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        if !dirty && last.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1)) { return false; }
+        *last = Some(std::time::Instant::now());
+        true
+    });
+    if !due { return; }
+    let (pid, unit) = { let s = sh.borrow(); (s.rt.selected_pid, s.rt.selected_unit.clone()) };
+    use crate::host::BoardOwner::{Yours, Painting, Suppressed};
+    let (painting, suppressed, name) = match crate::host::board_owner(pid, &unit) {
+        Yours => (false, false, String::new()),
+        Painting(name) => (true, false, name),
+        Suppressed(name) => (false, true, name),
+    };
+    let st = app.global::<State>();
+    st.set_light_foreign(painting);
+    st.set_light_suppressed(suppressed);
+    st.set_light_foreign_app(name.into());
+}
+
+fn install_saved_catalog(app: &AppWindow, result: Result<crate::light_metadata::SavedCatalog, String>) {
+    LIGHT_PREVIEW.with(|p| {
+        let mut p = p.borrow_mut();
+        p.catalog_pending = false;
+        match result {
+            Ok(saved) if !std::sync::Arc::ptr_eq(&p.saved, &saved) => {
+                let st = app.global::<State>();
+                let rows = saved.iter().map(|(slug, effect)| EffectTileMeta {
+                    name: effect.name.clone().into(), slug: format!("{USER_TILE_PREFIX}{slug}").into(),
+                    kind: "effect".into(), blurb: effect.blurb.clone().into(),
+                    source: "".into(), pairs: ModelRc::default(),
+                }).collect::<Vec<_>>();
+                let old_meta = st.get_light_user_tiles();
+                let old_swatches = st.get_light_user_swatches();
+                let same_order = p.saved.iter().map(|(slug, _)| slug)
+                    .eq(saved.iter().map(|(slug, _)| slug));
+                if same_order {
+                    if let Some(model) = old_meta.as_any().downcast_ref::<VecModel<EffectTileMeta>>() {
+                        for (index, next) in rows.into_iter().enumerate() {
+                            if model.row_data(index).is_none_or(|old| old.name != next.name || old.blurb != next.blurb) {
+                                model.set_row_data(index, next);
+                            }
                         }
                     }
-                    let comp = neuron::pattern::Compositor::from_defs(&effect.layers);
-                    Some(CachedEffect { slug, effect, comp })
-                }).collect();
+                } else {
+                    let images = saved.iter().map(|(slug, _)| {
+                        p.saved.iter().position(|(old, _)| old == slug)
+                            .and_then(|index| old_swatches.row_data(index)).unwrap_or_default()
+                    }).collect::<Vec<_>>();
+                    st.set_light_user_swatches(ModelRc::new(VecModel::from(images)));
+                    st.set_light_user_tiles(ModelRc::new(VecModel::from(rows)));
+                }
+                p.last_rgb.retain(|id, _| match id {
+                    crate::light_render::SurfaceId::Saved(slug) => saved.iter().any(|(current, _)| current == slug),
+                    _ => true,
+                });
+                p.saved_images.retain(|id, _| match id {
+                    crate::light_render::SurfaceId::Saved(slug) => saved.iter().any(|(current, _)| current == slug),
+                    _ => false,
+                });
+                p.saved = saved;
+                p.desired.layout_generation = p.desired.layout_generation.wrapping_add(1);
+                rebuild_preview_tiles(&mut p);
             }
-            c.dims = (rows, cols);
-            c.checked = Some(std::time::Instant::now());
-        }
-        let _quiet = neuron::capture::suppress_key_reads();
-        for cached in &mut c.entries {
-            let slug = &cached.slug;
-            let effect = &cached.effect;
-            let frame = cached.comp.render(rows, cols, t);
-            built.push(EffectTile {
-                name: effect.name.clone().into(),
-                slug: format!("{USER_TILE_PREFIX}{slug}").into(),
-                kind: "effect".into(),
-                blurb: user_effect_blurb(&layers_blurb(&effect.layers), &effect.tags).into(),
-                source: String::new().into(),
-                swatch: frame_to_preview(&frame, usize::from(rows), usize::from(cols)),
-                pairs: ModelRc::default(),
-            });
+            Err(e) => eprintln!("neuron: saved lighting catalog unavailable ({e})"),
+            _ => {}
         }
     });
-    let existing = state.get_light_user_tiles();
-    match existing.as_any().downcast_ref::<VecModel<EffectTile>>() {
-        Some(vm) if vm.row_count() == built.len() => {
-            for (i, row) in built.into_iter().enumerate() {
-                vm.set_row_data(i, row);
+    UI_SHARED.with(|s| { if let Some(sh) = s.borrow().as_ref() { request_light_render(app, sh); } });
+}
+
+fn poll_saved_effects(app: &AppWindow, _sh: &SharedRt, force: bool) {
+    let due = LIGHT_PREVIEW.with(|p| {
+        let mut p = p.borrow_mut();
+        if !force && (p.catalog_pending || p.last_catalog_check.is_some_and(|t| t.elapsed().as_secs() < 2)) { return false; }
+        p.catalog_pending = true;
+        p.last_catalog_check = Some(std::time::Instant::now());
+        true
+    });
+    if !due { return; }
+    let weak = app.as_weak();
+    let accepted = crate::light_metadata::submit(
+        crate::light_metadata::catalog,
+        move |result| {
+            let Some(app) = weak.upgrade() else { return; };
+            install_saved_catalog(&app, result);
+        },
+    );
+    if let Err(e) = accepted {
+        LIGHT_PREVIEW.with(|p| p.borrow_mut().catalog_pending = false);
+        eprintln!("neuron: saved lighting catalog request failed ({e})");
+    }
+}
+
+/// Complete frames are diffed against acknowledged UI state, never unpresented worker history.
+pub(crate) fn publish_light_frames() {
+    let started = std::time::Instant::now();
+    let frames = crate::light_render::take_completed();
+    let Some(app) = UI.get().and_then(slint::Weak::upgrade) else { return; };
+    let acknowledged = apply_light_frames(&app, frames);
+    crate::light_render::record_publication(started.elapsed(), acknowledged);
+}
+
+fn apply_light_frames(app: &AppWindow, frames: Vec<crate::light_render::CompletedFrame>) -> Option<std::time::Instant> {
+    let _timing = crate::ui_prof::Scope::new("light_publish");
+    let st = app.global::<State>();
+    let live_owner = UI_SHARED.with(|s| s.borrow().as_ref().is_some_and(|sh| {
+        let s = sh.borrow(); s.rt.animating(s.rt.selected_pid, &s.rt.selected_unit)
+    }));
+    let mut acknowledged: Option<std::time::Instant> = None;
+    LIGHT_PREVIEW.with(|p| {
+        let mut p = p.borrow_mut();
+        for frame in frames {
+            if !p.desired.active || frame.target != p.desired.target || frame.dims != p.desired.dims { continue; }
+            let hero = frame.id == crate::light_render::SurfaceId::Hero;
+            if hero {
+                if live_owner || !p.desired.hero || st.get_light_brush_on() || frame.content_rev != p.desired.content_rev { continue; }
+            } else {
+                let Some(tile) = p.desired.tiles.iter().find(|t| t.id == frame.id) else { continue; };
+                if frame.content_rev != p.desired.content_rev || frame.layout_generation != p.desired.layout_generation || !p.desired.demand[tile.shelf].warm(tile.row) && !p.desired.demand[tile.shelf].visible(tile.row) { continue; }
+            }
+            acknowledged = Some(acknowledged.map_or(frame.requested, |old| old.max(frame.requested)));
+            if p.last_rgb.get(&frame.id).is_some_and(|rgb| **rgb == *frame.rgb) { continue; }
+            if hero {
+                update_grid_model(&st, frame.rgb.iter().map(|c| grid_display(c.r, c.g, c.b)).collect());
+            } else {
+                let Some(tile) = p.desired.tiles.iter().find(|t| t.id == frame.id) else { continue; };
+                let model = match tile.shelf {
+                    0 => st.get_light_swatches(), 1 => st.get_light_input_swatches(),
+                    2 => st.get_light_data_swatches(), _ => st.get_light_user_swatches(),
+                };
+                let row = tile.row;
+                if let (Some(model), Some(buffer)) = (model.as_any().downcast_ref::<VecModel<Image>>(), frame.swatch) {
+                    if row < model.row_count() {
+                        if matches!(frame.id, crate::light_render::SurfaceId::Saved(_)) {
+                            p.saved_images.insert(frame.id.clone(), (buffer.as_slice().len() * 3, std::time::Instant::now()));
+                        }
+                        model.set_row_data(row, Image::from_rgb8(buffer));
+                    }
+                }
+            }
+            p.last_rgb.insert(frame.id, frame.rgb);
+        }
+        evict_saved_images(&st, &mut p);
+    });
+    acknowledged
+}
+
+#[cfg(test)]
+pub(crate) fn apply_preview_test_frames(app: &AppWindow, desired: &crate::light_render::DesiredSurfaceState, frames: Vec<crate::light_render::CompletedFrame>) {
+    LIGHT_PREVIEW.with(|preview| preview.borrow_mut().desired = desired.clone());
+    let _ = apply_light_frames(app, frames);
+}
+
+/// Release dormant image references once the saved-thumbnail cache exceeds its budget.
+fn evict_saved_images(st: &State, preview: &mut LightPreview) {
+    while preview.saved_images.len() > 128 || preview.saved_images.values().map(|(bytes, _)| bytes).sum::<usize>() > 8 * 1024 * 1024 {
+        let oldest = preview.saved_images.iter().filter(|(id, _)| {
+            preview.desired.tiles.iter().find(|tile| tile.id == **id).is_none_or(|tile|
+                !preview.desired.demand[tile.shelf].visible(tile.row) && !preview.desired.demand[tile.shelf].warm(tile.row))
+        }).min_by_key(|(_, (_, used))| used).map(|(id, _)| id.clone());
+        let Some(id) = oldest else { break; };
+        preview.saved_images.remove(&id);
+        preview.last_rgb.remove(&id);
+        crate::light_render::invalidate_thumbnail(id.clone());
+        if let Some(tile) = preview.desired.tiles.iter().find(|tile| tile.id == id) {
+            let images = st.get_light_user_swatches();
+            if let Some(model) = images.as_any().downcast_ref::<VecModel<Image>>() {
+                if tile.row < model.row_count() { model.set_row_data(tile.row, Image::default()); }
             }
         }
-        _ => state.set_light_user_tiles(ModelRc::new(VecModel::from(built))),
     }
 }
 
 /// What a saved effect's tile says it is, in plain words: how many layers it stacks, naming the presets
 /// behind them so a multi-layer look reads as recognisable ("heat + comet"). Derived on read from the
 /// saved layers, never a second stored description that could drift from the stack it describes.
-fn layers_blurb(layers: &[neuron::pattern::LayerDef]) -> String {
+pub(crate) fn layers_blurb(layers: &[neuron::pattern::LayerDef]) -> String {
     if layers.is_empty() {
         return "no layers".into();
     }
@@ -10324,7 +10344,7 @@ fn layers_blurb(layers: &[neuron::pattern::LayerDef]) -> String {
 
 /// A saved effect's blurb: the stack it holds, then its tags when it has any. An untagged effect reads
 /// as the bare stack description — no empty "·" tail for a fact the author never stated.
-fn user_effect_blurb(stack: &str, tags: &[String]) -> String {
+pub(crate) fn user_effect_blurb(stack: &str, tags: &[String]) -> String {
     let tags: Vec<&str> = tags.iter().map(String::as_str).filter(|t| !t.is_empty()).collect();
     if tags.is_empty() {
         stack.to_string()
@@ -10339,7 +10359,7 @@ fn user_effect_blurb(stack: &str, tags: &[String]) -> String {
 fn params_for(def: &neuron::pattern::LayerDef) -> Vec<EffectParam> {
     use neuron::effects::ParamKind;
     let mut out = Vec::new();
-    let no_opts = || ModelRc::new(VecModel::from(Vec::<SharedString>::new()));
+    let no_opts = ModelRc::default;
     for p in neuron::pattern::pattern_params(&def.pattern) {
         // conditional visibility (schema-driven): a knob gated on another knob's current value
         // (e.g. the meter's audio `focus` while a CPU source is picked) is simply not rendered —
@@ -10460,11 +10480,14 @@ fn project_placement(app: &AppWindow, region: &[u32], rows: u8, cols: u8) {
 /// auto-rendered PATTERN param model, the stack size, and the SPECTRUM editor surface. A full-colour
 /// pattern (Screen / custom / the vitals readout) reports no spectrum (honest: nothing to edit).
 fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
-    let (defs, sel, active_frame, (grows, gcols)) = {
-        let s = sh.borrow();
-        (s.light_layers.clone(), s.selected_layer, s.active_frame, s.rt.grid_dims())
-    };
+    let _timing = crate::ui_prof::Scope::new("light_editor");
     let st = app.global::<State>();
+    let (grows, gcols) = ui_grid_dims(&st);
+    let (defs, sel, active_frame) = {
+        let s = sh.borrow();
+        (s.light_layers.clone(), s.selected_layer, s.active_frame)
+    };
+    request_light_render(app, sh);
     let empty_params = || ModelRc::new(VecModel::from(Vec::<EffectParam>::new()));
     if defs.is_empty() {
         st.set_light_effect("".into());
@@ -10484,12 +10507,16 @@ fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
     // show — the inspector swaps the tunable-effect knobs for a short "what this is" note. Registry-driven
     // (no pattern-key string-matching); an empty stack has no selection, so it's false in the branch above.
     st.set_light_is_readout(neuron::pattern::pattern_is_readout(&active.pattern));
-    st.set_light_params(ModelRc::new(VecModel::from(params_for(active))));
+    let param_target = LIGHT_PREVIEW.with(|preview| {
+        let preview = preview.borrow();
+        preview.desired.layers.get(sel).and_then(|layer| layer.id).map(|id| (preview.desired.target.clone(), id))
+    });
+    update_param_model(&st, params_for(active), param_target);
     st.set_light_stack_count(defs.len() as i32);
     // STACK selector labels — each layer's display name (bottom→top) so the strip reads as its effects /
     // readouts and the user can SEE + pick which layer to place (the vitals readout included).
     let labels: Vec<SharedString> = defs.iter().map(|d| layer_label(d).into()).collect();
-    st.set_light_stack_labels(ModelRc::new(VecModel::from(labels)));
+    update_value_model(st.get_light_stack_labels(), labels, |model| st.set_light_stack_labels(model));
     // the SELECTED layer's placement — the honest badge (`light-place-label`) + the render's persistent
     // outline corners. An empty region reads as the whole board; a sub-rect drives the outline.
     project_placement(app, &active.region, grows, gcols);
@@ -10507,6 +10534,7 @@ fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
 
 /// Clear the spectrum-editor surface (no stops / no sequence) — used for data + full-colour Screen layers.
 fn clear_spectrum_surface(app: &AppWindow) {
+    SPECTRUM_PROJECTION.with(|cache| *cache.borrow_mut() = None);
     let st = app.global::<State>();
     st.set_light_stops(ModelRc::new(VecModel::from(Vec::<SpectrumStop>::new())));
     st.set_light_seq(ModelRc::new(VecModel::from(Vec::<SpectrumFrame>::new())));
@@ -10516,11 +10544,18 @@ fn clear_spectrum_surface(app: &AppWindow) {
     st.set_light_name_chars(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
 }
 
+thread_local! {
+    static SPECTRUM_PROJECTION: RefCell<Option<(neuron::spectrum::Spectrum, usize, ModelRc<SpectrumFrame>)>> = const { RefCell::new(None) };
+}
+
 /// Project a spectrum into the State spectrum-editor surface: the ACTIVE frame's palette stops +
 /// motion, plus the whole sequence (timeline chips), the loop policy, and the scrubber index.
 fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_frame: usize) {
     use neuron::spectrum::Motion;
     let st = app.global::<State>();
+    if SPECTRUM_PROJECTION.with(|cache| cache.borrow().as_ref().is_some_and(|(old, frame, model)|
+        old == sp && *frame == active_frame && *model == st.get_light_seq())) { return; }
+    let previous = SPECTRUM_PROJECTION.with(|cache| cache.borrow().clone());
     // A Spectrum always carries ≥1 frame (every constructor guarantees it), but guard the index for
     // REAL instead of leaning on a `.max(1)` that quietly wouldn't protect `seq[fr]` if that invariant
     // ever broke: clamp, then `get` — an empty seq clears the surface rather than panicking.
@@ -10542,7 +10577,7 @@ fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_fra
             at: s.at,
         })
         .collect();
-    st.set_light_stops(ModelRc::new(VecModel::from(stops)));
+    update_value_model(st.get_light_stops(), stops, |model| st.set_light_stops(model));
     // motion row
     let (kind, speed, depth, chaos) = match palette.motion {
         Motion::Hold => ("hold", 1.0, 0.5, 0.5),
@@ -10559,9 +10594,9 @@ fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_fra
     st.set_light_interp(palette.interp.as_str().into());
     // the palette's name, drawn in the palette: one string per char + the palette sampled forward then
     // back (a seamless loop for the hover flow)
-    st.set_light_name_chars(ModelRc::new(VecModel::from(
+    update_value_model(st.get_light_name_chars(),
         neuron::spectrum::palette_name(palette).chars().map(|c| SharedString::from(c.to_string())).collect::<Vec<_>>(),
-    )));
+        |model| st.set_light_name_chars(model));
     const RAMP: usize = 24;
     let ramp: Vec<slint::Color> = (0..RAMP)
         .chain((0..RAMP).rev())
@@ -10570,7 +10605,7 @@ fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_fra
             slint::Color::from_rgb_u8(c.r, c.g, c.b)
         })
         .collect();
-    st.set_light_name_ramp(ModelRc::new(VecModel::from(ramp)));
+    update_value_model(st.get_light_name_ramp(), ramp, |model| st.set_light_name_ramp(model));
     // timeline — one chip per frame (a live strip of its palette)
     let seq: Vec<SpectrumFrame> = sp
         .seq
@@ -10581,12 +10616,15 @@ fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_fra
             hold: f.hold,
             fade: f.fade,
             ease: f.ease.as_str().into(),
-            swatch: palette_strip_image(&f.palette),
+            swatch: previous.as_ref().filter(|(old, _, model)| *model == st.get_light_seq()
+                && old.seq.get(i).is_some_and(|old_frame| old_frame.palette == f.palette))
+                .and_then(|(_, _, model)| model.row_data(i)).map_or_else(|| palette_strip_image(&f.palette), |row| row.swatch),
         })
         .collect();
-    st.set_light_seq(ModelRc::new(VecModel::from(seq)));
+    update_value_model(st.get_light_seq(), seq, |model| st.set_light_seq(model));
     st.set_light_active_frame(fr as i32);
     st.set_light_loop(sp.play.as_str().into());
+    SPECTRUM_PROJECTION.with(|cache| *cache.borrow_mut() = Some((sp.clone(), active_frame, st.get_light_seq())));
 }
 
 thread_local! {
@@ -10594,7 +10632,7 @@ thread_local! {
     /// `pick-tile` it triggers.
     static PAIR_PICK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Per-effect suggestion chips, built once so a tile's row rewrite reuses the same model.
-    static PAIR_CHIPS: std::cell::RefCell<std::collections::HashMap<&'static str, ModelRc<PairChip>>> = Default::default();
+    static PAIR_CHIPS: std::cell::RefCell<std::collections::HashMap<&'static str, ModelRc<PairChip>>> = RefCell::default();
 }
 
 /// The suggested-gradient chips for an effect slug (empty model when it has none).
@@ -10701,7 +10739,7 @@ pub fn init_grid(app: &AppWindow, sh: &SharedRt) {
     st.set_light_fps_legacy(legacy);
     // seed the tile grid so the live previews appear the moment a lit device is selected (the page's
     // ~90ms timer keeps them animating after that).
-    render_light_tiles(app, sh, neuron::pattern::render_elapsed());
+    init_light_tile_metadata(app, sh);
     refresh_user_effect_tiles(app, sh);
     refresh_light_unified(app, sh);
 }
@@ -12451,5 +12489,27 @@ mod reconcile_units_tests {
             "state.slint's scroll-stages-note default must match SCROLL_STAGE_UNKNOWN_NOTE \
              ({SCROLL_STAGE_UNKNOWN_NOTE:?}), got: {note_line}"
         );
+    }
+}
+
+#[cfg(test)]
+mod lighting_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn device_switches_and_stale_save_acknowledgments_keep_the_latest_editor_state() {
+        let _cwd = crate::testsupport::cwd_guard("lighting_desired");
+        let first = remember_lighting(0x0226, 20, vec![preset_layer("static")]);
+        remember_lighting(0x0090, 30, vec![preset_layer("wave")]);
+        assert_eq!(desired_lighting_snapshot(0x0226).unwrap().fps, 20);
+        let latest = remember_lighting(0x0226, 60, vec![preset_layer("comet")]);
+        acknowledge_lighting_save(0x0226, first);
+        assert_eq!(desired_lighting_snapshot(0x0226).unwrap().fps, 60);
+        flush_lighting_save();
+        assert_eq!(desired_lighting_snapshot(0x0226).unwrap().layers[0].pattern, "comet");
+        crate::light_metadata::shutdown();
+        acknowledge_lighting_save(0x0226, latest);
+        assert_eq!(desired_lighting_snapshot(0x0226).unwrap().fps, 60);
+        assert_eq!(crate::prefs::device_light_snapshot(0x0090).unwrap().fps, 30);
     }
 }
