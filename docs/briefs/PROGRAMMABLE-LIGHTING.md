@@ -236,8 +236,22 @@ An effect-property snapshot contains declared property keys, types, accepted
 values, defaults, ranges, units and conditional availability. It is prepared once
 per accepted configuration/render boundary and packed into typed uniform data.
 Resolve names/bindings outside numerical kernels; no string-map lookup, reflection
-callback or UI read occurs per LED. The effect and its dependent programs observe
-the same accepted revision, not independently sampled slider values.
+callback or UI read occurs per LED. Cache descriptor layouts rather than calling
+the allocating native schema function every tick. The live scene canonicalizer
+already fills defaults; reuse that accepted representation rather than adding a
+second normalization rule. Preserve native enum rounding/toggle interpretation
+through its compatibility adapter, without pretending the stored float is the
+future program type.
+
+Property provenance is stage-specific. Present-only bindings may use a new
+presentation/property revision with the last committed simulation field. Advance
+and Initialize bindings take effect at their appropriate simulation boundaries.
+All consumers within one stage evaluation read the same immutable property block.
+Computed exports carry the field/tick/config generation that produced them; they
+are not paired with whichever accepted definition is newest when a reader asks.
+The output records both simulation and presentation provenance. Previously emitted
+pixels retain their rendered revision even when a newer scene has been accepted;
+the controls may display that pending/accepted value separately.
 
 A modifier can bind its own frequency to the effect's speed, or its strength to
 the effect's density, using a serialized property reference and an explicit value
@@ -245,11 +259,31 @@ mapping where needed. The UI offers that link next to the existing parameter,
 shows its source/live value and permits unlinking to a constant. A new catalog
 effect automatically exposes its declared properties without app-specific wiring.
 
-Bindings reference stable layer/node identity and property key, not selected row,
-translated label or numeric parameter position. Validate type and unit compatibility
-when the effect changes. Missing or incompatible properties use an explicitly
+Bindings reference stable layer/node identity, source descriptor/schema identity
+and property key, not selected row, translated label or numeric parameter position.
+Layer identity alone is insufficient: replacing an effect preserves the layer ID
+while constructing a different generator. On replacement, validate type, units,
+semantic role and conditional availability. A source-slot link may follow the
+replacement only under its declared compatibility policy; an instance-pinned link
+does not silently acquire another instance. Matching the key `speed`, even with
+matching numeric ranges, does not by itself authorize retargeting.
+Missing or incompatible properties use an explicitly
 declared fallback or mark the binding unavailable; never silently read zero or
 attach to a similarly named setting on another layer.
+
+Conditional properties retain both their stored value and availability. For example,
+Meter focus remains authored while its source uses CPU rather than audio, although
+the native effect ignores that setting in the CPU mode. A link becomes unavailable
+or uses its declared fallback, then restores the stored source value when the
+condition becomes active. Do not delete hidden values or treat UI visibility as
+evidence that a stored value has disappeared. Evaluate availability using the
+declared typed gate semantics, not a separate ad hoc float conversion.
+
+Program enums have stable variant IDs and schema-version migrations. Native enum
+indices remain a compatibility encoding, not durable semantic IDs: reordering
+option labels must not retarget a saved binding. Labels can change independently
+of identity. Unknown legacy parameter entries are not automatically exported as
+declared properties merely because they exist in the accepted parameter map.
 
 Matching a key named `speed` does not establish a common physical meaning. One
 effect's setting may be a dimensionless multiplier; another may expose cells per
@@ -257,6 +291,20 @@ second. Optional semantic roles such as temporal rate or particle density can be
 declared alongside units to help reusable modules discover compatible properties.
 Do not infer those roles from labels or pretend every effect has them. Normalized
 range mappings are explicit mappings, not proof of equivalent physical behavior.
+
+Linking rate values is not phase synchronization. A program that evaluates
+`time*rate` can jump when the rate changes, whereas a native effect may integrate
+rate over time. Continuous variable-rate motion uses explicit accumulated phase
+or a declared phase export, with pure presentation reading that state. Do not
+promise phase lock from a common speed value or guess a phase for an effect that
+has none. Units, conversions and any value-remapping domain are explicit.
+
+Mappings validate their target type/range and declare out-of-domain behavior.
+Normalizing a constant source range has a defined constant result or rejects the
+mapping; it cannot divide by zero. An existing binding does not silently change
+its mapping because a later schema expands a slider's range. Pin authored mapping
+domains or explicitly opt into following the source range. Enum-to-number and
+boolean-to-number conversions are deliberate mappings, not implicit coercions.
 
 Accepted settings, effective simulation quantities and live field channels are
 distinct. The parameter snapshot reports the accepted control value. A native
@@ -273,6 +321,21 @@ reads, just as it declares palette dependencies. Editing a linked property updat
 all consumers at the same boundary without recompiling. Simulation, presentation
 and required reinitialization follow those declared dependencies; linking a
 shader parameter does not grant write access to its source effect's settings.
+
+Initial parameter links read the owning effect's authored accepted controls.
+Computed exports and field channels use typed snapshot dependencies, not an event
+bus or implicit live getter. Reject current-cycle dependency loops; feedback needs
+an explicit previous-tick resource. Do not let a modifier output write back into
+the property that drives its own Advance. Link/source/value UI updates retain row
+identity; unlinking freezes the last resolved consumer value, rather than jumping
+back to the parameter's original default.
+
+Required binding regressions cover sparse versus explicit defaults; typed enum and
+toggle reads; conditional focus preservation across source changes; same-layer-ID
+effect replacement and reordering; rejected edits retaining the old snapshot;
+new presentation over old simulation with truthful provenance; deferred Advance
+and declared Initialize behavior; cycle rejection; and a shared producer evaluated
+once for multiple consumers.
 
 The numerical authoring scope includes functions, arithmetic, vectors, matrices,
 typed structs, conditionals, loops, indexed buffers, explicit random state and
