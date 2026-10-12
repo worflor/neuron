@@ -25,6 +25,129 @@ properties. Device access, filesystem access and synthesized input are not light
 primitives. Resource budgets protect responsiveness; they must not become arbitrary
 artistic restrictions or a permanently small catalog of allowed formulas.
 
+## Where it fits in the product
+
+The existing user model remains **effect + spectrum = layer**, followed by stack
+composition. Programmability extends those roles; it is not a third independent
+lighting system or a competing catalog that users must learn before creating a look.
+
+An effect supplies the evolving field: flames, falling columns, waves, stars,
+particles or a static surface. A spectrum supplies color: solid/gradient sources,
+their interpolation, motion and timeline. Compiled code can implement either role,
+and the same source pack can export both. Native and installed implementations
+appear together in the relevant existing editor surface.
+
+This distinction describes responsibility, not complexity. A spectrum can generate
+a sophisticated spatial or animated appearance on a static field. It does not need
+to be promoted to an effect merely because its math is expensive or its appearance
+is dramatic. An effect can be simple. Both use the same instance owner and execution
+substrate, with capabilities declared by the author rather than inferred from code
+length, performance or visual intensity.
+
+There are three useful module roles within that model:
+
+| Role | Operates on | User home |
+| --- | --- | --- |
+| Effect producer | Geometry, inputs and simulation resources; emits scalar fields, named channels or direct color. | Existing effect catalog and effect properties. |
+| Spectrum program | The source palette, field/sample attributes, geometry, time and declared input/state resources; resolves appearance. | Existing Spectrum section, alongside its source and motion controls. |
+| Modifier | An existing palette, field or layer-color result; transforms it non-destructively. | Inline under the property or layer it modifies. |
+
+A grade is a palette modifier, not the definition of all programmable lighting.
+Field and layer-color modifiers use the same program contract. A small ordered
+modifier list is an additive authoring feature, but it does not own another scene,
+device stream or simulation clock. Do not force every advanced module into grade
+chips or expand every chip into a separate lighting layer.
+
+### The layer flow
+
+```text
+geometry + snapshots + parameters + committed state
+                         |
+                 effect producer
+                         |
+          scalar / named field channels / direct color
+                         |
+             optional field processing
+                         |
+         spectrum resolution, when the field uses it
+         source palette/timeline -> sampling + grade chain
+                         |
+               resolved layer color
+                         |
+            optional layer-color processing
+                         |
+          placement, opacity and stack composition
+                         |
+          existing base transition and output path
+```
+
+This is a responsibility diagram, not a request to materialize every arrow as an
+allocated buffer. Uniform work can be prepared once; compatible pure operations
+can be fused. Stateful advance passes run on the producer's simulation schedule
+and provide committed resources to the relevant presentation stages.
+
+Direct-color effects take the direct-color branch, preserving their original
+colors instead of inventing a luminance-to-palette conversion. A layer-color
+modifier can still grade, filter or otherwise process that result. Using a palette
+inside a direct-color program is an explicit author choice with declared bindings.
+
+### Concrete authoring paths
+
+| Starting point | Edit | Result and ownership |
+| --- | --- | --- |
+| Fire + ember gradient | Add Pastel to the palette. | The same flame simulation uses a transformed palette; removing Pastel restores its source. |
+| Wave + rainbow | Reverse palette order. | Color order changes; Wave phase and direction remain intact. |
+| Static + a gradient | Select a spatial animated spectrum program. | The spectrum supplies the animated appearance over the static field; it uses the same layer owner. |
+| Fire + any palette | Add a field-distortion module. | Distortion processes Fire's existing field without reconstructing or rendering Fire a second time. |
+| A direct-color effect | Add a layer-color grade. | Its native color result is transformed without pretending it originally sampled the spectrum. |
+| Any layer | Select a community particle effect. | A program-backed producer occupies the existing effect slot and presents ordinary parameters. |
+
+A pack may export a reusable spectrum, an effect, modifiers and a saved composite
+look that wires them together. Selecting the saved look installs those bindings
+through existing scene authoring; it does not start a hidden renderer. A creator
+can offer the same underlying animation as a ready-made catalog effect and as a
+reusable spectrum module where both entry points genuinely support those roles.
+
+### Palette, spectrum and modifier boundaries
+
+Keep the source palette independently editable. A spectrum program samples that
+palette through a stable host interface rather than copying its stops into opaque
+kernel constants. The default spectrum program implements the existing interpolation,
+motion and timeline behavior through its existing native Rust implementation;
+programmability does not require rewriting that math in a kernel language.
+Existing motion controls remain bindings to this
+default program; they must not also run an undisclosed second motion system around
+a custom program. A custom program declares whether it consumes the standard
+coordinate/motion result, replaces it or exposes compatible parameter bindings.
+
+The palette service distinguishes source sampling from graded sampling, preventing
+accidental recursion or duplicate grading. A grade chain wraps palette queries;
+it does not imply baking transformed stops. Modules consuming a graded palette
+receive that service explicitly. Modules needing its original colors bind the
+source service explicitly. Persist those bindings with the authored definition.
+
+Pure palette grades depend on palette data, query coordinate and declared uniform
+parameters/assets. They have no independent simulation, time or device geometry.
+They may inspect the full source palette and sample its neighbors: purity does not
+limit them to a fixed pointwise color formula. Their mathematical result is the same
+in the gradient strip, live layer and export for the same query.
+
+Spatial, animated or input-reactive color programs belong to the spectrum-program
+role. They may use per-layer state with explicit advance/present access. That state
+is part of the existing layer instance, not a global state attached to a reusable
+palette preset. A static effect plus such a program is a valid complete animation.
+
+Field modifiers consume the producer's field and declared channels. Layer-color
+modifiers consume its resolved color result. This makes blur, distortion, edge
+extraction, spatial color grading and temporal feedback expressible without
+mislabeling them as palette-only grades or requiring a new scene engine.
+
+Graph nesting and exports do not duplicate instances implicitly. A native Fire
+node referenced by one layer is evaluated once for that scheduled cycle; multiple
+downstream consumers read its result. A second independently authored Fire node
+is a distinct stateful instance. Sharing state across layers requires explicit
+resource bindings and an ownership contract, never a matching program name.
+
 ## Existing architecture to extend
 
 The production live path uses `LiveComposite` around `Compositor`. Local and
@@ -59,7 +182,7 @@ Three objects have distinct lifetimes:
 | --- | --- |
 | Program | Immutable compiled code, entry points, reflected types, dependencies and execution requirements. |
 | Effect definition | Serializable program reference, parameters, resource declarations and pass connections. |
-| Instance | One layer's mutable simulation resources, input cursors and accepted configuration. |
+| Instance | One layer's effect, spectrum and modifier resources, input cursors and accepted configuration. |
 
 Two layers using the same program may share compiled code. They never implicitly
 share mutable simulation state. Reordering moves an instance by layer ID.
@@ -111,11 +234,61 @@ validated acyclic graph. Feedback is expressed through explicit previous-tick
 resources or ping-pong buffers, so it does not create an accidental scheduling cycle.
 Pass ordering, read/write access and synchronization have defined semantics.
 
+Simulation resources can belong to an effect, spectrum or modifier slot. Each has
+a stable node identity beneath its owning layer. Changing a palette does not reset
+the effect; changing one modifier does not reset unrelated modifier or spectrum
+state. Replacing an incompatible node replaces only that node's resources. The
+renderer coordinates all advances and commits; presentation never independently
+ticks a stateful color module just because the palette strip is drawn.
+
 Resources include typed sample buffers, particle/struct buffers, multidimensional
 fields, images and scratch storage. Persistent and temporary lifetimes are explicit.
 The host supplies shape and layout metadata; a pack cannot assume every device is
 a dense rectangle. Geometry exposes valid sample identities and normalized
 positions, with optional physical coordinates and neighbor relationships when known.
+
+## Low-level author contract
+
+Expose the information needed to build numerical algorithms, not just a
+`color_for_key(index)` callback. Typed numerical buffers and pass connections are
+the low-level interface; product roles give them an understandable editor home.
+
+| Surface | Required information and operations |
+| --- | --- |
+| Sample geometry | Stable sample IDs, valid mask, board and layer-local coordinates, placement transform and declared units; optional physical positions, adjacency and UV mappings with availability metadata. |
+| Field data | Palette coordinate, intensity and separate coverage; declared named scalar/vector channels and direct linear color. Examples include velocity, heat, age or distance when the producer supplies them. |
+| Palette service | Source stops, stop positions, interpolation/topology policy and sampling functions; resolve active timeline data once where possible and preserve unwrapped coordinates until the declared boundary stage. |
+| Timing | Monotonic high-precision elapsed time, simulation interval, tick/cycle identity and presentation interpolation fraction; no arbitrary global phase wrap. |
+| Inputs | Ordered mapped press/release observations, held states and declared provider snapshots with sequence, age, gap and availability metadata. |
+| State and scratch | Typed persistent buffers, multidimensional fields, particle structs, images, previous-tick resources and temporary storage with defined lifetime/access. |
+| Numerical library | Scalar/vector/matrix math, sampling/filtering, noise/hash functions, explicit seeded random state, color-space conversion, reductions and supported synchronization/atomic operations. |
+| Composition | Read-only upstream graph results and explicit palette/color outputs; coverage and radiance remain distinct from layer opacity and blend mode. |
+
+Do not fabricate unavailable channels for existing patterns or physical distances
+for a device with only a logical grid. A module declares required channels and
+providers; bindings validate availability and may use an explicitly authored
+fallback. Existing native producers initially expose their current field, then
+can add meaningful channels without a compulsory rewrite of every pattern.
+
+Sampling has a defined domain, boundary policy, filter and coordinate convention.
+Neighbor access and field resolutions are not implicitly keyboard-row operations.
+An offscreen simulation field may have a different resolution from the LEDs and
+be sampled onto their positions at presentation. This supports fluid fields,
+distance functions and image-based algorithms without allocating a pretend LED
+for every simulation cell.
+
+Random streams have explicit seeds and ownership. Cross-backend behavior specifies
+which operations are deterministic and which require a numerical tolerance;
+parallel reductions and floating transcendental functions must not be advertised
+as automatically byte-identical on every CPU/GPU. Existing bypass output retains
+its exact compatibility contract.
+
+Advanced scene processing may read explicitly bound authored-layer results or the
+authored base composition through the existing compositor. Define graph ordering
+and feedback resources before exposing it. It must not capture protocol-client
+paint, access final hardware output or create a second base-scene authority. This
+is an extension point in the same program contract, not an initial promise of
+arbitrary cross-layer access.
 
 Programs receive clock values, parameters, geometry and bounded provider snapshots.
 They do not poll keyboard/audio/desktop providers or renew capture leases themselves.
@@ -142,6 +315,15 @@ silently acquire transparency. The current emissive field converts to RGB before
 the byte-domain stack; this proposal does not claim that Neuron already has an HDR
 whole-scene compositor. Broader float composition can be an explicit extension.
 
+The stage ABI distinguishes unattenuated palette color from resolved layer radiance.
+The default scalar path applies its field intensity exactly once. Palette grading
+occurs before that attenuation, so lifting a palette does not unintentionally light
+cells whose effect intensity is zero. A general appearance program explicitly
+declares whether its output still needs the field gain or already resolves it;
+never infer this from pixel values. A layer-color filter intentionally operates
+after resolution and can change dark colors, but coverage and placement remain
+separate. Do not multiply a direct-color producer by an invented scalar intensity.
+
 Palette looks are non-destructive program references with parameters and strength.
 The original stops remain editable and clearing a look restores the original palette.
 No look and zero strength bypass new math to preserve existing RGB bytes exactly.
@@ -156,6 +338,11 @@ Do not cache an animated or input-dependent look as a static stop list.
 The first product examples are Pastel, Vivid, Watercolour and Mono, backed by the
 same stage interface as community programs. A fixed op-chain implementation alone
 does not establish support for arbitrary programmable effects.
+
+Color-stage strength mixes the input and transformed color in its declared working
+domain, with exact bypass at zero. It is not layer opacity. Field-processing
+modules declare their own wet/dry or parameter behavior; do not impose color-lerp
+semantics on a distortion, simulation solver or coverage operation.
 
 Palette color-order reverse is a presentation setting distinct from motion reverse.
 Reflect the resolved coordinate without destructively rearranging authored stops.
@@ -251,6 +438,20 @@ Installed looks appear near the spectrum they modify; effects appear in the exis
 catalog. Look ordering and strength are inline, with live preview and easy removal.
 The stack inspector retains stable rows while parameters and frames change.
 
+The default view stays effect, spectrum and layer stack. Choosing a program replaces
+or extends the relevant control in place and reveals only its useful parameters.
+Pure grade suggestions remain small palette controls. Stateful/spatial spectrum
+programs expose their own inline parameters rather than posing as a single grade
+chip with an unexplained intensity slider. Advanced field/color modifier lists
+expand within the selected layer's inspector instead of adding a global programs
+page or another competing stack.
+
+For pure palette grades, the strip is an exact palette-domain preview. A spatial or
+stateful spectrum has no unique context-free strip: its preview must use a declared
+probe context and the live hero remains the complete spatial result. Drawing that
+probe does not advance the live instance. Custom direct-color effects must not
+display a supposedly authoritative spectrum strip when they do not use it.
+
 Compilation begins on source changes or first import, never a slider event. Keep
 the last valid look visible while compilation runs. Source errors identify file,
 line and relevant parameter or stage in an inline author drawer. Consumers see a
@@ -294,6 +495,19 @@ This proposal does not authorize hardware experiments or public publication.
 
 - Python-authored numerical code executes without interpreted per-frame work.
 - General stateful and multipass numerical effects are expressible, not only grades.
+- Effect producers, spectrum programs and palette/field/color modifiers share the
+  execution contract and remain in their existing feature spaces.
+- Static plus a stateful/spatial spectrum is supported without a second renderer.
+- A native producer's field can be processed without a second simulation evaluation.
+- Direct-color effects remain correct and can receive explicit layer-color processing.
+- Palette, motion, strength, coverage and layer opacity have distinct tested semantics.
+- Custom spectrum programs do not receive unintended duplicate motion or grading;
+  source and graded palette bindings are explicit and non-recursive.
+- Pure palette grades preserve zero-intensity effect cells, while layer-color
+  processing follows its explicitly different post-resolution contract.
+- Stateful spectrum and modifier nodes retain independent identities; palette edits
+  and preview reads do not reset or advance unrelated nodes.
+- Field-channel and provider availability is explicit; missing data is not invented.
 - One scene authority, one per-layer state owner and one physical device writer.
 - Parameter/palette edits preserve compatible state and do not trigger compilation.
 - Presentation and preview reads cannot advance simulation or consume input.
