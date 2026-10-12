@@ -126,6 +126,11 @@ it does not imply baking transformed stops. Modules consuming a graded palette
 receive that service explicitly. Modules needing its original colors bind the
 source service explicitly. Persist those bindings with the authored definition.
 
+This service is a numerical ABI, not a per-sample Python or GPU-to-host callback.
+Use staged palette data and compatible kernel-library functions. Lookup-table
+acceleration requires a declared error contract; it cannot replace the exact
+legacy bypass with an undisclosed approximation.
+
 Pure palette grades depend on palette data, query coordinate and declared uniform
 parameters/assets. They have no independent simulation, time or device geometry.
 They may inspect the full source palette and sample its neighbors: purity does not
@@ -147,6 +152,19 @@ node referenced by one layer is evaluated once for that scheduled cycle; multipl
 downstream consumers read its result. A second independently authored Fire node
 is a distinct stateful instance. Sharing state across layers requires explicit
 resource bindings and an ownership contract, never a matching program name.
+
+The current compositor does not expose a reusable field node: it evaluates a
+pattern and immediately resolves its `Field` to RGB. Introduce an internal
+evaluated-field snapshot/stage adapter in that existing path. Legacy patterns keep
+their normal scheduled `field_at_time` evaluation; session-capable patterns retain
+their advance/emit contract. Downstream modifiers read the result, never call the
+pattern again. This seam must be demonstrated before claiming native-node reuse.
+
+The snapshot also retains native palette addressing and effective geometry. Some
+native layers replace raw `Cell.u` with a placement coordinate before sampling.
+Expose the effective palette-query coordinate separately from optional raw producer
+data; a coordinate modifier must not edit a value that a later native adapter
+silently ignores.
 
 ## Existing architecture to extend
 
@@ -174,6 +192,14 @@ implementations. The current static `PatternDef` table cannot alone represent
 installed dynamic modules. Keep one resolver and typed capability vocabulary;
 do not disguise an unknown pack ID as an existing native pattern key.
 
+Descriptors declare their output schema, available field channels and palette
+bindings for the instantiated configuration. A direct-color output can still read
+a palette internally; output type alone does not determine which Spectrum controls
+are useful. Replace the static `has_spectrum` assumption with declared binding
+capabilities for programs while retaining native behavior. An unexpected output
+variant or missing required channel is a checked error, not a fabricated scalar
+field or a silently active control.
+
 ## Authoring model
 
 Three objects have distinct lifetimes:
@@ -181,7 +207,7 @@ Three objects have distinct lifetimes:
 | Object | Responsibility |
 | --- | --- |
 | Program | Immutable compiled code, entry points, reflected types, dependencies and execution requirements. |
-| Effect definition | Serializable program reference, parameters, resource declarations and pass connections. |
+| Node binding | Serializable program/entry-point reference, role, parameters, resource declarations and connections within a layer. |
 | Instance | One layer's effect, spectrum and modifier resources, input cursors and accepted configuration. |
 
 Two layers using the same program may share compiled code. They never implicitly
@@ -295,6 +321,12 @@ They do not poll keyboard/audio/desktop providers or renew capture leases themse
 Representative catalog execution and deterministic export use the same interface
 with different policy and injected inputs.
 
+The current matrix snapshot exposes press events and held state, not a complete
+ordered release-event projection. Release-aware programs require extending the
+existing sequenced observation projection; reconstructing releases from two held
+snapshots would lose short transitions. Reuse the process input reservoir rather
+than introducing a program-specific hardware listener.
+
 Input cursors commit with successful simulation state, independently of whether the
 resulting image is displayed. Dropping a preview frame cannot discard key edges.
 Execution faults must not reuse partially mutated state as if it were committed.
@@ -303,12 +335,36 @@ Presentation cannot mutate hidden state, consume random numbers or read fresh in
 Enforce that through resource access and execution scheduling. Do not rely solely on
 a Python function being named `present`.
 
+The restriction concerns mutable random streams, not random-looking mathematics.
+Pure noise/hash functions keyed by seed, node/sample identity and an explicit time
+or tick coordinate are valid presentation operations. Repeating the same query
+must produce the same result without advancing any stream. If time is quantized,
+that sampling policy is declared rather than accidentally tied to preview FPS.
+
 ## Color and palette semantics
 
 Use floating working color with explicit encoded-sRGB, linear-RGB and OKLab/OKLCH
 interfaces. Apply gamut mapping and quantization at defined boundaries; do not
 repeatedly round intermediate passes to bytes. Existing authored interpolation and
 Cut compatibility remain intact unless a separately reviewed change replaces them.
+
+Two resolution contracts are explicit. The legacy adapter retains the existing
+byte-sRGB interpolation, motion, timeline mixing, rounded encoded-channel gain and
+byte composition. No program/no modifier and zero-strength bypass use that native
+path unchanged. A linear program operates on floating color/radiance and converts
+at the existing byte-composition boundary; it does not silently upgrade the whole
+stack to linear blending. Exact bypass and the linear program's semantics are
+separate promises.
+
+Use typed stage results rather than overlapping flags: an unattenuated palette
+sample still needs the adapter's field gain; a resolved appearance already owns
+its radiance calculation. The consumer knows which type it receives. Linear
+intermediates may carry extended or signed values where an algorithm needs them;
+display conversion has an explicit gamut/tone policy. The initial final conversion
+uses the existing clamped linear-to-RGB boundary unless a program applies a declared
+mapping first. Non-finite display color or invalid coverage is an error, not an
+implicit cast to black. Existing byte color helpers are not unquantized float APIs;
+provide the latter without routing every color operation through an `Rgb` roundtrip.
 
 Radiance/intensity and coverage are separate outputs. Zero intensity does not
 silently acquire transparency. The current emissive field converts to RGB before
@@ -330,10 +386,45 @@ No look and zero strength bypass new math to preserve existing RGB bytes exactly
 
 Define whether a look transforms prepared stops or interpolated samples. These are
 different operations: applying nonlinear grading before interpolation generally
-differs from applying it afterward. The initial color-look role transforms resolved
-floating samples; an explicit stop-preparation role may be added when needed.
+differs from applying it afterward. The initial palette-grade role transforms
+interpolated source queries, rather than baking transformed stops; an explicit
+stop-preparation role may be added when needed.
 Prepare uniform values once and fuse/cache work where dependency analysis permits.
 Do not cache an animated or input-dependent look as a static stop list.
+
+For the default adapter, each active timeline endpoint follows this order:
+coordinate motion and boundary resolution; native stop interpolation; floating
+palette-grade chain and strength; conversion to endpoint RGB; native color motion
+(hue cycle or breathing); existing byte timeline crossfade; rounded encoded field
+gain. A grade therefore recolors the palette while Breathe still modulates its
+brightness. All nodes in the grade chain retain floating intermediates; conversion
+occurs at the declared legacy endpoint boundary, not after each grade. The zero-
+strength path delegates to the untouched native endpoint sampler.
+
+Topology derives from the authored source and its declared overrides, not from
+whether a grade happens to make the endpoint colors coincide. Grade strength and
+time do not silently switch an open gradient between wrap and reflection. Custom
+spectrum programs can replace this order through explicit bindings; they cannot
+quietly inherit another application of native motion or grading.
+
+Legacy Cut eligibility is captured from the original resolved byte picture before
+every optional color transform, including palette grades. That original picture
+uses the same evaluated native field; a second color resolution may be required,
+but never another simulation evaluation. An originally empty cell remains absent
+after a lift; an originally present cell transformed to black still occupies its
+original footprint. Preserve the existing global Cut function for untouched
+layers and use an explicit compatibility adapter for processed Cut layers.
+Programmable cutouts normally use explicit coverage with Normal composition;
+choosing legacy final-black Cut semantics remains an explicit compatibility choice.
+
+Spatial filtering with coverage uses associated linear color internally: for
+straight color `c` and coverage `a`, filter `p = a*c` and `a` with the same weights.
+The stage adapter recovers straight color only when needed; zero coverage has a
+defined zero-color result and no division. Typed straight/associated results name
+the boundary owner and prevent a second coverage multiplication. Region masking
+and layer opacity apply to effective coverage at composition, not to color gain
+inside every pass. Initial composition still uses the existing byte blend path;
+linear filter arithmetic does not imply linear whole-stack blending.
 
 The first product examples are Pastel, Vivid, Watercolour and Mono, backed by the
 same stage interface as community programs. A fixed op-chain implementation alone
@@ -348,6 +439,60 @@ Palette color-order reverse is a presentation setting distinct from motion rever
 Reflect the resolved coordinate without destructively rearranging authored stops.
 Specify endpoint behavior for clamp, wrap and reflected topology; test asymmetric
 stop spacing and single-stop palettes. Neither reverse control resets simulation.
+
+## Worked author contract: Ink spectrum
+
+An Ink pack exports a spatial spectrum that can animate a Static layer, plus a
+catalog look wiring those two bindings together. The source palette remains an
+ordinary editable Neuron palette. Exporting another effect entry point can reuse
+the solver code without implicitly sharing its buffers.
+
+| Declaration | Example contract |
+| --- | --- |
+| Parameters | Integer seed; diffusion coefficient in declared grid units; injection strength; palette binding; boundary enum. Value edits update uniforms, not source compilation. |
+| State | Committed concentration field and candidate fields over a declared 128x64 simulation grid; scratch and any interpolation history are separately accounted. These are not 8192 physical LEDs. |
+| Initialize | Zero the field and establish explicit random seed. A palette is not an initialization dependency in this example. |
+| Advance pass 1 | Map every ordered press event to grid coordinates and inject into candidate concentration, reading the previous committed field. |
+| Advance pass 2 | Run a five-point diffusion stencil from one candidate field into another, with explicit boundary handling and substeps. Swap resource roles between substeps; publish only validated completion. |
+| Present | Sample the committed field at actual LED positions, use concentration as a palette query, and return a typed appearance. A pure seed/time hash can add shimmer without consuming RNG state. |
+| Edits | A palette change alters presentation immediately without clearing concentration. Diffusion changes future advances. A grid-shape change uses an explicit resample or reinitialize policy. |
+| Preview | Hero reads the complete live result. A strip probe reads committed state at a declared position; a catalog demonstration owns a separate representative instance. |
+
+For equal grid spacing, let `r = D*dt/dx^2`. The stencil has center weight
+`1-4*r` and four neighbor weights `r`. For `0 <= r <= 1/4`, these weights are
+nonnegative and sum to one: this specific averaging step cannot exceed its input
+minimum/maximum under compatible boundary handling. Larger diffusivity requires
+smaller substeps or another solver, not an arbitrary limitation on the author.
+Substep cost belongs in the execution/resource contract. This statement is about
+this discrete stencil, not a certificate for arbitrary fluid simulations.
+
+This example must run through the existing producer with independent code/state
+lifetimes, valid input-cursor commits and native/linear boundary semantics. Its
+proof gate is stateful multi-pass execution from Rust without per-frame Python,
+not just successful compilation of one color function.
+
+## Mathematical witnesses for the contract
+
+Scryer exact rational/symbolic arithmetic and certified real enclosures confirm
+the following ideal-arithmetic witnesses. They constrain stage ordering and form
+reference cases for later tests; they do not prove Rust floating execution, GPU
+agreement, physical LED transfer or subjective appearance.
+
+| Witness | Derived result | Required design consequence |
+| --- | --- | --- |
+| Let `G(x)=2/5+(3/5)*x`, `x=1/5`, gain `i=1/4`. | `i*G(x)=13/100`; `G(i*x)=43/100`. | A lift before gain differs from a lift after gain; preserve dark effect cells through the palette-grade placement. |
+| Let `G(x)=x^2` and stops be 0 and 1. | Grade of their midpoint is `1/4`; midpoint of graded stops is `1/2`. | Stop baking and query grading are different features; the editor cannot substitute one for the other. |
+| Half linear energy encoded with the ideal sRGB transfer. | `1.055*(1/2)^(5/12)-0.055` is approximately `0.7353569830524494906`; times 255 is approximately `187.5160306783746201`. | Rounded linear half-white is 188; legacy half-byte-white is 128. Retain a named legacy adapter rather than claiming float conversion preserves the old gain. |
+| Opaque red next to fully transparent blue, equal filter weights. | Filtered associated red is `1/2`, blue is 0, coverage is `1/2`; straight-color filtering instead introduces hidden blue. | Spatial processing filters associated color and coverage together. |
+| Associated color `p=1/2`, coverage `a=1/2`, opacity `o=1/2`. | Correct opacity-scaled `p` is `1/4`; multiplying by coverage again gives `1/8`. | Typed straight/associated results and one boundary owner prevent double attenuation. |
+| Constant-input recurrence `y_next=(9/10)*y+1/5`. | Its fixed point is 2. | Stable feedback can exceed display range; extended intermediate state and final mapping are separate contracts. |
+| Diffusion coefficient `r=1/8`, compared with `r=3/10`. | Center weights are `1/2` and `-1/5` respectively; the first stencil's weights sum to 1. | Choose substeps/solver from the numerical method, rather than confusing a negative numerical artifact with valid color data. |
+
+Decimal constants in these witnesses are exact written decimals. Shipped f32/f64
+constants, rounding and gamut helpers require their own execution fixtures. The
+existing five-step OKLab chroma search is a fast approximation, not a certified
+universal gamut solver. A kernel color library needs explicit tolerances and
+final-output policy rather than inheriting an unsupported precision claim.
 
 ## Compiler and execution choice
 
@@ -393,10 +538,40 @@ shape. Cache complete results per scheduled output cycle. A clone or preview rea
 must not advance simulation twice.
 
 Configuration changes are classified as presentation, compatible simulation
-configuration or instance replacement. Palette edits preserve state. Source changes
+configuration or instance replacement. Palette edits preserve compatible state. Source changes
 preserve state only when both resource schema and semantic compatibility are
 declared and validated. Dimensions or layout changes follow an explicit reshape or
 reinitialization policy. New instances use the existing scene-transition mechanism.
+
+Palette and parameter dependencies are declared per Initialize, Advance and Present
+entry point and checked against actual bound access. A Present-only palette edit
+does not reconfigure simulation. An Advance dependency uses the new palette on
+future ticks while preserving compatible state. An Initialize dependency declares
+whether an edit preserves existing resources or reinitializes the affected node.
+Do not label every palette edit presentation-only or recompile code for value edits.
+
+The per-layer runner coordinates node order, snapshots and commits within the
+existing producer. There is at most one mutable job in flight per state owner.
+Worker requests/replies carry surface, owner generation, graph revision, node
+identity, simulation sequence and presentation cycle. A compiled advance writes
+candidate resources; validated state and its input cursor commit together. The
+backend must establish how it keeps committed resources separate without claiming
+zero-cost rollback or copying all buffers unconditionally.
+
+A presentation deadline miss keeps the last complete picture available. It does
+not automatically discard a valid simulation advance: an ordered result from the
+current owner can commit state even if its image is superseded. Do not accept stale
+generations or out-of-order state; do not launch a competing job against an owner
+still advancing. Pending scene configuration coalesces, input history does not.
+An actual cancellation/fault leaves uncommitted cursors untouched and invokes the
+declared recovery/gap policy if retained history expires.
+
+Native legacy objects are not rollback-capable transactions. Their scheduled field
+evaluation commits under the existing producer contract. A downstream program
+failure can reject the new picture, but cannot pretend that native time/input/RNG
+never advanced. Retain a healthy native instance and its evaluated snapshot when
+safe; rebuild a compromised owner rather than reviving partially mutated state.
+Whole-graph rollback is not promised by the word atomic.
 
 Resource accounting covers persistent memory, scratch memory, compilation work,
 execution time and queued requests. Budgets are based on declared resources and
@@ -507,6 +682,15 @@ This proposal does not authorize hardware experiments or public publication.
   processing follows its explicitly different post-resolution contract.
 - Stateful spectrum and modifier nodes retain independent identities; palette edits
   and preview reads do not reset or advance unrelated nodes.
+- Dependency metadata distinguishes palette use in initialization, simulation and
+  presentation; edits follow that dependency without blanket rebuilds.
+- Legacy byte gain and Cut footprint remain stable under their compatibility
+  adapters; linear programs and explicit coverage have declared output semantics.
+- Spatial filter fixtures reject hidden-color bleed and double coverage/opacity.
+- Late valid simulation commits are distinct from stale frame publication;
+  cancellation and recovery cannot silently consume uncommitted input edges.
+- Pure time-based noise supports repeated and arbitrary presentation queries
+  without mutable RNG advancement.
 - Field-channel and provider availability is explicit; missing data is not invented.
 - One scene authority, one per-layer state owner and one physical device writer.
 - Parameter/palette edits preserve compatible state and do not trigger compilation.
