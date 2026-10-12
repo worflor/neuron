@@ -224,6 +224,56 @@ buffer/asset references. Do not force everything through the existing all-float
 parameter representation. Reflection and validation use one schema in the editor,
 CLI, persistence and runtime.
 
+### Effect properties as program inputs
+
+Every node can bind read-only properties of its owning effect through the same
+descriptor schema that drives the inspector. Do not maintain a second shader
+parameter list or add branches such as "if Fire, copy speed and density". The
+current `PatternDef.params` plus accepted `Params` provide the starting information;
+the compiled interface adds genuine typed values and declared units.
+
+An effect-property snapshot contains declared property keys, types, accepted
+values, defaults, ranges, units and conditional availability. It is prepared once
+per accepted configuration/render boundary and packed into typed uniform data.
+Resolve names/bindings outside numerical kernels; no string-map lookup, reflection
+callback or UI read occurs per LED. The effect and its dependent programs observe
+the same accepted revision, not independently sampled slider values.
+
+A modifier can bind its own frequency to the effect's speed, or its strength to
+the effect's density, using a serialized property reference and an explicit value
+mapping where needed. The UI offers that link next to the existing parameter,
+shows its source/live value and permits unlinking to a constant. A new catalog
+effect automatically exposes its declared properties without app-specific wiring.
+
+Bindings reference stable layer/node identity and property key, not selected row,
+translated label or numeric parameter position. Validate type and unit compatibility
+when the effect changes. Missing or incompatible properties use an explicitly
+declared fallback or mark the binding unavailable; never silently read zero or
+attach to a similarly named setting on another layer.
+
+Matching a key named `speed` does not establish a common physical meaning. One
+effect's setting may be a dimensionless multiplier; another may expose cells per
+second. Optional semantic roles such as temporal rate or particle density can be
+declared alongside units to help reusable modules discover compatible properties.
+Do not infer those roles from labels or pretend every effect has them. Normalized
+range mappings are explicit mappings, not proof of equivalent physical behavior.
+
+Accepted settings, effective simulation quantities and live field channels are
+distinct. The parameter snapshot reports the accepted control value. A native
+pattern may apply internal clamps, modes or multipliers; an actual velocity, phase,
+particle count or temperature requires a declared computed property or channel.
+Export those through the existing descriptor/snapshot contract where meaningful,
+without inspecting private Rust fields or parsing source code. Compute exports
+once at their declared configuration/tick boundary; reading them cannot advance
+simulation. Do not duplicate native configuration math in a generic adapter and
+call the result authoritative.
+
+An Initialize/Advance/Present entry point declares which property bindings it
+reads, just as it declares palette dependencies. Editing a linked property updates
+all consumers at the same boundary without recompiling. Simulation, presentation
+and required reinitialization follow those declared dependencies; linking a
+shader parameter does not grant write access to its source effect's settings.
+
 The numerical authoring scope includes functions, arithmetic, vectors, matrices,
 typed structs, conditionals, loops, indexed buffers, explicit random state and
 composable passes. Large fields, particle systems and reductions are legitimate
