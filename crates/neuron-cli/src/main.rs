@@ -8,6 +8,7 @@
 //! Neuron CLI — the lightweight, open replacement for Razer Synapse.
 
 mod cast_cmd;
+mod compat_cmd;
 mod control;
 mod device_cmds;
 mod light;
@@ -78,6 +79,11 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // parsed once per process; boxing every variant buys nothing
 enum Cmd {
+    /// Hardware compatibility: collect evidence and prepare a report
+    Compat {
+        #[command(subcommand)]
+        action: compat_cmd::CompatCmd,
+    },
     /// List connected, recognized Razer devices
     ///
     /// A device no definition covers yet is reported as `new device ...`; `neuron adopt` learns
@@ -972,7 +978,7 @@ fn twin_cmd(action: TwinCmd) -> Result<()> {
 /// old spellings, the debug harnesses) stay reachable by name. A test keeps this table and the
 /// command tree in step.
 const HELP_GROUPS: &[(&str, &[&str])] = &[
-    ("Devices", &["list", "info", "battery", "adopt", "storage", "mode", "backup", "verify", "badge", "button"]),
+    ("Devices", &["list", "info", "battery", "adopt", "storage", "mode", "backup", "verify", "badge", "button", "compat"]),
     ("Feel", &["feel"]),
     ("Input", &["bind", "control", "action", "trigger", "cast", "gesture", "radial", "macro", "pocket", "run", "watch", "pads", "rumble", "audio", "twin"]),
     ("Lighting", &["lighting"]),
@@ -1094,6 +1100,18 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<()> {
+    let cli = {
+        use clap::FromArgMatches as _;
+        Cli::from_arg_matches(&grouped_command().try_get_matches().unwrap_or_else(|e| usage_error(&e))).unwrap_or_else(|e| e.exit())
+    };
+    out::set_json(cli.json);
+    out::set_verbose(cli.verbose);
+    live::set_skip(cli.no_live);
+    // Compatibility export/replay must work even with broken app config and must never migrate it.
+    let command = match cli.cmd {
+        Cmd::Compat { action } => return compat_cmd::run(action),
+        command => command,
+    };
     neuron::screenshot::install_completion_sink(|message| eprintln!("[screenshot] {message}"));
     // Before ANY config read: carry a build-tree config universe forward (see
     // `runroot::adopt_legacy_run_root`). Both binaries do this because either one can be the first
@@ -1102,18 +1120,12 @@ fn run() -> Result<()> {
     if let Some((from, to)) = neuron::runroot::adopt_legacy_run_root()? {
         eprintln!("carried config forward: {} -> {}", from.display(), to.display());
     }
-    let cli = {
-        use clap::FromArgMatches as _;
-        Cli::from_arg_matches(&grouped_command().try_get_matches().unwrap_or_else(|e| usage_error(&e))).unwrap_or_else(|e| e.exit())
-    };
-    out::set_json(cli.json);
-    out::set_verbose(cli.verbose);
-    live::set_skip(cli.no_live);
     let reg = Registry::load()?;
     // Adoption is NOT a startup step (it would give read-only commands a hidden HID-probe + file
     // write): it fires lazily inside device resolution, the moment a command actually reaches for
     // the bus and comes up short. See `adopt_and_reload`.
-    match cli.cmd {
+    match command {
+        Cmd::Compat { action } => compat_cmd::run(action)?,
         Cmd::List => list(&reg)?,
         Cmd::Discover { emit } => discover_cmd(emit),
         Cmd::Adopt { dry_run } => adopt_cmd(&reg, dry_run)?,

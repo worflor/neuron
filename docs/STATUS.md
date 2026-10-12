@@ -1,8 +1,26 @@
 # neuron: state of the project
 
+Compatibility Lab collects unfiltered HID metadata through the existing transport
+policy and produces local dossiers, typed shareable bundles and research issue
+drafts. Windows exposes parsed input/output/feature fields and container grouping;
+Linux raw descriptors remain local unless separately approved for export. Passive
+vendor-input capture requires complete keyboard-free metadata and explicit consent.
+Inventory does not probe vendor commands, adopt devices or attest physical output.
+Audio-function graphs, GameInput/Raw Input comparisons, automated recognized
+protocol recipes and unknown-output experiments are outside this implementation.
+Windows collection and default export were exercised on 30 HID collections across
+six container groups, including a Naga V2 Pro, BlackWidow Chroma V2, USB Sound Card
+and Seiren V3 Mini. That verifies descriptor collection and export, not those
+devices' command protocols or physical output. Passive capture and Linux hardware
+collection remain hardware-unverified.
+Device-scoped inspection/export, verified ZIP packaging and default privacy
+projection were also exercised on the non-Razer ITE Device(8910), VID/PID
+`0b05:1866`, retaining its two collections and excluding the other groups. This
+does not verify its proprietary commands or user-facing device support.
+
 The v0.1.5 release candidate lighting transitions share one checked, persistent base renderer between local and hosted output. Complete frame snapshots feed the live hero; authored edits use finite interruptible linear-light dissolves, and explicit empty scenes persist as managed black. Software regressions cover identity, state preservation, interruption, edit storms, clone cycle caching, local/host output parity and FPS row-cache behavior. Physical LED transition appearance, host/game coexistence on real devices and non-Windows behavior remain unverified.
 
-This page tracks the Windows beta: v0.1.4 (published 2026-10-04) plus the v0.1.5 release candidate on `lighting/render-facade`. It grades what has been exercised on hardware, what is implemented but needs more use, and what is still planned. The [README](../README.md) has the device-write ledger.
+This page tracks the Windows beta: v0.1.4 (published 2026-10-04) plus the prepared v0.1.5 release candidate. It grades what has been exercised on hardware, what is implemented but needs more use, and what is still planned. The [README](../README.md) has the device-write ledger.
 
 | grade | meaning |
 |---|---|

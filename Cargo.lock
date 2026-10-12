@@ -3688,6 +3688,7 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "flate2",
+ "neuron",
  "proptest",
  "serde",
  "serde_json",

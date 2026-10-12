@@ -234,6 +234,7 @@ pub fn start() {
             if topology.as_ref() != Some(&next) {
                 // The notifier already invalidated a signalled change. This comparison is the
                 // backstop for missed notifications and unavailable notifier registration.
+                #[cfg(windows)]
                 if !woken {
                     neuron::hid_haptics::hid_topology_changed();
                 }

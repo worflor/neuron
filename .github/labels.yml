@@ -84,6 +84,9 @@ tier3:
     description: Low priority but nice - tightens an existing loop without changing guarantees.
 
 orthogonal:
+  - name: intake:compat-lab
+    color: 82B6CF
+    description: Hardware research collected through Compatibility Lab; not a verification grade.
   - name: epic
     color: 3E4B9E
     description: A large, multi-part effort with sub-issues. Still carries its own tier-1 and tier-2.

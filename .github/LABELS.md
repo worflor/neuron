@@ -62,6 +62,7 @@ when the need is real, not a smuggled axis with one value.
 |---|---|
 | `epic` | A large, multi-part effort with sub-issues. A size marker, never a type or area — an epic still carries its own Tier-1 and Tier-2 labels. |
 | `needs-triage` | Intake state for reported-but-unconfirmed issues; cleared by triage, not by the taxonomy. |
+| `intake:compat-lab` | Hardware research submitted through Compatibility Lab; evidence remains in the issue and bundle. |
 
 ## Lifecycle plumbing (not taxonomy)
 

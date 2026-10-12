@@ -1,0 +1,4 @@
+interface:
+  display_name: "Neuron Compatibility Lab"
+  short_description: "Collect safe hardware evidence and useful support reports"
+  default_prompt: "Use $neuron-compat to investigate this device and prepare a reviewed compatibility evidence bundle."
