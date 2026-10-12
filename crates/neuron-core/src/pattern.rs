@@ -6096,28 +6096,39 @@ mod tests {
     #[test]
     fn ring_ripple_contact_hold_and_release() {
         let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::capture::set_macro_held(0);
+        let _quiet = crate::capture::suppress_key_reads();
+        let render = |ring: &mut Ring, t: f32, held: bool, pressed: bool| {
+            let control = ControlId::VendorMacro { vendor: 0x1532, index: 0 };
+            let inputs = RenderInputs {
+                sampled: std::sync::Arc::new(MatrixInputSnapshot {
+                    held: if held { vec![MatrixHeld { control, row: 1, col: 0 }] } else { Vec::new() },
+                    pressed: if pressed { vec![MatrixPress { control, row: 1, col: 0, at: Duration::from_secs_f32(t) }] } else { Vec::new() },
+                    total_press_edges: u32::from(pressed),
+                    ..MatrixInputSnapshot::empty()
+                }),
+                policy: ProviderPolicy::InjectedDeterministic,
+            };
+            let _scope = inputs.enter();
+            scalar(ring.field(6, 22, t))
+        };
         let mut ring = Ring::default();
         ring.configure(&Params::defaults_for("ring"));
-        let _ = ring.field(6, 22, 0.0);
+        let _ = render(&mut ring, 0.0, false, false);
 
         let cell = 22;
-        crate::capture::set_macro_held(1 << 0);
-        let f = scalar(ring.field(6, 22, 0.10));
+        let f = render(&mut ring, 0.10, true, true);
         assert_eq!(f[cell].intensity, 1.0, "fresh strike emits peak 1.0");
         assert_eq!(ring.waves.len(), 1, "wave spawned on strike");
 
         // advance time past wave lifetime (BASE_LIFETIME = 2.2s) while still holding key
-        let f_held = scalar(ring.field(6, 22, 3.0));
+        let f_held = render(&mut ring, 3.0, true, false);
         assert!(ring.waves.is_empty(), "wave has dissipated past lifetime");
         assert!((f_held[cell].intensity - 0.55).abs() < 0.01, "held key maintains contact glow at 0.55");
 
-        crate::capture::set_macro_held(0);
-        let f_released = scalar(ring.field(6, 22, 3.15));
+        let f_released = render(&mut ring, 3.15, false, false);
         assert!(f_released[cell].intensity < 0.55, "releasing key triggers decay");
-        let f_dead = scalar(ring.field(6, 22, 4.0));
+        let f_dead = render(&mut ring, 4.0, false, false);
         assert_eq!(f_dead[cell].intensity, 0.0, "released key decays fully to zero");
-        crate::capture::set_macro_held(0);
     }
 
     #[test]
