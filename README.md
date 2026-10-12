@@ -136,6 +136,8 @@ a thing that remaps your buttons and runs python on a keypress is, by definition
 
 ## get it
 
+> **steam at 50 stars.** if this repo hits 50 stars, i'll put neuron on steam for easier installs and automatic updates. github releases aren't going anywhere, neuron stays free, and i'm still the one maintaining it. steam would just be a more convenient way to get the same thing :P
+
 ### with an agent
 
 if you'd rather not install the windows release by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo and the windows packages. the linux updater waits for a linux release asset.
