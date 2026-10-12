@@ -46,6 +46,7 @@ pub mod cast;
 pub mod clipboard;
 pub mod clipboard_transform;
 pub mod confirm;
+pub mod compat;
 pub mod controls;
 pub mod curtain;
 pub mod device;

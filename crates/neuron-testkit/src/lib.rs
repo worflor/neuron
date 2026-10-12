@@ -22,4 +22,5 @@
 
 pub mod budget;
 pub mod census;
+pub mod compat;
 pub mod tape;

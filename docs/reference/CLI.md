@@ -11,6 +11,60 @@ The device verbs live under `neuron feel`; the older top-level spellings (`dpi`,
 `scroll`, `lod`, `brightness`, `game-mode`, `sniper`, `idle`) and `import-export` still work but are hidden from
 help, as are the debug harnesses (`prof`, `probe`, `discover`) and `bind legacy|init`.
 
+## Compatibility Lab
+
+`neuron compat` collects hardware evidence independently of normal device adoption.
+It never initializes live dispatch or sends protocol commands. `collect` reads the
+registry without migrating app configuration; offline verbs need neither registry
+nor hardware access.
+
+```text
+neuron compat collect --out LOCAL_DIRECTORY --json
+neuron compat inspect LOCAL_DIRECTORY --local-names --json
+neuron compat inspect LOCAL_DIRECTORY --device DEVICE_ID --json
+neuron compat capture LOCAL_DIRECTORY --interface ID --seconds 10 --consent-input --json
+neuron compat export LOCAL_DIRECTORY --device DEVICE_ID --out SHAREABLE_DIRECTORY --json
+neuron compat verify SHAREABLE_DIRECTORY --json
+neuron compat pack SHAREABLE_DIRECTORY --out ATTACHMENT.zip --json
+neuron compat replay APPROVED_INPUT_BUNDLE --json
+```
+
+Device and interface IDs are positive and scoped to a single dossier. `--local-names`
+shows local product strings for selection; it is not shareable evidence. `--device`
+limits inspection or export to a group with its auxiliary interfaces and trials,
+leaving the complete local dossier unchanged. Collection includes
+unknown and auxiliary HID interfaces rather than using the adoption ledger's
+filter. Windows reads input/output/feature fields and PnP Container IDs; grouping
+falls back to the existing path heuristic with explicit provenance. Linux retains
+raw sysfs descriptors locally; normalized fields and public passive capture remain
+unavailable there. Interfaces the OS enumeration backend cannot read may be absent.
+
+The local directory contains `local.json`: paths, device-provided strings, topology
+keys and optional recordings. Keep it private. Export builds a new directory from
+typed fields, excluding unique identifiers, paths, device strings, raw descriptors,
+config and logs. Numeric descriptors, grouping relationships, findings, analysis,
+draft issues and SHA-256 artifact hashes are retained. Both destinations must be
+new; no existing dossier or bundle is overwritten.
+
+Capture requires explicit consent and a complete vendor-input descriptor without
+keyboard fields. Standard keyboard/mouse collections are refused. The recipe is
+bounded to 30 seconds, 2,048 reports and 256 KiB of payload; reports stay local. Raw vendor data can
+still contain private information. After separately reviewing and approving it,
+`export --include-input` includes recordings for offline replay;
+`--include-descriptors` separately includes reviewed local Linux descriptor bytes.
+Default exports
+contain only aggregate bit-variation analysis, which does not establish a control
+mapping. Integrity checks are not hardware attestation or proof of anonymity.
+
+`pack` packages only verified artifacts into a new ZIP attachment; `verify` accepts
+that ZIP or a directory and bounds archive size and expansion to 64 MiB. Keep edited
+issue text outside the bundle so its manifest hashes remain valid.
+
+No command uploads evidence or files GitHub issues. The
+[neuron-compat skill](../../skills/neuron-compat/SKILL.md) guides contributor consent,
+research and issue review. Existing SYSTEM diagnostics provide deeper recognized
+device checks; this collector does not claim that a registry capability worked.
+
 ## Conventions
 
 | | |

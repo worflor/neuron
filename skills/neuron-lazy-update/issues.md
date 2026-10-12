@@ -35,6 +35,22 @@ preference. Normal startup enables live dispatch; safe mode is not equivalent.
 
 Leave a working app running. Do not rebuild a release executable while it is open.
 
+### Automated-shell desktop isolation
+
+Child processes inherit an automated shell's desktop, which may be private even
+within the user's session. A window on that desktop is invisible to the user,
+and keyboard-reactive effects cannot observe typing on the interactive desktop.
+
+If Computer Use is unavailable, launch the exact executable at normal privilege
+with `CreateProcessW`, setting `STARTUPINFO.lpDesktop` to `WinSta0\Default`.
+Use no tray/safe flags or hidden-window option. Do not change desktop permissions
+or elevate. Verify desktop placement and confirm the rendered window through
+visual inspection or the user.
+
+Wait for the previous owner to exit before launching a replacement. A successful
+shutdown signal does not establish process exit; device restoration can delay
+shutdown.
+
 ## 1. Research first
 
 Before saying anything about bugs, find out whether it's already known or intended:

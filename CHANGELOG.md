@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added Compatibility Lab: unfiltered HID inventory, Windows descriptor fields and container grouping, local Linux descriptors, consented bounded vendor-input recordings, sanitized evidence bundles and issue drafts. Offline input and protocol replay adapters support investigation without the original device. Collection does not probe protocols, adopt devices or enable dispatch.
+- Compatibility evidence can be scoped to one device group, preserving its auxiliary interfaces and trials while withholding unrelated hardware. Local product names assist selection; verification checks findings and replay analysis against the evidence.
+
 ## v0.1.5
 
 - Made the lighting editor more responsive: pattern simulation, thumbnail rendering and saved-effect file operations run off the UI thread; offscreen catalogue tiles sleep, and live models retain their identity during updates.

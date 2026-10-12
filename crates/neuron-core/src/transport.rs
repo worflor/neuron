@@ -456,6 +456,9 @@ pub trait Backend: Send + Sync {
     fn enumerate(&self) -> Result<Vec<HidDeviceInfo>>;
     fn open_path(&self, path: &DevicePath) -> Result<Box<dyn Transport>>;
     fn open_reader(&self, path: &DevicePath) -> Result<Box<dyn InputReader>>;
+    fn research_metadata(&self, _path: &DevicePath) -> Result<research::Metadata> {
+        Ok(research::Metadata::unavailable())
+    }
 }
 
 /// Where this process's devices come from.
@@ -594,6 +597,20 @@ pub fn open_reader(path: &DevicePath) -> Result<Box<dyn InputReader>> {
     }
     platform_open_reader(path)
 }
+
+/// Read OS descriptor and topology metadata without opening a command or input channel.
+/// Uses the same deny-by-default hardware policy as enumeration and transport opens.
+pub fn research_metadata(path: &DevicePath) -> Result<research::Metadata> {
+    #[cfg(any(test, feature = "mock-transport"))]
+    match policy() {
+        Policy::Fake(b) => return b.research_metadata(path),
+        Policy::Denied => anyhow::bail!("{DENIED}"),
+        Policy::Real => {}
+    }
+    research::platform_metadata(path)
+}
+
+pub mod research;
 
 #[cfg(windows)]
 mod windows_hid;
