@@ -2733,9 +2733,13 @@ pub struct Ring {
 }
 
 impl Ring {
+    const MAX_WAVES: usize = 64;
+    const BASE_SPEED: f32 = 7.0;
+    const BASE_LIFETIME: f32 = 2.2;
+    const RING_WIDTH: f32 = 1.15;
+
     fn spawn(&mut self, or: f32, oc: f32, t: f32) {
-        const MAX_WAVES: usize = 8;
-        if self.waves.len() >= MAX_WAVES {
+        if self.waves.len() >= Self::MAX_WAVES {
             if let Some(idx) = self
                 .waves
                 .iter()
@@ -2762,7 +2766,7 @@ impl Pattern for Ring {
         let n = r * c;
         if self.dims != (rows, cols) {
             self.waves.clear();
-            self.waves.reserve_exact(8);
+            self.waves.reserve_exact(Self::MAX_WAVES);
             self.spawns = Vec::with_capacity(n);
             self.contact_level = vec![0.0; n];
             self.contact_age = vec![0.0; n];
@@ -2779,6 +2783,10 @@ impl Pattern for Ring {
         }
         let dt = (t - self.last_t).max(0.0);
         self.last_t = t;
+
+        let speed = self.speed.clamp(0.1, 6.0);
+        let life = Self::BASE_LIFETIME / self.fade.clamp(0.25, 4.0);
+        self.waves.retain(|w| t >= w.t0 && (t - w.t0) <= life);
 
         let generation = crate::capture::key_transition_generation();
         if key_scan_due(
@@ -2828,15 +2836,6 @@ impl Pattern for Ring {
             }
         }
 
-        // expansion + fade tunables. `speed` is the ring's outward velocity (cells/sec); `fade` the
-        // lifetime (higher → shorter rings). RING_WIDTH is the Gaussian band half-width (thickness).
-        const BASE_SPEED: f32 = 7.0;
-        const BASE_LIFETIME: f32 = 2.2;
-        const RING_WIDTH: f32 = 1.15;
-        let speed = self.speed.clamp(0.1, 6.0);
-        let life = BASE_LIFETIME / self.fade.clamp(0.25, 4.0);
-        self.waves.retain(|w| t >= w.t0 && (t - w.t0) <= life);
-
         let mut cells = vec![Cell::new(0.0, 0.0); n];
         if self.waves.is_empty() {
             for (cell, contact) in cells.iter_mut().zip(&self.contact_level) {
@@ -2854,11 +2853,11 @@ impl Pattern for Ring {
                 let mut best_u = 0.0f32;
                 for w in &self.waves {
                     let age = t - w.t0;
-                    let radius = age * BASE_SPEED * speed;
+                    let radius = age * Self::BASE_SPEED * speed;
                     let dr = y as f32 - w.or;
                     let dc = x as f32 - w.oc;
                     let d = (dr * dr + dc * dc).sqrt();
-                    let band_arg = (d - radius) / RING_WIDTH;
+                    let band_arg = (d - radius) / Self::RING_WIDTH;
                     let band = (-(band_arg * band_arg)).exp();
                     let atten = 1.0 / (radius + 1.0).sqrt();
                     let envelope = (1.0 - age / life).clamp(0.0, 1.0) * atten;
@@ -6119,6 +6118,29 @@ mod tests {
         let f_dead = scalar(ring.field(6, 22, 4.0));
         assert_eq!(f_dead[cell].intensity, 0.0, "released key decays fully to zero");
         crate::capture::set_macro_held(0);
+    }
+
+    #[test]
+    fn ring_ripple_typing_flurry_retains_active_waves_without_premature_cap() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _quiet = crate::capture::suppress_key_reads();
+        let mut ring = Ring::default();
+        ring.configure(&Params::defaults_for("ring"));
+        let _ = ring.field(6, 22, 0.0);
+
+        // Spawn 32 ripples in rapid succession (e.g. within 1 second of active typing)
+        for i in 0..32 {
+            let t = (i as f32) * 0.03;
+            ring.spawn(3.0, (i % 22) as f32, t);
+        }
+
+        // At t = 1.0s, all 32 waves are well within their 2.2s lifetime and should all be active
+        let _ = ring.field(6, 22, 1.0);
+        assert_eq!(ring.waves.len(), 32, "all 32 flurry waves remain active without premature truncation");
+
+        // Advance to t = 4.0s (past the 2.2s lifetime of all 32 waves)
+        let _ = ring.field(6, 22, 4.0);
+        assert!(ring.waves.is_empty(), "all waves gracefully dissipated once past lifetime");
     }
 }
 
