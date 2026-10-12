@@ -61,7 +61,11 @@ rm -rf -- "$stage"
 mkdir -p "$stage"
 cp "$cli" "$app" "$stage/"
 cp README.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "$stage/"
-cp -R LICENSES skills "$stage/"
+cp -R LICENSES "$stage/"
+git ls-files -z -- skills ':(exclude)skills/neuron-promo/**' | while IFS= read -r -d '' asset; do
+    mkdir -p "$stage/$(dirname "$asset")"
+    cp "$asset" "$stage/$asset"
+done
 cp packaging/linux/70-neuron.rules "$stage/"
 printf 'portable\n' > "$stage/portable.flag"
 cat > "$stage/SOURCE.txt" <<EOF

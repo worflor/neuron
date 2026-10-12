@@ -105,7 +105,7 @@ try {
     }
     # Stage repository assets from the tracked manifest. A developer's docs/ tree may also
     # contain ignored raw device captures; those are local research data, not package content.
-    $trackedAssets = @(& git -c core.quotePath=false ls-files -- LICENSES skills docs)
+    $trackedAssets = @(& git -c core.quotePath=false ls-files -- LICENSES skills docs ':(exclude)skills/neuron-promo/**')
     if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed while staging package assets' }
     foreach ($relative in $trackedAssets) {
         $sourcePath = Join-Path $repo $relative

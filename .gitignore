@@ -59,6 +59,7 @@ neuron-crash.log
 # Local project notes and scratch files. Useful while building Neuron, but not
 # part of the public repository.
 /.local/
+/skills/neuron-promo/
 # Licence drafts and correspondence kept beside the repo for convenience. Empty in a
 # clone; ignored so a future `git add -A` can never publish one by accident.
 /legal/

@@ -44,12 +44,11 @@ later engine changes may not reproduce them. Keep these if anyone asks whether t
 
 ## Build
 
-Requirements: see [`skills/neuron-promo`](../../../skills/neuron-promo/SKILL.md#tools) (Blender 5.2
-portable, ffmpeg on PATH, Python 3.11 with numpy/Pillow/scipy, Rust, the Harmonia repo, the installed
-neuron CLI). `pattern-export` is shared with `../effects/gen_effects.py`.
+Requirements: Blender 5.2 portable, ffmpeg on PATH, Python 3.11 with numpy/Pillow/scipy,
+Rust, the Harmonia repo and the installed neuron CLI. `pattern-export` is shared with
+`../effects/gen_effects.py`.
 
-All timing, shots, attention cues and the beat grid live in `timeline.py`. Direction rules for
-this and future ads: [`skills/neuron-promo`](../../../skills/neuron-promo/SKILL.md). Output goes to
+All timing, shots, attention cues and the beat grid live in `timeline.py`. Output goes to
 `D:\build-cache\promo\dev-ad` (`PROMO_OUT`).
 
 ```powershell
