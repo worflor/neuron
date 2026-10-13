@@ -1078,7 +1078,7 @@ fn lighting_effect_header_draws_painted_name_hovered_and_not() {
     // text antialiasing never yields a pure ramp pixel, so match the ramp's hue loosely
     let mark = |p: &slint::Rgba8Pixel| p.r >= 200 && p.b >= 200 && p.g <= 100;
     let width = painted.width();
-    let (x, y) = painted.as_slice().iter().position(|p| mark(p))
+    let (x, y) = painted.as_slice().iter().position(mark)
         .map(|i| (i as u32 % width, i as u32 / width))
         .expect("the painted name carries its ramp colour");
     for dx in [0.0f32, 4.0, -4.0, 8.0] {
