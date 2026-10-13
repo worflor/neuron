@@ -18,7 +18,7 @@ projection were also exercised on the non-Razer ITE Device(8910), VID/PID
 `0b05:1866`, retaining its two collections and excluding the other groups. This
 does not verify its proprietary commands or user-facing device support.
 
-The v0.1.5 release candidate lighting transitions share one checked, persistent base renderer between local and hosted output. Complete frame snapshots feed the live hero; authored edits use finite interruptible linear-light dissolves, and explicit empty scenes persist as managed black. Software regressions cover identity, state preservation, interruption, edit storms, clone cycle caching, local/host output parity and FPS row-cache behavior. Physical LED transition appearance, host/game coexistence on real devices and non-Windows behavior remain unverified.
+The v0.1.5 release candidate lighting transitions share one checked, persistent base renderer between local and hosted output. Complete frame snapshots feed the live hero; authored edits use finite interruptible linear-light dissolves, and explicit empty scenes persist as managed black. Software regressions cover identity, state preservation, interruption, edit storms, clone cycle caching, local/host output parity and FPS row-cache behavior. The owner verifies live LED fades in regular Windows use. Host/game coexistence and non-Windows behavior need separately recorded hardware evidence.
 
 This page tracks the Windows beta: v0.1.4 (published 2026-10-04) plus the prepared v0.1.5 release candidate. It grades what has been exercised on hardware, what is implemented but needs more use, and what is still planned. The [README](../README.md) has the device-write ledger.
 
