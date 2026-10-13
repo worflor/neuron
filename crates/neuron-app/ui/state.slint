@@ -411,6 +411,7 @@ export global State {
     in-out property <[GradientPreset]> gradient-presets;   // the base-colour gradient chips (built once at startup)
     in-out property <[string]> light-name-chars;           // the palette's name, one string per character
     in-out property <[color]> light-name-ramp;             // the palette sampled forward-then-back (a seamless loop) for the name's flow
+    in-out property <[string]> light-effect-chars;         // the selected layer's display name, one string per character (the EFFECT header's painted name)
     callback apply-gradient(int);                      // preset idx — swap the active palette's stops, keep motion + blend
     callback set-interp(string);                        // rgb | hsv | oklab — the gradient colour space
     // TIMELINE / sequencer — the keyframe track. The model `light-seq` is the SINGLE source of truth for

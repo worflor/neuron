@@ -462,6 +462,37 @@ component ParamControl inherits VerticalLayout {
     // COLOR is rendered by the page (it owns the swatch palette) — handled inline there, not here.
 }
 
+// A name painted in a palette's own colours — one Mono per character, character i sampling the
+// mirrored ramp at (i/n + phase) so the wrap is seamless; hovering lets the gradient drift through
+// the letters and settle back. Without a ramp (a layer with no spectrum) it falls back to the plain
+// `text` in faint ink: a name can only wear a palette its effect actually has. ONE component for
+// every painted name so the instances can't drift.
+component RampName inherits Rectangle {
+    in property <string> text: "";        // the plain-ink fallback when no ramp is loaded
+    in property <[string]> chars;         // the name, one string per character
+    in property <[color]> ramp;           // the palette sampled forward-then-back (a seamless loop)
+    in property <string> prefix: "";      // lead-in ink inside the hover area (the spectrum line's dash)
+    property <bool> painted: root.chars.length > 0 && root.ramp.length >= 2;
+    HorizontalLayout {
+        spacing: 0px;
+        if root.prefix != "" : Mono { text: root.prefix; color: Theme.text-faint; }
+        if !root.painted : Mono { text: root.text; color: Theme.text-faint; overflow: elide; }
+        if root.painted : ramped := HorizontalLayout {
+            property <int> m: root.ramp.length;
+            spacing: 0px;
+            for ch[i] in root.chars : Mono {
+                property <float> pos: mod((i / max(root.chars.length, 1) * 0.5 + root.phase) * ramped.m, ramped.m);
+                property <int> j: Math.floor(self.pos);
+                color: root.ramp[self.j].mix(root.ramp[mod(self.j + 1, ramped.m)], 1 - (self.pos - self.j));
+                text: ch;
+            }
+        }
+    }
+    property <float> phase: rta.has-hover ? 0.5 : 0.0;
+    animate phase { duration: 1400ms; easing: ease-in-out; }
+    rta := TouchArea {}
+}
+
 // THE SPECTRUM EDITOR — the active layer's COLOUR PROGRAM (a layer = PATTERN × SPECTRUM; the pattern's
 // knobs auto-render in TUNE, this block owns the colour). Three stacked instruments over the phase-3
 // State spectrum surface: the GRADIENT STRIP (the active palette's stops), the MOTION row (the palette's
@@ -512,24 +543,11 @@ component SpectrumEditor inherits VerticalLayout {
             SectionTitle { text: "SPECTRUM"; }
             // the book button — opens the SPECTRUM + MOTION guide (what a stop is, the motion kinds)
             VerticalLayout { alignment: center; GuideButton { guide-id: "spectrum"; } }
-            // the palette's name, painted in the palette itself; hovering lets the gradient drift
-            // through the letters and settle back. Character i samples the mirrored ramp at
-            // (i/n + phase), so the wrap is seamless.
-            if State.light-name-chars.length > 0 : name-hit := Rectangle {
-                property <int> m: State.light-name-ramp.length;
-                property <float> phase: nta.has-hover ? 0.5 : 0.0;
-                animate phase { duration: 1400ms; easing: ease-in-out; }
-                HorizontalLayout {
-                    spacing: 0px;
-                    Mono { text: "– "; color: Theme.text-faint; }
-                    for ch[i] in State.light-name-chars : Mono {
-                        property <float> pos: mod((i / max(State.light-name-chars.length, 1) * 0.5 + name-hit.phase) * name-hit.m, name-hit.m);
-                        property <int> j: Math.floor(self.pos);
-                        color: State.light-name-ramp[self.j].mix(State.light-name-ramp[mod(self.j + 1, name-hit.m)], 1 - (self.pos - self.j));
-                        text: ch;
-                    }
-                }
-                nta := TouchArea {}
+            // the palette's name, painted in the palette itself (RampName owns the drift-on-hover)
+            if State.light-name-chars.length > 0 : RampName {
+                chars: State.light-name-chars;
+                ramp: State.light-name-ramp;
+                prefix: "– ";
             }
             Rectangle {}
             // no stop-count here: "stop N of M" under the strip already carries the total —
@@ -1090,10 +1108,13 @@ export component LightingPanel inherits VerticalLayout {
                     HorizontalLayout {
                         SectionTitle { text: "EFFECT"; }
                         Rectangle {}
-                        Mono {
+                        // the effect's name wears the applied palette — the same instrument as the
+                        // spectrum line's painted name, so the two can't drift
+                        RampName {
                             text: State.selected-layer >= 0 && State.selected-layer < State.light-stack-labels.length
                                 ? State.light-stack-labels[State.selected-layer] : "";
-                            color: Theme.text-faint; overflow: elide;
+                            chars: State.light-effect-chars;
+                            ramp: State.light-name-ramp;
                         }
                     }
                     for cp in State.light-params : VerticalLayout {

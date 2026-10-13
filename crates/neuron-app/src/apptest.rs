@@ -1036,6 +1036,64 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
     assert!(demands.borrow().iter().any(|&(shelf, _, _, _, _)| shelf == 3));
 }
 
+/// The EFFECT header's painted name: with no ramp it draws the plain-ink fallback; with one, the
+/// name wears it (marked pure so it is findable — the spectrum editor is absent here, so no other
+/// element carries the mark), and hovering drifts the gradient through the letters. Hover-gated
+/// bindings only fire while drawn — see the section note above.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn lighting_effect_header_draws_painted_name_hovered_and_not() {
+    use slint::platform::WindowEvent;
+    use slint::{LogicalPosition, ModelRc, SharedString, VecModel};
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let st = app.global::<State>();
+    // the inspector column mounts on a selected effect; the EFFECT section on a declared param
+    st.set_selected_device(0);
+    st.set_selected_device_name("Test Board".into());
+    st.set_sel_can_light(true);
+    st.set_grid_rows(6);
+    st.set_grid_cols(22);
+    st.set_page(1);
+    st.set_light_effect("wave".into());
+    st.set_light_stack_labels(ModelRc::new(VecModel::from(vec![SharedString::from("wave")])));
+    st.set_light_params(ModelRc::new(VecModel::from(vec![crate::ui::EffectParam {
+        key: "speed".into(), label: "speed".into(), kind: "range".into(),
+        fval: 1.0, fmin: 0.0, fmax: 3.0,
+        options: ModelRc::new(VecModel::from(Vec::<SharedString>::new())),
+        ival: 0, hex: "".into(), col: slint::Color::from_rgb_u8(0, 0, 0), bval: false,
+    }])));
+    st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(1240.0, 1100.0));
+    app.show().expect("show the window");
+    app.window().take_snapshot().expect("the plain-ink fallback name draws");
+    // the painted branch: the header name wears the ramp. Only THIS name paints — the spectrum
+    // editor is absent (no has-spectrum here), so `light-name-chars` stays empty.
+    st.set_light_effect_chars(ModelRc::new(VecModel::from(
+        "wave".chars().map(|c| SharedString::from(c.to_string())).collect::<Vec<_>>(),
+    )));
+    st.set_light_name_ramp(ModelRc::new(VecModel::from(vec![slint::Color::from_rgb_u8(255, 0, 255); 4])));
+    let painted = app.window().take_snapshot().expect("the painted name draws");
+    // text antialiasing never yields a pure ramp pixel, so match the ramp's hue loosely
+    let mark = |p: &slint::Rgba8Pixel| p.r >= 200 && p.b >= 200 && p.g <= 100;
+    let width = painted.width();
+    let (x, y) = painted.as_slice().iter().position(|p| mark(p))
+        .map(|i| (i as u32 % width, i as u32 / width))
+        .expect("the painted name carries its ramp colour");
+    for dx in [0.0f32, 4.0, -4.0, 8.0] {
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(x as f32 + dx, y as f32),
+        });
+        app.window().take_snapshot().expect("the hover drift reads its bindings while drawn");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    slint::platform::update_timers_and_animations();
+    app.window().take_snapshot().expect("a mid-drift frame draws");
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    app.window().take_snapshot().expect("the settled name draws after the pointer leaves");
+}
+
 #[test]
 #[ignore = "run by gui_tests_in_fresh_processes"]
 fn lighting_parameter_drags_preserve_live_models_and_latest_value() {
