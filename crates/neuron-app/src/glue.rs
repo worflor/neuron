@@ -10512,6 +10512,18 @@ fn layer_label(def: &neuron::pattern::LayerDef) -> String {
         .unwrap_or_else(|| def.pattern.clone())
 }
 
+/// The EFFECT header's painted name, one string per character (Slint cannot split a string, so the
+/// glue does) — capped because a per-character row cannot `overflow: elide` the way a single Text can.
+fn effect_name_chars(label: &str) -> Vec<SharedString> {
+    const MAX_CHARS: usize = 24;
+    let capped = if label.chars().count() > MAX_CHARS {
+        label.chars().take(MAX_CHARS).chain(std::iter::once('…')).collect::<String>()
+    } else {
+        label.to_string()
+    };
+    capped.chars().map(|c| SharedString::from(c.to_string())).collect()
+}
+
 /// Project the SELECTED layer's PLACEMENT into the State surface: the honest badge (`light-place-label`
 /// + `light-layer-placed`) and the render's persistent outline corners (`light-place-r0..c1`, inclusive
 /// grid cells; -1 = full board). An empty region reads as the whole board (no outline); a sub-region's
@@ -10605,6 +10617,9 @@ fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
     let has_spectrum = neuron::pattern::pattern_has_spectrum(&active.pattern);
     st.set_light_has_spectrum(has_spectrum);
     if has_spectrum {
+        // the EFFECT header wears the applied palette too: the layer's name per character, painted
+        // from the same ramp as the spectrum line's palette name (one instrument, two callers).
+        update_value_model(st.get_light_effect_chars(), effect_name_chars(&layer_label(active)), |model| st.set_light_effect_chars(model));
         project_spectrum(app, &active.spectrum, active_frame);
     } else {
         clear_spectrum_surface(app);
@@ -10621,6 +10636,10 @@ fn clear_spectrum_surface(app: &AppWindow) {
     st.set_light_motion("hold".into());
     st.set_light_interp("rgb".into());
     st.set_light_name_chars(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    // the ramp and header chars too: a stale gradient would paint the next header in the PREVIOUS
+    // effect's colours once this layer's name falls back to plain ink
+    st.set_light_name_ramp(ModelRc::new(VecModel::from(Vec::<slint::Color>::new())));
+    st.set_light_effect_chars(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
 }
 
 thread_local! {
