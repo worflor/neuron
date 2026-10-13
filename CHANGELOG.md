@@ -2,11 +2,11 @@
 
 ## Unreleased
 
-- Added Compatibility Lab: unfiltered HID inventory, Windows descriptor fields and container grouping, local Linux descriptors, consented bounded vendor-input recordings, sanitized evidence bundles and issue drafts. Offline input and protocol replay adapters support investigation without the original device. Collection does not probe protocols, adopt devices or enable dispatch.
-- Compatibility evidence can be scoped to one device group, preserving its auxiliary interfaces and trials while withholding unrelated hardware. Local product names assist selection; verification checks findings and replay analysis against the evidence.
-
 ## v0.1.5
 
+- Added Compatibility Lab: vendor-neutral HID inventory, Windows descriptor fields and container grouping, device-scoped sanitized evidence bundles and issue drafts. Bounded vendor-input trials require explicit consent; offline input and protocol replay support investigation without the original hardware. Inventory does not probe protocols, adopt devices or enable dispatch. Linux descriptor collection is implemented for source builds; live Linux hardware capture remains unverified.
+- Effect names in the lighting inspector now use the applied palette, with a hover colour drift and a plain-text fallback for effects that bypass the spectrum. Long names are bounded and stale palette colours are cleared when switching effects.
+- Ripple retains active waves during rapid typing and expires completed waves before accepting new strikes. Its contact regression uses deterministic injected input rather than live keyboard state.
 - Made the lighting editor more responsive: pattern simulation, thumbnail rendering and saved-effect file operations run off the UI thread; offscreen catalogue tiles sleep, and live models retain their identity during updates.
 - Tightened the lighting inspector with a colour-mix dropdown, a colour-motion picker with reversible direction, compact timeline actions and inline effect property pickers. Existing authored motion and gradient interpolation remain intact.
 - Lighting layers now have an ordered, scrollable stack with visibility, duplication, per-layer opacity and a blend dropdown (Normal, Screen, Add, Multiply, Cutout). A covered-layer shortcut points to an opaque effect hiding the selection. Existing scenes retain full opacity by default.
