@@ -7,8 +7,8 @@ It is the shortest path to being useful here without breaking something that mat
 If you only take three things away, take these:
 
 1. **Tests may never arm input.** A test whose only job is enforcing that exists.
-2. **A device write either verifies itself against the hardware's own bytes, or it
-   stays gated.** Never guess at someone's hardware.
+2. **Hardware settings with getters read back; streaming writes check replies.**
+   Unknown or lower-confidence commands stay gated. Never guess at someone's hardware.
 3. **More, never bloat.** neuron does a lot on purpose. Every addition earns its
    place, or it doesn't ship.
 
@@ -153,18 +153,18 @@ insufficient. See the launch procedure for desktop selection and verification.
 
 ## The invariants, spelled out
 
-**The arm gate.** Every synthesized keystroke, click, and process spawn goes through
-one process-wide switch that starts *disarmed*. Only the running daemon or GUI ever
-flips it. Tests cannot arm it, and a dedicated test enforces that. If you are
-touching anything that synthesizes input, you are touching this, and it is `risky`
-work by definition.
+**The arm gate.** Neuron-mediated input and process actions pass a gate that starts
+disarmed. A normal live launch arms after dispatch starts; `--safe` doesn't. Tests
+cannot arm real input. BOUND macros use the brokered gate, but RAW Python has normal
+account authority and can bypass it. Any change to input synthesis or arming is
+`risky` work.
 
-**Read-back verification.** Device writes default to volatile (`NOSTORE`) (the one
-exception is `scroll`, which stores onboard by default to match Synapse), re-read the
-matching getter, and hard-error on a mismatch rather than reporting a silent
-success. A capability with no trusted opcode refuses rather than guessing. New writes
-stay behind a `NEURON_*_WRITE` feature gate until a wire capture confirms them. A
-an unverified guess must stay gated, and a read-back mismatch must fail loudly.
+**Hardware writes and evidence.** Use volatile (`NOSTORE`) settings where the
+protocol supports them; scroll stage selection stores onboard by default. Where a
+getter exists, verify the setting against the device and fail on a mismatch. Live
+lighting frames validate their replies, not a separate read-back of every LED.
+Unknown write opcodes stay gated or carry the explicit, reviewed `ungated_debt`
+allowed by the protocol ledger. Never infer hardware safety from mock success.
 
 **The protocol ledger.** Every wire fact neuron speaks has an entry in
 `crates/neuron-core/protocol/ledger.toml`: its grade (live / capture / agreed / single /

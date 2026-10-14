@@ -1,17 +1,17 @@
 ---
 name: neuron-compat
-description: Investigate Neuron hardware compatibility, including unknown HID devices, with native evidence collection, optional guided input experiments, sanitized bundles and actionable issue drafts. Use for support research and device-specific failures, not normal setup changes.
+description: Help someone test Neuron with unfamiliar or unsupported Razer and other HID hardware. Investigate device-specific problems, collect reviewed evidence and prepare an issue without requiring programming. Not for ordinary setup changes.
 ---
 
 # Neuron compatibility research
 
-Help a person contribute useful hardware evidence without becoming a developer.
-Produce a short explanation for them and a reproducible engineering handoff for
-the maintainer. Native collection decides what is observable and capture-eligible;
-do not reconstruct that logic in shell scripts or infer hardware support from names.
-Collection is vendor-neutral: Razer, Logitech and unrecognized HID devices can all
-contribute descriptor evidence. A dialect signature enables deeper investigation;
-it is not required for inventory. Non-HID functions remain outside this collector.
+Help someone contribute useful device evidence without needing to know Rust, USB
+IDs or report layouts. Explain what Neuron actually observed and prepare a clear,
+reproducible handoff. Native collection decides what's safe to inspect; never
+reconstruct that logic in shell scripts or infer support from device names.
+Razer, Logitech and other HID devices can contribute descriptor evidence. A
+recognized protocol enables deeper investigation, but isn't required for inventory.
+Non-HID functions remain outside this collector.
 
 ## Start with the installed build
 

@@ -1,14 +1,36 @@
 # Compatibility Lab
 
-Compatibility Lab turns a contributor's hardware observations into evidence a
-maintainer can investigate without owning the device. The contributor supplies a
-model, connection mode and one observed problem; an agent handles native collection,
-optional guided experiments and the reviewed issue draft.
+Compatibility Lab helps investigate devices I don't have on my desk. A basic [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) is already useful; you don't need to collect anything first. If you want to provide more detail, Neuron's CLI can collect read-only HID evidence without changing your device settings.
 
-The initial scope is HID evidence. Audio endpoints, non-HID PnP functions, runtime
-source comparisons and vendor-output experiments require their own reviewed
-recipes. An unavailable recipe is a reported gap, never an invitation for an agent
-to improvise packets.
+## try it yourself
+
+1. Find `neuron.exe` beside `neuron-app.exe`, and open PowerShell **in that folder**. Run `.\neuron.exe compat --help` to see the commands in your installed version. If Neuron is on your PATH, `neuron` works too.
+2. Collect to a **new local folder**, then inspect the device names **locally**:
+
+   ```powershell
+   $folder = Join-Path $env:LOCALAPPDATA ("neuron\compat-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+   $dossier = Join-Path $folder "private"
+   $bundle = Join-Path $folder "shareable"
+   $zip = Join-Path $folder "evidence.zip"
+   .\neuron.exe compat collect --out "$dossier"
+   .\neuron.exe compat inspect "$dossier" --local-names
+   ```
+
+3. Pick the device number shown in the local list. PowerShell will ask for it, then export **only that device**:
+
+   ```powershell
+   $deviceId = [int](Read-Host "Device number from the list above")
+   .\neuron.exe compat inspect "$dossier" --device $deviceId
+   .\neuron.exe compat export "$dossier" --device $deviceId --out "$bundle"
+   .\neuron.exe compat verify "$bundle"
+   .\neuron.exe compat pack "$bundle" --out "$zip"
+   ```
+
+4. Open `$bundle\summary.md` and review any drafts in `$bundle\issues\`. Write what actually happened in your own words, then [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml). Attach the ZIP only if you're comfortable sharing it. Neuron doesn't upload or post anything for you.
+
+**keep the local dossier private.** It can contain serials, paths and other identifiers. The default export leaves out those fields and raw input, but you should still review it. Recording input or including raw descriptors is a separate opt-in, not part of these steps. The bundle verifies its own structure, not that your device is supported.
+
+This is HID evidence, not automatic device support. Audio endpoints, non-HID functions and unknown output experiments need separate reviewed procedures. Missing evidence never authorizes guessed writes. [CLI reference](CLI.md#compatibility-lab) · [optional guided skill](../../skills/neuron-compat/SKILL.md).
 
 ## Ownership and architecture
 

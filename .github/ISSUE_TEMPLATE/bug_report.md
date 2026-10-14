@@ -6,13 +6,13 @@ labels: bug, needs-triage
 assignees: ''
 ---
 
-Rather talk it through? An AI agent can help investigate and draft this from your description. Writing it yourself is just as welcome.
+no special tools needed. describe what happened in your own words; a short report is fine.
 
-**device + PID**
-which device, and its product id. the DEVICE page shows both, or run `neuron list`.
+**device + connection** (if relevant)
+model, and whether it's wired, dongle or Bluetooth. PID is helpful but optional; the DEVICE page or `neuron list` can show it.
 
 **OS version**
-windows build (`winver`), or your distro if you're running one of the seams.
+Windows build (`winver`), or your Linux distro if you built from source.
 
 **what happened**
 
@@ -23,9 +23,8 @@ windows build (`winver`), or your distro if you're running one of the seams.
 **how to reproduce it**
 the shortest path you know of.
 
-**diagnostics** (if it's device- or lighting-shaped)
-the SYSTEM page has a diagnostics bench — nine read-only probes. run it and paste the output.
-it's always safe: it never writes to your hardware.
+**diagnostics** (optional)
+SYSTEM has a read-only diagnostics bench. share what helps, after checking the output for private details. no need to attach your whole setup.
 
 **anything else**
-crash log (`neuron-crash.log`), relevant config snippets, a screenshot — whatever you've got.
+crash log (`neuron-crash.log`), relevant config snippets or a screenshot. please leave out serial numbers, paths and private data.

@@ -6,7 +6,7 @@ labels: enhancement, needs-triage
 assignees: ''
 ---
 
-Rather talk it through? An AI agent can help investigate and draft this from your description. Writing it yourself is just as welcome.
+no special tools needed. describe what happened in your own words; a short report is fine.
 
 **what you were trying to do**
 
@@ -17,8 +17,8 @@ Rather talk it through? An AI agent can help investigate and draft this from you
 **why it matters to you**
 the situation you hit this in. one real use beats a list of hypothetical ones.
 
-**device + PID** (if it's device-shaped)
-the DEVICE page shows both, or run `neuron list`.
+**device + connection** (if relevant)
+model and wired/dongle/Bluetooth is enough. PID is optional; the DEVICE page or `neuron list` can show it.
 
 **anything else**
 a workaround you're using now, how another tool handles it, a screenshot.

@@ -217,30 +217,29 @@ don't want to write python? the GUI has a **block builder**: drag typed nodes (t
 
 ## won't surprise you
 
-this is a tool whose whole job is injecting input and writing to your hardware, so the safety has to be real. three mechanisms, always on.
+neuron can send input, change hardware settings and run Python. these are the rules it follows.
 
 ### the arm gate
 
-every synthesised keystroke, click, and process-spawn (and every macro helper) goes through one process-wide switch that **starts disarmed.** tests, the verify pass, anything that isn't the actual running app fires nothing. only the daemon or the GUI ever flips it on, and a normal launch of either does, so binds work from logon; `--safe` never does. (there's a test whose only job is making sure the test suite can never arm input.)
+the input gate starts disarmed. a normal GUI or daemon launch arms it once live dispatch starts, so your binds work after sign-in. `--safe` leaves input disarmed and pauses device writes. the GUI can pause writes separately, too. disarming is immediate; manually re-arming asks first. tests can't arm real input.
 
-the running app hands the same switch to the Macro Host, so helpers obey it too. `neuron run --safe` is fully read-only: input disarmed, writes paused; `neuron-app --safe` boots the app the same way; and the GUI keeps a separate switch that just pauses device writes. re-arming by hand takes a deliberate confirm; disarming is instant. reads are always safe.
-
-a thing that remaps your buttons and runs python on a keypress is, by definition, an input hook, which is exactly why you get the full source. read it, build it yourself, throw the binary at virustotal. and a small unsigned binary will sometimes trip defender's smartscreen; that's the tax on indie exes.
+Neuron-managed actions and BOUND macro helpers check this gate. RAW Python is unrestricted and can bypass it, so treat RAW macros like any other program you'd run. [the full security model](../SECURITY.md) spells out the difference.
 
 ### writes that verify themselves
 
-reads are free and always safe. writes are where people get burned, so every one runs the same gauntlet:
+receiving a command isn't the same as knowing the hardware kept the setting. neuron separates the two:
 
-1. **backup first.** before any "safe" write, neuron can snapshot the device's entire getter space (every class × id) to `backups/*.json`, the known-good reference you diff a fresh read against (`neuron verify`) when you want to prove nothing drifted.
-2. **driver mode.** host control only renders in device-mode `0x03`: razer gates it, synapse flips it, so does `neuron mode driver`. it's idempotent and reverts when you reopen synapse or power-cycle.
-3. **volatile first.** writes default to `NOSTORE`: they take effect now but aren't flashed to onboard memory unless you ask (`--persist`). the one exception is the scroll-wheel stage, which `neuron scroll` stores onboard by default because that's what synapse sends; `--volatile` opts out. nothing permanent happens until a clean round-trip proves the opcode.
-4. **read-back verify.** after the write, neuron re-reads the matching getter and confirms the bytes it sent actually landed. a mismatch is a hard error (`VERIFY FAILED, write NOT trusted`), never a silent success.
+1. **backup if you want a baseline.** `neuron backup` and `neuron verify` let you compare device state before and after changing it.
+2. **use the right device mode.** some hardware needs driver-mode custody; other functions, including firmware-backed Naga binds, work in normal mode. Neuron keeps those distinct instead of forcing every device into one state.
+3. **prefer volatile changes.** settings use `NOSTORE` when the command supports it. `--persist` is deliberate; scroll stage selection stores onboard by default (`--volatile` opts out).
+4. **verify settings with getters.** DPI, polling and other supported settings read back the result. a mismatch fails loudly instead of becoming a fake success.
+5. **check streaming replies.** live lighting frames validate the device's protocol response. that's not the same as reading back every LED, and it isn't described as such.
 
-and when there's no opcode it actually trusts, it just refuses. no guessing at your hardware. the full ledger of what's proven, gated, and missing is down in [the honesty ledger](../README.md#honesty-proven-gated-absent).
+lower-confidence write commands stay gated unless the ledger records an explicit exception and why. [the device-write ledger](../README.md#honesty-proven-gated-absent) says which ones.
 
 ### confirmations
 
-neuron never changes anything silently. every committed change (dpi, scroll stage, polling, brightness, a profile or layer flip, a macro's `notify`, a swapped side-plate, a dying battery) pops a small **card** on screen, but only *after* the change actually lands. they stack, collapse to just-the-latest, or batch into a digest (your call), and you drag a little mock-monitor to say where they show up or mute the kinds you don't care about. they can make noise, too: a soft chime per kind, and a sharper one as the battery crosses 20 / 10 / 5 / 2%. it's the OSD synapse pops at you, minus the part where you can't turn it off.
+committed changes can show a small on-screen card: DPI, polling, profile, lighting, battery and more. move them, group them or turn them off. optional sounds and battery thresholds are yours to configure. it's the useful part of Synapse's OSD without being stuck with it.
 
 ## life after synapse
 

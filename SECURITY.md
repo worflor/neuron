@@ -1,19 +1,19 @@
 # security
 
-neuron injects input, writes to your hardware, and runs code you wrote. that's a real attack surface, so here's the honest shape of it.
+neuron changes device settings, sends input and runs code you choose. that's real authority, so here's what it can and can't promise.
 
 ## what the surface actually is
 
-**input injection is arm-gated.** every synthesised keystroke, click, and process spawn goes through one process-wide switch that starts *disarmed*. only the running daemon or GUI ever flips it on, and arming takes a deliberate confirm. tests can't arm it (there's a test whose only job is enforcing that). if that gate can be flipped by anything other than a deliberate user action, that's a vulnerability and i want to hear about it.
+**input is arm-gated.** the process starts disarmed. a normal GUI or daemon launch arms Neuron's live binds once dispatch starts; `--safe` does not. turning input off is immediate, and manually turning it back on requires confirmation. tests can't arm real input. this gate applies to Neuron-managed actions, not unrestricted RAW Python or other programs running under your account.
 
-**device writes verify themselves.** writes default to volatile (`NOSTORE`), except `neuron scroll <stage>`, which stores onboard by default like synapse (`--volatile` opts out). every write reads back the matching getter and hard-errors on a mismatch rather than reporting a silent success. anything without a trusted opcode refuses instead of guessing. no kernel driver, no vendor SDK, just HID feature reports on an access-zero handle.
+**device settings are checked against hardware.** supported setters with matching getters (such as DPI and polling) read back the result and fail on a mismatch. live lighting frames validate protocol replies, not the physical colour of every LED. unverified writes are gated or named as exceptions in the protocol ledger. settings are volatile by default where supported; `scroll` stores its stage onboard unless you use `--volatile`. Neuron needs no Razer SDK or additional kernel driver for these controls.
 
 **neuron-host opens local surfaces, and every one of them is reachable by anything already running on your machine.** here's the complete list:
 
 - **the OpenRGB protocol server (port 6742) and the Chroma REST face (port 54235)** bind loopback only. they exist so other apps on *your* machine can push into your lighting, and they're unauthenticated by design, the same as the tools they're compatible with.
 - **the native Chroma face is shared memory, not a socket.** games reach Razer's SDK through `Global\` shared-memory objects. creating those sections requires `SeCreateGlobalPrivilege`. The packaged `neuron-chroma-broker` runs from a protected Program Files directory at high integrity and only creates and holds the fixed Chroma sections. The limited tray process adopts them and owns parsing, arbitration and device output. The broker has no macro, input, network or HID path. The sections grant **full access to Everyone** (`D:(A;;GA;;;WD)`), because that is what games expect to open. Without the broker, Chroma REST remains available.
 
-that permission isn't a choice i get to make — a game opens these with `FILE_MAP_ALL_ACCESS`, which includes the standard write-DACL/write-owner rights, so a tighter descriptor fails the open and the game never paints. neuron uses fixed section sizes, and parse loops are bounds-checked. Do not run the whole user-writable app as administrator to recover native Chroma: RAW Python and the executable itself then inherit that authority.
+  that permission isn't a choice i get to make: the game uses `FILE_MAP_ALL_ACCESS`, which includes write-DACL/write-owner rights. a tighter descriptor fails the open and the game can't paint. neuron uses fixed section sizes and bounds-checked parsing. don't elevate the whole app to make native Chroma work; RAW Python would inherit that authority too.
 - **a held loopback port (47615)** marks "a neuron host already owns this machine" so two instances never both write to a device. it's never accepted on, so it carries no data.
 - **an outbound connection to OBS Studio (`127.0.0.1:4455`)**, and only if you turn it on (it's off by default). it runs both ways: macros can drive scenes, streaming and recording, and OBS's events come back in and can fire your `on_obs_*` hook macros. so whatever is answering on that port can trigger those macros. set an obs-websocket password if that matters to you.
 
