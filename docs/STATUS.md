@@ -1,26 +1,20 @@
 # neuron: state of the project
 
-Compatibility Lab collects unfiltered HID metadata through the existing transport
-policy and produces local dossiers, typed shareable bundles and research issue
-drafts. Windows exposes parsed input/output/feature fields and container grouping;
-Linux raw descriptors remain local unless separately approved for export. Passive
-vendor-input capture requires complete keyboard-free metadata and explicit consent.
-Inventory does not probe vendor commands, adopt devices or attest physical output.
-Audio-function graphs, GameInput/Raw Input comparisons, automated recognized
-protocol recipes and unknown-output experiments are outside this implementation.
-Windows collection and default export were exercised on 30 HID collections across
-six container groups, including a Naga V2 Pro, BlackWidow Chroma V2, USB Sound Card
-and Seiren V3 Mini. That verifies descriptor collection and export, not those
-devices' command protocols or physical output. Passive capture and Linux hardware
-collection remain hardware-unverified.
-Device-scoped inspection/export, verified ZIP packaging and default privacy
-projection were also exercised on the non-Razer ITE Device(8910), VID/PID
-`0b05:1866`, retaining its two collections and excluding the other groups. This
-does not verify its proprietary commands or user-facing device support.
+## the quick version
 
-The v0.1.5 lighting transitions share one checked, persistent base renderer between local and hosted output. Complete frame snapshots feed the live hero; authored edits use finite interruptible linear-light dissolves, and explicit empty scenes persist as managed black. Software regressions cover identity, state preservation, interruption, edit storms, clone cycle caching, local/host output parity and FPS row-cache behavior. The owner verifies live LED fades in regular Windows use. Host/game coexistence and non-Windows behavior need separately recorded hardware evidence.
+- **Windows beta:** this is the release you can download today. i use it instead of Synapse on my Naga V2 Pro and BlackWidow Chroma V2.
+- **Other Razer devices:** not all verified. identification, successful reads and actual working controls are different things.
+- **Beyond Razer:** a PowerA gamepad has been tested for input and rumble on Windows. Logitech HID++ discovery is experimental and read-only, without hardware verification.
+- **Linux:** the app and CLI build from source, but no Linux package or native Razer HID test yet. **macOS:** no backend yet.
+- **Got different hardware?** [share what works](https://github.com/worflor/neuron/issues/new?template=device_report.yml), or [collect evidence yourself](reference/COMPATIBILITY-LAB.md#try-it-yourself).
 
-This page tracks the Windows beta: [v0.1.5](https://github.com/worflor/neuron/releases/tag/v0.1.5), published 2026-10-13. Windows and Linux CI passed; the Windows release's full validation, installer and portable ZIP checksums, and GitHub Actions provenance attestations were verified. It grades what has been exercised on hardware, what is implemented but needs more use, and what is still planned. The [README](../README.md) has the device-write ledger.
+This page tracks [v0.1.5](https://github.com/worflor/neuron/releases/tag/v0.1.5), published 2026-10-13. Windows and Linux CI passed, and the Windows release's checksums and provenance attestations were verified. These are build checks, not proof that a new device works.
+
+The Compatibility Lab was checked against 30 HID collections across six Windows device groups and an unrelated ITE device (`0b05:1866`). This verifies descriptor inventory and reviewable export, not device command support. Passive input capture and Linux hardware collection still need physical testing. [How the Lab works](reference/COMPATIBILITY-LAB.md).
+
+Lighting scene changes now dissolve through the persistent base renderer. Software regressions cover interrupted edits, renderer state and local/host parity; live LED fades have been checked on the owner's Windows setup. Other hardware and game coexistence still need verification.
+
+The table below grades what actually works. [The README](../README.md#honesty-proven-gated-absent) has the device-write ledger.
 
 | grade | meaning |
 |---|---|

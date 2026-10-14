@@ -1,0 +1,60 @@
+name: Device compatibility report
+description: Tried Neuron on your hardware? Tell me what worked, even if nothing did.
+title: "[device] "
+labels: [enhancement, needs-triage, "area:device"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying Neuron! Just tell me what you saw, even if nothing worked.
+        Neuron is a Windows beta; Linux source builds haven't had native Razer HID testing.
+        Diagnostics are optional. You can [collect a reviewable bundle yourself](https://github.com/worflor/neuron/blob/main/docs/reference/COMPATIBILITY-LAB.md#try-it-yourself) if you want to help with deeper support.
+  - type: input
+    id: device
+    attributes:
+      label: Device model
+      placeholder: "e.g. Razer Naga V2 Pro"
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: How is it connected?
+      options:
+        - Wired / USB
+        - USB receiver / dongle
+        - Bluetooth
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: OS and Neuron version (if you know them)
+      placeholder: "e.g. Windows 11, Neuron v0.1.5"
+  - type: dropdown
+    id: result
+    attributes:
+      label: How did it go?
+      options:
+        - Everything I tried worked
+        - Some things worked
+        - Detected, but nothing I tried worked
+        - Not detected
+        - Just investigating / not sure yet
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What did you try, and what happened?
+      description: Even one setting is useful. Say what worked and what didn't; no need to test everything.
+      placeholder: "DPI worked. The mouse was detected, but side buttons didn't remap..."
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Diagnostics or anything else (optional)
+      description: Share a reviewed summary or compatibility bundle if you have one. Don't paste raw serial numbers, device paths, tokens or private data.
+      placeholder: "Optional diagnostics, steps to reproduce, or what you wish the device could do"
