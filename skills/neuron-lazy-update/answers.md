@@ -22,19 +22,22 @@ repository: https://github.com/worflor/neuron
 
 Use the linked evidence to answer for the user's version and hardware.
 
-- **Does it need an account or send data anywhere?** No account, cloud or telemetry. The optional
-  OBS link stays on the same machine; optional OpenRGB and Chroma listeners accept local clients.
-  RAW Python macros may use the network if their author writes them to. (`SECURITY.md`)
-- **Can I use it with Synapse installed?** Not on the same device at the same time. neuron can
-  import Synapse settings and remove Synapse. (`README.md`, GDD *life after synapse*)
-- **Which devices work?** Check the device-specific grades and hardware evidence in
-  `docs/STATUS.md`. Distinguish detection, verified reads, verified writes, and audio support.
-- **Linux or Mac?** Check the release's platform assets, README build instructions, and
-  `docs/STATUS.md`. Distinguish a released download, a source build, and verification on hardware.
-- **Why does Windows warn when I run it?** Check the selected package's signing information,
-  `SHA256SUMS.txt`, `SOURCE.txt`, and published provenance. Explain what that evidence verifies.
-- **Where are my settings?** In the install folder next to the exes, or in `%LOCALAPPDATA%\neuron`
-  if the install folder isn't writable.
+- **Does it need an account or send data anywhere?** No Neuron account, cloud or telemetry.
+  OpenRGB, Chroma and the optional OBS link are local integrations. RAW Python macros can use
+  the network like ordinary Python. (`SECURITY.md`)
+- **Can I replace Synapse?** The maintainer does on the Naga V2 Pro and BlackWidow Chroma V2.
+  Other devices need their own checks; don't promise compatibility from detection alone.
+  Synapse and Neuron shouldn't control the same device at once. (`README.md`, `docs/STATUS.md`)
+- **Which devices work?** Check `docs/STATUS.md` for verified hardware and feature grades.
+  To help test another device, use the [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml)
+  or the optional [`neuron-compat` skill](../neuron-compat/SKILL.md).
+- **Linux or Mac?** Windows is the released platform. Linux app and CLI build from source,
+  but have no released package or native Razer HID verification; macOS has no backend.
+- **Why does Windows warn when I run it?** The Windows builds are unsigned. Check the
+  release's `SHA256SUMS.txt`, `SOURCE.txt` and provenance to verify the download.
+- **Where are my settings?** Installer/source builds use `%LOCALAPPDATA%\neuron` on Windows.
+  A portable ZIP marked with `portable.flag` keeps its setup beside the executables.
+  `NEURON_RUN_DIR` overrides either location. (`README.md`, *where your config lives*)
 
 ## Something broken, or a bug to report
 

@@ -60,10 +60,11 @@ mapping. Integrity checks are not hardware attestation or proof of anonymity.
 that ZIP or a directory and bounds archive size and expansion to 64 MiB. Keep edited
 issue text outside the bundle so its manifest hashes remain valid.
 
-No command uploads evidence or files GitHub issues. The
-[neuron-compat skill](../../skills/neuron-compat/SKILL.md) guides contributor consent,
-research and issue review. Existing SYSTEM diagnostics provide deeper recognized
-device checks; this collector does not claim that a registry capability worked.
+No command uploads evidence or files GitHub issues. For a manual walkthrough,
+see [Compatibility Lab](COMPATIBILITY-LAB.md#try-it-yourself); the
+[neuron-compat skill](../../skills/neuron-compat/SKILL.md) can guide the same steps.
+Existing SYSTEM diagnostics provide deeper recognized-device checks; this collector
+does not claim that a registry capability worked.
 
 ## Conventions
 

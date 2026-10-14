@@ -1,24 +1,25 @@
 # neuron
 
-a lean, mean, do-what-i-say control layer for razer gear, built by Woflo Labs
-as an *anti-synapse*. (woflo labs is a publishing name, not a company - it's me,
-one person, obsessed with research in my free time)
+**your razer hardware. your rules.**
 
-two small executables, one shared core. no account, no cloud, no telemetry. no "please update razer central." it talks to your mouse and keyboard directly: the same `razer_report` HID bytes synapse sends, worked out from wire captures (USBPcap), the open-source [openrazer](https://github.com/openrazer/openrazer) driver, and a lot of live probing. it does exactly what you tell it then fricks off. no kernel driver, no vendor SDK 😳
+neuron is my replacement for Razer Synapse: a free Windows app and CLI for DPI, polling, lighting, profiles and button remapping. i reverse-engineered how Synapse talks to my Razer hardware and built my own controls in Rust. no account, cloud sync, telemetry, extra kernel driver or vendor SDK.
+
+i don't run Synapse anymore. neuron handles my Naga V2 Pro and BlackWidow Chroma V2 every day. if something's missing, i build it in.
+
+**more than a replacement.** layered reactive lighting, Python macros, app-aware binds, radial menus and gesture controls. it's the Synapse stuff i needed, plus the things i always wanted.
+
+**a control layer built to grow beyond Razer.** gamepads already feed the same action engine; the hardware layer can grow to other vendors. Razer mouse and keyboard controls are still the focus for now. [here's what actually works](docs/STATUS.md).
+
+**[download for Windows](https://github.com/worflor/neuron/releases/latest)** · [FAQ & manual help](docs/FAQ.md) · [check device support](docs/STATUS.md) · [help test yours](#help-neuron-on-your-hardware)
 
 <p align="center"><img src="docs/media/hero-desktop.webp" alt="The neuron window on a desktop, with a spellweaving stroke mid-cast and three change confirmations in the corner" width="100%"></p>
 
 | | |
 |---|---|
-| **what** | a tray-resident app and a CLI built to replace razer synapse |
-| **platform** | windows app + CLI. linux app + CLI build from source, but the linux release is deferred and hardware control is unverified; no mac |
-| **hardware** | razer mice + keyboards over raw HID; daily-driven and hardware-verified on a Naga V2 Pro + BlackWidow Chroma V2. other `razer_report` devices need their own checks. experimental Logitech HID++ discovery is read-only and has no hardware verification |
-| **install** | use the windows installer or unpack its portable zip anywhere writable, or build from source: `cargo build --release` |
-| **built to hold** | one trigger → action engine for every input; every device write reads itself back and fails loudly on a mismatch; tests cannot arm input or reach hardware; every wire fact has a graded entry in a [protocol ledger](crates/neuron-core/protocol/ledger.toml) |
-| **footprint** | no vendor driver, account, or cloud; your config is plain TOML |
-| **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
-
-> **status: beta mk1.** windows-first, single dev, very much a personal project with too much ambition. mk1 is the same release language my other tools use, and it means exactly this: until now the only eyes and hands on this thing were mine. it works on my desk every day but *obviously* hasn't been tested on yours, and that gap is the whole definition. that goes for getting it onto your desk too: the windows install path has been run end to end here, the linux GUI has opened under WSL2 and its CLI has run on Ubuntu 22.04, but no razer device has ever been plugged into a linux box running neuron. once it has survived desks that aren't mine, it graduates to mk2. where each feature actually stands, and what evidence is behind each one, is tracked in [state of the project](docs/STATUS.md).
+| **status** | Windows beta; daily-driven on the Naga V2 Pro and BlackWidow Chroma V2. Other Razer devices need their own testing |
+| **platforms** | Windows 10/11 download. Linux app and CLI build from source, but Razer hardware control is unverified there; macOS has no backend yet |
+| **under the hood** | shared trigger → action engine; read-back checks for supported settings; an [evidence ledger](crates/neuron-core/protocol/ledger.toml) for the hardware protocol |
+| **license** | mostly GPL-3.0-or-later with an exception; some research components have separate community-source terms. [details](LICENSE.md) |
 
 ---
 
@@ -29,7 +30,7 @@ two small executables, one shared core. no account, no cloud, no telemetry. no "
 - [what it does](#what-it-does)
 - [won't surprise you](#wont-surprise-you)
 - [get it](#get-it)
-- [contributing](#contributing)
+- [help test your hardware](#help-neuron-on-your-hardware) · [contributing](#contributing)
 - [honesty: proven, gated, absent](#honesty-proven-gated-absent)
 - [philosophy / non-goals](#philosophy--non-goals)
 
@@ -42,18 +43,18 @@ honestly, is **[state of the project](docs/STATUS.md)**.
 
 ## why this exists
 
-i ran synapse 1. then 2... and hated it but survived with it. then 3 came out and i reluctantly downloaded it, but it's *still synapse*. i figured 3 was the ceiling. then **4**??? and one day the app told me i *had* to update!? i said nuh uh. neuron started roughly there. (the other half of the spark: i wanted to use my mouse's onboard storage like a little usb drive. and cast spells.)
+i've been through Synapse 1, 2, 3... and then 4 showed up and wanted to tell me when to update my mouse software. i said nuh uh. i like my Razer hardware. i just got tired of what came with controlling it.
 
-to be clear, i love my razer hardware. this is anti-*synapse*: a multi-process, account-gated, cloud-synced ~2GB install that re-enables features you turned off, forgets settings, phones home, and bolts a login screen onto your *mouse dpi*. a fine idea drowned in shittification.
+i wanted the basic stuff to work without an account, background clutter or having to fight a settings app. then i wanted better lighting. then i wanted to cast spells with my mouse. you can probably see where this went :P
 
-neuron is the opposite design, on purpose:
+so neuron has a few rules:
 
-- **one resident app process, with a hidden window in tray mode.** the live remap loop runs *inside* it. Python workers start on the first macro, a manual arm, or an editor action; they are not separate device-control daemons.
-- **no cloud, no account.** your config is plain TOML on your disk. you can read it, diff it, and check it into git if you want :P
-- **deterministic.** it changes what you ask and nothing else. no surprise re-enables, no "smart" anything you turned off three separate times. new Python macros start BOUND to Neuron's capability surface; add `# neuron: raw` when you deliberately want full Python to LITERALLY do whatever you want. true freedom, with the escalation visible in source.
-- **on-device first.** push settings to the mouse's onboard memory and you can uninstall *everything*. the dream is no software at all. (older hardware has no onboard storage, so we make do.)
+- **stay local.** no Neuron account, telemetry or cloud sync. settings are plain TOML files you can read and keep.
+- **don't fight the user.** one resident app, one shared action engine. change what you asked for, not three other settings on the way.
+- **don't guess at hardware.** settings with getters are checked against the device; live lighting checks its protocol replies. unverified writes stay gated.
+- **more, never bloat.** extra features are welcome when they earn their place. another mandatory background service isn't.
 
-i'll be honest about the name, though: neuron isn't a faithful, minimal re-implementation of synapse. it's closer to *synapse+++*: it does **more** (gestures, an open effects engine, real-code macros, a whiteboard tool built in, a suite of hand-built actions). all of it is built low-level, and every decision has a reason i can point at. it's meant for *me*, and replacing slop with slop would defeat the whole point. more, sure. bloat, never.
+neuron isn't a one-for-one Synapse clone. it's the replacement i use, with room for things Synapse was never going to do.
 
 
 ## the idea: `trigger → action`
@@ -100,18 +101,16 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 
 | | |
 |---|---|
-| **[talks to your gear](docs/GDD.md#talks-to-your-gear)** | dpi (single or the whole stage table), polling to 8000 Hz where the hardware has it, brightness, idle timer, scroll stage, lift-off distance, onboard storage, battery. reads decode the device's own bytes and match synapse byte-for-byte. no driver, no vendor SDK: razer's control collection answers feature reports on an access-zero handle, and that one trick is the whole foundation. |
-| **[lighting](docs/GDD.md#lighting)** | native firmware effects invoked by their real effect-id, per-key frames painted at the device's true LED count, and an open effects engine where a look is a **pattern** (shape and motion) composed with a **spectrum** (colour as a whole program). presets are pure data, from fire and aurora to Wildlife's seasonal cellular habitat. eight gradients drop onto any effect in one click, and each tile suggests pairings (comet in rainbow, fire in aurora, Cascade's matrix mode in bubble). live vitals drop in as another layer in the same stack. |
-| **[audio](docs/GDD.md#audio)** | mute and gain for any mic or output, and flipping your default device, from a binding. your mic's mute is itself a trigger. |
-| **[actions](docs/reference/CLI.md#triggers-and-actions)** | absolute mic gain stays distinct from relative nudges; dial actions can scroll at the pointer or at a hold-anchored window. Undo restores the last successful audio, profile, or app lighting change only while its resource still matches. |
-| **[the spine](docs/GDD.md#the-spine)** | binds, hypershift layers with four stances (hold · latch · smart · one-shot), side-plate layers that scope binds to the plate actually seated on the mouse, and app-aware profile switching with a fallback so closing a game puts you back. |
-| **[spellweaving](docs/GDD.md#spellweaving)** | hold, weave a stroke, release, and it fires as a real keybind. recognised by **eigenmotion** — a stroke fit as a damped complex oscillator, where the eigenvalues are the stroke's identity, so it's invariant to where you drew it, how big, and how fast. the same capture drives a family of instruments: teleport, tether, whiteboard, glance, window verbs, dial, knockback, control. |
-| **[macros & beacons](docs/GDD.md#macros--beacons)** | bundled CPython starts on demand and stays **warm** in two authority domains: new macros are BOUND to Neuron's brokered capabilities, while `# neuron: raw` is the explicit full-Python escape hatch. every macro gets a frozen trigger snapshot, persistent state, macro composition, and beacons; RAW and BOUND never share an interpreter. don't want to write Python? the block builder edits the same source document and preserves module-level code/metadata while you work visually. |
-| **[life after synapse](docs/GDD.md#life-after-synapse)** | import your synapse export (it's a zip of plaintext XML), purge synapse off the machine properly, and point `neuron discover` at hardware it's never seen to fingerprint it into a TOML. |
-| **[any controller](docs/GDD.md#controllers-and-anything-else-with-buttons)** | gamepads, mice, keyboards and macro pads all become the same bindable controls, read from each device's own report descriptor. a stick can aim the radial; Xbox-protocol pads get rumble. windows only for now. |
-| **[plays with games and RGB tools](docs/reference/PROTOCOL-HOST.md)** | games on the Chroma SDK and tools that speak OpenRGB paint through neuron's lighting arbiter instead of fighting it, with your own lighting underneath; a Chroma lab splits a game's frames into ambient, held keys and effects. early, and off until you enable it in SYSTEM → CONNECTIONS. |
-| **[scriptable](docs/reference/CLI.md)** | `neuron <noun> <verb>`: everything the app can author, with `--json`, validated writes, and a running app reloading within a second. built to be driven by an agent as much as by hand. |
-| **[the app](docs/GDD.md#the-app)** | a tray-resident GUI in four sections — device, lighting, input, system — plus profiles as one object: its settings, its lighting, and its binds. |
+| **[device control](docs/GDD.md#talks-to-your-gear)** | DPI and stage cycles, polling, brightness, scroll stages, lift-off, battery and idle settings on supported hardware. no Synapse needed. |
+| **[lighting](docs/GDD.md#lighting)** | layer effects, gradients, blends and typing reactions. paint per-key lighting, use live system data, and fade between looks instead of resetting everything. |
+| **[buttons & profiles](docs/GDD.md#the-spine)** | remap supported controls, use HyperShift and Naga side-plate layers, and switch profiles automatically for different apps. |
+| **[spellweaving & radial](docs/GDD.md#spellweaving)** | draw a glyph or flick a wheel to trigger the same actions as a button. teleport windows, summon tools, even draw on your screen. |
+| **[macros & beacons](docs/GDD.md#macros--beacons)** | Python macros, a visual block editor, persistent state and on-screen questions from your scripts. BOUND by default, RAW when you want full Python. |
+| **[audio & other actions](docs/reference/CLI.md#triggers-and-actions)** | bind mic mute/gain, output switching, clipboard transforms, screenshots, undo and window actions to your controls. |
+| **[games & RGB tools](docs/reference/PROTOCOL-HOST.md)** | opt-in Chroma and OpenRGB connections let games paint through Neuron alongside your own lighting. early, and still being tested across games. |
+| **[life after Synapse](docs/GDD.md#life-after-synapse)** | import supported Synapse exports, clean up its Windows services, and investigate unfamiliar devices. |
+| **[gamepads](docs/GDD.md#controllers-and-anything-else-with-buttons)** | buttons, sticks and triggers can become binds. aim the radial with a stick and use rumble where it's been verified on Windows. |
+| **[app & CLI](docs/reference/CLI.md)** | use the app to set things up, or the CLI to change the same settings by hand. configs stay on disk as plain TOML. |
 
 <p align="center"><img src="docs/media/macro-blocks.webp" alt="The macro workshop in blocks view: press, ask, then a yes branch and a no branch" width="100%"></p>
 
@@ -119,7 +118,7 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 
 ## won't surprise you
 
-this is a tool whose whole job is injecting input and writing to your hardware, so the safety has to be real. three mechanisms, always on:
+neuron can change hardware settings, send input and run Python. the boring safety stuff matters.
 
 <table>
 <tr>
@@ -128,25 +127,32 @@ this is a tool whose whole job is injecting input and writing to your hardware, 
 </tr>
 </table>
 
-- **[the arm gate](docs/GDD.md#the-arm-gate).** every synthesised keystroke, click, and process-spawn goes through one process-wide switch. it starts **disarmed**, and only the running app or daemon arms it: a normal launch does, so your binds work after logon, `--safe` doesn't, turning it off is one instant flip and turning it back on asks first. tests can't arm it — there's a test whose only job is enforcing that. reads are always safe.
-- **[writes that verify themselves](docs/GDD.md#writes-that-verify-themselves).** writes are volatile (`NOSTORE`) unless you ask for storage, with one exception: `scroll` stores the stage onboard by default, the way synapse does (`--volatile` opts out). every write then re-reads the matching getter and confirms the bytes it sent actually landed. a mismatch is a hard error, never a silent success. when there's no opcode it trusts, it refuses rather than guessing at your hardware.
-- **[confirmations](docs/GDD.md#confirmations).** nothing changes silently. every committed change pops a small card *after* it actually lands — and unlike the OSD this replaces, you can move it, batch it, or turn it off.
+- **[input has a switch](docs/GDD.md#the-arm-gate).** a normal Windows launch arms live binds when the input engine starts. `--safe` keeps input disarmed and device writes paused. disarming is instant; turning input back on manually asks first. tests can't arm real input.
+- **[hardware changes get checked](docs/GDD.md#writes-that-verify-themselves).** settings like DPI and polling read back what the device accepted. writes without enough evidence stay gated or are explicitly flagged in the evidence ledger. live lighting frames use checked protocol replies rather than pretending every LED update has a matching getter.
+- **[notifications are yours](docs/GDD.md#confirmations).** on-screen cards tell you when supported changes land. move them, quiet them, or turn them off entirely.
 
-a thing that remaps your buttons and runs python on a keypress is, by definition, an input hook, which is exactly why you get the full source. read it, build it yourself, throw the binary at virustotal.
+and yes, Neuron can run full Python if you choose RAW macros. that's your computer's authority, not a sandbox. [here's the actual security model](SECURITY.md).
 
 ## get it
 
-> **steam at 50 stars.** if this repo hits 50 stars, i'll put neuron on steam for easier installs and automatic updates. github releases aren't going anywhere, neuron stays free, and i'm still the one maintaining it. steam would just be a more convenient way to get the same thing :P
+**Windows 10/11 (x86_64): [download the latest release](https://github.com/worflor/neuron/releases/latest).** Grab the installer for a normal setup, or the portable ZIP if you'd rather unpack it yourself. Both have the app and CLI. Run `neuron-app.exe` from the portable ZIP.
 
-### with an agent
+Windows may warn about the unsigned build. The release includes `SHA256SUMS.txt`, and `SOURCE.txt` tells you what source commit the binaries came from. [install and build details](#build).
 
-if you'd rather not install the windows release by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo and the windows packages. the linux updater waits for a linux release asset.
+> **steam at 50 stars.** if this repo hits 50 stars, i'll put neuron on Steam for easier updates. It'll still be free and available on GitHub. this would just be another way to get it :P
 
-it can install or update neuron, restore a portable update, run CLI commands for you, and answer questions from the docs. installer-managed updates stay in Windows Setup so install and uninstall remain one coherent lifecycle. when something doesn't work, it looks into it first, and offers to draft a proper issue only if it turns out to be a real, unreported bug. it checks every download before installing and never overwrites your config. it's written to be followed step by step, so it doesn't need a frontier model.
+### just use it
 
-for something that looks broken, start with [troubleshooting and bug reports](skills/neuron-lazy-update/issues.md): known limits, setup checks, existing reports, then a useful issue if it is new. for unknown hardware or device-specific support research, [Compatibility Lab](skills/neuron-compat/SKILL.md) collects a local dossier and exports a checked engineering bundle without probing unknown commands. for writing Python macros, [macros in neuron](skills/neuron-macros/SKILL.md) covers the API, authority modes, beacons, and how to check a macro before running it.
+open neuron from Start, or run `neuron-app.exe` from the portable folder. DEVICE handles hardware settings, LIGHTING builds your effects, and INPUT is for buttons and gestures. profiles are in the header; SYSTEM has diagnostics and the safety switches. no terminal needed.
 
-the script under it does the risky parts and reports plain status lines, one per platform — `neuron-update.ps1` for windows, `neuron-update.sh` for linux. you can run either yourself without an agent anywhere in the loop; `--action check` (or `-Action check`) only reads.
+the [FAQ](docs/FAQ.md) covers installing, updating, profiles, macros and troubleshooting. want to do more by hand? the [CLI reference](docs/reference/CLI.md) covers the same engine, including backups and compatibility tools.
+
+<details>
+<summary><b>optional: using a coding agent</b></summary>
+
+if you already use OpenCode, Claude Code or something similar, Neuron includes [setup and update](skills/neuron-lazy-update/SKILL.md), [CLI configuration](skills/neuron-cli/SKILL.md), [macros](skills/neuron-macros/SKILL.md) and [compatibility research](skills/neuron-compat/SKILL.md) skills. they're a shortcut for workflows you can also do yourself. check any device changes and review evidence before sharing it.
+
+</details>
 
 ### build
 
@@ -233,15 +239,17 @@ full-format pockets, in-session displaced-state history, and screen/window/regio
 `neuron pocket --help` lists pocket management and history commands; `neuron action list` shows the
 typed action forms.
 
+## help neuron on your hardware
+
+i can't own every Razer mouse and keyboard. if you try neuron on yours, tell me what works, what doesn't, and whether you're using it wired, through a dongle or over Bluetooth. even a partial result is useful. [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml).
+
+want to dig deeper? [Compatibility Lab](docs/reference/COMPATIBILITY-LAB.md#try-it-yourself) has read-only CLI steps to inspect your device and export a reviewable report. nothing uploads automatically, and identifying a device isn't proof its controls work. the optional [`neuron-compat` skill](skills/neuron-compat/SKILL.md) can guide the same steps.
+
 ## contributing
 
-neuron is one person, one desk, one vendor gone deep. that's the point, but it also means a handful of pieces are wide open, and some are shaped so you can own one cleanly without reading the whole tree.
+want to write code or design an effect instead? there's plenty to pick up without learning the whole tree. [CONTRIBUTING.md](CONTRIBUTING.md) has the device work, lighting patterns, presets, protocol adapters and larger ports, with the groundwork for each spelled out. [neuron · orbit](https://github.com/users/worflor/projects/1) is the issue board; anything in *Up for grabs* is ready to claim.
 
-the honest map of what's pickable — a device's wire-captured leftovers (scroll stages, side-plate maps), a lighting pattern (one registry entry plus a `field()` generator), a preset (pure data, zero code), a neuron-host protocol adapter, or one of the bigger chunks like the linux/mac port — is in **[CONTRIBUTING.md](CONTRIBUTING.md)**, graded by how much groundwork is already done. the board, **[neuron · orbit](https://github.com/users/worflor/projects/1)**, is the front door: anything in *Up for grabs* is blessed and ready to claim.
-
-new to the tree entirely? **[AGENTS.md](AGENTS.md)** is the fast orientation — the layout, the three hard invariants, and what "verified" has to mean here before you claim it.
-
-the short version of the gates: `cargo test --workspace` is green or it doesn't go in; tests may never arm input; device writes read-back-verify or stay gated. and please don't run `cargo fmt --all` — the source is hand-formatted, and a blanket format would bury your change in ~1900 lines of noise.
+new to the tree? [AGENTS.md](AGENTS.md) is the quick orientation. tests can't arm input, and unknown hardware commands don't get a free pass. those rules aren't negotiable.
 
 ### the legal bit
 
@@ -251,18 +259,16 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 ## honesty: proven, gated, absent
 
-the full per-feature status (solid to barely-started) lives in [state of the project](docs/STATUS.md); this section is just the device-write ledger.
+[the full status page](docs/STATUS.md) tracks feature maturity and hardware testing. this is the device-control evidence, including things i haven't verified yet.
 
-**linux is in progress**: the CLI builds and passes local tests, and a GUI opens, but no linux download is published yet. the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity) has work in progress on live input, overlays, and audio; its overlay still needs the windows renderer's full look. no razer device has tested the linux HID or input paths yet. if you try a source build, [tell me what happened](https://github.com/worflor/neuron/issues). mac seam is unwritten.
+Linux builds from source but still needs native Razer hardware testing. [OpenRazer](https://github.com/openrazer/openrazer) is the mature Linux option for now; [OpenRGB](https://openrgb.org) covers broader RGB hardware. Neuron's Logitech HID++ discovery remains experimental and read-only.
 
-on linux, [openrazer](https://github.com/openrazer/openrazer) is the mature option while neuron's hardware path gets real-device testing. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron's verified writes remain Razer-focused; the experimental HID++ dialect only discovers read-only Logitech capabilities so far.
-
-every device write is sorted by how sure i am of it:
+what's proven, what's gated, and what's still missing:
 
 | capability | status |
 |---|---|
 | reads: dpi, battery, polling, brightness, storage, lighting state | **proven** on hardware |
-| dpi · polling · lighting writes | **proven** on hardware; current setters require matching read-back |
+| dpi · polling · lighting settings | **proven** on named hardware; setters with paired getters read back the result. live lighting frames validate protocol replies |
 | brightness write | **proven**: matrix and legacy setters read back the same varstore and LED region; live round-trip checked on the Naga V2 Pro and BlackWidow Chroma V2 |
 | dpi-stage table · scroll-stage select | **wire-confirmed** off synapse (USBPcap) + round-tripped |
 | symmetric lift-off distance | **proven**: reads back clean on the Naga |
@@ -287,7 +293,7 @@ things it flat-out doesn't do, so you know before you install:
 - novelty done well (spellweaving, radial, the open effects engine) is the fun. reheated gimmicks are not, and won't be added.
 - lean is a feature. every background cost has to earn itself.
 - more than synapse is fine; bloat is not. every extra thing here is deliberate and low-level, or it doesn't ship.
-- built for one desk: mine. if it fits yours too, great; that was never the requirement.
+- started on my desk. i'm building the tools to make it work on more of yours, one verified device at a time.
 - when neuron doesn't know something about your hardware, it says so instead of guessing.
 
 built from first principles because the alternative is a 2GB login screen for a mouse.

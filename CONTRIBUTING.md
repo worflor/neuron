@@ -1,6 +1,12 @@
 # contributing to neuron
 
-neuron is a one-person project with room for focused contributions. you can work on a device, lighting pattern, preset, or protocol adapter without learning the whole tree.
+neuron started with the hardware on my desk. i'd like to get it working on a lot more of yours. you don't have to write code to help with that, although you're welcome to.
+
+## got hardware i don't have?
+
+try neuron on it, or just help investigate where support is missing. tell me the model, whether it's wired/dongle/Bluetooth, and what actually happened. "lighting works, buttons don't" is useful information. [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) or [start a discussion](https://github.com/worflor/neuron/discussions) if you're not sure yet.
+
+want to go beyond a short report? [Compatibility Lab](docs/reference/COMPATIBILITY-LAB.md#try-it-yourself) explains how to collect read-only device information and prepare a shareable bundle from the CLI. review it before attaching anything. you can do the whole thing yourself, including filing the issue.
 
 ## where the work lives
 
@@ -59,10 +65,10 @@ The CI build jobs are configured for code changes; docs-only changes skip them.
 three hard invariants:
 
 1. **tests may never arm input.** there's a test whose only job is enforcing that. don't break it.
-2. **device writes read-back-verify, or they stay gated.** a write either confirms itself against the device's own bytes, or it lives behind a `NEURON_*_WRITE` gate until a capture proves it. a mismatch must fail loudly; do not infer hardware safety from a passing unit test.
+2. **no guessing at hardware.** supported setting writes read back through their getters; streaming lighting checks replies. new unverified commands need a gate or an explicit ledger exception, and a passing mock test isn't physical verification.
 3. **more, never bloat.** neuron does a lot on purpose, but every addition must justify its complexity and background cost.
 
-the diagnostics bench on the system page is the "prove it works" surface: read-only, always safe, and the fastest way to show a change actually landed on real hardware instead of just compiling.
+the SYSTEM diagnostics bench is the quickest read-only check when a device is on your desk. it's evidence, not a guarantee that every control works.
 
 ## building it (windows gotchas)
 
