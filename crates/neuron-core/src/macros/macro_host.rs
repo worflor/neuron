@@ -3494,14 +3494,18 @@ fn seed_option_defaults(id: &str, manifest: &Value) {
 /// Scan macros/scripts/*.py into (id, source) pairs (id = file stem).
 #[must_use]
 pub fn scan_macro_dir() -> Vec<(String, String)> {
+    scan_macro_dir_at(&macros_dir())
+}
+
+fn scan_macro_dir_at(dir: &std::path::Path) -> Vec<(String, String)> {
     // A failed migration (a file another process holds open mid-rename) is retried on the next
     // scan; meanwhile an unstamped legacy macro loads under the stricter BOUND default, so the
     // list never empties on a transient filesystem error.
-    if let Err(e) = ensure_macro_policy_migration() {
+    if let Err(e) = migrate_legacy_macro_dir(dir) {
         eprintln!("[macro] legacy authority migration failed (will retry): {e}");
     }
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(macros_dir()) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("py") {
@@ -3660,9 +3664,6 @@ mod tests {
 
     #[test]
     fn directory_scan_ignores_noncanonical_python_stems() {
-        let _env = crate::runroot::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join(format!(
             "neuron_macro_scan_identity_{}",
             std::process::id()
@@ -3670,12 +3671,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         {
-            let _pin = crate::runroot::RunDirPin::to(&tmp);
-            let dir = macros_dir();
+            let dir = tmp.join("scripts");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("good_id.py"), "def macro(ctx):\n    pass\n").unwrap();
             std::fs::write(dir.join("bad name.py"), "def macro(ctx):\n    pass\n").unwrap();
-            let found = scan_macro_dir();
+            let found = scan_macro_dir_at(&dir);
             assert!(found.iter().any(|(id, _)| id == "good_id"));
             assert!(
                 found.iter().all(|(id, _)| id != "bad name"),
