@@ -660,7 +660,7 @@ struct Surface {
 /// thread, so there is no lock here to poison.
 pub struct Arbiter {
     surfaces: HashMap<String, Surface>,
-    next_layer: u64,
+    pub(crate) next_layer: u64,
     next_seq: u64,
 }
 
