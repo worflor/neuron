@@ -259,6 +259,9 @@ fn run(rx: Receiver<Cmd>) {
     // or timeout would then drop BOTH sessions' claims. Carry the high-water mark
     // across rebirths so an id is never reused while its original owner may live.
     let mut next_source: u64 = 1;
+    // Surviving adapters also retain layer handles; reusing one would let a stale
+    // refresh, content update or release act on another session's new claim.
+    let mut next_layer: u64 = 1;
     let Ok(mut governor) = Governor::new(Config::critically_damped(0.8)) else {
         eprintln!("neuron-host: invalid default governor configuration");
         return;
@@ -266,6 +269,7 @@ fn run(rx: Receiver<Cmd>) {
     loop {
         let mut kernel = Kernel::new();
         kernel.next_source = next_source;
+        kernel.arbiter.next_layer = next_layer;
         for info in seed.clone() {
             kernel.declare(info);
         }
@@ -275,6 +279,7 @@ fn run(rx: Receiver<Cmd>) {
         // plain `u64` — worst case a fault mid-`next_source()` leaves it one short
         // of incremented, still >= every id ever issued, so never reused.
         next_source = kernel.next_source;
+        next_layer = kernel.arbiter.next_layer;
         match outcome {
             Ok(Flow::Stop) => break,
             Err(_) => match governor.on_crash(Instant::now()) {
@@ -585,6 +590,63 @@ mod tests {
             c.0 > b.0,
             "reused a source id across rebirth: {c:?} not above {b:?}"
         );
+    }
+
+    #[test]
+    fn stale_layer_handles_cannot_touch_a_new_claim_after_rebirth() {
+        let host = Host::spawn().expect("spawn host");
+        let mut h = host.handle();
+        h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let old_owner = h.next_source();
+        let stale = h.claim(
+            "kbd", old_owner, band::SESSION, LeaseSpec::Pinned,
+            Content::Fill(Rgb(255, 0, 0)), Instant::now(),
+        ).unwrap();
+
+        for _ in 0..2 {
+            h.poison();
+            let owner = h.next_source();
+            let current = h.claim(
+                "kbd", owner, band::SESSION, LeaseSpec::Pinned,
+                Content::Fill(Rgb(0, 0, 255)), Instant::now(),
+            ).expect("claim after rebirth");
+
+            assert!(!h.refresh(stale, Instant::now()), "stale layer must require a re-claim");
+            assert!(!h.set_content(stale, Content::Fill(Rgb(255, 0, 0)), Instant::now()));
+            h.release(stale);
+            assert_eq!(h.resolve("kbd", Instant::now()), Some(vec![Some(Rgb(0, 0, 255))]));
+            assert!(h.refresh(current, Instant::now()), "new claim survives stale operations");
+        }
+    }
+
+    #[test]
+    fn openrgb_reassert_recovers_when_another_session_claims_first_after_rebirth() {
+        use crate::adapters::openrgb::{ids, packet, OrgbConn};
+        use crate::paint::PaintPolicy;
+
+        let host = Host::spawn().expect("spawn host");
+        let mut h = host.handle();
+        h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let mut client = OrgbConn::new(&mut h, PaintPolicy::opaque());
+        client.feed(&packet(0, ids::SET_CLIENT_NAME, b"survivor"), &mut h, Instant::now());
+        let mut payload = 0u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[255, 0, 0, 0]);
+        client.feed(&packet(0, ids::UPDATESINGLELED, &payload), &mut h, Instant::now());
+        assert_eq!(h.resolve("kbd", Instant::now()), Some(vec![Some(Rgb(255, 0, 0))]));
+
+        h.poison();
+        let other = h.next_source();
+        let competing = h.claim(
+            "kbd", other, band::SESSION, LeaseSpec::Pinned,
+            Content::Fill(Rgb(0, 0, 255)), Instant::now(),
+        ).expect("competing claim after rebirth");
+        client.reassert(&mut h, Instant::now());
+        assert_eq!(h.resolve("kbd", Instant::now()), Some(vec![Some(Rgb(255, 0, 0))]));
+        assert_eq!(h.claims("kbd", Instant::now())[0].label.as_deref(), Some("survivor"));
+
+        client.disconnected(&mut h);
+        assert!(h.refresh(competing, Instant::now()), "disconnect preserves the other session");
+        assert_eq!(h.resolve("kbd", Instant::now()), Some(vec![Some(Rgb(0, 0, 255))]));
     }
 
     // ── TASK 2 (second half): claim fight racing a real kernel fault ───────
