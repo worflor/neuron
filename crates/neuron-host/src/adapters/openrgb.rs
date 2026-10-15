@@ -563,6 +563,7 @@ impl OrgbConn {
             Some(s) => s.snapshot(),
             None => vec![None; info.leds],
         };
+        cells.resize(info.leds, None);
         cells[idx] = Some(color);
         let key = info.key.clone();
         let leds = info.leds;
@@ -735,6 +736,36 @@ mod tests {
         let frame = k.resolve("kbd", now()).unwrap();
         assert_eq!(frame[4], Some(Rgb(7, 8, 9)));
         assert_eq!(frame[1], Some(Rgb(1, 2, 3)));
+    }
+
+    #[test]
+    fn single_led_updates_follow_surface_resizes_without_reviving_removed_cells() {
+        let mut k = kernel_with_kbd();
+        let mut c = conn(&mut k);
+        let paint = |c: &mut OrgbConn, k: &mut Kernel, idx: u32, color: [u8; 4]| {
+            let mut payload = idx.to_le_bytes().to_vec();
+            payload.extend_from_slice(&color);
+            c.feed(&packet(0, ids::UPDATESINGLELED, &payload), k, now());
+        };
+        paint(&mut c, &mut k, 4, [7, 8, 9, 0]);
+
+        k.declare(SurfaceInfo::grid("kbd", "Test Board", SurfaceKind::Keyboard, 1, 8));
+        paint(&mut c, &mut k, 7, [1, 2, 3, 0]);
+        let mut expected = vec![None; 8];
+        expected[4] = Some(Rgb(7, 8, 9));
+        expected[7] = Some(Rgb(1, 2, 3));
+        assert_eq!(k.resolve("kbd", now()).unwrap(), expected);
+
+        k.declare(SurfaceInfo::grid("kbd", "Test Board", SurfaceKind::Keyboard, 1, 2));
+        paint(&mut c, &mut k, 1, [10, 20, 30, 0]);
+        assert_eq!(k.resolve("kbd", now()).unwrap(), vec![None, Some(Rgb(10, 20, 30))]);
+
+        k.declare(SurfaceInfo::grid("kbd", "Test Board", SurfaceKind::Keyboard, 1, 8));
+        paint(&mut c, &mut k, 6, [40, 50, 60, 0]);
+        let mut expected = vec![None; 8];
+        expected[1] = Some(Rgb(10, 20, 30));
+        expected[6] = Some(Rgb(40, 50, 60));
+        assert_eq!(k.resolve("kbd", now()).unwrap(), expected);
     }
 
     #[test]
