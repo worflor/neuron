@@ -162,6 +162,11 @@ if ($Mode -eq 'lint') {
 # this is safe on a shared runner - and also why a green suite is NOT verification of a
 # user-facing change. See AGENTS.md.
 if ($Mode -in @('quick', 'full')) {
+    if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+        Invoke-Gate 'Windows install lifecycle fixtures' {
+            & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'packaging/windows/test-lifecycle.ps1')
+        }
+    }
     # One compile, not two: `cargo test` already compiles every lib, bin and test target, so
     # a separate `cargo build` first doubles the workspace compile for ~2 min of actual test
     # execution. `-Mode full` (and the release workflow) still does a real release build, so

@@ -38,6 +38,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\skills\neuron-lazy-update
 
 if it says `RESULT: update-available`, quit Neuron and run the same command with `-Action apply`. it verifies the download and backs up the existing release files before replacing them. if it says `blocked` or `error`, stop and read the `FLAG` lines. [script reference](../skills/neuron-lazy-update/update.md).
 
+### am i running the installed release or a repository build?
+
+from the repository or an unpacked release, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\skills\neuron-lazy-update\scripts\neuron-update.ps1" -Action status
+```
+
+it lists the running copy, Windows startup target and installed release separately. `-Action check`
+compares the selected copy with the latest stable release; `-InstallDir` selects a different copy.
+An installed release can stay as a checkpoint while you work from the repo. Both normally use
+`%LOCALAPPDATA%\neuron`; a portable copy uses its own folder. The same version number doesn't
+guarantee the same source commit or binary.
+
+`.\release.ps1` builds and runs the repo copy for the session. Add `-UseAtStartup` only when you
+want that build to become the Windows startup copy. `-NoRelaunch` builds without replacing your
+current session.
+
+### how do i uninstall without losing my profiles?
+
+remove the installed copy through Windows **Installed apps**. Your profiles and settings stay in
+`%LOCALAPPDATA%\neuron`. A portable copy keeps its settings beside the executables, so keep that
+data before removing its folder. Repository build output is disposable; source-build config lives
+outside `target`. An explicit `NEURON_RUN_DIR` overrides these defaults.
+
 ### where does my configuration live?
 
 Windows installer/source builds: `%LOCALAPPDATA%\neuron`. a marked portable ZIP keeps its settings alongside its executables. `NEURON_RUN_DIR` can override either location. [full path rules](../README.md#where-your-config-lives).

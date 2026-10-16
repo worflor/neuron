@@ -45,25 +45,34 @@ Read the output as lines:
 
 ## Update (Windows release)
 
-1. **Check.** Run `-Action check`.
-2. **Decide from the `RESULT`:**
+1. **Identify.** Run `-Action status -Json` (offline). It reports each discovered copy's path,
+   kind, version, running/startup roles and default config directory. Copies are discovered from
+   the selected target, enabled startup tasks, running app and normal per-user install directory;
+   this is not a whole-disk search. The shell's `NEURON_RUN_DIR` is reported separately because
+   another process can have a different environment.
+2. **Check.** Run `-Action check` for the intended copy. Without `-InstallDir`, an enabled startup
+   task selects the target, falling back to `%LOCALAPPDATA%\Programs\Neuron`. Use `-InstallDir`
+   explicitly when updating an installed checkpoint while a repo build owns startup.
+3. **Decide from the `RESULT`:**
 
    | RESULT | meaning | do this |
    |---|---|---|
    | `up-to-date` | already on the latest release | tell the user, stop |
-   | `update-available` | a newer release exists | step 3 |
+   | `update-available` | a newer release exists | step 4 |
    | `not-installed` | no neuron in the expected folder | go to **Install** |
-   | `source-build` | a developer build from the git repo | go to **Source builds** |
+   | `source-build` | a developer build from the git repo | read `installed_version`, `latest_version` and `release_comparison`; go to **Source builds** |
    | `error` | couldn't reach GitHub or read the release | show the `FLAG` line, stop |
 
-3. **Establish scope.** Report the installed and selected versions and the app restart.
+4. **Establish scope.** Report the running/selected versions and any required restart.
    Proceed with the requested update; ask if the target or operation needs additional authorization.
-4. **Apply.** Run `-Action apply`.
-5. **Decide from the `RESULT`:**
+5. **Apply.** Run `-Action apply`. An already-current copy returns `up-to-date` without downloading,
+   reinstalling or making a backup. Use `-Reinstall` only for an intentional repair/reinstall.
+6. **Decide from the `RESULT`:**
 
    | RESULT | do this |
    |---|---|
    | `updated` | say so, and mention any `FLAG` lines |
+   | `up-to-date` | no replacement was needed |
    | `blocked` | stop, show the `FLAG` lines, don't retry |
    | `needs-admin` | explain it, see **Admin rights** |
    | `error` | show the lines; recovery was attempted when a backup exists. If `ROLLBACK_FAILED` appears, recovery was incomplete. |
@@ -147,16 +156,34 @@ a separate, system-wide step, not part of installing.
 ## Source builds
 
 `source-build` means neuron runs from a cargo `target` folder inside a git checkout. That's a
-developer's copy, and the release zip must not overwrite it. Tell the user to update it from the
-repo instead: `git pull`, rebuild with `cargo build --release`, then restart neuron.
+developer's copy; custom Cargo target lanes are recognized too. A release ZIP must not overwrite
+it. `same-version` means version parity with the latest stable release, not proof of the same
+commit or binary. Never label an unknown build as "ahead" from its folder or the checkout's HEAD.
+
+Inventory reads `SOURCE.txt` or executable version resources without launching discovered
+programs. A source build without passive version metadata reports an unknown version.
+
+For an authorized rebuild of the intended checkout, use `.\release.ps1`. It builds and runs that
+repository copy for the session while preserving another copy's startup target. `-NoRelaunch`
+builds without stopping an unrelated installed app. `-UseAtStartup` explicitly pins the repository
+copy to Windows startup. Do not pull or switch branches merely to check the running version.
+
+An installed release is the current stable checkpoint alongside development; an accidentally old
+installation is stale. Update it with `-InstallDir "$env:LOCALAPPDATA\Programs\Neuron"`. Keep
+historical releases only when intentionally archived. New setup builds preserve
+another running/autostarted Neuron copy; older setup releases may retarget startup, so inspect the
+selected release's behavior before applying it to a mixed source/install setup.
 
 ## Uninstall
 
-Confirm each step with the user first. Don't delete anything they haven't agreed to lose.
+Use the requested installation's uninstaller. A removal request authorizes its normal payload
+cleanup; ask separately only about deleting user configuration or an unclear target.
 
-1. The user quits neuron from the tray.
-2. Run the packaged uninstaller when available. It requests administrator approval to remove the
-   protected Chroma broker plus the current and historical autostart tasks.
+1. If the copy being removed is running, quit that copy from its tray. Another copy can remain in use.
+2. Run the packaged uninstaller when available. It keeps per-user config. New setup builds retain
+   the shared Chroma broker and another copy's startup task when that copy is running or registered
+   for startup; otherwise protected broker removal requests administrator approval. Older releases
+   can remove shared startup/broker state, so check the selected uninstaller's behavior first.
 3. For a portable copy, delete the install folder. **This deletes their config too**, because it lives in the same
    folder. Ask whether they want to keep a copy of the `profiles` folder and `*.toml` files first.
 4. If `%LOCALAPPDATA%\neuron` exists, it holds config as well. Ask before deleting it.
@@ -176,7 +203,8 @@ from the build directory; ask before removing either.
 | `STOP_UNCONFIRMED` | something is using neuron's exe, and it can't be identified | user quits neuron from the tray, then rerun |
 | `CANNOT_STOP` | neuron is running elevated | same as above |
 | `NOT_WRITABLE` | can't write to the install folder | see **Admin rights** |
-| `TASK_ELSEWHERE` | autostart points at a different neuron folder | ask which install they mean |
+| `TASK_ELSEWHERE` | autostart points at a different neuron folder | report both roles; proceed when the requested target is already clear |
+| `STALE_COPY` | another discovered copy is older than the latest stable release | report the path and version; do not assume it was deliberately archived |
 | `UNSAFE_STARTUP_TASK` | an older task can start neuron elevated at sign-in; update stops before copying | see **Admin rights**, then rerun the updater |
 | `STARTUP_TASK_QUERY_FAILED` | the startup task's privilege level could not be read | resolve the task query before updating |
 | `CHROMA_BROKER_SETUP_FAILED` | automatic protected broker setup was declined or failed | rerun the installer or updater to retry; REST still works |
@@ -213,6 +241,8 @@ from the build directory; ask before removing either.
   downloaded. `SHA256SUMS.txt` must sit next to it, or be passed with `-SumsPath` / `--sums`. An
   installer-managed Windows copy also needs the matching `*-setup.exe` beside the ZIP; both hashes
   are checked before setup runs.
+- Locally packaged Windows archives can carry `<zip-basename>.SHA256SUMS.txt`. The Windows updater
+  prefers that version-specific file over a shared `SHA256SUMS.txt`; `-SumsPath` takes precedence.
 - `-NoRelaunch` (Windows) leaves Neuron closed afterwards.
 
 ## Linux: no device found

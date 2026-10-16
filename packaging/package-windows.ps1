@@ -5,7 +5,8 @@
 param(
     [string]$Version,
     [switch]$SkipBuild,
-    [switch]$AllowDirty
+    [switch]$AllowDirty,
+    [switch]$ReplaceExisting
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +38,9 @@ $name = "neuron-$Version-windows-x86_64"
 $stage = Join-Path $dist $name
 $zip = Join-Path $dist "$name.zip"
 $setup = Join-Path $dist "$name-setup.exe"
+if (-not $ReplaceExisting -and ((Test-Path -LiteralPath $zip) -or (Test-Path -LiteralPath $setup))) {
+    throw "package assets already exist for $Version; use -ReplaceExisting only to intentionally replace this local package"
+}
 $resolvedDist = [IO.Path]::GetFullPath($dist)
 $resolvedStage = [IO.Path]::GetFullPath($stage)
 if (-not $resolvedStage.StartsWith($resolvedDist + [IO.Path]::DirectorySeparatorChar,
@@ -166,6 +170,8 @@ license terms are in the repository.
             (Split-Path -Leaf $_)
     }
     [IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS.txt'),
+        (($checksums -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $dist "$name.SHA256SUMS.txt"),
         (($checksums -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
     Write-Host "Packaged $setup, $zip and SHA256SUMS.txt"
 } finally {
