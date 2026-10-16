@@ -32,5 +32,6 @@ features = [
 ]
 
 [dev-dependencies]
+toml.workspace = true
 proptest = "1"
 static_assertions = "1.1"

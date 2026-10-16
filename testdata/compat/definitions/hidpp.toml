@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+codename = "source-fixture"
+name = "Source HID++ direct-device fixture"
+dialect = "hidpp"
+vendor_id = 0x046d
+transaction_id = 0
+[[modes]]
+name = "synthetic-direct"
+product_id = 0xf201
+[control_interface]
+usage_page = 0xff00
+usage = 1
+feature_report_len = 0
+[commands.dpi]
+class = 7
+id = 2
+size = 0
+args = [2]
+[commands.battery_level]
+class = 6
+id = 0
+size = 0
+args = [1]
