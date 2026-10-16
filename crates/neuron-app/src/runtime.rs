@@ -365,14 +365,12 @@ impl AppRuntime {
     fn reload_registry_if_dirty(&mut self) -> bool {
         if self.synth_dirty.swap(false, Ordering::SeqCst) {
             if let Ok(reg) = Registry::load() {
+                crate::hidwatch::reload_registry(reg.clone());
                 self.registry = reg;
                 // A def behind an existing unit id may have changed (learning→real, edited auto
                 // file) — bump the generation so a same-unit selection re-seeds the panel.
                 self.registry_gen = self.registry_gen.wrapping_add(1);
             }
-            // Keep the app-layer shared cache (hidwatch arming + glue capability gating) in step with
-            // this reload, so a freshly-adopted device's event pipe arms + gates without a restart.
-            crate::hidwatch::reload_registry();
             return true;
         }
         false
