@@ -358,6 +358,10 @@ pub trait Transport {
         anyhow::bail!("transport does not carry input reports")
     }
 
+    /// Whether input reads use the collection's fixed maximum length, including OS padding.
+    /// Dialects may remove that envelope only after identifying a complete logical report.
+    fn padded_input_reports(&self) -> bool { false }
+
     /// The per-pipe WIRE LOCK shared by every transport opened on the same `DevicePath`, or None for
     /// a transport with no shared identity (test fakes). A `razer_report` conversation is a
     /// SetFeature→GetFeature(s) pair on one firmware control pipe; two handles interleaving pairs

@@ -11,7 +11,7 @@ use neuron::compat::InputRecording;
 use neuron::transport::{InputReader, Transport};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub struct RecordedInput(Mutex<VecDeque<Vec<u8>>>);
 
@@ -65,9 +65,22 @@ pub struct ProtocolTape {
 struct State {
     exchanges: VecDeque<Exchange>,
     pending: Option<(Channel, VecDeque<Reply>)>,
+    violation: Option<String>,
 }
 
-pub struct RecordedProtocol(Mutex<State>);
+impl State {
+    fn reject(&mut self, message: &str) -> anyhow::Error {
+        self.violation.get_or_insert_with(|| message.to_string());
+        anyhow::anyhow!("{message}")
+    }
+}
+
+/// Clones share one conversation and its verification history, including across reopened handles.
+#[derive(Clone)]
+pub struct RecordedProtocol {
+    state: Arc<Mutex<State>>,
+    identity: (u16, u16),
+}
 
 impl RecordedProtocol {
     pub fn new(tape: ProtocolTape) -> Result<Self> {
@@ -79,24 +92,34 @@ impl RecordedProtocol {
                 if let Reply::Bytes(bytes) = reply { ensure!(bytes.len() <= 4096, "reply exceeds 4096 bytes"); }
             }
         }
-        Ok(Self(Mutex::new(State { exchanges: tape.exchanges.into(), pending: None })))
+        Ok(Self { identity: (tape.vid, tape.pid), state: Arc::new(Mutex::new(State {
+            exchanges: tape.exchanges.into(), pending: None, violation: None,
+        })) })
     }
 
+    #[must_use]
+    pub fn identity(&self) -> (u16, u16) { self.identity }
+
     fn send(&self, channel: Channel, bytes: &[u8]) -> Result<()> {
-        let mut state = self.0.lock().map_err(|_| anyhow::anyhow!("protocol replay state poisoned"))?;
-        ensure!(state.pending.is_none(), "previous recorded conversation was not drained");
-        let next = state.exchanges.front().ok_or_else(|| anyhow::anyhow!("no recorded request remains"))?;
-        ensure!(next.channel == channel && next.request == bytes, "request does not match recorded bytes or channel");
+        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("protocol replay state poisoned"))?;
+        if state.pending.is_some() { return Err(state.reject("previous recorded conversation was not drained")); }
+        let Some(next) = state.exchanges.front() else { return Err(state.reject("no recorded request remains")); };
+        if next.channel != channel || next.request != bytes {
+            return Err(state.reject("request does not match recorded bytes or channel"));
+        }
         let next = state.exchanges.pop_front().ok_or_else(|| anyhow::anyhow!("recorded request disappeared"))?;
         state.pending = Some((channel, next.replies.into()));
         Ok(())
     }
 
     fn receive(&self, channel: Channel, buffer: &mut [u8]) -> Result<usize> {
-        let mut state = self.0.lock().map_err(|_| anyhow::anyhow!("protocol replay state poisoned"))?;
-        let (expected, replies) = state.pending.as_mut().ok_or_else(|| anyhow::anyhow!("no recorded reply is pending"))?;
-        ensure!(*expected == channel, "wrong reply channel");
-        if let Some(Reply::Bytes(bytes)) = replies.front() { ensure!(bytes.len() <= buffer.len(), "reply buffer too small"); }
+        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("protocol replay state poisoned"))?;
+        let Some((expected, replies)) = state.pending.as_ref() else { return Err(state.reject("no recorded reply is pending")); };
+        if *expected != channel { return Err(state.reject("wrong reply channel")); }
+        if let Some(Reply::Bytes(bytes)) = replies.front() {
+            if bytes.len() > buffer.len() { return Err(state.reject("reply buffer too small")); }
+        }
+        let (_, replies) = state.pending.as_mut().ok_or_else(|| anyhow::anyhow!("recorded replies disappeared"))?;
         let reply = replies.pop_front().ok_or_else(|| anyhow::anyhow!("recorded replies exhausted"))?;
         if replies.is_empty() { state.pending = None; }
         match reply {
@@ -106,9 +129,18 @@ impl RecordedProtocol {
         }
     }
 
+    /// Queue state only. Use `verify_complete` to also reject swallowed contract errors.
     pub fn drained(&self) -> Result<bool> {
-        let state = self.0.lock().map_err(|_| anyhow::anyhow!("protocol replay state poisoned"))?;
+        let state = self.state.lock().map_err(|_| anyhow::anyhow!("protocol replay state poisoned"))?;
         Ok(state.exchanges.is_empty() && state.pending.is_none())
+    }
+
+    /// Require every exchange to be consumed without a contract error, even if a caller swallowed it.
+    pub fn verify_complete(&self) -> Result<()> {
+        let state = self.state.lock().map_err(|_| anyhow::anyhow!("protocol replay state poisoned"))?;
+        ensure!(state.violation.is_none(), "replay contract violated: {}", state.violation.as_deref().unwrap_or_default());
+        ensure!(state.exchanges.is_empty() && state.pending.is_none(), "recorded conversation was not fully consumed");
+        Ok(())
     }
 }
 
@@ -123,6 +155,35 @@ impl Transport for RecordedProtocol {
 mod tests {
     use super::*;
     use neuron::compat::{InputSample, RecordingEnd};
+
+    fn single_exchange(replies: Vec<Reply>) -> RecordedProtocol {
+        RecordedProtocol::new(ProtocolTape { schema: 1, vid: 0x1234, pid: 0x5678,
+            exchanges: vec![Exchange { channel: Channel::Feature, request: vec![1, 2], replies }] }).unwrap()
+    }
+
+    #[test]
+    fn swallowed_contract_errors_remain_visible_after_the_tape_is_drained() {
+        let transport = single_exchange(vec![Reply::Bytes(vec![3])]);
+        let handle = transport.clone();
+        assert!(handle.set_feature(&[9]).is_err());
+        handle.set_feature(&[1, 2]).unwrap();
+        handle.get_feature(&mut [0; 1]).unwrap();
+        assert!(transport.drained().unwrap());
+        assert!(transport.verify_complete().unwrap_err().to_string().contains("request does not match"));
+    }
+
+    #[test]
+    fn completion_distinguishes_expected_faults_from_missing_or_extra_io() {
+        let transport = single_exchange(vec![Reply::Timeout, Reply::Disconnected]);
+        assert!(transport.verify_complete().is_err());
+        transport.set_feature(&[1, 2]).unwrap();
+        assert!(transport.get_feature(&mut [0; 1]).is_err());
+        assert!(transport.verify_complete().is_err());
+        assert!(transport.get_feature(&mut [0; 1]).is_err());
+        transport.verify_complete().unwrap();
+        assert!(transport.get_feature(&mut [0; 1]).is_err());
+        assert!(transport.verify_complete().is_err());
+    }
 
     #[test]
     fn input_replay_preserves_short_edges_and_refuses_truncation() {

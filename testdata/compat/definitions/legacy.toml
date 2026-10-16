@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+codename = "source-fixture"
+name = "Source standard-matrix keyboard fixture"
+vendor_id = 0x1532
+transaction_id = 0xff
+[[modes]]
+name = "synthetic-wired"
+product_id = 0xf101
+[control_interface]
+usage_page = 1
+usage = 2
+feature_report_len = 91
+[commands]
+[lighting]
+protocol = "legacy"
+rows = 6
+cols = 22
+varstore = 0
+[lighting.effects]
+static = 6
+[lighting.effect]
+class = 3
+id = 10
+size = 8
+args = []
+transaction_id = 0x3f
+[lighting.custom_frame]
+class = 3
+id = 11
+size = 0x46
+args = [0xff]
+transaction_id = 0x3f

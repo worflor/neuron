@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+codename = "source-fixture"
+name = "Source extended-matrix fixture"
+vendor_id = 0x1532
+transaction_id = 0x1f
+[[modes]]
+name = "synthetic-link"
+product_id = 0xf102
+[control_interface]
+usage_page = 0xff00
+usage = 2
+feature_report_len = 91
+[commands.firmware_version]
+class = 0
+id = 0x81
+size = 2
+[commands.set_brightness]
+class = 15
+id = 4
+size = 3
+args = [0, 4]
+[commands.brightness]
+class = 15
+id = 0x84
+size = 3
+args = [0, 4]
+[lighting]
+protocol = "matrix"
+rows = 1
+cols = 2
+varstore = 0
+custom_id = 8
+[lighting.effects]
+static = 1
+[lighting.effect]
+class = 15
+id = 2
+size = 9
+args = [0, 0]
+[lighting.custom_frame]
+class = 15
+id = 3
+size = 11
+args = [0, 0]

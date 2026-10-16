@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+
+schema = 1
+id = "legacy-row"
+evidence = "source-derived"
+replies = "synthetic"
+definition = "legacy.toml"
+expected_value = "ok"
+
+[operation]
+kind = "row"
+pixels = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]
+
+[[sources]]
+repository = "openrazer/openrazer"
+commit = "477f4d6d3ab7e9deb6310d5bd3742560c5cbe80d"
+path = "driver/razerchromacommon.c"
+symbol = "standard/extended matrix report builders"
+claim = "Command classes, lengths, effect layout and region parameters; not hardware success"
+
+[[sources]]
+repository = "CalcProgrammer1/OpenRGB"
+commit = "6a10f77c15e4be47c792b89f1a3cc4e992389684"
+path = "Controllers/RazerController/RazerController.cpp"
+symbol = "razer_create_mode_static_*_matrix_report / razer_set_custom_mode"
+claim = "Independent static and full-width row layouts"
+
+[[exchanges]]
+channel = "feature"
+request = "00 00 3F 00 00 00 46 03 0B FF 00 00 15 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 A4 00"
+[[exchanges.replies]]
+kind = "bytes"
+hex = "00 02 3F 00 00 00 00 03 0B 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 08 00"

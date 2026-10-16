@@ -192,6 +192,24 @@ license = "GPL-3.0-or-later"
 sha = "48c17934a6a1313ee6efc1e68175c39f29565a13"
 note = "neuron's own code (cites are to the working tree on top of this commit). Cited only on derived facts, to point at where neuron states its own reconstruction; never used to raise a grade."
 
+[sources.logitech-cpg-docs]
+url = "https://github.com/Logitech/cpg-docs"
+license = "NOASSERTION"
+sha = "f9107a4e3190d798f9be8c5d596f255f5e5741d2"
+note = "Official HID++ 2.0 report structure documentation."
+
+[sources.solaar]
+url = "https://github.com/pwr-Solaar/Solaar"
+license = "GPL-2.0-or-later"
+sha = "e7304c4c451cc9bb4f206a914844525e67856a28"
+note = "Standard short/long report sizes and report-ID-specific length validation in base.py; Centurion uses a separate extended framing."
+
+[sources.microsoft-hid-samples]
+url = "https://github.com/microsoft/Windows-driver-samples"
+license = "MS-PL"
+sha = "2dc3fd3a0cc84a2933f2194e7ec0871584979071"
+note = "Windows HID ReadFile reports use the collection's maximum input length; protocol lengths and OS envelopes are distinct."
+
 # ------------------------------------------------------------------------------------------------
 # razer_report framing, transport, timing
 # ------------------------------------------------------------------------------------------------
@@ -2591,8 +2609,8 @@ evidence = [
 ]
 
 # ------------------------------------------------------------------------------------------------
-# HID++ (Logitech) — experimental, read-only, never observed on a wire. neuron attributes these to
-# cpg-docs / Solaar / libratbag, which this ledger has not pinned, so every row is derived.
+# HID++ (Logitech) — experimental, read-only, never observed on a wire. Pinned cpg-docs and Solaar
+# references below support standard framing; feature behavior remains source-derived and unverified.
 # Feature calls are kind "enum": HID++ has no razer class/id byte pair to key a get on.
 # ------------------------------------------------------------------------------------------------
 
@@ -2604,7 +2622,9 @@ layout = "0x10 SHORT (7 bytes) / 0x11 LONG (20 bytes): [report id, device index,
 meaning = "HID++ 2.0 framing."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L38-L52", what = "transcribed from cpg-docs hidpp20/README.rst (unpinned here)" },
+  { kind = "source", src = "logitech-cpg-docs", at = "hidpp20/README.rst#L31-L36", what = "standard short 0x10 reports are 7 bytes; long 0x11 reports are 20" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/base.py#L90-L100", what = "standard short/long report IDs and lengths" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L38-L52", what = "neuron emits standard LONG reports only" },
 ]
 
 [[fact]]
@@ -2622,11 +2642,14 @@ evidence = [
 key = "hidpp/frame/reply-validation"
 dialect = "hidpp"
 kind = "frame"
-layout = "swId 0x0A; accept if byte0 in {0x10,0x11}, byte1 0xFF, byte2 = feature index, byte3 = (fn<<4)|0x0A; no CRC"
-meaning = "Reply matching."
+layout = "complete logical frame only (0x10/7 bytes or 0x11/20 bytes); an explicitly padded transport may deliver short reports in a 20-byte envelope; then match swId 0x0A, device index 0xFF, feature index and (fn<<4)|0x0A; no CRC"
+meaning = "Reply matching and complete-frame validation."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L202-L209", what = "neuron transcription" },
+  { kind = "source", src = "logitech-cpg-docs", at = "hidpp20/README.rst#L31-L36", what = "short 0x10 reports are 7 bytes; long 0x11 reports are 20" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/base.py#L542-L554", what = "validates actual read length by report ID, with a separate 63-byte Centurion form" },
+  { kind = "source", src = "microsoft-hid-samples", at = "hid/hclient/report.c#L39-L62", what = "ReadFile uses the collection's maximum InputReportByteLength and the sample asserts the returned byte count equals it" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L212-L217", what = "neuron's field-match rule after complete-frame validation" },
 ]
 
 [[fact]]
@@ -2655,7 +2678,7 @@ evidence = [
 key = "hidpp/frame/transport"
 dialect = "hidpp"
 kind = "frame"
-layout = "OUTPUT report via WriteFile, INPUT replies via ReadFile; claim VID 0x046D, not a receiver pid, output_len 20, input_len >= 7"
+layout = "OUTPUT report via WriteFile, INPUT replies via ReadFile; claim VID 0x046D, not a receiver pid, output_len 20, input_len 7 or 20; larger input maxima remain unclaimed"
 meaning = "Control-pipe claim."
 grade = "derived"
 evidence = [

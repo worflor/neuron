@@ -186,11 +186,32 @@ fn err_name(code: u8) -> &'static str {
     }
 }
 
+/// Standard HID++ report IDs carry fixed wire lengths; the caller's buffer capacity is not the read length.
+fn valid_report_shape(buf: &[u8]) -> bool {
+    match buf.first().copied() {
+        Some(REPORT_ID_SHORT) => buf.len() == SHORT_LEN as usize,
+        Some(REPORT_ID_LONG) => buf.len() == LONG_LEN,
+        _ => false,
+    }
+}
+
+fn logical_report<'a>(t: &dyn Transport, buf: &'a [u8]) -> Option<&'a [u8]> {
+    if valid_report_shape(buf) {
+        Some(buf)
+    } else if t.padded_input_reports() && buf.len() == LONG_LEN && buf.first() == Some(&REPORT_ID_SHORT) {
+        // Windows ReadFile returns the collection maximum, even for a short report.
+        Some(&buf[..SHORT_LEN as usize])
+    } else {
+        None
+    }
+}
+
 /// Is `buf` an error report for our in-flight request? The feature-index slot carries `0x8F` (1.0)
 /// or `0xFF` (2.0). We drive one request at a time on a dedicated handle, so any error bearing our
-/// device index in the drain window is ours. Returns the error code (byte 5) when so.
+/// device index in the drain window is ours. Returns the error code (byte 5) only for a complete
+/// report.
 fn error_code(buf: &[u8]) -> Option<u8> {
-    if buf.len() >= 6 && buf[1] == DEVICE_INDEX && (buf[2] == ERR_HIDPP10 || buf[2] == ERR_HIDPP20) {
+    if valid_report_shape(buf) && buf[1] == DEVICE_INDEX && (buf[2] == ERR_HIDPP10 || buf[2] == ERR_HIDPP20) {
         Some(buf[5])
     } else {
         None
@@ -198,10 +219,9 @@ fn error_code(buf: &[u8]) -> Option<u8> {
 }
 
 /// Does `buf` echo a normal reply to `(feature_idx, fn_id)` for us? (report id short/long, our
-/// device index, echoed feature index, echoed function|softwareId.)
+/// device index, echoed feature index, echoed function|softwareId, and the complete report length.)
 fn matches_reply(buf: &[u8], feature_idx: u8, fn_id: u8) -> bool {
-    buf.len() >= 4
-        && (buf[0] == REPORT_ID_LONG || buf[0] == REPORT_ID_SHORT)
+    valid_report_shape(buf)
         && buf[1] == DEVICE_INDEX
         && buf[2] == feature_idx
         && buf[3] == func_swid(fn_id)
@@ -218,12 +238,17 @@ fn recv_matching(t: &dyn Transport, feature_idx: u8, fn_id: u8) -> Option<[u8; L
             Ok(n) => n,
             Err(_) => continue, // nothing in this window; keep draining
         };
-        let got = &buf[..n.min(LONG_LEN)];
+        if n > buf.len() {
+            continue;
+        }
+        let Some(got) = logical_report(t, &buf[..n]) else { continue; };
         if error_code(got).is_some() {
             return None;
         }
         if matches_reply(got, feature_idx, fn_id) {
-            return Some(buf);
+            let mut reply = [0u8; LONG_LEN];
+            reply[..got.len()].copy_from_slice(got);
+            return Some(reply);
         }
         // else: a reply for a different request/softwareId — keep draining.
     }
@@ -279,8 +304,8 @@ impl Dialect for HidppDialect {
     /// ledger instead):
     ///   * output side — a LONG HID++ request report of [`LONG_LEN`] (20) bytes. This dialect only
     ///     emits LONG reports; a SHORT-only output pipe is recognized but stays unclaimed.
-    ///   * input side — able to CARRY the reply: `input_len >= SHORT_LEN`. The reply fields used by
-    ///     the probe fit in a SHORT report, and longer input reports are also accepted.
+    ///   * input side — a standard SHORT or LONG maximum. Larger collections require a larger
+    ///     read buffer and extended-report handling before they can be claimed.
     ///
     /// Byte-length convention (stated so the next reader doesn't re-derive it): `output_len`/
     /// `input_len` are `HIDP_CAPS` `OutputReportByteLength`/`InputReportByteLength`, which INCLUDE the
@@ -292,7 +317,7 @@ impl Dialect for HidppDialect {
     /// `1..=6`, not the corded [`DEVICE_INDEX`] `0xFF` this dialect addresses — see the `DEVICE_INDEX` note.
     fn claims(&self, info: &HidDeviceInfo) -> bool {
         let output_supports_long_requests = info.output_len == LONG_LEN as u16;
-        let input_carries_reply = info.input_len >= SHORT_LEN;
+        let input_carries_reply = info.input_len == SHORT_LEN || info.input_len == LONG_LEN as u16;
         info.vid == HIDPP_VID
             && !is_receiver_pid(info.pid)
             && output_supports_long_requests
@@ -472,7 +497,10 @@ impl Dialect for HidppDialect {
                 Ok(n) => n,
                 Err(_) => continue, // window empty; keep waiting
             };
-            let got = &buf[..n.min(LONG_LEN)];
+            if n > buf.len() {
+                continue;
+            }
+            let Some(got) = logical_report(t, &buf[..n]) else { continue; };
             if let Some(code) = error_code(got) {
                 bail!(
                     "HID++ error {code:#04x} ({}) for feature {feature_idx:#06x} fn {fn_id:#x}",
@@ -480,7 +508,7 @@ impl Dialect for HidppDialect {
                 );
             }
             if matches_reply(got, feature_idx, fn_id) {
-                return Ok(reshape(reshape_tag, &buf[4..]));
+                return Ok(reshape(reshape_tag, &got[4..]));
             }
         }
         bail!("HID++ timed out waiting for reply to feature {feature_idx:#06x} fn {fn_id:#x}")
@@ -612,6 +640,7 @@ mod tests {
     struct MockHidpp {
         writes: Mutex<Vec<Vec<u8>>>,
         inbox: Mutex<VecDeque<Vec<u8>>>,
+        padded: bool,
     }
 
     impl MockHidpp {
@@ -619,6 +648,7 @@ mod tests {
             MockHidpp {
                 writes: Mutex::new(Vec::new()),
                 inbox: Mutex::new(frames.into_iter().collect()),
+                padded: false,
             }
         }
         fn last_write(&self) -> Vec<u8> {
@@ -627,6 +657,7 @@ mod tests {
     }
 
     impl Transport for MockHidpp {
+        fn padded_input_reports(&self) -> bool { self.padded }
         fn set_feature(&self, _buf: &[u8]) -> Result<()> {
             bail!("hidpp mock carries no feature reports")
         }
@@ -709,9 +740,9 @@ mod tests {
     #[test]
     fn error_report_maps_to_error_with_code() {
         // exec for feature 0x06 fn 0; the device answers with a 0x8F error, code 0x02 (InvalidArgument).
-        let mock = MockHidpp::with_replies(vec![frame(&[
-            0x10, 0xFF, ERR_HIDPP10, 0x06, func_swid(0x00), 0x02,
-        ])]);
+        let mock = MockHidpp::with_replies(vec![vec![
+            0x10, 0xFF, ERR_HIDPP10, 0x06, func_swid(0x00), 0x02, 0,
+        ]]);
         let err = HidppDialect
             .exec(&mock, 0x00, 0x06, 0x00, 0x00, &[RESHAPE_NONE])
             .expect_err("an error report must map to Err");
@@ -772,7 +803,9 @@ mod tests {
         assert!(HidppDialect.claims(&info(HIDPP_VID, 20, 20)), "20-byte out + 20-byte in = HID++ long, bidirectional");
         assert!(!HidppDialect.claims(&info(HIDPP_VID, 7, 20)), "short-only output is gated because this dialect writes long requests");
         assert!(!HidppDialect.claims(&info(HIDPP_VID, 7, 7)), "short-only bidirectional pipe is gated until short framing exists");
-        assert!(HidppDialect.claims(&info(HIDPP_VID, 20, 64)), "input >= short carries the reply (a 64-byte input qualifies)");
+        assert!(HidppDialect.claims(&info(HIDPP_VID, 20, 7)), "a short input maximum carries standard replies");
+        assert!(!HidppDialect.claims(&info(HIDPP_VID, 20, 64)), "a 64-byte input maximum exceeds the read buffer");
+        assert!(!HidppDialect.claims(&info(HIDPP_VID, 20, 8)), "nonstandard input maximum is not claimed");
         // One-direction collections can never complete write_output → read_input:
         assert!(!HidppDialect.claims(&info(HIDPP_VID, 20, 0)), "output-only (no input report) can't carry a reply");
         assert!(!HidppDialect.claims(&info(HIDPP_VID, 7, 0)), "output-only short pipe is unsupported and can't carry a reply");
@@ -927,6 +960,51 @@ mod tests {
         assert_eq!(parsed, s.def, "emit → parse must be lossless for a hidpp def");
     }
 
+    #[test]
+    fn padded_short_reports_require_an_explicit_transport_envelope() {
+        let mut reply = frame(&[0x10, 0xFF, 7, func_swid(2), 0, 3, 0x20]);
+        reply[7..].fill(0xA5);
+        let exact = MockHidpp::with_replies(vec![reply.clone()]);
+        assert!(HidppDialect.exec(&exact, 0, 7, 2, 0, &[RESHAPE_DPI]).is_err());
+
+        let mut padded = MockHidpp::with_replies(vec![reply.clone(), reply]);
+        padded.padded = true;
+        let dpi = HidppDialect.exec(&padded, 0, 7, 2, 0, &[RESHAPE_DPI]).unwrap();
+        assert_eq!(&dpi[1..5], &[3, 0x20, 3, 0x20]);
+        let raw = HidppDialect.exec(&padded, 0, 7, 2, 0, &[RESHAPE_NONE]).unwrap();
+        assert_eq!(&raw[..3], &[0, 3, 0x20]);
+        assert!(raw[3..].iter().all(|b| *b == 0), "OS envelope bytes are not protocol payload");
+
+        let mut probe = MockHidpp::with_replies(vec![
+            frame(&[0x10, 0xFF, 0, 0x1A, 2, 0, PING_TOKEN]),
+            frame(&[0x10, 0xFF, 0, 0x0A, 6, 0, 0]),
+            frame(&[0x10, 0xFF, 0, 0x0A, 7, 0, 0]),
+        ]);
+        probe.padded = true;
+        let report = probe_report(&probe).unwrap();
+        assert_eq!(report.battery_feature, Some(6));
+        assert_eq!(report.dpi_feature, Some(7));
+    }
+
+    #[test]
+    fn reply_matching_requires_a_complete_report_for_its_id() {
+        let mut short = [0u8; SHORT_LEN as usize];
+        short[..4].copy_from_slice(&[REPORT_ID_SHORT, DEVICE_INDEX, 7, func_swid(2)]);
+        assert!(valid_report_shape(&short));
+        assert!(matches_reply(&short, 7, 2));
+        assert!(!matches_reply(&short[..SHORT_LEN as usize - 1], 7, 2));
+
+        let mut long = [0u8; LONG_LEN];
+        long[..4].copy_from_slice(&[REPORT_ID_LONG, DEVICE_INDEX, 7, func_swid(2)]);
+        assert!(valid_report_shape(&long));
+        assert!(matches_reply(&long, 7, 2));
+        assert!(!matches_reply(&long[..LONG_LEN - 1], 7, 2));
+        assert!(!matches_reply(&long[..4], 7, 2));
+
+        let truncated_error = [REPORT_ID_LONG, DEVICE_INDEX, ERR_HIDPP20, 0, 0, 9];
+        assert_eq!(error_code(&truncated_error), None);
+    }
+
     // ---- Property tests (EXPERIMENTAL dialect — see module doc: spec-implemented, zero
     // hardware verification). These properties pin the STRUCTURAL contracts that follow from the
     // code as written — reshape's `.unwrap_or(0)`/`.get(..)` semantics, the fixed 80-byte output
@@ -992,7 +1070,6 @@ mod tests {
                 prop_assert_eq!([out[1], out[2], out[3], out[4]], [hi, lo, hi, lo]);
                 prop_assert_eq!(out[0], 0, "the reshape tag slot is never populated by RESHAPE_DPI");
             }
-
             /// (b) RESHAPE_NONE (and any unrecognized tag — the `_` arm, hidpp.rs:251-255): the raw
             /// payload is copied left-aligned into out[0..], truncated to 80 bytes, with everything
             /// past the payload's length left zeroed. Covers both the documented RESHAPE_NONE tag
@@ -1008,10 +1085,9 @@ mod tests {
                 prop_assert!(out[n..].iter().all(|&b| b == 0), "bytes past the payload stay zero-padded");
             }
 
-            /// (c) `error_code`/`matches_reply` are length-safe over the WHOLE short-buffer space:
-            /// no panic for any length 0..24, and buffers shorter than each function's documented
-            /// guard length always yield the "not applicable" result — `error_code` guards on
-            /// `buf.len() >= 6` (hidpp.rs:187), `matches_reply` on `buf.len() >= 4` (hidpp.rs:197).
+            /// (c) `error_code`/`matches_reply` accept only complete HID++ report shapes:
+            /// short 0x10 reports are 7 bytes and long 0x11 reports are 20 bytes. Arbitrary
+            /// slices must remain length-safe and cannot be mistaken for a complete reply.
             #[test]
             fn error_code_and_matches_reply_are_length_safe(
                 full in proptest::collection::vec(any::<u8>(), 0..24),
@@ -1023,13 +1099,11 @@ mod tests {
                 let buf = &full[..cut];
 
                 let ec = error_code(buf); // must not panic
-                if buf.len() < 6 {
-                    prop_assert_eq!(ec, None, "error_code must be None below its 6-byte guard");
-                }
 
                 let mr = matches_reply(buf, feature_idx, fn_id); // must not panic
-                if buf.len() < 4 {
-                    prop_assert!(!mr, "matches_reply must be false below its 4-byte guard");
+                if !valid_report_shape(buf) {
+                    prop_assert_eq!(ec, None, "truncated or overlong frames are not error reports");
+                    prop_assert!(!mr, "truncated or overlong frames are not normal replies");
                 }
             }
 
