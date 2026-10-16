@@ -544,6 +544,8 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
 begin
   ResultCode := OtherNeuronCopyInUse();
   if (ResultCode <> 0) and (ResultCode <> 1) then begin

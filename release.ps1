@@ -145,14 +145,13 @@ if (Get-ReleaseProcesses) {
     }
     $running = Get-ReleaseProcesses
     if ($running) {
-        # Not the task's instance (a debug or manual launch) - stop it directly.
         try { $running | Stop-Process -Force -ErrorAction Stop } catch {
             throw "a Neuron instance (pid $($running.Id -join ', ')) won't die from this shell - close it manually, then re-run"
         }
         Start-Sleep -Milliseconds 400   # let the OS release the file lock before we relink
         Write-Host "    stopped directly: $($running.Id -join ', ')"
     } else {
-        Write-Host '    stopped via task'
+        Write-Host '    selected processes exited'
     }
 } else {
     Write-Host '    (none running)'
