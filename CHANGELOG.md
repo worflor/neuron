@@ -10,6 +10,7 @@
 - Added offline Windows copy inventory (`neuron-update.ps1 -Action status`, with `-Json` for agents), separating the running repo build, installed release checkpoint, startup target and config paths. Version checks read passive package metadata; unknown source-build versions remain unknown. Ambiguous startup targets can be inspected without selecting an update destination.
 - Repository builds preserve another copy's Windows startup target; `release.ps1 -UseAtStartup` makes reassignment explicit. New checkpoint installers preserve other running/startup copies, and checkpoint uninstall retains their startup target and shared Chroma broker. User configuration stays separate from payload removal. Real setup/UAC/uninstall transitions still need a clean Windows VM run.
 - Already-current updates avoid redundant downloads and backups, updater scratch directories are cleaned on reported outcomes, and local packaging requires `-ReplaceExisting` to overwrite existing versioned assets. Local packages retain version-specific checksum files. Windows lifecycle fixtures run in the normal validation gate; app tests keep line-table debug information to reduce build memory.
+- Chroma broker updates verify a protected replacement before stopping the working copy. Failed replacements restore the previous files and task; failed rollback retains a protected recovery copy for inspection. Uninstall preserves unresolved recovery state, and interrupted first installs can resume from their verified ownership record.
 
 ## v0.1.5
 

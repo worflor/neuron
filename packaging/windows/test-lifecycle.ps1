@@ -56,6 +56,8 @@ function Get-InnoCommand($name) {
     $expression = $body.Substring($paramsStart, $paramsEnd - $paramsStart)
     $targetLiteral = "'" + (Join-Path $fixtureRoot 'installed/neuron-app.exe').Replace("'", "''") + "'"
     $expression = $expression.Replace("PowerShellLiteral(ExpandConstant('{app}\neuron-app.exe'))", "'" + $targetLiteral.Replace("'", "''") + "'")
+    $transactionLiteral = "'" + (Join-Path $fixtureRoot 'programfiles').Replace("'", "''") + "'"
+    $expression = $expression.Replace("PowerShellLiteral(ExpandConstant('{commonpf64}'))", "'" + $transactionLiteral.Replace("'", "''") + "'")
     $parts = [regex]::Matches($expression, "'(?:[^']|'')*'")
     $command = ($parts | ForEach-Object { $_.Value.Substring(1, $_.Value.Length - 2).Replace("''", "'") }) -join ''
     $prefix = '-NoProfile -NonInteractive -Command "'
@@ -71,15 +73,15 @@ function Get-InnoCommand($name) {
         $n -is [Management.Automation.Language.InvokeMemberExpressionAst]
     }, $true)) {
         if ($node -isnot [Management.Automation.Language.CommandAst] -or
-            $node.GetCommandName() -notin @('Get-Process', 'Get-ScheduledTask', 'Unregister-ScheduledTask', 'Where-Object', 'Out-Null')) {
+            $node.GetCommandName() -notin @('Get-Process', 'Get-ScheduledTask', 'Unregister-ScheduledTask', 'Where-Object', 'Out-Null', 'Get-ChildItem', 'Select-Object')) {
             throw 'fixture runner refuses unmocked commands, dynamic calls and .NET invocation'
         }
     }
     return $command
 }
 
-function Invoke-InnoFixture($command, $processes, $tasks, $failQuery = $false, $failProcess = $false) {
-    $fixture = @{ Command=$command; Processes=@($processes); Tasks=@($tasks); FailQuery=$failQuery; FailProcess=$failProcess }
+function Invoke-InnoFixture($command, $processes, $tasks, $failQuery = $false, $failProcess = $false, $transactions = @(), $failTransactions = $false) {
+    $fixture = @{ Command=$command; Processes=@($processes); Tasks=@($tasks); FailQuery=$failQuery; FailProcess=$failProcess; Transactions=@($transactions); FailTransactions=$failTransactions; TransactionRoot=(Join-Path $fixtureRoot 'programfiles') }
     $inputPath = Join-Path $fixtureRoot 'case.json'
     $outputPath = Join-Path $fixtureRoot 'case-result.json'
     [IO.File]::WriteAllText($inputPath, (ConvertTo-Json -InputObject $fixture -Depth 8), $utf8)
@@ -91,6 +93,12 @@ $fixture = Get-Content -LiteralPath $InputPath -Raw | ConvertFrom-Json
 $script:tasks = @($fixture.Tasks)
 $script:removed = @()
 function Get-Process { param($Name, $ErrorAction) if ($fixture.FailProcess) { throw 'fixture process query failure' }; return $fixture.Processes }
+function Get-ChildItem {
+    [CmdletBinding()]param($LiteralPath, [switch]$Force)
+    if ($LiteralPath -ne $fixture.TransactionRoot) { throw 'fixture refused an unexpected transaction root' }
+    if ($fixture.FailTransactions) { throw 'fixture transaction query failure' }
+    return $fixture.Transactions
+}
 function Get-ScheduledTask {
     [CmdletBinding()]param($TaskName)
     if ($fixture.FailQuery) { throw 'fixture query failure' }
@@ -396,6 +404,45 @@ try {
     $signalInstalled = $setup.Substring($setup.IndexOf('function SignalInstalledTray()'))
     $signalInstalled = $signalInstalled.Substring(0, $signalInstalled.IndexOf("`nend;"))
     Assert ($signalInstalled.Contains("Shutdown.''+`$p.Id")) 'setup signal helper must address each owned process by pid'
+
+    $transactionQuery = Get-InnoCommand 'ChromaTransactionPresent'
+    Assert ((Invoke-InnoFixture $transactionQuery @() @()).Code -eq 0) 'empty transaction inventory must report none'
+    foreach ($entryName in @('NeuronChromaBroker.installing-owner-test', 'NeuronChromaBroker.removing-owner-test', 'NeuronChromaBroker.recovery-foreign-test')) {
+        $result = Invoke-InnoFixture $transactionQuery @() @() $false $false @(@{Name=$entryName})
+        Assert ($result.Code -eq 1 -and $result.Removed.Count -eq 0) 'all transaction prefixes must block the no-broker fast path without task mutation'
+    }
+    Assert ((Invoke-InnoFixture $transactionQuery @() @() $false $false @() $true).Code -eq 2) 'transaction query failures must stay distinct from no transaction'
+
+    $uninstallerSource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'uninstall-chroma-broker.ps1'))
+    $uninstallerAst = [Management.Automation.Language.Parser]::ParseInput($uninstallerSource, [ref]$null, [ref]$null)
+    $recoveryAssignment = @($uninstallerAst.FindAll({ param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$recoveryState'
+    }, $true))
+    $recoveryGuard = @($uninstallerAst.FindAll({ param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text -eq '$recoveryState.Count -gt 0'
+    }, $true))
+    Assert ($recoveryAssignment.Count -eq 1 -and $recoveryGuard.Count -eq 1) 'uninstall must have one recovery preflight guard'
+    Assert ($recoveryGuard[0].Extent.EndOffset -lt $uninstallerSource.IndexOf('foreach ($stale')) 'recovery inspection must precede stale-file cleanup'
+    Assert ($recoveryGuard[0].Extent.EndOffset -lt $uninstallerSource.IndexOf('Disable-ScheduledTask')) 'recovery inspection must precede task mutation'
+    $guardText = $recoveryAssignment[0].Extent.Text + "`n" + $recoveryGuard[0].Extent.Text
+    $guardAst = [Management.Automation.Language.Parser]::ParseInput($guardText, [ref]$null, [ref]$null)
+    foreach ($command in $guardAst.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst]}, $true)) {
+        if ($command.GetCommandName() -notin @('Get-ChildItem','Where-Object')) { throw 'uninstall preflight fixture refuses an unmocked command' }
+    }
+    $recoveryPrefix = 'NeuronChromaBroker.recovery-'
+    foreach ($shape in @('none','directory','file','unrelated','query-failure')) {
+        $programFiles64 = Join-Path $fixtureRoot ('recovery-preflight-' + $shape)
+        if ($shape -ne 'query-failure') { [IO.Directory]::CreateDirectory($programFiles64) | Out-Null }
+        $entryPath = Join-Path $programFiles64 'NeuronChromaBroker.recovery-foreign-test'
+        if ($shape -eq 'directory') { [IO.Directory]::CreateDirectory($entryPath) | Out-Null }
+        if ($shape -eq 'file') { [IO.File]::WriteAllText($entryPath, 'retain this recovery record', $utf8) }
+        if ($shape -eq 'unrelated') { [IO.File]::WriteAllText((Join-Path $programFiles64 'unrelated'), 'keep', $utf8) }
+        $guardFailed = $false
+        try { & ([scriptblock]::Create($guardText)) } catch { $guardFailed = $true }
+        Assert ($guardFailed -eq ($shape -in @('directory','file','query-failure'))) "uninstall recovery preflight returned the wrong result for $shape"
+        if ($shape -eq 'directory') { Assert ([IO.Directory]::Exists($entryPath)) 'uninstall must preserve a recovery directory' }
+        if ($shape -eq 'file') { Assert ([IO.File]::ReadAllText($entryPath) -eq 'retain this recovery record') 'uninstall must preserve a recovery file' }
+    }
     Write-Output "lifecycle fixtures: $script:Assertions assertions passed"
 } finally {
     # Only the fresh, resolved fixture directory belongs to this test.

@@ -197,14 +197,14 @@ mod tests {
             .find("Copy-Item -LiteralPath $source -Destination $stageExe")
             .expect("installer stages the broker binary");
         let publish = INSTALLER
-            .find("[IO.Directory]::Move($stage, $dir)")
+            .find("[IO.Directory]::Move($staged.Directory, $dir)")
             .expect("installer publishes with a no-replace directory rename");
         let receipt = INSTALLER
-            .rfind("Write-ProtectedRecord $receipt")
+            .rfind("Commit-BrokerReceipt $context")
             .expect("installer commits the final ownership receipt");
         let finish = INSTALLER
-            .rfind("Remove-Item -LiteralPath $pending")
-            .expect("installer removes pending state only after commit");
+            .rfind("Verify-BrokerReplacement $context $true")
+            .expect("installer verifies the committed receipt and pending removal");
         assert!(pending < binary, "ownership must be recoverable before the first fallible mutation");
         assert!(
             binary < publish && publish < receipt && receipt < finish,
@@ -236,7 +236,7 @@ mod tests {
             assert!(acquire < recovery, "{name} must lock before inspecting stale transactions");
         }
         assert!(
-            INSTALLER.contains("[IO.Directory]::Move($stage, $dir)"),
+            INSTALLER.contains("[IO.Directory]::Move($staged.Directory, $dir)"),
             "install publication must fail when the destination already exists"
         );
     }

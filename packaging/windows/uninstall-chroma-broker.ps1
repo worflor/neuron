@@ -124,6 +124,7 @@ function Remove-RecognizedRemovalDirectory($path) {
 $ownerToken = $OwnerSid -replace '[^A-Za-z0-9-]', '_'
 $removingPrefix = "NeuronChromaBroker.removing-$ownerToken-"
 $installingPrefix = "NeuronChromaBroker.installing-$ownerToken-"
+$recoveryPrefix = 'NeuronChromaBroker.recovery-'
 $transactionMutex = New-BrokerTransactionMutex
 $transactionHeld = $false
 try {
@@ -133,6 +134,11 @@ try {
     $transactionHeld = $true
 }
 if (-not $transactionHeld) { throw 'timed out waiting for another Chroma broker transaction' }
+$recoveryState = @(Get-ChildItem -LiteralPath $programFiles64 -Force -ErrorAction Stop |
+    Where-Object { $_.Name.StartsWith($recoveryPrefix, [StringComparison]::OrdinalIgnoreCase) })
+if ($recoveryState.Count -gt 0) {
+    throw "an interrupted broker replacement needs inspection; preserving $($recoveryState[0].FullName)"
+}
 foreach ($stale in @(Get-ChildItem -LiteralPath $programFiles64 -Directory -Force -ErrorAction Stop |
     Where-Object { $_.Name.StartsWith($removingPrefix) -or $_.Name.StartsWith($installingPrefix) })) {
     Remove-RecognizedRemovalDirectory $stale.FullName
