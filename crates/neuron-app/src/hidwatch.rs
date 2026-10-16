@@ -145,18 +145,19 @@ pub fn registry() -> Option<&'static neuron::registry::Registry> {
     if cell.is_none() {
         *cell = neuron::registry::Registry::load()
             .ok()
-            .map(|r| &*Box::leak(Box::new(r)));
+            .map(|r| {
+                neuron::registry::refresh_event_identities(&r);
+                &*Box::leak(Box::new(r))
+            });
     }
     *cell
 }
 
-/// Re-read the registry from disk and swap it in — called from the runtime's `synth_dirty` reload
-/// path (an adoption wrote a new `devices/auto/*.toml`) so hidwatch arming + glue capability gating
-/// see the newly-adopted/edited defs on the next re-arm/select, not only after a restart.
-pub fn reload_registry() {
-    if let Ok(r) = neuron::registry::Registry::load() {
-        *reg_cell().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(&*Box::leak(Box::new(r)));
-    }
+/// Install the runtime's loaded snapshot so event arming and capability gating agree after adoption.
+pub fn reload_registry(registry: neuron::registry::Registry) {
+    let mut cell = reg_cell().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    neuron::registry::refresh_event_identities(&registry);
+    *cell = Some(&*Box::leak(Box::new(registry)));
 }
 
 fn reg_cell() -> &'static Mutex<Option<&'static neuron::registry::Registry>> {
@@ -1956,6 +1957,7 @@ mod tests {
 
     #[test]
     fn registry_cache_swaps_on_reload_instead_of_freezing_startup() {
+        let _guard = crate::testsupport::cwd_guard("registry-reload");
         // The reload-mismatch pin: this cache is the ONE app-layer registry both hidwatch (arming)
         // and glue (capability gating) read, and the runtime's `synth_dirty` reload path calls
         // `reload_registry()` on it. A regression back to a frozen OnceLock snapshot would make an
@@ -1963,7 +1965,7 @@ mod tests {
         // snapshot until restart — so pin that a reload actually SWAPS the snapshot. (Old readers
         // keeping their previous leaked snapshot is by design; new reads must see the new one.)
         let before = std::ptr::from_ref::<neuron::registry::Registry>(registry().expect("registry loads on a dev checkout"));
-        reload_registry();
+        reload_registry(neuron::registry::Registry::load().expect("registry reloads"));
         let after = std::ptr::from_ref::<neuron::registry::Registry>(registry().expect("registry reloads"));
         assert!(
             !std::ptr::eq(before, after),
