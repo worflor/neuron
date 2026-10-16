@@ -72,6 +72,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Registry",          # SHELLEXECUTEINFOW dependency in windows-sys.
     "Win32_System_Ole",
     "Win32_Foundation",
+    "Win32_Globalization",           # Compare full UTF-16 process paths without lossy decoding.
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
@@ -92,6 +93,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Kernel",             # EXCEPTION_POINTERS/CONTEXT for the SEH filter
     # synapse purge: stop respawning services, then terminate every process
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot — enumerate live processes by name
+    "Win32_System_RemoteDesktop",        # ProcessIdToSessionId — scope shutdown to this logon session.
     "Win32_System_Services",           # SCM: stop RzActionSvc/Razer Synapse Service/… so they can't respawn
     "Win32_Security",                  # OpenProcessToken/TokenElevation — are we elevated
 ] }

@@ -72,6 +72,10 @@ the SYSTEM diagnostics bench is the quickest read-only check when a device is on
 
 ## building it (windows gotchas)
 
+- `powershell -NoProfile -ExecutionPolicy Bypass -File .\skills\neuron-lazy-update\scripts\neuron-update.ps1 -Action status` shows the running copy, installed checkpoint and startup target. `-Json` gives agents the same state without parsing prose.
+- `.\release.ps1` builds and runs your checkout for this session. It preserves another copy's startup target; `-UseAtStartup` explicitly makes this checkout the startup copy. Keep an installed release as a checkpoint if useful. `-NoRelaunch` builds without stopping an unrelated installed app.
+- `powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\test-lifecycle.ps1` tests copy detection and startup ownership using fixtures, without changing the live installation. The Windows validation gate runs it too. A clean Windows VM is still needed to verify the real setup/UAC/uninstall path.
+- Local packages are checkpoints too: `packaging/package-windows.ps1` refuses to overwrite existing versioned assets without `-ReplaceExisting`. Keep their version-specific `*.SHA256SUMS.txt`; the plain `SHA256SUMS.txt` tracks the most recently packaged version.
 - kill the running tray instance before a release build. windows locks the live `.exe` and the build fails.
 - don't run two builds at once. it corrupts the incremental cache (you'll get bogus `LNK2019 anon.*.llvm`); clear `target/debug/incremental` to recover.
 - `cargo clean` is safe. your config does not live in `target/` — a source build puts the run root in `%LOCALAPPDATA%\neuron` for exactly that reason (see [where your config lives](README.md#where-your-config-lives)). test binaries are the exception on purpose: they live in `target/*/deps`, so their run root stays beside them and the suite can never touch your real profiles.

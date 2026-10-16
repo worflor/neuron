@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-# release.ps1 - build Neuron in release mode and make it the resident (startup) instance.
+# release.ps1 - build and run the repository copy without changing another copy's startup.
 #
 # The app and RAW macros must not start elevated from a user-writable build directory. The old
 # task name is recognized only so this script can migrate it to the current `Neuron` task.
@@ -15,11 +15,13 @@
 #   .\release.ps1                 # build release, restart the tray instance
 #   .\release.ps1 -SkipBuild      # just restart the tray from the existing release binary
 #   .\release.ps1 -NoRelaunch     # build, but leave the app closed
+#   .\release.ps1 -UseAtStartup   # explicitly make this build the Windows startup copy
 
 [CmdletBinding()]
 param(
     [switch]$SkipBuild,
-    [switch]$NoRelaunch
+    [switch]$NoRelaunch,
+    [switch]$UseAtStartup
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,41 +83,67 @@ function Test-LimitedStartupTask($task, $exe) {
         $task.Settings.ExecutionTimeLimit -eq 'PT0S'
 }
 
+function Get-ReleaseLaunchMode($task, $exe, $useAtStartup) {
+    if ($useAtStartup) { return 'register' }
+    if (Test-LimitedStartupTask $task $exe) { return 'task' }
+    return 'direct'
+}
+
+function Get-ReleaseProcesses {
+    foreach ($process in (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue)) {
+        if (-not $NoRelaunch -or ($process.Path -and (Split-Path -Parent $process.Path) -ieq $ReleaseDir)) {
+            $process
+        }
+    }
+}
+
+function Get-ReleaseTrayProcesses {
+    Get-ReleaseProcesses | Where-Object { $_.ProcessName -eq 'neuron-app' }
+}
+
+function Signal-ReleaseTrayProcesses($processes) {
+    foreach ($process in $processes) {
+        if (-not $process.Path) { continue }
+        try {
+            $current = Get-Process -Id $process.Id -ErrorAction Stop
+            if (-not $current.Path -or (Split-Path -Parent $current.Path) -ine (Split-Path -Parent $process.Path)) { continue }
+            $eventName = 'Local\WofloLabs.Neuron.Shutdown.' + $process.Id
+            $shutdown = [Threading.EventWaitHandle]::OpenExisting($eventName)
+            try { $shutdown.Set() | Out-Null } finally { $shutdown.Dispose() }
+        } catch {
+            # Older app builds have no per-process event; the selected-path timeout below handles them.
+        }
+    }
+}
+
+if ($UseAtStartup -and $NoRelaunch) { throw '-UseAtStartup and -NoRelaunch cannot be combined' }
+
 # Refuse before stopping the resident app: a direct launch from an administrator shell would
 # inherit that shell's elevated token even though the autostart task is absent or disabled.
 if (-not $NoRelaunch -and (Test-CurrentProcessElevated)) {
     $preflightTask = Get-StartupTask
-    if (-not (Test-EnabledLogonTask $preflightTask)) {
-        throw 'autostart is off; run release.ps1 from a normal PowerShell to relaunch Neuron without elevation'
+    if (-not (Test-LimitedStartupTask $preflightTask $AppExe)) {
+        throw 'run release.ps1 from a normal PowerShell; the existing startup task does not safely launch this build'
     }
 }
 
-# 1. Stop any running instance through its task when available, then any strays directly.
-#    The exe must be unlocked or the link step fails. Teardown is asynchronous, so poll
-#    for exit instead of guessing a sleep.
+# 1. Signal selected tray processes and wait before relinking their executable. Startup tasks
+#    remain registered; only the exact build selected for this run is stopped in -NoRelaunch mode.
 Write-Step 'Stopping any running Neuron instances'
-if (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue) {
-    # Current builds quit through a same-session event so the ordinary teardown flushes settings
-    # and returns devices to firmware mode. Older builds simply do not own the event.
-    try {
-        $shutdown = [Threading.EventWaitHandle]::OpenExisting('Local\WofloLabs.Neuron.Shutdown')
-        $shutdown.Set() | Out-Null
-        $shutdown.Dispose()
-        $deadline = (Get-Date).AddSeconds(3)
-        while ((Get-Date) -lt $deadline -and (Get-Process neuron-app -ErrorAction SilentlyContinue)) {
-            Start-Sleep -Milliseconds 100
-        }
-    } catch { }
-    foreach ($name in @($TaskName, $LegacyTaskName)) {
-        if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-            Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-        }
+if (Get-ReleaseProcesses) {
+    # Current builds have one scoped event per tray PID. If an older build has no event, the
+    # bounded wait and path-selected process fallback below still unlock only selected binaries.
+    $trayProcesses = @(Get-ReleaseTrayProcesses)
+    Signal-ReleaseTrayProcesses $trayProcesses
+    $deadline = (Get-Date).AddSeconds(3)
+    while ((Get-Date) -lt $deadline -and (Get-ReleaseTrayProcesses)) {
+        Start-Sleep -Milliseconds 100
     }
     $deadline = (Get-Date).AddSeconds(5)
-    while ((Get-Date) -lt $deadline -and (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue)) {
+    while ((Get-Date) -lt $deadline -and (Get-ReleaseProcesses)) {
         Start-Sleep -Milliseconds 250
     }
-    $running = Get-Process neuron-app, neuron -ErrorAction SilentlyContinue
+    $running = Get-ReleaseProcesses
     if ($running) {
         # Not the task's instance (a debug or manual launch) - stop it directly.
         try { $running | Stop-Process -Force -ErrorAction Stop } catch {
@@ -163,12 +191,11 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path $AppExe)) { throw "release binary not found at $AppExe" }
 
-# 3. Preserve the user's autostart setting. Repair an enabled task before using it, but launch
-#    directly when no enabled logon task exists. Never run a stale elevated task.
+# 3. A one-session developer run does not claim another copy's startup task.
 if (-not $NoRelaunch) {
     $task = Get-StartupTask
-    $useTask = Test-EnabledLogonTask $task
-    if ($useTask) {
+    $launchMode = Get-ReleaseLaunchMode $task $AppExe $UseAtStartup
+    if ($launchMode -eq 'register') {
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         $dir = Split-Path -Parent $AppExe
         if ($task.TaskName -ne $TaskName -or -not (Test-LimitedStartupTask $task $AppExe)) {
@@ -191,22 +218,15 @@ if (-not $NoRelaunch) {
         if (Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction Stop
         }
+    }
+    if ($launchMode -in @('task', 'register')) {
         Write-Step "Launching via limited scheduled task '$TaskName'"
         Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     } else {
         if (Test-CurrentProcessElevated) {
             throw 'autostart is off; run release.ps1 from a normal PowerShell to relaunch Neuron without elevation'
         }
-        foreach ($name in @($TaskName, $LegacyTaskName)) {
-            if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-                try {
-                    Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
-                } catch {
-                    throw "could not remove the inactive task '$name': $_. Remove it with administrator permission, then retry."
-                }
-            }
-        }
-        Write-Step 'Launching directly (autostart is off)'
+        Write-Step 'Launching repository build for this session (startup target preserved)'
         Start-Process -FilePath $AppExe -ArgumentList '--tray' -WorkingDirectory (Split-Path -Parent $AppExe)
     }
     # The launch is unelevated, so its executable path must be readable and match the build.

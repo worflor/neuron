@@ -5,7 +5,8 @@ description: Operate, maintain, troubleshoot, and explain Neuron. Use for genera
 
 # Using and maintaining Neuron
 
-Start with the user's goal and the installed build. Use the references below
+Start with the user's goal and the running copy. A repository build, an installed
+release checkpoint and a portable copy can coexist. Use the references below
 for the relevant commands, release workflow, and product evidence.
 
 ## Pick the right file
@@ -21,23 +22,19 @@ for the relevant commands, release workflow, and product evidence.
 
 Read only the file you need.
 
-## The loop
+## Resolve the copy, then act
 
-For questions, inspect the relevant evidence and answer. For changes:
+For installation/version work, run `-Action status -Json` to identify the running copy, startup
+target and installed release. `-Action check` compares the selected copy with the latest stable
+release. Other tasks start with a read-only CLI command.
 
-1. **Check.** Look before touching anything: run the read-only step (`-Action check`, or a
-   read-only CLI command).
-2. **Report.** Tell the user what you found in one or two plain sentences, including any `FLAG:`
-   lines.
-3. **Establish scope.** Match the operation to the user's request. If the change needs additional
-   authorization, explain the specific effect and ask. Updating closes Neuron; device writes change hardware.
-4. **Act.** Run the authorized operation.
-5. **Verify.** Read the result back: the script's final `RESULT:` line, or re-read the setting
-   you changed.
-6. **Report.** Say what happened, including anything that didn't go to plan.
+Use the target established by the request and inspection. An old installation is stale unless the
+user deliberately retained it. Ask only about an unclear target or an additional change. Updating
+may restart the selected copy; changing which copy starts with Windows is a separate choice.
 
-If step 5 doesn't match what you expected, stop and tell the user. Don't try a different command
-to force it.
+Run the requested operation and verify its final `RESULT:` or read the changed setting back.
+Report the outcome and relevant flags briefly. If verification differs from the expected result,
+stop and report it; do not try another command to force success.
 
 ## Operating constraints
 
@@ -53,6 +50,10 @@ to force it.
 4. **Use the installed command interface.** Read `neuron <command> --help` for exact commands and flags.
 5. **Resolve uncertainty before changing the setup.** Inspect commands and read-only state first;
    ask the user for missing intent or information that affects the operation.
+6. **Keep checks read-only and small.** Use the updater's payload backup for updates; do not copy
+   the entire installation or user-data tree for a version check. Do not inspect unrelated cached
+   archives to establish the running version. Equal version numbers do not prove identical binaries
+   or source commits. Checksum/provenance verification applies to the package being installed.
 
 ## Reporting what you notice
 

@@ -23,7 +23,7 @@ members = [
 
 # Shared metadata so every crate stays in lockstep.
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license-file = "LICENSE.md"
 authors = ["Woflo Labs"]
@@ -97,6 +97,7 @@ opt-level = 3
 # quick correctness gate into a memory-heavy release-style compile on both platforms.
 [profile.test.package.neuron-app]
 opt-level = 0
+debug = "line-tables-only"
 
 [profile.test.package.neuron]
 opt-level = 0
