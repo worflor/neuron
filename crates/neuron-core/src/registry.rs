@@ -436,6 +436,7 @@ impl Capability {
     }
 }
 
+#[derive(Clone)]
 pub struct Registry {
     pub devices: Vec<DeviceDef>,
 }
@@ -450,28 +451,41 @@ pub struct Registry {
 // (the stable, documented identity), and triggers/captures/the held registry all speak that one
 // pid. Transport/control identity is untouched — `razer_report` still opens the live pid.
 
-/// The event-identity tables (canonical map + alias set), built from ONE successful registry
-/// load and cached. A FAILED load is NOT cached — it returns `None` (callers degrade to identity
-/// behaviour) and the next call retries, so a transient startup race or a momentarily-bad def
-/// file can never freeze canonicalization off for the whole process. Def edits still need a
-/// restart once a load has succeeded, like the rest of the registry surface.
-#[allow(clippy::type_complexity)]
-fn event_identity_tables(
-) -> Option<std::sync::Arc<(std::collections::HashMap<u16, u16>, std::collections::HashSet<u16>)>>
-{
-    static CACHE: std::sync::Mutex<
-        Option<std::sync::Arc<(std::collections::HashMap<u16, u16>, std::collections::HashSet<u16>)>>,
-    > = std::sync::Mutex::new(None);
-    let mut g = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+type EventIdentities = std::sync::Arc<(std::collections::HashMap<u16, u16>, std::collections::HashSet<u16>)>;
+static EVENT_IDENTITIES: std::sync::Mutex<Option<EventIdentities>> = std::sync::Mutex::new(None);
+
+/// Learn newly adopted event PIDs without changing identities already owned this session.
+pub fn refresh_event_identities(registry: &Registry) {
+    let mut cache = EVENT_IDENTITIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fresh = event_identities(registry);
+    *cache = Some(match cache.as_ref() {
+        None => fresh,
+        Some(previous) => extend_event_identities(previous, &fresh),
+    });
+}
+
+fn extend_event_identities(previous: &EventIdentities, fresh: &EventIdentities) -> EventIdentities {
+    let (mut map, mut aliases) = (**previous).clone();
+    for (&raw, &canonical) in &fresh.0 {
+        let canonical = previous.0.get(&canonical).copied().unwrap_or(canonical);
+        map.entry(raw).or_insert(canonical);
+    }
+    aliases.extend(&fresh.1);
+    std::sync::Arc::new((map, aliases))
+}
+
+fn event_identities(registry: &Registry) -> EventIdentities {
+    let map = build_canonical_map(&registry.devices);
+    let aliases = registry.devices.iter().flat_map(|d| d.event_alias_pids.iter().copied()).collect();
+    std::sync::Arc::new((map, aliases))
+}
+
+/// Cache a successful load; failed loads retry. Runtime adoption refreshes the same tables.
+fn event_identity_tables() -> Option<EventIdentities> {
+    let mut g = EVENT_IDENTITIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if g.is_none() {
         if let Ok(r) = Registry::load() {
-            let map = build_canonical_map(&r.devices);
-            let aliases = r
-                .devices
-                .iter()
-                .flat_map(|d| d.event_alias_pids.iter().copied())
-                .collect();
-            *g = Some(std::sync::Arc::new((map, aliases)));
+            *g = Some(event_identities(&r));
         }
     }
     g.clone()
@@ -626,6 +640,18 @@ fn subsumed(existing: &[DeviceDef], def: &DeviceDef) -> bool {
 }
 
 impl Registry {
+    /// Razer event PIDs eligible for deferred macro-key input. DPI-device ownership
+    /// takes precedence, including receiver aliases; firmware custody stays untouched.
+    #[must_use]
+    pub fn razer_macro_key_pids(&self) -> BTreeSet<u16> {
+        let razer = |d: &&DeviceDef| d.vendor_id == crate::dialect::RAZER_VID && d.dialect == "razer";
+        let mice: BTreeSet<u16> = self.devices.iter().filter(razer)
+            .filter(|d| d.supports(Capability::Dpi)).flat_map(DeviceDef::owned_event_pids).collect();
+        self.devices.iter().filter(razer)
+            .filter(|d| d.has_command("device_mode") && !d.supports(Capability::Dpi) && d.custody == Custody::Driver)
+            .flat_map(DeviceDef::owned_event_pids).filter(|pid| !mice.contains(pid)).collect()
+    }
+
     pub fn load() -> Result<Self> {
         let mut devices = Vec::new();
 
@@ -818,6 +844,49 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn adoption_extends_event_identity_without_retargeting_existing_owners() {
+        let previous = std::sync::Arc::new((HashMap::from([(0x4560, 0x4560), (0x4561, 0x4560)]), HashSet::from([0x4561])));
+        let fresh = std::sync::Arc::new((HashMap::from([(0x4561, 0x4561), (0x4562, 0x4561), (0x4563, 0x4563)]), HashSet::from([0x4562])));
+        let extended = extend_event_identities(&previous, &fresh);
+        assert_eq!(extended.0[&0x4561], 0x4560);
+        assert_eq!(extended.0[&0x4562], 0x4560);
+        assert_eq!(extended.0[&0x4563], 0x4563);
+        assert_eq!(extended.1, HashSet::from([0x4561, 0x4562]));
+    }
+
+    #[test]
+    fn macro_key_ownership_tracks_adoption_without_claiming_mice_or_other_families() {
+        let (mut mouse, mut keyboard) = builtins();
+        mouse.modes[0].product_id = 0x4560;
+        mouse.event_alias_pids = vec![0x4561];
+        keyboard.modes[0].product_id = 0x4562;
+        keyboard.event_alias_pids = vec![0x4561, 0x4563];
+        let mut reg = Registry { devices: vec![mouse] };
+        assert!(reg.razer_macro_key_pids().is_empty());
+        reg.devices.push(keyboard.clone());
+        assert_eq!(reg.razer_macro_key_pids(), BTreeSet::from([0x4562, 0x4563]));
+
+        let mut foreign = keyboard.clone();
+        foreign.dialect = "hidpp".into();
+        foreign.modes[0].product_id = 0x4564;
+        foreign.event_alias_pids.clear();
+        reg.devices.push(foreign);
+        let mut other_vendor = keyboard.clone();
+        other_vendor.vendor_id = 0x046D;
+        other_vendor.modes[0].product_id = 0x4565;
+        reg.devices.push(other_vendor);
+        keyboard.custody = Custody::Firmware;
+        keyboard.modes[0].product_id = 0x4566;
+        keyboard.event_alias_pids.clear();
+        reg.devices.push(keyboard);
+        assert_eq!(reg.razer_macro_key_pids(), BTreeSet::from([0x4562, 0x4563]));
+
+        reg.devices[1].commands.remove("device_mode");
+        assert!(reg.razer_macro_key_pids().is_empty());
+    }
 
     /// Parse just the two embedded builtins (no `devices/` dir, no I/O) so capability tests are
     /// hermetic and deterministic regardless of the working directory.

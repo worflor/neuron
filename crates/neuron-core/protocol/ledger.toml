@@ -277,7 +277,7 @@ evidence = [
 ]
 conflicts = [
   "openrazer never compares tx or CRC on replies and treats BUSY as success (driver/razermouse_driver.c#L116-L163); a device that rewrote tx in replies would time out under neuron.",
-  "Inside neuron: synth timed_exec and the razer-audio dialect only echo-filter class/id (no tx/CRC check), unlike the ACK'd exec. Unsettled design inconsistency.",
+  "Inside neuron: the 64-byte razer-audio dialect only echo-filters class/id (no tx/CRC check); synth timed_exec uses the 91-byte Razer validator.",
 ]
 
 [[fact]]
