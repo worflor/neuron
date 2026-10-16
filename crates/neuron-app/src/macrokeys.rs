@@ -378,6 +378,8 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "macrokeys::tests::adopted_keyboard_reaches_the_macro_registry_without_restart", "--nocapture"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .env_remove("NEURON_RUN_DIR")
                 .env(CHILD, "1").output().unwrap();
             assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             return;
