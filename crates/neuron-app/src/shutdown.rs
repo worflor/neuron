@@ -89,22 +89,22 @@ mod platform {
         let prefix = prefix.encode_utf16().collect::<Vec<_>>();
         path.len() >= prefix.len()
             && path[..prefix.len()].iter().zip(prefix).all(|(left, right)| {
-                let fold_ascii = |unit: u16| if (b'A' as u16..=b'Z' as u16).contains(&unit) { unit + 32 } else { unit };
+                let fold_ascii = |unit: u16| if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) { unit + 32 } else { unit };
                 fold_ascii(*left) == fold_ascii(right)
             })
     }
 
     fn normalize_path(path: &OsStr) -> Vec<u16> {
-        let mut path = path.encode_wide().map(|unit| if unit == b'/' as u16 { b'\\' as u16 } else { unit }).collect::<Vec<_>>();
+        let mut path = path.encode_wide().map(|unit| if unit == u16::from(b'/') { u16::from(b'\\') } else { unit }).collect::<Vec<_>>();
         if ascii_prefix_matches(&path, r"\\?\UNC\") {
             let suffix = path.split_off(8);
             path.clear();
-            path.extend([b'\\' as u16, b'\\' as u16]);
+            path.extend([u16::from(b'\\'), u16::from(b'\\')]);
             path.extend(suffix);
         } else if ascii_prefix_matches(&path, r"\\?\") {
             path.drain(..4);
         }
-        while path.len() > 1 && path.last() == Some(&(b'\\' as u16)) {
+        while path.len() > 1 && path.last() == Some(&u16::from(b'\\')) {
             path.pop();
         }
         path
@@ -169,7 +169,7 @@ mod platform {
             return None;
         }
         let _handle = OwnedHandle(handle);
-        let mut buffer = [0u16; 32768];
+        let mut buffer = vec![0u16; 32768];
         let mut length = buffer.len() as u32;
         // SAFETY: handle is live, buffer is writable and length is its capacity in UTF-16 code units.
         let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &raw mut length) };
