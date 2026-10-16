@@ -544,6 +544,8 @@ impl Drop for OsWireMutex {
 }
 
 impl Transport for WinHid {
+    fn padded_input_reports(&self) -> bool { true }
+
     fn wire_lock(&self) -> Option<Arc<WireLock>> {
         Some(self.wire.clone())
     }

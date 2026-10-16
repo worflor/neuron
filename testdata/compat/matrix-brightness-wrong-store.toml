@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+
+schema = 1
+id = "matrix-brightness-wrong-store"
+evidence = "source-derived"
+replies = "synthetic"
+definition = "matrix.toml"
+expected_error = "VERIFY FAILED"
+
+[operation]
+kind = "brightness"
+percent = 50
+
+[[sources]]
+repository = "openrazer/openrazer"
+commit = "477f4d6d3ab7e9deb6310d5bd3742560c5cbe80d"
+path = "driver/razerchromacommon.c"
+symbol = "razer_chroma_extended_matrix_effect_brightness / get_brightness"
+claim = "0F/04 and 0F/84 use varstore, LED ID and brightness; replies constructed synthetically"
+
+[[exchanges]]
+channel = "feature"
+request = "00 00 1F 00 00 00 03 0F 04 00 04 7F 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 73 00"
+[[exchanges.replies]]
+kind = "bytes"
+hex = "00 02 1F 00 00 00 00 0F 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0B 00"
+
+[[exchanges]]
+channel = "feature"
+request = "00 00 1F 00 00 00 03 0F 84 00 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8C 00"
+[[exchanges.replies]]
+kind = "bytes"
+hex = "00 02 1F 00 00 00 03 0F 84 01 04 7F 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 F2 00"
