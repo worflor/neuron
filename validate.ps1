@@ -166,6 +166,9 @@ if ($Mode -in @('quick', 'full')) {
         Invoke-Gate 'Windows install lifecycle fixtures' {
             & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'packaging/windows/test-lifecycle.ps1')
         }
+        Invoke-Gate 'Windows broker transaction fixtures' {
+            & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'packaging/windows/test-broker-transaction.ps1')
+        }
     }
     # One compile, not two: `cargo test` already compiles every lib, bin and test target, so
     # a separate `cargo build` first doubles the workspace compile for ~2 min of actual test

@@ -22,6 +22,17 @@ inventory. Windows PowerShell fixtures exercise copy selection and the installer
 commands with fake tasks/processes. The revised Inno Setup source compiles; real setup/UAC/uninstall
 transitions have not yet been checked in a clean Windows VM. These changes are not in v0.1.5.
 
+The v0.1.6 release remains a draft. During Windows installation testing on 2026-10-16,
+Microsoft Defender blocked its Chroma broker and setup stopped before replacing the app payload.
+The previous broker was restored and verified. The detection remains unresolved; no protection
+setting was changed. The replacement installer now stages the candidate before stopping the old
+broker and retains protected rollback state. Its isolated failure fixtures pass 214 assertions
+in Windows PowerShell 5.1 and PowerShell 7; they do not establish that the blocked binary is safe.
+The revised helper's successful replacement path was separately checked through real UAC with
+the verified v0.1.5 broker. Broker files, task definition and permissions matched afterward;
+the running source app, startup tasks, configuration and installed checkpoint were preserved.
+Native failure rollback remains unverified.
+
 | grade | meaning |
 |---|---|
 | 🟢 solid | Daily-driven or directly tested on the named hardware. |
