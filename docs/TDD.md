@@ -29,7 +29,7 @@ The workspace has six crates:
 - `crates/neuron-app`: Slint desktop app, tray resident runtime, live dispatch worker, UI glue, spellweaving/beacon service, overlays, audio UI, window instruments, diagnostics, and reliability surfaces.
 - `crates/neuron-cli`: command-line device control and daemon-style run path. It is still an important reference implementation for the GUI live dispatcher.
 - `crates/neuron-host`: the protocol-host kernel (ownership arbiter, signal bus, declaration journal, restart governor, host shell) plus the OpenRGB and Chroma protocol adapters other apps drive Neuron through.
-- `crates/engram`: trajectory codec used by the newer rhythm/twin systems.
+- `crates/engram`: [trajectory codec](https://github.com/worflor/engram) used by the newer rhythm/twin systems.
 - `crates/neuron-testkit`: shared test scaffolding (mock transport, fault injection) for the other crates.
 
 Important non-code state:

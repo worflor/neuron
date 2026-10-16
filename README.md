@@ -253,7 +253,7 @@ new to the tree? [AGENTS.md](AGENTS.md) is the quick orientation. tests can't ar
 
 ### the legal bit
 
-most changes land under GPL-3.0-or-later with the Neuron-Woflo exception. Engram and three reusable codec/eigenmotion modules keep their Woflo Labs community-source terms because they're research components rather than neuron-specific application code. [the license file](LICENSE.md) shows the exact four paths and how the combined build works.
+most changes land under GPL-3.0-or-later with the Neuron-Woflo exception. [Engram](https://github.com/worflor/engram) and three reusable codec/eigenmotion modules keep their Woflo Labs community-source terms because they're research components rather than neuron-specific application code. [the license file](LICENSE.md) shows the exact four paths and how the combined build works.
 
 what you write stays yours. the checkbox on a pull request gives Woflo Labs enough permission to ship, maintain, relicense, and commercially license an accepted contribution, with a promise that work accepted into the public project stays available in source form under a public project license. the full agreement is [here](LICENSES/CONTRIBUTOR-AGREEMENT-1.0.md); if an employer or client might own your work, please clear it with them before sending it.
 
