@@ -88,6 +88,36 @@ fn export_projects_only_allowlisted_evidence_and_is_replayable_after_consent() {
 }
 
 #[test]
+fn archive_scratch_cleanup_retries_only_bounded_directory_not_empty_errors() {
+    let path = std::path::Path::new("scratch");
+    let mut attempts = 0;
+    remove_archive_scratch(path, |_| {
+        attempts += 1;
+        if attempts == 1 {
+            Err(std::io::Error::new(std::io::ErrorKind::DirectoryNotEmpty, "transient"))
+        }
+        else { Ok(()) }
+    }).unwrap();
+    assert_eq!(attempts, 2);
+
+    attempts = 0;
+    let error = remove_archive_scratch(path, |_| {
+        attempts += 1;
+        Err(std::io::Error::new(std::io::ErrorKind::DirectoryNotEmpty, "persistent"))
+    }).unwrap_err();
+    assert_eq!(attempts, 3);
+    assert_eq!(error.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+
+    attempts = 0;
+    let error = remove_archive_scratch(path, |_| {
+        attempts += 1;
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "unrelated"))
+    }).unwrap_err();
+    assert_eq!(attempts, 1);
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+#[test]
 fn integrity_rejects_tampering_extra_files_and_traversal() {
     let scratch = Scratch::new();
     let shared = scratch.path("shared");
