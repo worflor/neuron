@@ -197,7 +197,7 @@ mod tests {
             .find("Copy-Item -LiteralPath $source -Destination $stageExe")
             .expect("installer stages the broker binary");
         let publish = INSTALLER
-            .find("[IO.Directory]::Move($stage, $dir)")
+            .find("[IO.Directory]::Move($staged.Directory, $dir)")
             .expect("installer publishes with a no-replace directory rename");
         let receipt = INSTALLER
             .rfind("Commit-BrokerReceipt $context")
@@ -236,7 +236,7 @@ mod tests {
             assert!(acquire < recovery, "{name} must lock before inspecting stale transactions");
         }
         assert!(
-            INSTALLER.contains("[IO.Directory]::Move($stage, $dir)"),
+            INSTALLER.contains("[IO.Directory]::Move($staged.Directory, $dir)"),
             "install publication must fail when the destination already exists"
         );
     }

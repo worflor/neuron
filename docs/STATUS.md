@@ -26,9 +26,10 @@ The v0.1.6 release remains a draft. During Windows installation testing on 2026-
 Microsoft Defender blocked its Chroma broker and setup stopped before replacing the app payload.
 The previous broker was restored and verified. The detection remains unresolved; no protection
 setting was changed. The replacement installer now stages the candidate before stopping the old
-broker and retains protected rollback state. Its isolated failure fixtures pass 214 assertions
-in Windows PowerShell 5.1 and PowerShell 7; they do not establish that the blocked binary is safe.
-The revised helper's successful replacement path was separately checked through real UAC with
+broker and retains protected rollback state. Uninstall preserves unresolved recovery state;
+pending-only first installs can resume after ownership and process checks. Isolated failure fixtures
+pass in Windows PowerShell 5.1 and PowerShell 7; they do not establish that the blocked binary is safe.
+The helper at `253f7db` was separately checked through real UAC on its successful replacement path with
 the verified v0.1.5 broker. Broker files, task definition and permissions matched afterward;
 the running source app, startup tasks, configuration and installed checkpoint were preserved.
 Native failure rollback remains unverified.
