@@ -140,6 +140,12 @@ are an offline fixture format, not collected by the public inventory command.
 Approved capture procedures must establish their provenance before they become
 wire facts or committed fixtures.
 
+`ReplayBackend` adds deterministic enumeration, multiple collections, and explicit
+disconnect/reconnect over those tapes. The [source-derived corpus](../../testdata/compat/README.md)
+compares production device selection and capability requests with fixture literals.
+Correspondence with pinned upstream facts is reviewed manually. Its replies and
+device metadata are synthetic; passing it does not establish physical hardware support.
+
 The CLI's `replay` reproduces neutral bit analysis only. A passing replay is not a
 passing device decoder, driver, hardware write or physical-output test.
 

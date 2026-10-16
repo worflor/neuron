@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+
+schema = 1
+id = "00-hidpp-short-six"
+evidence = "source-derived"
+replies = "synthetic"
+definition = "hidpp.toml"
+expected_error = "timed out"
+
+[operation]
+kind = "dpi"
+
+[[sources]]
+repository = "Logitech/cpg-docs"
+commit = "f9107a4e3190d798f9be8c5d596f255f5e5741d2"
+path = "hidpp20/README.rst"
+symbol = "HID++ 2.0 reports"
+claim = "Report ID 10 is 7 bytes; report ID 11 is 20 bytes"
+
+[[sources]]
+repository = "pwr-Solaar/Solaar"
+commit = "e7304c4c451cc9bb4f206a914844525e67856a28"
+path = "lib/logitech_receiver/base.py"
+symbol = "_read / request"
+claim = "Exact input report lengths, direct index FF and function/software ID echo"
+
+[[sources]]
+repository = "Logitech/cpg-docs"
+commit = "f9107a4e3190d798f9be8c5d596f255f5e5741d2"
+path = "hidpp20/features/0x2201-AdjustableDPI.rst"
+symbol = "getSensorDpi"
+claim = "Sensor index followed by big-endian DPI"
+
+[[exchanges]]
+channel = "output_input"
+request = "11 FF 07 2A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+[[exchanges.replies]]
+kind = "bytes"
+hex = "10 FF 07 2A 00 03"
+[[exchanges.replies]]
+kind = "timeout"
+[[exchanges.replies]]
+kind = "timeout"
+[[exchanges.replies]]
+kind = "timeout"
+[[exchanges.replies]]
+kind = "timeout"
+[[exchanges.replies]]
+kind = "timeout"
+[[exchanges.replies]]
+kind = "timeout"
+[[exchanges.replies]]
+kind = "timeout"
+[[exchanges.replies]]
+kind = "timeout"
+[[exchanges.replies]]
+kind = "timeout"
