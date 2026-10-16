@@ -205,7 +205,7 @@ fn timed_exec(
     args: &[u8],
     max_polls: usize,
 ) -> Option<([u8; 80], Duration)> {
-    use crate::protocol::{reply_status, Report, Status, BUF_LEN};
+    use crate::protocol::{razer_reply_status, Report, Status, BUF_LEN};
 
     // Hold the pipe's wire lock for this ONE request/reply conversation only — not the whole probe
     // sweep. A sweep touches dozens of commands; locking per-pair (not per-sweep) is what lets a
@@ -225,10 +225,8 @@ fn timed_exec(
     for i in 0..max_polls {
         std::thread::sleep(Duration::from_millis(2));
         let mut b = [0u8; BUF_LEN];
-        if t.get_feature(&mut b).is_ok() {
-            // Shared echo filter (dialect seam) — same class/id echo the busy-poll loops use; only
-            // the 2ms cadence differs (it IS the stream_wait_us calibration instrument).
-            if let Some(status) = reply_status(&b, class, id) {
+        if t.get_feature(&mut b).ok() == Some(BUF_LEN) {
+            if let Some(status) = razer_reply_status(&b, PROBE_TX, class, id) {
                 match status {
                     Status::Success => return Some((Report::from_buf(&b).args, start.elapsed())),
                     Status::Fail | Status::Unsupported => return None,
@@ -1078,7 +1076,7 @@ mod tests {
     /// real firmware gives the probe.
     struct MockDevice {
         supports: Vec<(u8, u8, [u8; 80])>,
-        last: Mutex<Option<(u8, u8)>>,
+        last: Mutex<Option<(u8, u8, u8)>>,
     }
 
     impl MockDevice {
@@ -1100,14 +1098,14 @@ mod tests {
 
     impl Transport for MockDevice {
         fn set_feature(&self, buf: &[u8]) -> anyhow::Result<()> {
-            *self.last.lock().unwrap() = Some((buf[7], buf[8]));
+            *self.last.lock().unwrap() = Some((buf[7], buf[8], buf[6]));
             Ok(())
         }
         fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
-            let Some((class, id)) = *self.last.lock().unwrap() else {
+            let Some((class, id, size)) = *self.last.lock().unwrap() else {
                 anyhow::bail!("no pending command");
             };
-            let mut rep = Report::command(PROBE_TX, class, id, 0);
+            let mut rep = Report::command(PROBE_TX, class, id, size);
             match self.supports.iter().find(|(c, i, _)| *c == class && *i == id) {
                 Some((_, _, args)) => {
                     rep.status = 0x02; // SUCCESS
@@ -1130,6 +1128,43 @@ mod tests {
             usage: 0x0002,
             feature_len: RAZER_FEATURE_LEN,
             product: product.into(),
+        }
+    }
+
+    #[test]
+    fn probe_rejects_short_or_invalid_razer_replies() {
+        struct Reply {
+            bytes: [u8; BUF_LEN],
+            reported: usize,
+        }
+        impl Transport for Reply {
+            fn set_feature(&self, _: &[u8]) -> anyhow::Result<()> { Ok(()) }
+            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
+                let n = self.reported.min(buf.len());
+                buf[..n].copy_from_slice(&self.bytes[..n]);
+                Ok(n)
+            }
+        }
+        let mut report = Report::command(PROBE_TX, 0x00, 0x81, 2);
+        report.status = 2;
+        report.args[..2].copy_from_slice(&[1, 2]);
+        let good = report.to_buf();
+        assert!(timed_exec(&Reply { bytes: good, reported: BUF_LEN }, 0x00, 0x81, 2, &[], 1).is_some());
+        // Synthetic variable-length reply: request capacity is not a reply-length contract.
+        report.class = 0x04;
+        report.id = 0x86;
+        report.data_size = 10;
+        report.args[..10].copy_from_slice(&[0, 1, 1, 1, 0x03, 0x20, 0x03, 0x20, 0, 0]);
+        assert!(timed_exec(&Reply { bytes: report.to_buf(), reported: BUF_LEN }, 0x04, 0x86, 0x26, &[], 1).is_some());
+        for (name, bytes, reported) in [
+            ("short read", good, 9),
+            ("wrong transaction", { let mut b = good; b[2] ^= 1; b }, BUF_LEN),
+            ("bad checksum", { let mut b = good; b[9] ^= 1; b }, BUF_LEN),
+            ("nonzero report id", { let mut b = good; b[0] = 1; b }, BUF_LEN),
+            ("nonzero reserved byte", { let mut b = good; b[90] = 1; b }, BUF_LEN),
+            ("invalid payload size", { let mut b = good; b[6] = 81; b[89] = crate::protocol::crc(&b); b }, BUF_LEN),
+        ] {
+            assert!(timed_exec(&Reply { bytes, reported }, 0x00, 0x81, 2, &[], 1).is_none(), "{name}");
         }
     }
 
