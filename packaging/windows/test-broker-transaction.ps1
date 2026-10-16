@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-# Offline fixtures for the broker replacement transaction. Only bounded temporary files and
-# fake Task Scheduler/ACL commands are used; the installation script's top level is never run.
+# Offline fixtures for broker replacement and first-install repair. Only bounded temporary files,
+# fake Task Scheduler/ACL commands, and a controlled process-image query are used; the installation
+# script's top level is never run.
 [CmdletBinding()]
 param()
 
@@ -29,12 +30,13 @@ function Assert($Condition, [string]$Message) {
 
 function Assert-MockBindings {
     $mockCommands = @(
-        'Test-Path','Get-Item','Get-ChildItem','New-Item','Copy-Item','Get-FileHash','Move-Item',
+        'Test-Path','Get-Item','Get-ChildItem','New-Item','Copy-Item','Get-FileHash',
         'Remove-Item','Get-Content','Set-ProtectedFileAcl','Assert-ProtectedFileAcl','Get-ScheduledTask',
         'Export-ScheduledTask','Disable-ScheduledTask','Enable-ScheduledTask','Stop-ScheduledTask',
         'Start-ScheduledTask','Unregister-ScheduledTask','Register-ScheduledTask',
         'New-ScheduledTaskAction','New-ScheduledTaskTrigger','New-ScheduledTaskPrincipal',
-        'New-ScheduledTaskSettingsSet','Start-Sleep','New-Object','Replace-BrokerFile'
+        'New-ScheduledTaskSettingsSet','Start-Sleep','New-Object','Replace-BrokerFile',
+        'Get-BrokerProcessImagePaths'
     )
     foreach ($name in $mockCommands) {
         $command = Get-Command -Name $name -ErrorAction Stop
@@ -233,6 +235,12 @@ function Initialize-Fixture([string]$Name, [bool]$OldState = $true, [bool]$Enabl
     $Script:Fault = ''
     $Script:SecondaryFaults = @()
     $Script:FaultTriggered = $false
+    $Script:ProcessImagePaths = @()
+    $Script:ProcessQueryFailure = $false
+    $Script:PendingRepairBytes = $null
+    $Script:PendingRepairReceiptBytes = $null
+    $Script:PendingRepairTaskJson = $null
+    $Script:PendingRefreshTempPath = $null
     Assert-MockBindings
     [IO.File]::WriteAllBytes($Script:Source, $Script:NewBinary)
     $Script:ExpectedHash = Get-TestHash $Script:Source
@@ -284,6 +292,130 @@ function Set-PriorPendingOnly {
     $Script:OldReceiptPresent = $false
     [IO.File]::WriteAllBytes($Script:Pending, $Script:OldPending)
     $Script:AclState[$Script:Pending] = 'file-protected'
+}
+
+function Set-PendingRepairRecord([string]$Kind = 'valid') {
+    $hash = $Script:ExpectedHash
+    $owner = $Script:OwnerSid
+    if ($Kind -eq 'malformed') { $text = "not-a-hash`nwrong kind`nwrong ACL`n$owner`n" }
+    elseif ($Kind -eq 'foreign') { $text = "$hash`nSYSTEM startup`ntask-acl-v1`nS-1-5-21-999999999-999999999-999999999-1001`n" }
+    elseif ($Kind -eq 'old-hash') {
+        $previousCandidate = Join-Path $Script:Root 'previous-candidate.exe'
+        [IO.File]::WriteAllBytes($previousCandidate, [Text.Encoding]::UTF8.GetBytes('previous trusted candidate'))
+        $hash = Get-TestHash $previousCandidate
+        [IO.File]::Delete($previousCandidate)
+        $text = "$hash`nSYSTEM startup`ntask-acl-v1`n$owner`n"
+    }
+    else { $text = "$hash`nSYSTEM startup`ntask-acl-v1`n$owner`n" }
+    $Script:PendingRepairBytes = [Text.Encoding]::UTF8.GetBytes($text)
+    [IO.File]::WriteAllBytes($Script:Pending, $Script:PendingRepairBytes)
+    $Script:AclState[$Script:Pending] = 'file-protected'
+}
+
+function Set-PendingRepairReceipt {
+    $text = "$Script:ExpectedHash`nSYSTEM startup`ntask-acl-v1`n$Script:OwnerSid`n"
+    $Script:PendingRepairReceiptBytes = [Text.Encoding]::UTF8.GetBytes($text)
+    [IO.File]::WriteAllBytes($Script:Receipt, $Script:PendingRepairReceiptBytes)
+    $Script:AclState[$Script:Receipt] = 'file-protected'
+}
+
+function Set-PendingRepairTask {
+    $Script:BrokerTask = [ordered]@{
+        Present=$true
+        Xml='<?xml version="1.0" encoding="UTF-16"?><Task version="1.3"><Settings></Settings><Triggers><BootTrigger /></Triggers><Actions><Exec><Command>C:\Program Files\NeuronChromaBroker\neuron-chroma-broker.exe</Command></Exec></Actions></Task>'
+        Sddl='O:BA:D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)'
+        Enabled=$true
+        Running=$false
+        Principal=[pscustomobject]@{ UserId='SYSTEM'; LogonType='ServiceAccount'; RunLevel='Highest' }
+        Actions=@([pscustomobject]@{ Execute=$Script:Executable; WorkingDirectory=$Script:Directory; Arguments='' })
+        Triggers=@([pscustomobject]@{ CimClass=[pscustomobject]@{ CimClassName='MSFT_TaskBootTrigger' } })
+    }
+    $Script:PendingRepairTaskJson = ConvertTo-Json -InputObject $Script:BrokerTask -Compress -Depth 8
+}
+
+function Get-StagingDirectories {
+    if (-not [IO.Directory]::Exists($Script:ProgramFiles)) { return @() }
+    return @([IO.Directory]::GetDirectories($Script:ProgramFiles) | Where-Object {
+        Assert-PrivatePath $_ | Out-Null
+        [IO.Path]::GetFileName($_).StartsWith('NeuronChromaBroker.installing-', [StringComparison]::OrdinalIgnoreCase)
+    })
+}
+
+function Invoke-PendingRepair {
+    try {
+        Install-PendingBrokerRepair $Script:Source $Script:ExpectedHash $Script:OwnerSid `
+            $Script:ProgramFiles $Script:Directory $Script:Executable $Script:Receipt $Script:Pending $Script:TaskName
+        return [pscustomobject]@{ Failed=$false; Message='' }
+    } catch {
+        return [pscustomobject]@{ Failed=$true; Message=$_.Exception.Message }
+    }
+}
+
+function Assert-PendingRepairUnchanged([string]$Description, [string]$RecordKind = 'pending') {
+    Assert (-not [IO.File]::Exists($Script:Executable)) "$Description created an executable"
+    if ($RecordKind -eq 'receipt') {
+        Assert-ByteFile $Script:Receipt $Script:PendingRepairReceiptBytes "$Description receipt"
+        Assert (-not [IO.File]::Exists($Script:Pending)) "$Description created a pending record"
+    } else {
+        Assert-ByteFile $Script:Pending $Script:PendingRepairBytes "$Description pending record"
+        Assert (-not [IO.File]::Exists($Script:Receipt)) "$Description created a receipt"
+    }
+    $expectedName = if ($RecordKind -eq 'receipt') { 'broker-installed.sha256' } else { 'broker-install.pending' }
+    $children = @(Get-ChildItem -LiteralPath $Script:Directory -Force)
+    Assert ($children.Count -eq 1 -and $children[0].Name -ceq $expectedName) "$Description left an unexpected partial or auxiliary file"
+    Assert ((Get-StagingDirectories).Count -eq 0) "$Description left a staging directory"
+    Assert ((Get-RecoveryDirectories).Count -eq 0) "$Description left recovery state"
+    Assert ((ConvertTo-Json -InputObject $Script:ForeignTask -Compress -Depth 6) -ceq $Script:ForeignTaskJson) "$Description touched the unrelated task"
+    if ($Script:PendingRepairTaskJson) {
+        Assert ((ConvertTo-Json -InputObject $Script:BrokerTask -Compress -Depth 8) -ceq $Script:PendingRepairTaskJson) "$Description changed the existing broker task"
+    } else {
+        Assert (-not $Script:BrokerTask.Present) "$Description registered or changed a broker task"
+    }
+}
+
+function Assert-PendingRefreshTempStayedInStage([string]$Description) {
+    $temp = Assert-PrivatePath $Script:PendingRefreshTempPath
+    $stage = [IO.Path]::GetDirectoryName($temp)
+    Assert ([IO.Path]::GetDirectoryName($stage) -ieq $Script:ProgramFiles -and
+        [IO.Path]::GetFileName($stage).StartsWith('NeuronChromaBroker.installing-', [StringComparison]::OrdinalIgnoreCase)) "$Description used a pending-record temp outside its stage directory"
+    Assert ($stage -ine $Script:Directory) "$Description placed a partial file in the final broker directory"
+    Assert (-not [IO.File]::Exists($temp)) "$Description left its staged pending-record temp behind"
+}
+
+function Assert-PendingRepairSucceeded([string]$Description) {
+    Assert-ByteFile $Script:Executable $Script:NewBinary "$Description executable"
+    Assert-ProtectedFileAcl $Script:Executable
+    Assert ([IO.File]::Exists($Script:Receipt)) "$Description receipt is missing"
+    Assert (-not [IO.File]::Exists($Script:Pending)) "$Description left its pending record"
+    Assert-ProtectedFileAcl $Script:Receipt
+    $lines = [IO.File]::ReadAllLines($Script:Receipt)
+    Assert ($lines.Count -eq 4 -and $lines[0] -ieq $Script:ExpectedHash -and
+        $lines[1] -eq 'SYSTEM startup' -and $lines[2] -eq 'task-acl-v1' -and
+        $lines[3] -eq $Script:OwnerSid) "$Description receipt does not authenticate the installed executable"
+    Assert ($Script:BrokerTask.Present -and $Script:BrokerTask.Enabled -and $Script:BrokerTask.Running) "$Description task is not installed, enabled, and running"
+    Assert ($Script:BrokerTask.Actions[0].Execute -ieq $Script:Executable -and
+        $Script:BrokerTask.Actions[0].WorkingDirectory -ieq $Script:Directory) "$Description task points outside the protected install path"
+    Assert ((Get-StagingDirectories).Count -eq 0) "$Description left a staging directory"
+    Assert ((Get-RecoveryDirectories).Count -eq 0) "$Description left recovery state"
+    Assert (($Script:Events | Where-Object { $_ -eq 'ProcessQuery' }).Count -eq 2) "$Description did not check process ownership before and after staging"
+    Assert ((ConvertTo-Json -InputObject $Script:ForeignTask -Compress -Depth 6) -ceq $Script:ForeignTaskJson) "$Description touched the unrelated task"
+}
+
+function Test-PendingRepairRejected([string]$Name, [string]$RecordKind, [string]$Blocker = 'none', [bool]$ReceiptPresent = $false) {
+    Initialize-Fixture $Name $false
+    if ($ReceiptPresent) { Set-PendingRepairReceipt }
+    else { Set-PendingRepairRecord $RecordKind }
+    if ($Blocker -eq 'task') { Set-PendingRepairTask }
+    elseif ($Blocker -eq 'process') { $Script:ProcessImagePaths = @($Script:Executable) }
+    elseif ($Blocker -eq 'query-fails') { $Script:ProcessQueryFailure = $true }
+    $result = Invoke-PendingRepair
+    Assert $result.Failed "$Name was not rejected"
+    $recordKind = if ($ReceiptPresent) { 'receipt' } else { 'pending' }
+    Assert-PendingRepairUnchanged $Name $recordKind
+    Assert (@($Script:Events | Where-Object { $_ -like 'Copy:*' }).Count -eq 0) "$Name copied a candidate before rejection"
+    Assert (-not ($Script:Events -contains 'RegisterTask')) "$Name changed Task Scheduler before rejection"
+    Assert (-not ($Script:Events -contains 'StartTask')) "$Name started a broker before rejection"
+    return $result
 }
 
 function script:Test-Path {
@@ -376,25 +508,6 @@ function script:Get-FileHash {
     return [pscustomobject]@{ Algorithm='SHA256'; Hash=$hash; Path=$full }
 }
 
-function script:Move-Item {
-    [CmdletBinding()]
-    param([string]$LiteralPath, [string]$Destination, [switch]$Force)
-    $source = Assert-PrivatePath $LiteralPath
-    $destination = Assert-PrivatePath $Destination
-    Add-FixtureEvent ("Move:" + [IO.Path]::GetFileName($source) + '>' + [IO.Path]::GetFileName($destination))
-    if ((Test-FixtureFault 'ReceiptCommit') -and -not $Script:FaultTriggered -and $destination -eq $Script:Receipt) {
-        [IO.File]::Replace($source, $destination, [NullString]::Value)
-        if ($Script:AclState.ContainsKey($source)) { $Script:AclState[$destination] = $Script:AclState[$source]; $Script:AclState.Remove($source) }
-        $Script:FaultTriggered = $true
-        throw 'injected receipt commit failure after replacement'
-    }
-    if ([IO.File]::Exists($destination)) {
-        if (-not $Force) { throw "Fixture refused overwrite: $destination" }
-        [IO.File]::Replace($source, $destination, [NullString]::Value)
-    } else { [IO.File]::Move($source, $destination) }
-    if ($Script:AclState.ContainsKey($source)) { $Script:AclState[$destination] = $Script:AclState[$source]; $Script:AclState.Remove($source) }
-}
-
 function script:Remove-Item {
     [CmdletBinding()]
     param([string]$LiteralPath, [switch]$Force)
@@ -436,6 +549,10 @@ function script:Assert-ProtectedFileAcl([string]$Path) {
 function script:Get-ScheduledTask {
     [CmdletBinding()]
     param([string]$TaskName, [string]$TaskPath)
+    if ((Test-FixtureFault 'TaskDisappearsAfterReceiptCommit') -and
+        [IO.File]::Exists($Script:Receipt) -and -not [IO.File]::Exists($Script:Pending)) {
+        $Script:BrokerTask.Present = $false
+    }
     if ($TaskName -ne $Script:TaskName -or -not $Script:BrokerTask.Present) {
         Write-Error 'fixture task absent' -Category ObjectNotFound -ErrorAction Stop
     }
@@ -577,13 +694,26 @@ function script:Replace-BrokerFile($SourcePath, $DestinationPath) {
     $source = Assert-PrivatePath $SourcePath
     $destination = Assert-PrivatePath $DestinationPath
     Add-FixtureEvent ("Replace:" + [IO.Path]::GetFileName($source) + '>' + [IO.Path]::GetFileName($destination))
+    if ($destination -eq $Script:Pending) { $Script:PendingRefreshTempPath = $source }
     if ($Script:Fault -eq 'PublishFailure' -and -not $Script:FaultTriggered -and
         [IO.Path]::GetFileName($source) -eq 'candidate.exe' -and $destination -eq $Script:Executable) {
         $Script:FaultTriggered = $true
         throw 'injected broker publication failure'
     }
+    if ((Test-FixtureFault 'PendingRefreshBeforeReplace') -and -not $Script:FaultTriggered -and $destination -eq $Script:Pending) {
+        $Script:FaultTriggered = $true
+        throw 'injected pending-record failure before atomic replacement'
+    }
     Invoke-ProductionReplaceBrokerFile $source $destination
     if ($Script:AclState.ContainsKey($source)) { $Script:AclState[$destination] = $Script:AclState[$source]; $Script:AclState.Remove($source) }
+    if ((Test-FixtureFault 'ReceiptCommit') -and -not $Script:FaultTriggered -and $destination -eq $Script:Receipt) {
+        $Script:FaultTriggered = $true
+        throw 'injected receipt commit failure after atomic replacement'
+    }
+    if ((Test-FixtureFault 'PendingRefreshAfterReplace') -and -not $Script:FaultTriggered -and $destination -eq $Script:Pending) {
+        $Script:FaultTriggered = $true
+        throw 'injected pending-record failure after atomic replacement'
+    }
 }
 
 function Assert-ProductionCommandAllowlist([string]$Name, [string[]]$Allowed) {
@@ -605,6 +735,8 @@ if ($parseErrors.Count -gt 0) { throw ($parseErrors | ForEach-Object { $_.Messag
 
 $productionFunctions = @(
     'Test-OwnershipRecord', 'Assert-RegularFileIfPresent', 'Get-OptionalScheduledTask',
+    'Remove-RecognizedTransactionDirectory', 'New-StagedBrokerPayload', 'Get-BrokerProcessImagePaths',
+    'Assert-NoBrokerProcessAtPath', 'Install-PendingBrokerRepair',
     'Get-BrokerTaskSnapshot', 'Get-NormalizedBrokerTaskXml', 'Restore-BrokerTaskSnapshot', 'Prepare-BrokerCandidate',
     'Copy-ProtectedBrokerFile', 'Capture-BrokerPriorState', 'Stop-BrokerTask',
     'Restore-BrokerTaskRuntimeState', 'Publish-BrokerCandidate', 'Install-BrokerTask',
@@ -614,21 +746,33 @@ $productionFunctions = @(
 )
 foreach ($name in $productionFunctions) { Import-ProductionFunction $name $name }
 Import-ProductionFunction 'Replace-BrokerFile' 'Invoke-ProductionReplaceBrokerFile'
+Import-ProductionFunction 'Get-BrokerProcessImagePaths' 'Invoke-ProductionGetBrokerProcessImagePaths'
+
+function script:Get-BrokerProcessImagePaths {
+    [CmdletBinding()]
+    param()
+    Add-FixtureEvent 'ProcessQuery'
+    if ($Script:ProcessQueryFailure) { throw 'injected process image query failure' }
+    return @($Script:ProcessImagePaths)
+}
 
 $productionCommands = @(
     'Assert-ProtectedFileAcl', 'Assert-RegularFileIfPresent', 'Capture-BrokerPriorState',
     'Cleanup-BrokerTransaction', 'Commit-BrokerReceipt', 'Copy-Item', 'Copy-ProtectedBrokerFile',
     'ConvertTo-Json', 'Disable-ScheduledTask', 'Enable-ScheduledTask', 'Export-ScheduledTask',
-    'Get-BrokerTaskSnapshot', 'Get-ChildItem', 'Get-Content', 'Get-FileHash', 'Get-Item',
+    'ForEach-Object', 'Get-BrokerProcessImagePaths', 'Get-BrokerTaskSnapshot', 'Get-ChildItem',
+    'Get-CimInstance', 'Get-Content', 'Get-FileHash', 'Get-Item', 'Get-Process',
     'Get-NormalizedBrokerTaskXml', 'Get-OptionalScheduledTask', 'Get-ScheduledTask',
-    'Install-BrokerTask', 'Install-ProtectedBrokerReplacement', 'Join-Path', 'Move-Item',
+    'Install-BrokerTask', 'Install-PendingBrokerRepair', 'Install-ProtectedBrokerReplacement',
+    'New-StagedBrokerPayload', 'Assert-NoBrokerProcessAtPath',
+    'Join-Path',
     'New-Item', 'New-Object', 'New-ScheduledTaskAction', 'New-ScheduledTaskPrincipal',
     'New-ScheduledTaskSettingsSet', 'New-ScheduledTaskTrigger', 'New-TimeSpan', 'Out-Null',
     'Out-String', 'Prepare-BrokerCandidate', 'Publish-BrokerCandidate', 'Register-ScheduledTask',
-    'Remove-Item', 'Replace-BrokerFile', 'Restore-BrokerFile', 'Restore-BrokerState',
-    'Restore-BrokerTaskRuntimeState', 'Restore-BrokerTaskSnapshot', 'Set-ProtectedFileAcl',
+    'Remove-Item', 'Remove-RecognizedTransactionDirectory', 'Replace-BrokerFile', 'Restore-BrokerFile', 'Restore-BrokerState',
+    'Restore-BrokerTaskRuntimeState', 'Restore-BrokerTaskSnapshot', 'Select-Object', 'Set-ProtectedFileAcl',
     'Start-ScheduledTask', 'Start-Sleep', 'Stop-BrokerTask', 'Stop-ScheduledTask', 'Test-Path',
-    'Test-OwnershipRecord', 'Unregister-ScheduledTask', 'Verify-BrokerReplacement',
+    'Test-OwnershipRecord', 'Unregister-ScheduledTask', 'Verify-BrokerReplacement', 'Where-Object',
     'Write-ProtectedRecord', 'Write-Warning'
 )
 foreach ($name in $productionFunctions) { Assert-ProductionCommandAllowlist $name $productionCommands }
@@ -690,7 +834,7 @@ try {
     Initialize-Fixture 'stop-times-out'
     $result = Invoke-Replacement 'StopTimeout'
     Assert $result.Failed 'stop timeout did not fail replacement'
-    Assert (@($Script:Events | Where-Object { $_ -like 'Replace:*' }).Count -eq 0) 'stop timeout attempted file publication'
+    Assert (@($Script:Events | Where-Object { $_ -like 'Replace:*>neuron-chroma-broker.exe' }).Count -eq 0) 'stop timeout attempted executable publication'
     Assert (($Script:Events | Where-Object { $_ -eq 'StopTask' }).Count -eq 1) 'stop timeout retried stopping the task during rollback'
     Assert (-not ($Script:Events -contains 'UnregisterTask')) 'stop timeout replaced the task definition during runtime rollback'
     Assert (($Script:Events | Where-Object { $_ -eq 'EnableTask' }).Count -ge 1) 'stop timeout did not restore the task enabled state'
@@ -752,6 +896,80 @@ try {
     Assert ($snapshot.Enabled -and $snapshot.Running) 'task snapshot inferred disabled from XML that omits Enabled'
     Assert ($snapshot.Sddl -eq $Script:BrokerTask.Sddl) 'task snapshot did not capture the security descriptor'
     Assert (($Script:Events | Where-Object { $_ -like 'GetSD:*' } | Select-Object -Last 1) -eq 'GetSD:7') 'task snapshot used the wrong GET security descriptor flags'
+
+    foreach ($scenario in @(
+        @{ Name='pending-only-first-install-repair'; OtherProcess=$false; RecordKind='valid' },
+        @{ Name='pending-repair-ignores-other-image'; OtherProcess=$true; RecordKind='valid' },
+        @{ Name='pending-repair-refreshes-older-hash'; OtherProcess=$false; RecordKind='old-hash' }
+    )) {
+        Initialize-Fixture $scenario.Name $false
+        Set-PendingRepairRecord $scenario.RecordKind
+        if ($scenario.OtherProcess) {
+            $Script:ProcessImagePaths = @((Join-Path $Script:Root 'other\neuron-chroma-broker.exe'))
+        }
+        $result = Invoke-PendingRepair
+        Assert (-not $result.Failed) ("$($scenario.Name) failed: " + $result.Message)
+        Assert-PendingRepairSucceeded $scenario.Name
+    }
+
+    Initialize-Fixture 'pending-refresh-atomic-replacement-before-fault' $false
+    Set-PendingRepairRecord 'old-hash'
+    $Script:Fault = 'PendingRefreshBeforeReplace'
+    $result = Invoke-PendingRepair
+    Assert $result.Failed 'pending refresh fault before atomic replacement did not fail repair'
+    Assert-PendingRepairUnchanged 'pending refresh before replacement'
+    Assert-PendingRefreshTempStayedInStage 'pending refresh before replacement'
+    Assert (($Script:Events | Where-Object { $_ -eq 'ProcessQuery' }).Count -eq 2) 'pending refresh before replacement skipped a process-state recheck'
+    Assert (-not ($Script:Events -contains 'RegisterTask')) 'pending refresh before replacement registered a task'
+
+    Initialize-Fixture 'pending-refresh-atomic-replacement-after-fault' $false
+    Set-PendingRepairRecord 'old-hash'
+    $Script:Fault = 'PendingRefreshAfterReplace'
+    $result = Invoke-PendingRepair
+    Assert $result.Failed 'pending refresh fault after atomic replacement did not fail repair'
+    $Script:PendingRepairBytes = [Text.Encoding]::UTF8.GetBytes("$Script:ExpectedHash`nSYSTEM startup`ntask-acl-v1`n$Script:OwnerSid`n")
+    Assert-PendingRepairUnchanged 'pending refresh after replacement'
+    Assert-PendingRefreshTempStayedInStage 'pending refresh after replacement'
+    Assert (($Script:Events | Where-Object { $_ -eq 'ProcessQuery' }).Count -eq 2) 'pending refresh after replacement skipped a process-state recheck'
+    Assert (-not ($Script:Events -contains 'RegisterTask')) 'pending refresh after replacement registered a task'
+
+    Initialize-Fixture 'pending-repair-task-disappears-after-receipt' $false
+    Set-PendingRepairRecord 'valid'
+    Assert (-not [IO.File]::Exists($Script:Receipt) -and [IO.File]::Exists($Script:Pending)) 'post-receipt task disappearance pre-state is not pending-only'
+    $Script:Fault = 'TaskDisappearsAfterReceiptCommit'
+    $result = Invoke-PendingRepair
+    Assert $result.Failed 'post-receipt task disappearance did not fail final verification'
+    Assert ($result.Message -match 'for administrator inspection') ("post-receipt task disappearance did not request administrator inspection: $($result.Message)")
+    Assert-ByteFile $Script:Executable $Script:NewBinary 'post-receipt task disappearance executable'
+    Assert-ProtectedFileAcl $Script:Executable
+    Assert-ByteFile $Script:Receipt ([Text.Encoding]::UTF8.GetBytes("$Script:ExpectedHash`nSYSTEM startup`ntask-acl-v1`n$Script:OwnerSid`n")) 'post-receipt task disappearance receipt'
+    Assert (-not [IO.File]::Exists($Script:Pending)) 'post-receipt task disappearance left pending state'
+    Assert (-not $Script:BrokerTask.Present) 'post-receipt task disappearance fixture did not remove its task'
+    Assert ((Get-StagingDirectories).Count -eq 0) 'post-receipt task disappearance leaked its stage'
+    Assert ((ConvertTo-Json -InputObject $Script:ForeignTask -Compress -Depth 6) -ceq $Script:ForeignTaskJson) 'post-receipt task disappearance touched the unrelated task'
+
+    Initialize-Fixture 'pending-repair-image-disappears-after-task-start' $false
+    Set-PendingRepairRecord 'valid'
+    $Script:Fault = 'ExeRemovedAfterStart'
+    $result = Invoke-PendingRepair
+    Assert $result.Failed 'missing image after task start did not fail closed'
+    Assert ($result.Message -match 'for administrator inspection') 'post-start image disappearance did not request administrator inspection'
+    Assert (-not [IO.File]::Exists($Script:Executable)) 'post-start image-removal fixture did not remove the executable'
+    Assert (-not [IO.File]::Exists($Script:Receipt)) 'post-start image-removal fixture committed a receipt'
+    Assert ([IO.File]::Exists($Script:Pending)) 'post-start image-removal fixture discarded the authenticated pending record'
+    $pendingLines = [IO.File]::ReadAllLines($Script:Pending)
+    Assert ($pendingLines.Count -eq 4 -and $pendingLines[0] -ieq $Script:ExpectedHash -and
+        $pendingLines[3] -eq $Script:OwnerSid) 'post-start image-removal fixture lost the refreshed owner record'
+    Assert ($Script:BrokerTask.Present -and $Script:BrokerTask.Enabled -and $Script:BrokerTask.Running) 'post-start image-removal fixture removed or stopped the possibly active task'
+    Assert ((Get-StagingDirectories).Count -eq 0) 'post-start image-removal fixture leaked its stage'
+    Assert ((ConvertTo-Json -InputObject $Script:ForeignTask -Compress -Depth 6) -ceq $Script:ForeignTaskJson) 'post-start image-removal fixture touched the unrelated task'
+
+    $null = Test-PendingRepairRejected 'pending-repair-malformed-record' 'malformed'
+    $null = Test-PendingRepairRejected 'pending-repair-foreign-owner' 'foreign'
+    $null = Test-PendingRepairRejected 'pending-repair-receipt-backed-missing-exe' 'valid' 'none' $true
+    $null = Test-PendingRepairRejected 'pending-repair-task-present' 'valid' 'task'
+    $null = Test-PendingRepairRejected 'pending-repair-process-present' 'valid' 'process'
+    $null = Test-PendingRepairRejected 'pending-repair-process-query-unknown' 'valid' 'query-fails'
 
     foreach ($scenario in @(
         @{ Name='successful-replacement-receipt-only'; HasPending=$false },

@@ -125,12 +125,22 @@ function Assert-ProtectedFileAcl($path) {
     }
 }
 
-function Write-ProtectedRecord($path, $content) {
+function Write-ProtectedRecord($path, $content, $temporaryDirectory) {
     $temp = "$path.partial-$PID-$([guid]::NewGuid().ToString('N'))"
+    if ($temporaryDirectory) {
+        $temp = Join-Path $temporaryDirectory ([IO.Path]::GetFileName($temp))
+        $directoryItem = Get-Item -LiteralPath $temporaryDirectory -Force -ErrorAction Stop
+        if (-not $directoryItem.PSIsContainer -or ($directoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'protected record staging path is not a normal directory'
+        }
+        Assert-ProtectedFileAcl $temporaryDirectory
+    }
     try {
         [IO.File]::WriteAllText($temp, $content, [Text.UTF8Encoding]::new($false))
         Set-ProtectedFileAcl $temp $false
-        Move-Item -LiteralPath $temp -Destination $path -Force -ErrorAction Stop
+        Assert-RegularFileIfPresent $path
+        Replace-BrokerFile $temp $path
+        Set-ProtectedFileAcl $path $false
         Assert-ProtectedFileAcl $path
     } finally {
         Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
@@ -176,6 +186,165 @@ function Remove-RecognizedTransactionDirectory($path) {
         Remove-Item -LiteralPath $child.FullName -Force -ErrorAction Stop
     }
     Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+}
+
+function New-StagedBrokerPayload($source, $expectedSha256, $ownerSid, $programFiles) {
+    $ownerToken = $ownerSid -replace '[^A-Za-z0-9-]', '_'
+    $stagingPrefix = "NeuronChromaBroker.installing-$ownerToken-"
+    $stage = Join-Path $programFiles ($stagingPrefix + $PID + '-' + [guid]::NewGuid().ToString('N'))
+    $stageExe = Join-Path $stage 'neuron-chroma-broker.exe'
+    $stagePending = Join-Path $stage 'broker-install.pending'
+    try {
+        New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
+        Set-ProtectedFileAcl $stage $true
+        Write-ProtectedRecord $stagePending "$expectedSha256`nSYSTEM startup`ntask-acl-v1`n$ownerSid`n"
+        Copy-Item -LiteralPath $source -Destination $stageExe -Force -ErrorAction Stop | Out-Null
+        Assert-RegularFileIfPresent $stageExe
+        Set-ProtectedFileAcl $stageExe $false
+        if ((Get-FileHash -LiteralPath $stageExe -Algorithm SHA256).Hash -ine $expectedSha256) {
+            throw 'staged broker binary hash changed before publication'
+        }
+        return @{ Directory = $stage; Executable = $stageExe }
+    } catch {
+        Remove-RecognizedTransactionDirectory $stage
+        throw
+    }
+}
+
+function Get-BrokerProcessImagePaths {
+    try {
+        $processes = [Diagnostics.Process]::GetProcessesByName('neuron-chroma-broker')
+    } catch {
+        throw "could not enumerate broker processes: $($_.Exception.Message)"
+    }
+    $paths = [Collections.Generic.List[string]]::new()
+    foreach ($process in $processes) {
+        try {
+            $path = $process.MainModule.FileName
+            if ([string]::IsNullOrWhiteSpace($path)) { throw 'process image path is empty' }
+            $paths.Add([IO.Path]::GetFullPath($path))
+        } catch {
+            throw "could not verify broker process $($process.Id): $($_.Exception.Message)"
+        } finally {
+            $process.Dispose()
+        }
+    }
+    return $paths.ToArray()
+}
+
+function Assert-NoBrokerProcessAtPath($executable) {
+    $target = [IO.Path]::GetFullPath($executable)
+    foreach ($path in @(Get-BrokerProcessImagePaths)) {
+        if ([string]::IsNullOrWhiteSpace([string]$path)) {
+            throw 'could not verify a broker process image path'
+        }
+        $image = [IO.Path]::GetFullPath([string]$path)
+        if ([string]::Equals($image, $target, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'a broker process is running from the protected installation path'
+        }
+    }
+}
+
+function Install-PendingBrokerRepair($source, $expectedSha256, $ownerSid, $programFiles,
+    $directory, $executable, $receipt, $pending, $taskName) {
+    $dirItem = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
+    if (-not $dirItem.PSIsContainer -or ($dirItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'pending broker repair path is not a normal directory'
+    }
+    Assert-ProtectedFileAcl $directory
+    Assert-RegularFileIfPresent $executable
+    Assert-RegularFileIfPresent $receipt
+    Assert-RegularFileIfPresent $pending
+    if ((Test-Path -LiteralPath $receipt -PathType Leaf) -or
+        (Test-Path -LiteralPath $executable -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $pending -PathType Leaf)) {
+        throw 'pending broker repair requires only an ownership record and no executable or receipt'
+    }
+    $record = @(Get-Content -LiteralPath $pending -TotalCount 5)
+    if (-not (Test-OwnershipRecord $record) -or $record[3].Trim() -ine $ownerSid) {
+        throw 'pending broker repair ownership record is invalid or belongs to another Windows user'
+    }
+    Assert-ProtectedFileAcl $pending
+    $children = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)
+    if ($children.Count -ne 1 -or $children[0].Name -cne 'broker-install.pending' -or
+        $children[0].PSIsContainer -or ($children[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'pending broker repair directory contains unexpected state'
+    }
+    if (Get-OptionalScheduledTask $taskName) {
+        throw 'pending broker repair cannot proceed while the broker task exists'
+    }
+    Assert-NoBrokerProcessAtPath $executable
+    $originalPendingHash = (Get-FileHash -LiteralPath $pending -Algorithm SHA256).Hash
+    $staged = New-StagedBrokerPayload $source $expectedSha256 $ownerSid $programFiles
+    $published = $false
+    try {
+        if ((Test-Path -LiteralPath $receipt -PathType Leaf) -or
+            (Test-Path -LiteralPath $executable -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $pending -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $pending -Algorithm SHA256).Hash -ine $originalPendingHash) {
+            throw 'pending broker repair state changed while staging the candidate'
+        }
+        if (Get-OptionalScheduledTask $taskName) {
+            throw 'broker task appeared while staging the pending repair'
+        }
+        Assert-NoBrokerProcessAtPath $executable
+        $children = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)
+        if ($children.Count -ne 1 -or $children[0].Name -cne 'broker-install.pending' -or
+            $children[0].PSIsContainer -or ($children[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'pending broker repair directory changed while staging the candidate'
+        }
+        Write-ProtectedRecord $pending "$expectedSha256`nSYSTEM startup`ntask-acl-v1`n$ownerSid`n" $staged.Directory
+        [IO.File]::Move($staged.Executable, $executable)
+        $published = $true
+        Assert-RegularFileIfPresent $executable
+        Set-ProtectedFileAcl $executable $false
+        if ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash -ine $expectedSha256) {
+            throw 'repaired broker binary hash changed during publication'
+        }
+        if (Get-OptionalScheduledTask $taskName) {
+            throw 'broker task appeared before pending repair registration'
+        }
+        $context = @{
+            ExpectedSha256 = $expectedSha256
+            OwnerSid = $ownerSid
+            Directory = $directory
+            Executable = $executable
+            TaskName = $taskName
+            Receipt = $receipt
+            Pending = $pending
+        }
+        Install-BrokerTask $context
+        Verify-BrokerReplacement $context $false
+        Commit-BrokerReceipt $context
+        Verify-BrokerReplacement $context $true
+    } catch {
+        $failure = $_
+        $taskAfterFailure = $null
+        try {
+            $taskAfterFailure = Get-OptionalScheduledTask $taskName
+        } catch {
+            throw "pending broker repair failed: $($failure.Exception.Message); task state is unknown and broker files are preserved at $directory for administrator inspection: $($_.Exception.Message)"
+        }
+        $receiptCommitted = Test-Path -LiteralPath $receipt -PathType Leaf
+        if ($published -and ($taskAfterFailure -or $receiptCommitted)) {
+            throw "pending broker repair failed: $($failure.Exception.Message); broker task or committed receipt remains, so files are preserved at $directory for administrator inspection"
+        }
+        if ($published -and -not $taskAfterFailure) {
+            try {
+                Assert-NoBrokerProcessAtPath $executable
+                Assert-RegularFileIfPresent $executable
+                if (Test-Path -LiteralPath $executable -PathType Leaf) {
+                    Remove-Item -LiteralPath $executable -Force -ErrorAction Stop
+                    if (Test-Path -LiteralPath $executable) { throw 'failed to restore the pending-only repair state' }
+                }
+            } catch {
+                throw "pending broker repair failed: $($failure.Exception.Message); candidate cleanup failed: $($_.Exception.Message)"
+            }
+        }
+        throw $failure
+    } finally {
+        Remove-RecognizedTransactionDirectory $staged.Directory
+    }
 }
 
 function Get-BrokerTaskSnapshot($taskName) {
@@ -716,34 +885,28 @@ if ($record) {
 } elseif ($dirPresent -or $oldTask -or (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw 'existing machine-wide Chroma broker state has no ownership receipt'
 }
+$pendingOnlyRepair = $dirPresent -and -not $receiptPresent -and $pendingPresent -and
+    $record -and $record.Path -eq $pending -and -not (Test-Path -LiteralPath $exe -PathType Leaf)
 
 if (-not $dirPresent) {
-    $stage = Join-Path $programFiles64 ($stagingPrefix + $PID + '-' + [guid]::NewGuid().ToString('N'))
-    $stageExe = Join-Path $stage 'neuron-chroma-broker.exe'
-    $stagePending = Join-Path $stage 'broker-install.pending'
+    $staged = New-StagedBrokerPayload $source $ExpectedSha256 $OwnerSid $programFiles64
     try {
-        New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
-        Set-ProtectedFileAcl $stage $true
-        Write-ProtectedRecord $stagePending "$ExpectedSha256`nSYSTEM startup`ntask-acl-v1`n$OwnerSid`n"
-        Copy-Item -LiteralPath $source -Destination $stageExe -Force -ErrorAction Stop
-        Set-ProtectedFileAcl $stageExe $false
-        if ((Get-FileHash -LiteralPath $stageExe -Algorithm SHA256).Hash -ine $ExpectedSha256) {
-            throw 'staged broker binary hash changed before publication'
-        }
         # Same-volume directory rename publishes a complete, protected pending transaction. A kill
         # before this point leaves only a recognized staging directory; after it, repair can trust
         # the pending owner record at the final path.
-        [IO.Directory]::Move($stage, $dir) # no-replace: a concurrent/fabricated destination fails
+        [IO.Directory]::Move($staged.Directory, $dir) # no-replace: a concurrent/fabricated destination fails
         $dirPresent = $true
         $pendingPresent = $true
     } catch {
-        Remove-RecognizedTransactionDirectory $stage
+        Remove-RecognizedTransactionDirectory $staged.Directory
         throw
     }
 }
 Set-ProtectedFileAcl $dir $true
 
-if ($existingInstall) {
+if ($pendingOnlyRepair) {
+    Install-PendingBrokerRepair $source $ExpectedSha256 $OwnerSid $programFiles64 $dir $exe $receipt $pending $taskName
+} elseif ($existingInstall) {
     Install-ProtectedBrokerReplacement $source $ExpectedSha256 $OwnerSid $programFiles64 $dir $exe $receipt $pending $taskName
 } else {
     Assert-RegularFileIfPresent $exe
