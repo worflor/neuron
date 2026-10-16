@@ -201,8 +201,13 @@ jobs:
           notes=".github/releases/${VERSION}.md"
           if [ -f "$notes" ]; then notes_args=(--notes-file "$notes"); else notes_args=(--generate-notes); fi
           assets=(dist/*-setup.exe dist/*.zip dist/SHA256SUMS.txt)
-          gh release create "$VERSION" "${assets[@]}" \
+          if ! gh release create "$VERSION" "${assets[@]}" \
             --draft \
             --title "neuron $VERSION" \
-            "${notes_args[@]}" \
-            || gh release upload "$VERSION" "${assets[@]}" --clobber
+            "${notes_args[@]}"; then
+            if [ "$(gh release view "$VERSION" --json isDraft --jq '.isDraft')" != true ]; then
+              echo "::error::refusing to replace assets on a published release"
+              exit 1
+            fi
+            gh release upload "$VERSION" "${assets[@]}" --clobber
+          fi
