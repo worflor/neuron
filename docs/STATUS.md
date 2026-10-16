@@ -16,6 +16,12 @@ Lighting scene changes now dissolve through the persistent base renderer. Softwa
 
 The table below grades what actually works. [The README](../README.md#honesty-proven-gated-absent) has the device-write ledger.
 
+The v0.1.6 candidate separates active repository builds from installed checkpoints,
+preserves other-copy startup ownership during checkpoint setup/removal, and adds offline copy
+inventory. Windows PowerShell fixtures exercise copy selection and the installer's actual ownership
+commands with fake tasks/processes. The revised Inno Setup source compiles; real setup/UAC/uninstall
+transitions have not yet been checked in a clean Windows VM. These changes are not in v0.1.5.
+
 | grade | meaning |
 |---|---|
 | 🟢 solid | Daily-driven or directly tested on the named hardware. |

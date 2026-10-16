@@ -54,6 +54,7 @@ var
   NeedsTaskCleanup: Boolean;
   PreparedInstall: Boolean;
   CompletedInstall: Boolean;
+  PreserveOtherCopy: Boolean;
   CustomExitCode: Integer;
 
 function PowerShellLiteral(Value: String): String;
@@ -145,6 +146,63 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
 end;
 
+function SignalInstalledTray(): Boolean;
+var
+  ResultCode: Integer;
+  Params: String;
+begin
+  Params := '-NoProfile -NonInteractive -Command "$target=' +
+    PowerShellLiteral(ExpandConstant('{app}\neuron-app.exe')) + ';' +
+    '$own=@(Get-Process -Name neuron-app -ErrorAction SilentlyContinue|Where-Object{' +
+    'try{$_.Path -ieq $target}catch{$false}});' +
+    'foreach($p in $own){try{$name=''Local\WofloLabs.Neuron.Shutdown.''+$p.Id;' +
+    '$e=[Threading.EventWaitHandle]::OpenExisting($name);try{$e.Set()|Out-Null}finally{$e.Dispose()}}catch{}};' +
+    'exit 0"';
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
+{ A checkpoint install must not take over a running or autostarted developer/portable copy. }
+function OtherNeuronCopyInUse(): Integer;
+var
+  ResultCode: Integer;
+  Params: String;
+begin
+  Params := '-NoProfile -NonInteractive -Command "$ErrorActionPreference=''Stop'';trap{exit 2};$target=' +
+    PowerShellLiteral(ExpandConstant('{app}\neuron-app.exe')) + ';$other=$false;' +
+    'foreach($p in @(Get-Process -Name neuron-app -ErrorAction SilentlyContinue)){' +
+    'if(-not $p.Path){exit 2};if($p.Path -ine $target){$other=$true}};' +
+    'foreach($name in @(''Neuron'',''Neuron (elevated tray)'')){' +
+    'try{$t=Get-ScheduledTask -TaskName $name -ErrorAction Stop}catch{' +
+    'if($_.CategoryInfo.Category -eq ''ObjectNotFound''){continue};exit 2};' +
+    'foreach($a in $t.Actions){if($a.Execute -ine $target){$other=$true}}};' +
+    'if($other){exit 1};exit 0"';
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Result := 2
+  else
+    Result := ResultCode;
+end;
+
+function RemoveInstalledStartupTasks(): Boolean;
+var
+  ResultCode: Integer;
+  Params: String;
+begin
+  Params := '-NoProfile -NonInteractive -Command "$ErrorActionPreference=''Stop'';$target=' +
+    PowerShellLiteral(ExpandConstant('{app}\neuron-app.exe')) + ';' +
+    'foreach($name in @(''Neuron'',''Neuron (elevated tray)'')){' +
+    'try{$t=Get-ScheduledTask -TaskName $name -ErrorAction Stop}catch{' +
+    'if($_.CategoryInfo.Category -eq ''ObjectNotFound''){continue};exit 1};' +
+    'if(@($t.Actions|Where-Object{$_.Execute -ieq $target}).Count -eq 0){continue};' +
+    'if(@($t.Actions).Count -ne 1){exit 1};' +
+    'Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop;' +
+    'try{Get-ScheduledTask -TaskName $name -ErrorAction Stop|Out-Null;exit 1}catch{' +
+    'if($_.CategoryInfo.Category -ne ''ObjectNotFound''){exit 1}}};exit 0"';
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
 function StopInstalledTray(): Boolean;
 var
   ResultCode: Integer;
@@ -154,8 +212,10 @@ begin
   AppExe := ExpandConstant('{app}\neuron-app.exe');
   Params := '-NoProfile -NonInteractive -Command "$ErrorActionPreference=''Stop'';' +
     '$target=' + PowerShellLiteral(AppExe) + ';' +
-    'try{$e=[Threading.EventWaitHandle]::OpenExisting(''Local\WofloLabs.Neuron.Shutdown'');' +
-    '$e.Set()|Out-Null;$e.Dispose()}catch{};' +
+    '$own=@(Get-Process -Name neuron-app -ErrorAction SilentlyContinue|Where-Object{' +
+    'try{$_.Path -ieq $target}catch{$false}});if($own.Count -eq 0){exit 0};' +
+    'foreach($p in $own){try{$name=''Local\WofloLabs.Neuron.Shutdown.''+$p.Id;' +
+    '$e=[Threading.EventWaitHandle]::OpenExisting($name);try{$e.Set()|Out-Null}finally{$e.Dispose()}}catch{}};' +
     '$deadline=[DateTime]::UtcNow.AddSeconds(5);do{' +
     '$p=@(Get-Process -Name neuron-app -ErrorAction SilentlyContinue|Where-Object{' +
     'try{$_.Path -ieq $target}catch{$false}});if($p.Count -eq 0){exit 0};' +
@@ -312,6 +372,7 @@ begin
   NeedsTaskCleanup := False;
   PreparedInstall := False;
   CompletedInstall := False;
+  PreserveOtherCopy := False;
   CustomExitCode := 0;
   InstallOwnerSid := ResolveCurrentUserSid();
   if InstallOwnerSid = '' then begin
@@ -362,7 +423,9 @@ var
 begin
   if not RestartTray then Exit;
   Params := '-NoProfile -NonInteractive -Command "$t=Get-ScheduledTask -TaskName ''Neuron'' -ErrorAction SilentlyContinue;' +
-    'if($t -and $t.Settings.Enabled -and $t.Principal.RunLevel -eq ''Limited''){' +
+    'if($t -and $t.Settings.Enabled -and $t.Principal.RunLevel -eq ''Limited'' -and ' +
+    '@($t.Actions).Count -eq 1 -and $t.Actions[0].Execute -ieq ' +
+    PowerShellLiteral(ExpandConstant('{app}\neuron-app.exe')) + '){' +
     'Start-ScheduledTask -TaskName ''Neuron'' -ErrorAction Stop}' +
     'else{Start-Process -FilePath ' + PowerShellLiteral(ExpandConstant('{app}\neuron-app.exe')) +
     ' -ArgumentList ''--tray'' -WorkingDirectory ' + PowerShellLiteral(ExpandConstant('{app}')) + '}"';
@@ -373,7 +436,7 @@ end;
 
 procedure RestoreFailedSetupState();
 begin
-  if RestoreAutostart and (not RegisterLimitedAutostartTask()) then
+  if (not PreserveOtherCopy) and RestoreAutostart and (not RegisterLimitedAutostartTask()) then
     Log('Could not restore the limited startup task after setup stopped');
   RestartInstalledTray();
 end;
@@ -484,6 +547,16 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
+  ResultCode := OtherNeuronCopyInUse();
+  if (ResultCode <> 0) and (ResultCode <> 1) then begin
+    Result := 'Neuron setup could not identify the running copy or startup target. No files were changed.';
+    Exit;
+  end;
+  PreserveOtherCopy := ResultCode = 1;
+  if PreserveOtherCopy and NeedsTaskCleanup then begin
+    Result := 'Another Neuron copy owns startup and an old elevated task needs repair. Repair that task before installing this checkpoint.';
+    Exit;
+  end;
   RestartTray := NeuronTrayRunning();
   { The broker and any unsafe legacy task are resolved before Inno mutates the app directory. }
   Result := EnsureProtectedChromaBroker();
@@ -494,16 +567,16 @@ begin
   end;
   { Current builds exit through their normal tray-quit path and flush pending state. Older builds
     do not own the event; Restart Manager's bounded forced-close fallback handles those. }
-  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    '-NoProfile -NonInteractive -Command "try{$e=[Threading.EventWaitHandle]::OpenExisting(''Local\WofloLabs.Neuron.Shutdown'');$e.Set()|Out-Null;$e.Dispose()}catch{}"',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if RestartTray then SignalInstalledTray();
   PreparedInstall := True;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep <> ssPostInstall then Exit;
-  if RestoreAutostart then begin
+  if PreserveOtherCopy then begin
+    Log('Preserving the other Neuron copy and its startup target');
+  end else if RestoreAutostart then begin
     if not RegisterLimitedAutostartTask() then begin
       CustomExitCode := 1;
       RaiseException('Neuron setup could not restore the limited startup task.');
@@ -535,14 +608,26 @@ var
   ProtectedDir: String;
   Params: String;
   OwnerSid: String;
+  OtherCopyState: Integer;
 begin
   if CurUninstallStep <> usUninstall then Exit;
   RestartTray := NeuronTrayRunning();
   OwnerSid := ResolveCurrentUserSid();
   if OwnerSid = '' then
     RaiseException('Neuron could not identify the current Windows user. No files were removed.');
+  OtherCopyState := OtherNeuronCopyInUse();
+  if (OtherCopyState <> 0) and (OtherCopyState <> 1) then
+    RaiseException('Neuron could not identify other running copies or startup targets. No files were removed.');
   if not StopInstalledTray() then
     RaiseException('Neuron could not stop its running tray process. No files were removed.');
+  if OtherCopyState = 1 then begin
+    if not RemoveInstalledStartupTasks() then begin
+      RestartInstalledTray();
+      RaiseException('Neuron could not remove this installation''s startup task. No files were removed.');
+    end;
+    Log('Keeping the shared Chroma broker and other startup target for the remaining Neuron copy');
+    Exit;
+  end;
   ProtectedDir := ExpandConstant('{commonpf64}\NeuronChromaBroker');
   if (not DirExists(ProtectedDir)) and (not ChromaTaskPresent()) and
      (not ChromaTransactionPresent()) then begin

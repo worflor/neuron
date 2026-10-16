@@ -17,27 +17,26 @@ pub fn set_skip(on: bool) {
     SKIP.store(on, Ordering::Relaxed);
 }
 
-/// Is a neuron app running in this session? The app owns the graceful-shutdown event; opening it
-/// (without signalling) is a cheap presence test. Where that test does not exist the answer is
-/// "maybe", and the caller falls back to waiting for an acknowledgement.
+/// Is a neuron app running in this session? Opening its presence event changes no state.
+/// The legacy event is checked too for apps released before presence and shutdown were separated.
 #[cfg(windows)]
 #[allow(clippy::unnecessary_wraps)] // one signature with the non-Windows stub, which answers None
 pub fn app_running() -> Option<bool> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenEventW, EVENT_MODIFY_STATE};
-    let name: Vec<u16> = std::ffi::OsStr::new(r"Local\WofloLabs.Neuron.Shutdown")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: `name` is a live NUL-terminated UTF-16 string; a non-null handle is closed at once.
-    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
-    if handle.is_null() {
-        return Some(false);
+    for event in [r"Local\WofloLabs.Neuron.Present", r"Local\WofloLabs.Neuron.Shutdown"] {
+        let name: Vec<u16> = std::ffi::OsStr::new(event)
+            .encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: name is NUL-terminated UTF-16; opening the event does not signal it.
+        let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if !handle.is_null() {
+            // SAFETY: this closes the event handle opened above exactly once.
+            unsafe { CloseHandle(handle) };
+            return Some(true);
+        }
     }
-    // SAFETY: `handle` was just returned by OpenEventW and is closed exactly once.
-    unsafe { CloseHandle(handle) };
-    Some(true)
+    Some(false)
 }
 
 #[cfg(not(windows))]

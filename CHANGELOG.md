@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.1.6
+
+- Preserved lighting ownership across host recovery and fixed OpenRGB single-LED updates after surface resizing.
+- Refreshed macro-key eligibility after keyboard adoption, with held-key state shared correctly across sibling collections and aliases.
+- Rejected malformed Razer discovery replies and incomplete HID++ replies, while preserving Windows' padded short-report handling. Added source-derived offline protocol, adoption and reconnect regressions; no new hardware support is claimed.
+- Added offline Windows copy inventory (`neuron-update.ps1 -Action status`, with `-Json` for agents), separating the running repo build, installed release checkpoint, startup target and config paths. Version checks read passive package metadata; unknown source-build versions remain unknown. Ambiguous startup targets can be inspected without selecting an update destination.
+- Repository builds preserve another copy's Windows startup target; `release.ps1 -UseAtStartup` makes reassignment explicit. New checkpoint installers preserve other running/startup copies, and checkpoint uninstall retains their startup target and shared Chroma broker. User configuration stays separate from payload removal. Real setup/UAC/uninstall transitions still need a clean Windows VM run.
+- Already-current updates avoid redundant downloads and backups, updater scratch directories are cleaned on reported outcomes, and local packaging requires `-ReplaceExisting` to overwrite existing versioned assets. Local packages retain version-specific checksum files. Windows lifecycle fixtures run in the normal validation gate; app tests keep line-table debug information to reduce build memory.
+
 ## v0.1.5
 
 - Added Compatibility Lab: vendor-neutral HID inventory, Windows descriptor fields and container grouping, device-scoped sanitized evidence bundles and issue drafts. Bounded vendor-input trials require explicit consent; offline input and protocol replay support investigation without the original hardware. Inventory does not probe protocols, adopt devices or enable dispatch. Linux descriptor collection is implemented for source builds and remains hardware-unverified; incomplete Linux field metadata currently prevents vendor-input trials.

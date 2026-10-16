@@ -9,6 +9,7 @@
 #   key: value         facts
 #   FLAG: CODE - text  something worth telling the user; codes marked STOP mean do not continue
 #   RESULT: code       always the last line; see update.md for what each code means
+#   -Action status -Json emits one JSON object instead of the line protocol.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File neuron-update.ps1 -Action check
 #   powershell -NoProfile -ExecutionPolicy Bypass -File neuron-update.ps1 -Action apply
@@ -19,13 +20,15 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('check', 'apply', 'rollback')]
+    [ValidateSet('status', 'check', 'apply', 'rollback')]
     [string]$Action = 'check',
     [string]$InstallDir,
     [string]$Version,
     [string]$ZipPath,
     [string]$SumsPath,
     [switch]$NoRelaunch,
+    [switch]$Json,
+    [switch]$Reinstall,
     [switch]$AllowDowngrade
 )
 
@@ -36,10 +39,23 @@ $BackupRoot = '.neuron-update-backup'
 $DefaultDir = Join-Path $env:LOCALAPPDATA 'Programs\neuron'
 $ReleaseViaGh = $false
 $CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$script:UpdateWork = $null
 
 function Say($k, $v) { Write-Output ("{0}: {1}" -f $k, $v) }
 function Flag($code, $text) { Write-Output ("FLAG: {0} - {1}" -f $code, $text) }
 function Finish($code) {
+    if ($script:UpdateWork) {
+        try {
+            $scratch = [IO.Path]::GetFullPath($script:UpdateWork)
+            if (-not (Same-Dir (Split-Path -Parent $scratch) $env:TEMP) -or
+                (Split-Path -Leaf $scratch) -notmatch '^neuron-update-[0-9a-f]{32}$' -or
+                (Get-Item -LiteralPath $scratch -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'updater scratch path failed cleanup checks'
+            }
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction Stop
+        }
+        catch { Flag 'TEMP_CLEANUP_FAILED' "could not remove updater scratch directory $script:UpdateWork" }
+    }
     Write-Output ("RESULT: {0}" -f $code)
     if ($code -in @('blocked', 'error', 'needs-admin')) { exit 1 }
     exit 0
@@ -56,24 +72,38 @@ function Get-TaskExeDirs {
     foreach ($taskName in $Tasks) {
         $ErrorActionPreference = 'Continue'
         $xml = schtasks /query /tn $taskName /xml 2>$null | Out-String
-        if ($LASTEXITCODE -eq 0 -and $xml -match '<Command>([^<]+)</Command>') {
-            Split-Path -Parent $Matches[1]
+        if ($LASTEXITCODE -eq 0) {
+            $task = [xml]$xml
+            $enabled = $task.SelectSingleNode('//*[local-name()="Settings"]/*[local-name()="Enabled"]')
+            $logon = @($task.SelectNodes('//*[local-name()="LogonTrigger"]') | Where-Object {
+                $on = $_.SelectSingleNode('*[local-name()="Enabled"]')
+                -not $on -or $on.InnerText -ne 'false'
+            })
+            if (($enabled -and $enabled.InnerText -eq 'false') -or $logon.Count -eq 0) { continue }
+            foreach ($command in $task.SelectNodes('//*[local-name()="Exec"]/*[local-name()="Command"]')) {
+                Split-Path -Parent $command.InnerText.Trim('"')
+            }
         }
     }
 }
 
 function Get-InstalledVersion($dir) {
-    $ErrorActionPreference = 'Continue'
-    $src = Join-Path $dir 'SOURCE.txt'
-    if (Test-Path $src) {
-        $first = Get-Content $src -TotalCount 1
-        if ($first -match 'neuron (v\S+)') { return $Matches[1] }
+    $source = Join-Path $dir 'SOURCE.txt'
+    if (Test-Path -LiteralPath $source -PathType Leaf) {
+        try {
+            $first = Get-Content -LiteralPath $source -TotalCount 1
+            if ($first -match '(?i)neuron (v\S+)') { return $Matches[1] }
+        } catch { }
     }
-    $cli = Join-Path $dir 'neuron.exe'
-    if (Test-Path $cli) {
-        $out = & $cli --version 2>$null | Out-String
-        $v = Parse-Version $out
-        if ($v) { return "v$v" }
+    $app = Join-Path $dir 'neuron-app.exe'
+    if (Test-Path -LiteralPath $app -PathType Leaf) {
+        try {
+            $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($app)
+            foreach ($candidate in @($info.ProductVersion, $info.FileVersion)) {
+                $version = Parse-Version $candidate
+                if ($version -and $version -ne [version]'0.0.0') { return "v$version" }
+            }
+        } catch { }
     }
     return $null
 }
@@ -81,7 +111,8 @@ function Get-InstalledVersion($dir) {
 function Test-SourceBuild($dir) {
     $p = $dir
     while ($p) {
-        if ((Split-Path -Leaf $p) -eq 'target' -and (Test-Path (Join-Path (Split-Path -Parent $p) 'Cargo.toml'))) { return $true }
+        if (((Split-Path -Leaf $p) -eq 'target' -and (Test-Path (Join-Path (Split-Path -Parent $p) 'Cargo.toml'))) -or
+            (Test-Path -LiteralPath (Join-Path $p '.fingerprint') -PathType Container)) { return $true }
         $parent = Split-Path -Parent $p
         if ($parent -eq $p) { break }
         $p = $parent
@@ -101,7 +132,49 @@ function Test-Writable($dir) {
 
 function Same-Dir($a, $b) {
     if (-not $a -or -not $b) { return $false }
-    return ([IO.Path]::GetFullPath($a).TrimEnd('\') -ieq [IO.Path]::GetFullPath($b).TrimEnd('\'))
+    return ([IO.Path]::GetFullPath($a).Replace('/', '\').TrimEnd('\') -ieq [IO.Path]::GetFullPath($b).Replace('/', '\').TrimEnd('\'))
+}
+
+function Get-InstallKind($dir) {
+    if (Test-SourceBuild $dir) { return 'source-build' }
+    if (Test-Path -LiteralPath (Join-Path $dir 'unins000.exe') -PathType Leaf) { return 'installer' }
+    if (Test-Path -LiteralPath (Join-Path $dir 'portable.flag') -PathType Leaf) { return 'portable' }
+    return 'unmanaged'
+}
+
+function Get-InstallInventory($selected, $startupDirs) {
+    $running = @(Get-NeuronProcesses $selected | Where-Object { $_.Name -eq 'neuron-app' })
+    $runningVersions = @($running | Where-Object { $_.Path } | ForEach-Object {
+        Get-InstalledVersion (Split-Path -Parent $_.Path)
+    } | Where-Object { $_ } | Sort-Object -Unique)
+    $runningVersion = if ($runningVersions.Count -eq 1) { $runningVersions[0] } else { $null }
+    $dirs = @($selected, $DefaultDir) + @($startupDirs) + @($running | Where-Object { $_.Path } | ForEach-Object { Split-Path -Parent $_.Path })
+    foreach ($dir in ($dirs | Where-Object { $_ } | Sort-Object -Unique)) {
+        $dir = [IO.Path]::GetFullPath($dir)
+        if (-not (Test-Path -LiteralPath (Join-Path $dir 'neuron-app.exe') -PathType Leaf)) { continue }
+        $kind = Get-InstallKind $dir
+        $version = Get-InstalledVersion $dir
+        $root = if ($kind -eq 'portable') { $dir } else { Join-Path $env:LOCALAPPDATA 'neuron' }
+        [pscustomobject]@{
+            Directory = $dir
+            Kind = $kind
+            Version = $version
+            ComparedWithRunningVersion = $runningVersion
+            RelativeToRunning = Compare-ReleaseVersion $version $runningVersion
+            Running = @($running | Where-Object { $_.Path -and (Same-Dir (Split-Path -Parent $_.Path) $dir) }).Count -gt 0
+            Startup = @($startupDirs | Where-Object { Same-Dir $_ $dir }).Count -gt 0
+            Selected = Same-Dir $selected $dir
+            DefaultConfigDirectory = $root
+        }
+    }
+}
+
+function Compare-ReleaseVersion($current, $target) {
+    $cv = Parse-Version $current; $tv = Parse-Version $target
+    if (-not $cv -or -not $tv) { return 'unknown' }
+    if ($cv -gt $tv) { return 'newer-version' }
+    if ($cv -eq $tv) { return 'same-version' }
+    return 'older-version'
 }
 
 # Copies every file under $from into $to, preserving relative paths, overwriting.
@@ -161,7 +234,56 @@ function Get-NeuronProcesses($dir) {
             Unknown = (-not $path)
         }
     }
-    return , $list
+    return $list
+}
+
+function Get-TargetNeuronAppProcesses($dir) {
+    return @((Get-NeuronProcesses $dir) | Where-Object { $_.InDir -and $_.Name -eq 'neuron-app' })
+}
+
+function Test-TargetNeuronProcessPath($processId, $dir) {
+    $current = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    $path = $null
+    try { $path = $current.Path } catch { }
+    if (-not $path) { return $false }
+    return (Same-Dir (Split-Path -Parent $path) $dir)
+}
+
+function Request-NeuronShutdown($processId) {
+    $eventName = "Local\WofloLabs.Neuron.Shutdown.$processId"
+    try {
+        $shutdown = [Threading.EventWaitHandle]::OpenExisting($eventName)
+        $shutdown.Set() | Out-Null
+        $shutdown.Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Request-TargetNeuronShutdown($dir) {
+    $targets = @(Get-TargetNeuronAppProcesses $dir)
+    $sent = 0
+    foreach ($process in $targets) {
+        if (Test-TargetNeuronProcessPath $process.Id $dir) {
+            if (Request-NeuronShutdown $process.Id) { $sent++ }
+        }
+    }
+    return $sent
+}
+
+function Get-TargetNeuronTaskNames($dir) {
+    $expectedExe = [IO.Path]::GetFullPath((Join-Path $dir 'neuron-app.exe')).Replace('/', '\').TrimEnd('\')
+    foreach ($taskName in $Tasks) {
+        try { $task = Get-OptionalScheduledTask $taskName } catch { continue }
+        if (-not $task) { continue }
+        $actions = @($task.Actions)
+        if ($actions.Count -ne 1) { continue }
+        $exe = ([string]$actions[0].Execute).Trim('"')
+        if (-not $exe -or -not [IO.Path]::IsPathRooted($exe)) { continue }
+        try { $actualExe = [IO.Path]::GetFullPath($exe).Replace('/', '\').TrimEnd('\') } catch { continue }
+        if ($actualExe -ieq $expectedExe) { $taskName }
+    }
 }
 
 # A running exe is locked against writes. This is the ground truth for "running from $dir":
@@ -378,13 +500,9 @@ function Stop-Neuron($dir, $taskDirs) {
     $ErrorActionPreference = 'Continue'
     if (-not (Test-Running $dir)) { return 'not-running' }
 
-    # Current builds listen on a same-session event and quit through the tray path, which flushes
-    # pending settings and returns devices to firmware ownership. Older builds have no event and
-    # fall through to the bounded task/process stop below.
+    # PID-scoped events let another copy keep running while this install is updated.
     try {
-        $shutdown = [Threading.EventWaitHandle]::OpenExisting('Local\WofloLabs.Neuron.Shutdown')
-        $shutdown.Set() | Out-Null
-        $shutdown.Dispose()
+        $null = Request-TargetNeuronShutdown $dir
         $deadline = (Get-Date).AddSeconds(3)
         while ((Get-Date) -lt $deadline -and (Test-Running $dir)) {
             Start-Sleep -Milliseconds 100
@@ -392,13 +510,15 @@ function Stop-Neuron($dir, $taskDirs) {
         if (-not (Test-Running $dir)) { return 'stopped' }
     } catch { }
 
-    # An elevated, task-launched instance can only be stopped through the task from an
-    # unelevated shell.
-    if ($taskDirs | Where-Object { Same-Dir $_ $dir }) {
-        foreach ($taskName in $Tasks) { schtasks /end /tn $taskName 2>$null | Out-Null }
-        Start-Sleep -Seconds 2
+    # Legacy or elevated instances may need their own startup task ended before the path-owned
+    # process fallback. Never end a same-name task whose action belongs to another copy.
+    $ownedTasks = @(Get-TargetNeuronTaskNames $dir)
+    foreach ($taskName in $ownedTasks) {
+        schtasks /end /tn $taskName 2>$null | Out-Null
     }
+    if ($ownedTasks.Count -gt 0) { Start-Sleep -Seconds 2 }
     foreach ($p in ((Get-NeuronProcesses $dir) | Where-Object { $_.InDir })) {
+        if (-not (Test-TargetNeuronProcessPath $p.Id $dir)) { continue }
         try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { return 'needs-admin' }
     }
     Start-Sleep -Seconds 1
@@ -430,7 +550,7 @@ function Start-Neuron($dir, $taskDirs) {
 
 function Get-Release($tag) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $route = if ($tag) { "repos/$Repo/releases/tags/$tag" } else { "repos/$Repo/releases?per_page=20" }
+    $route = if ($tag) { "repos/$Repo/releases/tags/$tag" } else { "repos/$Repo/releases/latest" }
     $data = $null
     if (Get-Command gh -ErrorAction SilentlyContinue) {
         $ErrorActionPreference = 'Continue'
@@ -447,47 +567,77 @@ function Get-Release($tag) {
             $data = Invoke-RestMethod -Uri "https://api.github.com/$route" -Headers @{ 'User-Agent' = 'neuron-lazy-update' } -TimeoutSec 30 -ErrorAction Stop
         } catch { return $null }
     }
-    if ($tag) { return $data }
-    return $data | Where-Object { -not $_.draft } | Select-Object -First 1
+    return $data
 }
 
 # ---------------------------------------------------------------------------------------------
 
+try {
 $taskDirs = @(Get-TaskExeDirs | Sort-Object -Unique)
+$startupTargetsAmbiguous = $taskDirs.Count -gt 1
 if (-not $InstallDir) {
     if ($taskDirs.Count -eq 1) { $InstallDir = $taskDirs[0] }
-    elseif ($taskDirs.Count -gt 1) {
+    elseif ($startupTargetsAmbiguous -and $Action -eq 'status') {
+        $InstallDir = $null
+    } elseif ($startupTargetsAmbiguous) {
         Flag 'TASK_AMBIGUOUS' "Neuron autostart tasks point at more than one folder: $($taskDirs -join ', ')"
         Finish 'blocked'
     }
     elseif (Test-Path (Join-Path $DefaultDir 'neuron-app.exe')) { $InstallDir = $DefaultDir }
     else { $InstallDir = $DefaultDir }
 }
-$InstallDir = [IO.Path]::GetFullPath($InstallDir)
-$installed = (Test-Path (Join-Path $InstallDir 'neuron-app.exe'))
-$installerManaged = $installed -and (Test-Path (Join-Path $InstallDir 'unins000.exe') -PathType Leaf)
+if ($InstallDir) { $InstallDir = [IO.Path]::GetFullPath($InstallDir) }
+$installed = $false
+if ($InstallDir) { $installed = Test-Path -LiteralPath (Join-Path $InstallDir 'neuron-app.exe') -PathType Leaf }
+$installerManaged = $false
+if ($installed) { $installerManaged = Test-Path -LiteralPath (Join-Path $InstallDir 'unins000.exe') -PathType Leaf }
+
+if ($Json -and $Action -ne 'status') { throw '-Json is supported with -Action status only' }
+$inventory = @(Get-InstallInventory $InstallDir $taskDirs)
+if ($Action -eq 'status') {
+    if ($Json) {
+        [pscustomobject]@{
+            SelectedDirectory = $InstallDir
+            StartupTargetsAmbiguous = $startupTargetsAmbiguous
+            StartupTargetDirectories = @($taskDirs)
+            Copies = $inventory
+            UnknownProcessIds = @(Get-NeuronProcesses $InstallDir | Where-Object { $_.Unknown } | ForEach-Object { $_.Id })
+            RunDirectoryOverride = $env:NEURON_RUN_DIR
+        } | ConvertTo-Json -Depth 5
+        exit 0
+    }
+    if ($startupTargetsAmbiguous) { Say 'startup_targets_ambiguous' $true }
+    foreach ($taskDir in $taskDirs) { Say 'autostart_task_dir' $taskDir }
+    foreach ($copy in $inventory) {
+        Say 'copy' ("{0} | {1} | {2} | running={3} | startup={4} | relative_to_running={5}" -f $copy.Directory, $copy.Kind, $copy.Version, $copy.Running, $copy.Startup, $copy.RelativeToRunning)
+        Say 'default_config_dir' $copy.DefaultConfigDirectory
+    }
+    if ($env:NEURON_RUN_DIR) { Say 'shell_run_dir_override' $env:NEURON_RUN_DIR }
+    Finish 'status'
+}
 
 Say 'install_dir' $InstallDir
 Say 'installed' $installed
 foreach ($taskDir in $taskDirs) {
     Say 'autostart_task_dir' $taskDir
     if (-not (Same-Dir $taskDir $InstallDir)) {
-        Flag 'TASK_ELSEWHERE' "an autostart task launches a neuron in $taskDir, not this folder. Check which install the user means."
+        Flag 'TASK_ELSEWHERE' "Windows startup uses $taskDir. The selected update target is $InstallDir."
     }
 }
 
 $current = $null
 if ($installed) {
-    if (Test-SourceBuild $InstallDir) {
-        Say 'kind' 'source build (inside a cargo target folder)'
-        Flag 'SOURCE_BUILD' 'this is a developer build. Update it with git pull and a rebuild, not a release zip.'
-        Finish 'source-build'
-    }
+    Say 'kind' (Get-InstallKind $InstallDir)
     $current = Get-InstalledVersion $InstallDir
     Say 'installed_version' $(if ($current) { $current } else { 'unknown' })
-    if (-not (Test-Path (Join-Path $InstallDir 'SOURCE.txt'))) {
+    if (-not (Test-SourceBuild $InstallDir) -and -not (Test-Path (Join-Path $InstallDir 'SOURCE.txt'))) {
         Flag 'NO_SOURCE_TXT' 'no SOURCE.txt, so this was not installed from a release zip. Version detection is best effort.'
     }
+}
+
+if ((Test-SourceBuild $InstallDir) -and $Action -ne 'check') {
+    Flag 'SOURCE_BUILD' 'this is a developer build; use release.ps1 in its repository. Release packages never overwrite Cargo output.'
+    Finish 'source-build'
 }
 
 # The task check must precede rollback and apply: a warning after the files have been replaced
@@ -535,13 +685,13 @@ if ($Action -eq 'rollback') {
 }
 
 # ---- resolve the target release ------------------------------------------------------------
-$work = Join-Path $env:TEMP ("neuron-update-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-New-Item -ItemType Directory -Path $work -Force | Out-Null
-
 if ($ZipPath) {
     if (-not (Test-Path $ZipPath)) { Flag 'ZIP_MISSING' "no file at $ZipPath"; Finish 'error' }
     $zip = [IO.Path]::GetFullPath($ZipPath)
-    $sums = if ($SumsPath) { [IO.Path]::GetFullPath($SumsPath) } else { Join-Path (Split-Path -Parent $zip) 'SHA256SUMS.txt' }
+    $versionedSums = [IO.Path]::ChangeExtension($zip, 'SHA256SUMS.txt')
+    $sums = if ($SumsPath) { [IO.Path]::GetFullPath($SumsPath) }
+        elseif (Test-Path -LiteralPath $versionedSums) { $versionedSums }
+        else { Join-Path (Split-Path -Parent $zip) 'SHA256SUMS.txt' }
     $target = $null
     $setup = Join-Path (Split-Path -Parent $zip) ((Split-Path -Leaf $zip) -replace '\.zip$', '-setup.exe')
     Say 'source' "local file $zip"
@@ -553,6 +703,13 @@ if ($ZipPath) {
     }
     $target = $rel.tag_name
     Say 'latest_version' $target
+    if ($Action -eq 'check') {
+        foreach ($copy in $inventory) {
+            if (-not $copy.Selected -and (Compare-ReleaseVersion $copy.Version $target) -eq 'older-version') {
+                Flag 'STALE_COPY' "$($copy.Kind) $($copy.Version) at $($copy.Directory) is older than the latest stable release $target."
+            }
+        }
+    }
     $zipAsset = $rel.assets | Where-Object { $_.name -like 'neuron-*-windows-x86_64.zip' } | Select-Object -First 1
     $setupAsset = $rel.assets | Where-Object { $_.name -like 'neuron-*-windows-x86_64-setup.exe' } | Select-Object -First 1
     $sumAsset = $rel.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' } | Select-Object -First 1
@@ -560,11 +717,21 @@ if ($ZipPath) {
 
     if ($Action -eq 'check') {
         if (-not $installed) { Finish 'not-installed' }
+        Say 'release_comparison' (Compare-ReleaseVersion $current $target)
+        if (Test-SourceBuild $InstallDir) { Finish 'source-build' }
         $cv = Parse-Version $current; $tv = Parse-Version $target
         if ($cv -and $tv -and $cv -ge $tv) { Finish 'up-to-date' }
         Finish 'update-available'
     }
 
+    if ($installed -and -not $Reinstall -and ($current -ieq $target -or
+        (-not $Version -and -not $AllowDowngrade -and (Compare-ReleaseVersion $current $target) -eq 'newer-version'))) {
+        Finish 'up-to-date'
+    }
+
+    $work = [IO.Path]::GetFullPath((Join-Path $env:TEMP ("neuron-update-" + [guid]::NewGuid().ToString('N'))))
+    New-Item -ItemType Directory -Path $work -ErrorAction Stop | Out-Null
+    $script:UpdateWork = $work
     $zip = Join-Path $work $zipAsset.name
     $setup = if ($setupAsset) { Join-Path $work $setupAsset.name } else { $null }
     $sums = Join-Path $work 'SHA256SUMS.txt'
@@ -586,6 +753,12 @@ if ($ZipPath) {
 if ($Action -eq 'check') {
     Say 'note' 'offline check: the target version is read from the zip during apply'
     Finish $(if ($installed) { 'update-available' } else { 'not-installed' })
+}
+
+if (-not $script:UpdateWork) {
+    $work = [IO.Path]::GetFullPath((Join-Path $env:TEMP ("neuron-update-" + [guid]::NewGuid().ToString('N'))))
+    New-Item -ItemType Directory -Path $work -ErrorAction Stop | Out-Null
+    $script:UpdateWork = $work
 }
 
 # ---- verify the download -------------------------------------------------------------------
@@ -691,7 +864,6 @@ if ($installerManaged) {
         if ($stop -eq 'needs-admin') { Flag 'CANNOT_STOP' 'the updated tray is running elevated and could not be stopped from this shell. Quit it from the tray.'; Finish 'needs-admin' }
         if ($stop -eq 'unknown') { Flag 'STOP_UNCONFIRMED' 'the updated neuron process is still running and its location cannot be read. Quit it from the tray.'; Finish 'blocked' }
     }
-    Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
     Finish 'updated'
 }
 
@@ -753,5 +925,8 @@ if ($newVersion -and (Parse-Version $cliOut) -ne (Parse-Version $newVersion)) {
 
 Ensure-ChromaBroker $payloadDir $packageBrokerHash $packageInstallerHash
 if ($wasRunning -and -not $NoRelaunch) { Start-Neuron $InstallDir $taskDirs }
-Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
 Finish $(if ($installed) { 'updated' } else { 'installed' })
+} catch {
+    Flag 'UPDATE_FAILED' $_.Exception.Message
+    Finish 'error'
+}

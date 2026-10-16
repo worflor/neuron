@@ -100,7 +100,6 @@ jobs:
             -e '^LICENSE\.md$' \
             -e '^\.github/(ISSUE_TEMPLATE|CODEOWNERS|labels\.yml|social-preview\.png|LABELS\.md|pull_request_template\.md|dependabot\.yml|sync-labels\.sh)' \
             -e '^\.github/workflows/(release|sync-labels)\.yml$' \
-            -e '^release\.ps1$' \
             -e '^_shots/' \
             || true)"
 

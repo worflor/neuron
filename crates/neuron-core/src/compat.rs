@@ -812,8 +812,21 @@ fn with_archive<T>(path: &Path, action: fn(&Path) -> Result<T>) -> Result<T> {
     let result = action(&scratch);
     let resolved = std::fs::canonicalize(&scratch)?;
     ensure!(resolved.parent() == Some(temp.as_path()), "verification directory escaped temp root");
-    std::fs::remove_dir_all(resolved)?;
+    remove_archive_scratch(&resolved, |path| std::fs::remove_dir_all(path))?;
     result
+}
+
+fn remove_archive_scratch(path: &Path, mut remove: impl FnMut(&Path) -> std::io::Result<()>) -> std::io::Result<()> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        match remove(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt + 1 < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
 }
 
 /// Reproduce analysis from the exact shared reports, with no enumeration or device handles.
