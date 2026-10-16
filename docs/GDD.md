@@ -170,7 +170,7 @@ while you weave, the real cursor is pinned (clipped to a 1px box, hidden) so dra
 
 glyphs are recognised by **eigenmotion**. a stroke is the complex sequence `z[n] = x + iy`; each segment is fit by a damped complex oscillator, `z[n] = K·z[n-1] − G·z[n-2]`, and **the eigenvalues of that recurrence are the stroke's identity**: its natural frequency and decay, not its pixels. magnitude is damping (an open arc vs a sustained loop), and the *signed* rotation is handedness, so clockwise ≠ counter-clockwise falls out for free. the fit is on velocity and arc-length-resampled, so it's invariant to where you drew it, how big, and how fast. do wizard shit.
 
-the recognition core is its own crate, `engram`, a general trajectory codec. the same oscillator math also does lossy compression (a real cascaded encoder, plus a streaming mode) and will embed any byte stream, not just pen strokes. it's reused beyond gestures: it's the engine behind the rhythm familiar below, and the reason the twin knocks back *your* rhythm instead of a canned loop.
+the recognition core is its own crate, [`engram`](https://github.com/worflor/engram), a general trajectory codec. the same oscillator math also does lossy compression (a real cascaded encoder, plus a streaming mode) and will embed any byte stream, not just pen strokes. it's reused beyond gestures: it's the engine behind the rhythm familiar below, and the reason the twin knocks back *your* rhythm instead of a canned loop.
 
 because a resolved weave is just another `Trigger`, it dispatches through the same engine as a hardware button, which is what lets it drive a whole family of **new-input instruments** off the same capture:
 
