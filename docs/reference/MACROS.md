@@ -35,22 +35,23 @@ RAW toggle; both edit that header line.
 
 ## Return values and the arm gate
 
-Helpers marked **gated** do nothing while input is disarmed (SAFE mode, or a Workshop test run) and
-return `"[disarmed]"`. More generally, a gated helper returns a string starting with `[` when the
-effect did not happen: `"[disarmed]"`, `"[unsupported]"` (not Windows), `"[unknown key 'x']"`,
-`"[timed out]"`, `"[failed]"`, `"[requires RAW]"`, `"[no host]"`. On success a RAW input helper
-returns `True`, and a BOUND or host-side helper returns the host's confirmation string, such as
-`"DPI -> 1600"`.
+Helpers marked **gated** do nothing while input is disarmed (SAFE mode, or a Workshop test run).
+Every effect helper returns the same shapes in BOUND and RAW:
+
+- **It happened:** `True` for input helpers, or the host's confirmation string for device, audio,
+  OBS and signal helpers, such as `"DPI -> 1600"`.
+- **It did not:** a string in brackets giving the reason, such as `"[disarmed]"`, `"[unsupported]"`,
+  `"[unknown key 'x']"`, `"[no window titled 'x']"`, `"[timed out]"` or
+  `"[brightness failed: …]"`. This string is falsy, so a plain `if` tests whether the effect
+  happened, and it still compares equal to its text.
 
 ```python
 import neuron
 
-def done(result):
-    return result is True or not str(result).startswith("[")
-
 def macro(ctx):
-    if not done(neuron.dpi(800)):
-        neuron.notify("DPI change did not happen")
+    result = neuron.dpi(800)
+    if not result:
+        neuron.notify("DPI unchanged: " + result)
 ```
 
 Reads (`battery`, `current_dpi`, the store, `clipboard_get`, …) and beacons (`ask`, `notify`, …) are
@@ -262,9 +263,6 @@ These need OBS connected under SYSTEM → CONNECTIONS. The control helpers are g
 | `obs_mute(input_name="Mic/Aux")` | toggle mute on an OBS input |
 | `obs_request(request_type, data=None)` | send any obs-websocket v5 request; the response is not returned |
 | `obs_connected()`, `obs_scene_name()`, `obs_streaming()`, `obs_recording()` | read OBS state; not gated |
-
-The OBS helpers and `signal` are not in the module's `__all__`, so `from neuron import *` does not
-import them. Call them as `neuron.obs_scene(...)`.
 
 ```python
 import neuron

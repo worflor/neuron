@@ -290,13 +290,14 @@ pub(crate) fn focus_title(title: &str) -> String {
         use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
         let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         let hwnd = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
+        // Failures are bracketed: the macro host treats a `[`-prefixed reply as "not done".
         if hwnd.is_null() {
-            return "window not found".into();
+            return format!("[no window titled {title:?}]");
         }
         if unsafe { SetForegroundWindow(hwnd) } != 0 {
             "ok".into()
         } else {
-            "focus refused".into()
+            "[focus refused]".into()
         }
     }
     #[cfg(not(windows))]
