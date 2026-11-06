@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Worker heartbeat ages now exclude time the PC spends asleep, so waking from sleep no longer raises an "internal stall" warning or writes a stall dump to the crash log. Verified by unit test while awake; the resume path itself has not been exercised in an automated run.
+- Generated device files no longer claim that every command answered, or that a round-trip was measured, when the dialect probed nothing or measured nothing.
+- The device report form asks whether Windows Dynamic Lighting is on and accepts Neuron's generated device file.
+- Added a source-derived BlackWidow V4 X descriptor fixture from two identical public upstream dumps. It pins one control pipe, the M-key report collections and a Windows Dynamic Lighting LampArray. No V4 X support is claimed.
+- `neuron-core` production code now fails lint on unchecked `Instant - Duration` subtraction, the pattern behind an early-session notification-thread panic fixed in September.
+
 ## v0.1.6
 
 - Preserved lighting ownership across host recovery and fixed OpenRGB single-LED updates after surface resizing.
