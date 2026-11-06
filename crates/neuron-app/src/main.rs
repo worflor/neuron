@@ -841,17 +841,20 @@ fn main() {
     // and-suspenders, making the no-tick-during-flush invariant structural rather than incidental.
     drop(timer);
     drop(resident.borrow_mut().ui_profile.take());
+    // Stop live dispatch first, while its worker thread still exists, so no action runs during
+    // the teardown below. Left in `resident`, the runtime is reachable from the tray wake
+    // thread-local and is dropped during process teardown, after ExitProcess has already killed
+    // the pump, where its join panics. The join is bounded so a wedged device call cannot hang quit.
+    let live = resident.borrow_mut().live.take();
+    if let Some(mut live) = live {
+        live.stop_within(Some(Duration::from_secs(2)));
+    }
     // Flush any still-debounced lighting save before teardown — a quit must never strand the last
     // edit. Structural edits (stack/remove/tile-pick) already persist immediately; this catches a
     // knob (speed/stop/timing) tweaked within the 400ms debounce window right before quitting.
     glue::flush_lighting_save();
     light_render::shutdown();
     light_metadata::shutdown();
-    // Stop live dispatch while its worker thread still exists. Left in `resident`, the runtime is
-    // reachable from the tray wake thread-local and is dropped during process teardown, after
-    // ExitProcess has already killed the pump, where its join panics.
-    let live = resident.borrow_mut().live.take();
-    drop(live);
     // ── DEVICE-MODE RESTORE (the DPI-16000 trap) ──────────────────────────
     // Driver mode is a scoped LEASE (streams/writes), never a permanent state: while a device is held
     // in it, its onboard buttons/FN defer to software and it wakes with a stale factory volatile plane
@@ -866,9 +869,8 @@ fn main() {
     buttonfw::restore_all();
     neuron::haptics::stop_all();
     restore_devices_to_firmware();
-    // Thread-local holders of runtime state release it here, while worker threads are alive.
+    // The tray wake thread-local holds `resident`; release it while worker threads are alive.
     tray.uninstall_wake();
-    glue::release_ui_shared();
     // keep the tray alive for the whole loop
     drop(tray);
 }
