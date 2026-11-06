@@ -11,6 +11,10 @@ The same helper names work in both modes; arbitrary process execution requires R
 SAFE/disarm is enforced twice for brokered effects: the helper gives immediate feedback and Rust
 re-checks before acting. RAW code may deliberately bypass helpers through ctypes; that is the explicit
 authority escalation selected by "# neuron: raw".
+
+Effect helpers return the same shapes in both modes. When the effect happened: True for input helpers,
+the host's confirmation string for device, audio, OBS and signal helpers. When it did not (disarmed,
+unsupported, refused): a string "[reason]" that is falsy, so `if neuron.key("f"):` tests the effect.
 """
 
 import sys
@@ -31,6 +35,9 @@ __all__ = [
     "dpi", "dpi_cycle", "scroll_cycle", "profile", "profile_cycle", "brightness",
     "mic_mute", "out_mute", "mic_gain", "out_gain",
     "battery", "current_dpi", "active_profile", "scroll_stage",
+    "signal",
+    "obs_scene", "obs_stream", "obs_record", "obs_replay", "obs_mute", "obs_request",
+    "obs_connected", "obs_scene_name", "obs_streaming", "obs_recording",
 ]
 
 _IS_WIN = sys.platform == "win32"
@@ -65,6 +72,20 @@ def _gated():
         or not getattr(_tls, "authorized", False)
         or getattr(_tls, "arm_generation", -1) != _arm_generation
     )
+
+
+class _Undone(str):
+    """An effect helper's result when the effect did not happen: the reason in brackets, and falsy,
+    so `if neuron.key("f"):` is false exactly when no key was pressed."""
+    __slots__ = ()
+
+    def __bool__(self):
+        return False
+
+
+def _undone(reason):
+    reason = str(reason or "failed")
+    return _Undone(reason if reason.startswith("[") else "[%s]" % reason)
 
 
 # ── the captured world (read-only snapshot at trigger time) ─────────────────────────────────────
@@ -546,12 +567,31 @@ def _deliver_act(rid, ok, msg):
 
 
 def _act(verb, arg=None, timeout=5.0, gated=True):
-    """Send a device verb to the host and block (briefly) for its result string. Effectful verbs are
+    """Send a device verb to the host and block (briefly) for its raw result string — for verbs whose
+    reply is data (state, invoke, reads). Effect helpers use `_effect` instead."""
+    ok, msg = _act_outcome(verb, arg, timeout, gated)
+    if msg is not None:
+        return msg
+    return "ok" if ok else "[failed]"
+
+
+def _effect(verb, arg=None, timeout=5.0, gated=True, done=None):
+    """Run an effect verb: `done` (or the host's confirmation) on success, else a falsy `_Undone`."""
+    ok, msg = _act_outcome(verb, arg, timeout, gated)
+    if not ok:
+        return _undone(msg)
+    if done is not None:
+        return done
+    return msg if msg is not None else "ok"
+
+
+def _act_outcome(verb, arg=None, timeout=5.0, gated=True):
+    """Send a device verb to the host and block (briefly) for `(ok, message)`. Effectful verbs are
     arm-gated (gated=True); read-back verbs pass gated=False — reading state has no side effect."""
     if _host_send is None:
-        return "[no host]"
+        return False, "[no host]"
     if gated and _gated():
-        return "[disarmed]"
+        return False, "[disarmed]"
     ev = threading.Event()
     with _act_lock:
         _act_seq[0] += 1
@@ -566,62 +606,60 @@ def _act(verb, arg=None, timeout=5.0, gated=True):
     done = ev.wait(timeout)
     with _act_lock:
         slot = _acts.pop(rid, None)
-    if not done:
-        return "[timed out]"
-    if slot and slot["msg"] is not None:
-        return slot["msg"]
-    return "ok" if slot and slot["ok"] else "[failed]"
+    if not done or not slot:
+        return False, "[timed out]"
+    return slot["ok"], slot["msg"]
 
 
 def dpi(value):
     """Set the mouse DPI to an absolute value (clamped to the device's range). Arm-gated. Returns the
     host's confirmation string (e.g. 'DPI -> 1600')."""
-    return _act("dpi", int(value))
+    return _effect("dpi", int(value))
 
 
 def dpi_cycle(direction="up"):
     """Cycle DPI to the next/previous stage of the active profile. direction='up'|'down'. Arm-gated."""
-    return _act("dpi_cycle", str(direction))
+    return _effect("dpi_cycle", str(direction))
 
 
 def scroll_cycle(direction="up"):
     """Cycle the HyperScroll wheel stage. direction='up'|'down'. Arm-gated."""
-    return _act("scroll_cycle", str(direction))
+    return _effect("scroll_cycle", str(direction))
 
 
 def profile(name):
     """Switch to a saved Neuron profile by name. Arm-gated. Returns the host's confirmation string."""
-    return _act("profile", str(name))
+    return _effect("profile", str(name))
 
 
 def profile_cycle(direction="up"):
     """Cycle to the next/previous saved profile. direction='up'|'down'. Arm-gated."""
-    return _act("profile_cycle", str(direction))
+    return _effect("profile_cycle", str(direction))
 
 
 def brightness(pct):
     """Set the device lighting brightness to `pct` (0-100). Arm-gated. Returns the host's message."""
-    return _act("brightness", int(pct))
+    return _effect("brightness", int(pct))
 
 
 def mic_mute(mode="toggle"):
     """Mute/unmute the system microphone. mode='on'|'off'|'toggle'. Arm-gated."""
-    return _act("mic_mute", str(mode))
+    return _effect("mic_mute", str(mode))
 
 
 def out_mute(mode="toggle"):
     """Mute/unmute the system output (speakers). mode='on'|'off'|'toggle'. Arm-gated."""
-    return _act("out_mute", str(mode))
+    return _effect("out_mute", str(mode))
 
 
 def mic_gain(delta_pct):
     """Nudge the microphone volume by `delta_pct` (e.g. +5 / -10). Arm-gated."""
-    return _act("mic_gain", float(delta_pct))
+    return _effect("mic_gain", float(delta_pct))
 
 
 def out_gain(delta_pct):
     """Nudge the output volume by `delta_pct` (e.g. +5 / -10). Arm-gated."""
-    return _act("out_gain", float(delta_pct))
+    return _effect("out_gain", float(delta_pct))
 
 
 # ── SENSE: read live device / app state so a macro can react to it (reads are never arm-gated) ──
@@ -663,29 +701,29 @@ def scroll_stage():
 def obs_scene(name):
     """Switch OBS to the named scene. Works with OBS minimized (a real obs-websocket request,
     no phantom hotkeys). Arm-gated. Returns the host's confirmation string."""
-    return _act("obs_scene", str(name))
+    return _effect("obs_scene", str(name))
 
 
 def obs_stream(mode="toggle"):
     """Start/stop/toggle the OBS stream. mode='start'|'stop'|'toggle'. Arm-gated."""
-    return _act("obs_stream", str(mode))
+    return _effect("obs_stream", str(mode))
 
 
 def obs_record(mode="toggle"):
     """Start/stop/toggle OBS recording; mode='pause' toggles pause/resume on a running one.
     mode='start'|'stop'|'toggle'|'pause'. Arm-gated."""
-    return _act("obs_record", str(mode))
+    return _effect("obs_record", str(mode))
 
 
 def obs_replay(mode="save"):
     """The OBS replay buffer — the 'clip that!' button. mode='save' (default) writes the clip;
     'start'/'stop' run the buffer itself (it must be running before a save can land). Arm-gated."""
-    return _act("obs_replay", str(mode))
+    return _effect("obs_replay", str(mode))
 
 
 def obs_mute(input_name="Mic/Aux"):
     """Toggle mute on a named OBS input (OBS's own mute, distinct from the system mic). Arm-gated."""
-    return _act("obs_mute", str(input_name))
+    return _effect("obs_mute", str(input_name))
 
 
 def obs_request(request_type, data=None):
@@ -694,8 +732,8 @@ def obs_request(request_type, data=None):
     obs_request("SetInputVolume", {"inputName": "Mic/Aux", "inputVolumeDb": -6}).
     Fire-and-forget: the response body does not come back. Arm-gated."""
     if data is None:
-        return _act("obs_request", str(request_type))
-    return _act("obs_request", {"type": str(request_type), "data": data})
+        return _effect("obs_request", str(request_type))
+    return _effect("obs_request", {"type": str(request_type), "data": data})
 
 
 def signal(channel, value=1.0):
@@ -703,7 +741,7 @@ def signal(channel, value=1.0):
     channel wherever the user painted it. value 0..1 (0 = dark; on the default spectrum the value
     reads as urgency green->red). The value STAYS until overwritten — a CI light keeps burning red
     until a macro turns it green. Not arm-gated: it's engine state, like store()."""
-    return _act("signal", {"ch": int(channel), "value": float(value)}, gated=False)
+    return _effect("signal", {"ch": int(channel), "value": float(value)}, gated=False)
 
 
 def obs_connected():
@@ -850,42 +888,42 @@ if _IS_WIN:
 def key(name):
     """Press a key by name ('f', 'enter', 'f5', 'ctrl'…). down+up. Arm-gated."""
     if _BOUND:
-        return _act("key", str(name))
+        return _effect("key", str(name), done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     vk = _vk(name)
     if vk is None:
-        return "[unknown key %r]" % name
+        return _undone("[unknown key %r]" % name)
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     _send_keys([_mk_key(vk, False), _mk_key(vk, True)])
     return True
 
 
 def key_down(name):
     if _BOUND:
-        return _act("key_down", str(name))
+        return _effect("key_down", str(name), done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     vk = _vk(name)
     if vk is None:
-        return "[unknown key %r]" % name
+        return _undone("[unknown key %r]" % name)
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     _send_keys([_mk_key(vk, False)])
     return True
 
 
 def key_up(name):
     if _BOUND:
-        return _act("key_up", str(name))
+        return _effect("key_up", str(name), done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     vk = _vk(name)
     if vk is None:
-        return "[unknown key %r]" % name
+        return _undone("[unknown key %r]" % name)
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     _send_keys([_mk_key(vk, True)])
     return True
 
@@ -893,14 +931,14 @@ def key_up(name):
 def hotkey(*keys):
     """Fire a chord: hotkey('ctrl','shift','v'). down in order, up in reverse. Arm-gated."""
     if _BOUND:
-        return _act("hotkey", [str(k) for k in keys])
+        return _effect("hotkey", [str(k) for k in keys], done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     vks = [_vk(k) for k in keys]
     if any(v is None for v in vks):
-        return "[unknown key in chord]"
+        return _undone("[unknown key in chord]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     _send_keys([_mk_key(v, False) for v in vks] + [_mk_key(v, True) for v in reversed(vks)])
     return True
 
@@ -908,11 +946,11 @@ def hotkey(*keys):
 def type_text(s):
     """Type a literal Unicode string as keystrokes, all at once. Arm-gated."""
     if _BOUND:
-        return _act("type_text", str(s))
+        return _effect("type_text", str(s), done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     inputs = []
     for ch in s:
         code = ord(ch)
@@ -938,11 +976,11 @@ def type_ghost(s, speed="borderline"):
     if _BOUND:
         # normal pace is ~165ms/char plus pauses; size the reply wait to the requested work.
         timeout = max(5.0, len(str(s)) * 0.35 + 2.0)
-        return _act("type_ghost", {"text": str(s), "speed": str(speed)}, timeout=timeout)
+        return _effect("type_ghost", {"text": str(s), "speed": str(speed)}, timeout=timeout, done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     import random
     base, jit = _GHOST_SPEED.get(str(speed).lower(), _GHOST_SPEED["borderline"])
     i = 0
@@ -950,7 +988,7 @@ def type_ghost(s, speed="borderline"):
     n = len(chars)
     while i < n:
         if _gated():
-            return "[disarmed mid-type]"
+            return _undone("[disarmed mid-type]")
         ch = chars[i]
         if ch == "\r":
             _send_keys([_mk_key(0x0D, False), _mk_key(0x0D, True)])
@@ -985,11 +1023,11 @@ def type_ghost(s, speed="borderline"):
 def mouse_move(dx, dy):
     """Move the cursor by a relative delta. Arm-gated."""
     if _BOUND:
-        return _act("mouse_move", {"dx": int(dx), "dy": int(dy)})
+        return _effect("mouse_move", {"dx": int(dx), "dy": int(dy)}, done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     _send_keys([_mk_mouse(_MOUSEEVENTF_MOVE, int(dx), int(dy))])
     return True
 
@@ -997,11 +1035,11 @@ def mouse_move(dx, dy):
 def mouse_to(x, y):
     """Move the cursor to an absolute primary-screen pixel. Arm-gated."""
     if _BOUND:
-        return _act("mouse_to", {"x": int(x), "y": int(y)})
+        return _effect("mouse_to", {"x": int(x), "y": int(y)}, done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     w = max(1, _user32.GetSystemMetrics(_SM_CXSCREEN))
     h = max(1, _user32.GetSystemMetrics(_SM_CYSCREEN))
     ax = int(int(x) * 65535 / w)
@@ -1013,11 +1051,11 @@ def mouse_to(x, y):
 def click(button="left"):
     """Click a mouse button ('left'|'right'|'middle'). Arm-gated."""
     if _BOUND:
-        return _act("click", str(button))
+        return _effect("click", str(button), done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     b = button.strip().lower()
     if b == "right":
         down, up = _MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP
@@ -1032,11 +1070,11 @@ def click(button="left"):
 def scroll(notches):
     """Scroll the wheel by `notches` (positive = up/away). Arm-gated."""
     if _BOUND:
-        return _act("scroll", int(notches))
+        return _effect("scroll", int(notches), done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     _send_keys([_mk_mouse(_MOUSEEVENTF_WHEEL, 0, 0, int(notches) * 120 & 0xFFFFFFFF)])
     return True
 
@@ -1068,25 +1106,27 @@ def clipboard_get():
 def clipboard_set(s):
     """Put a string on the clipboard (CF_UNICODETEXT). Arm-gated (it mutates user state)."""
     if _BOUND:
-        return _act("clipboard_set", str(s))
+        return _effect("clipboard_set", str(s), done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     data = (s + "\x00").encode("utf-16-le")
     h = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
     if not h:
-        return False
+        return _undone("clipboard write failed")
     dst = _kernel32.GlobalLock(h)
     if not dst:
-        return False
+        return _undone("clipboard write failed")
     ctypes.memmove(dst, data, len(data))
     _kernel32.GlobalUnlock(h)
     if _user32.OpenClipboard(0) == 0:
-        return False
+        return _undone("clipboard busy")
     try:
         _user32.EmptyClipboard()
-        return bool(_user32.SetClipboardData(_CF_UNICODETEXT, h))
+        if _user32.SetClipboardData(_CF_UNICODETEXT, h):
+            return True
+        return _undone("clipboard write failed")
     finally:
         _user32.CloseClipboard()
 
@@ -1094,9 +1134,9 @@ def clipboard_set(s):
 def run(cmd, wait=False):
     """Run a command line. Arbitrary process execution is the explicit RAW escape hatch."""
     if _BOUND:
-        return "[requires RAW]"
+        return _undone("[requires RAW]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     env = dict(os.environ)
     env.pop("NEURON_INPUT_ARMED", None)  # don't leak armed authority into children
     if _IS_WIN:
@@ -1113,15 +1153,17 @@ def run(cmd, wait=False):
 def focus(title):
     """Bring a window to the foreground by exact title. Arm-gated."""
     if _BOUND:
-        return _act("focus", str(title))
+        return _effect("focus", str(title), done=True)
     if not _IS_WIN:
-        return "[unsupported]"
+        return _undone("[unsupported]")
     if _gated():
-        return "[disarmed]"
+        return _undone("[disarmed]")
     h = _user32.FindWindowW(None, title)
     if not h:
-        return False
-    return bool(_user32.SetForegroundWindow(h))
+        return _undone("no window titled %r" % title)
+    if _user32.SetForegroundWindow(h):
+        return True
+    return _undone("focus refused")
 
 
 def sleep(ms):

@@ -95,7 +95,7 @@ _RAW_ONLY_HELPERS = {"run"}
 
 
 def _requires_raw(*_args, **_kwargs):
-    return "[requires RAW]"
+    return _nh._undone("[requires RAW]")
 
 
 class _BoundNeuron:

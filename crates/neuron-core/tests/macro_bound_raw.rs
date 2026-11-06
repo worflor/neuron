@@ -193,7 +193,39 @@ def macro(ctx):
         "RAW process death reset or disturbed the BOUND interpreter"
     );
 
+    // Every exported helper, OBS and signal included, resolves in both domains by attribute and by
+    // from-import, and effect helpers share one result contract: a falsy "[reason]" when nothing
+    // happened (disarmed, or refused by the host), a truthy result when it did.
+    let surface = "from neuron import obs_scene, signal\n\
+                   def macro(ctx):\n    \
+                   return 'surface:%s:%s:%s' % (callable(obs_scene), callable(signal), callable(neuron.obs_connected))\n";
+    let contract = "def macro(ctx):\n    \
+                    out = []\n    \
+                    for r in (neuron.key('f'), neuron.dpi(800), neuron.signal(9, 1.0)):\n        \
+                    out.append('%s/%s' % (bool(r), str(r).startswith('[')))\n    \
+                    done = neuron.signal(1, 0.25)\n    \
+                    neuron.signal(1, 0.0)\n    \
+                    out.append('%s/%s' % (bool(done), str(done).startswith('[')))\n    \
+                    return 'contract:' + ','.join(out)\n";
+    for (mode, header) in [("bound", ""), ("raw", "# neuron: raw\n")] {
+        host.register(&format!("{mode}_helper_surface"), &format!("{header}{surface}"))
+            .expect("register helper surface probe");
+        let got = host.invoke(&format!("{mode}_helper_surface"), &ctx);
+        assert!(got.contains("surface:True:True:True"), "{mode} lost exported helpers: {got}");
+        host.register(&format!("{mode}_result_contract"), &format!("{header}{contract}"))
+            .expect("register result contract probe");
+        let got = host.invoke(&format!("{mode}_result_contract"), &ctx);
+        assert!(
+            got.contains("contract:False/True,False/True,False/True,True/False"),
+            "{mode} effect results broke the contract: {got}"
+        );
+    }
+
     for id in [
+        "bound_helper_surface",
+        "raw_helper_surface",
+        "bound_result_contract",
+        "raw_result_contract",
         "raw_surface",
         "bound_survivor",
         "raw_crash",
