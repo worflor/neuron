@@ -52,6 +52,22 @@ body:
       placeholder: "DPI worked. The mouse was detected, but side buttons didn't remap..."
     validations:
       required: true
+  - type: dropdown
+    id: dynamic-lighting
+    attributes:
+      label: Is Windows Dynamic Lighting on?
+      description: Windows 11 › Settings › Personalization › Dynamic Lighting. On newer boards Windows can hold the lights, so this matters for lighting problems.
+      options:
+        - Not sure
+        - "On"
+        - "Off"
+        - Not Windows 11
+  - type: textarea
+    id: device-file
+    attributes:
+      label: Neuron's device file (optional)
+      description: |
+        If Neuron detected the device but something didn't work, drag in `%LOCALAPPDATA%\neuron\devices\auto\razer-<id>.toml`. It's what Neuron learned about the device. Delete its `# Probed unit serial` line first if it has one.
   - type: textarea
     id: evidence
     attributes:
