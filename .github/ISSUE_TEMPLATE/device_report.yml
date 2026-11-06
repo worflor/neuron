@@ -67,7 +67,7 @@ body:
     attributes:
       label: Neuron's device file (optional)
       description: |
-        If Neuron detected the device but something didn't work, drag in `%LOCALAPPDATA%\neuron\devices\auto\razer-<id>.toml`. It's what Neuron learned about the device. Delete its `# Probed unit serial` line first if it has one.
+        If Neuron detected the device but something didn't work, paste the contents of its file from the `devices\auto` folder next to Neuron's settings (usually `%LOCALAPPDATA%\neuron\devices\auto`), named after the product id, such as `razer-0293.toml`. It's what Neuron learned about the device. Delete its `# Probed unit serial` line first if it has one.
   - type: textarea
     id: evidence
     attributes:

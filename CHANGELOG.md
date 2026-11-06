@@ -2,15 +2,14 @@
 
 ## Unreleased
 
-- Worker heartbeat ages now exclude time the PC spends asleep, so waking from sleep no longer raises an "internal stall" warning or writes a stall dump to the crash log. Verified by unit test while awake; the resume path itself has not been exercised in an automated run.
-- Generated device files no longer claim that every command answered, or that a round-trip was measured, when the dialect probed nothing or measured nothing.
+- Worker heartbeat ages now exclude time the PC spends asleep, and a gap of more than five seconds between heartbeat checks is treated as the whole app having been frozen rather than as each worker stalling. Waking from sleep or Modern Standby should no longer raise an "internal stall" warning or write a stall dump to the crash log. Verified by unit tests while awake; the resume path itself has not been exercised in an automated run.
+- Generated device files no longer claim that a round-trip was measured when none was, and say that their setters were paired with an answering getter but never sent. A file for a dialect that probed nothing no longer claims any command answered.
 - The device report form asks whether Windows Dynamic Lighting is on and accepts Neuron's generated device file.
 - Added a source-derived BlackWidow V4 X descriptor fixture from two identical public upstream dumps. It pins one control pipe, the M-key report collections and a Windows Dynamic Lighting LampArray. No V4 X support is claimed.
-- `neuron-core` production code now fails lint on unchecked `Instant - Duration` subtraction, the pattern behind an early-session notification-thread panic fixed in September.
-- Generated definitions for keyboards on the extended (0x0F) lighting protocol, such as the BlackWidow V3 and V4 X, now target the whole board instead of the logo region. Effects, custom-frame rows and brightness carry the bytes Razer's own Synapse modules send those boards; spectrum and wave ids follow the same source, and brightness is read from the backlight. The custom-frame row layout matches a public capture of Synapse driving a V3. Mice keep their existing values. Unverified on a V3 or V4 X; no support is claimed.
-- A generated keyboard definition from earlier versions with the old logo-region bytes is renamed to `.toml.v1.bak` and rebuilt on the next adoption pass. Hand-edited definitions, mice and other devices are left alone. Generated files now carry a `synth-version` line.
-- The first-light lighting check reads the effect state from the LED it painted.
-- Quitting from the tray stops live dispatch while its worker is still running and releases thread-local runtime state before exit. On Windows, a graceful quit previously panicked in process teardown when the runtime joined an already-terminated thread. Not yet re-checked by quitting the real app.
+- The full validation gate now fails `neuron-core` lint on unchecked `Instant - Duration` subtraction, the pattern behind an early-session panic fixed in September; the other crates already had this lint.
+- Generated definitions for devices without DPI on the extended (0x0F) lighting protocol, such as the BlackWidow V3 and V4 X keyboards, now target the whole board instead of the logo region. Effects and custom-frame rows carry the bytes Razer's own Synapse modules send those boards, and spectrum and wave ids follow the same source. Brightness is written and read back on the backlight region, which Synapse reads and openrazer writes. The custom-frame row layout matches a public capture of Synapse driving a V3. Mice keep their existing values. Unverified on a V3 or V4 X; no support is claimed.
+- A generated definition from earlier versions with the old logo-region bytes on the keyboard grid is no longer loaded. The next adoption pass moves it to `.toml.v1.bak`, rebuilds it, and reports the move. A file whose lighting was edited by hand, or whose backup already exists, is kept and loads as before; other edits stay in the backup. Generated files now carry a `synth-version` line.
+- Quitting from the tray stops live dispatch first, with a two-second limit on waiting for its worker, and releases the tray's hold on runtime state before exit. On Windows, a graceful quit previously panicked in process teardown when the runtime joined an already-terminated thread. Not yet re-checked by quitting the real app.
 
 ## v0.1.6
 
