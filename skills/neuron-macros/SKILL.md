@@ -13,7 +13,8 @@ and clipboard snapshot supplied by its caller.
 
 Run `neuron macro prelude` for the exact `neuron` module in the user's build.
 When working in this repository, [`runtime/host/neuron.py`](../../runtime/host/neuron.py)
-is the source and [the macro overview](../../docs/GDD.md#macros--beacons) explains the runtime.
+is the source, [the macro API reference](../../docs/reference/MACROS.md) documents every helper,
+and [the macro overview](../../docs/GDD.md#macros--beacons) explains the runtime.
 Check helper names and return values against the installed prelude.
 `neuron macro check <file.py>` parses a candidate without executing it.
 
