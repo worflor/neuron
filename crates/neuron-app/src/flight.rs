@@ -206,11 +206,38 @@ pub fn pulse_clear(organ: usize) {
 /// uses the same order of magnitude (1.5s) to free the mouse when the weave that armed it stops.
 pub const SESSION_STALL_MS: u64 = 1500;
 
+/// A gap this long between two reads of the heartbeats means the readers were frozen with
+/// everything else (Modern Standby, a suspended VM, a debugger break), since the watcher reads
+/// them every 500 ms. That is not a stall of each worker.
+const FREEZE_GAP_MS: u64 = 5_000;
+
+/// Last read of the heartbeats, as `awake_ms`+1 (0 = never read).
+static LAST_LOOK: AtomicU64 = AtomicU64::new(0);
+
+/// The heartbeat clock for a reader, after crediting a freeze (see [`forgive_freeze`]).
+fn look() -> u64 {
+    let now = awake_ms();
+    forgive_freeze(&PULSES, &LAST_LOOK, now);
+    now
+}
+
+/// After a gap longer than [`FREEZE_GAP_MS`] since the previous read, credit every running organ
+/// with a beat at `now`. A worker that really stopped still surfaces one threshold later.
+fn forgive_freeze(pulses: &[AtomicU64], last_look: &AtomicU64, now: u64) {
+    let prev = last_look.swap(now + 1, Ordering::Relaxed);
+    if prev != 0 && now.saturating_sub(prev - 1) > FREEZE_GAP_MS {
+        for p in pulses {
+            let _ = p.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v != 0).then_some(now + 1));
+        }
+    }
+}
+
 /// Milliseconds since `organ` last beat, or `None` if it isn't running (deliberately cleared or
 /// never started).
 pub fn beat_age(organ: usize) -> Option<u64> {
+    let now = look();
     let last = PULSES[organ].load(Ordering::Relaxed);
-    (last != 0).then(|| awake_ms().saturating_sub(last - 1))
+    (last != 0).then(|| now.saturating_sub(last - 1))
 }
 
 /// True if `organ` is RUNNING but has gone silent past [`SESSION_STALL_MS`] — a session whose
@@ -258,7 +285,7 @@ pub fn crash_dump_count() -> usize {
 /// Every running organ whose heart has been silent longer than `max_age_ms`:
 /// `(name, silent_for_ms)`. Cold path — the UI timer calls this once a second.
 pub fn stalls(max_age_ms: u64) -> Vec<(&'static str, u64)> {
-    let now = awake_ms();
+    let now = look();
     let mut out = Vec::new();
     for (i, p) in PULSES.iter().enumerate() {
         let last = p.load(Ordering::Relaxed);
@@ -293,7 +320,7 @@ pub fn dump(w: &mut dyn std::io::Write) {
         } else {
             let _ = writeln!(
                 w,
-                "  organ {:<13} beat {:.1}s ago",
+                "  organ {:<13} beat {:.1}s ago (awake time)",
                 ORGAN_NAMES[i],
                 awake.saturating_sub(last - 1) as f64 / 1000.0
             );
@@ -419,6 +446,23 @@ mod tests {
         // Unbiased interrupt time ticks at the system timer (~15.6 ms), so allow one tick of slop.
         assert!(b >= a + 100, "awake clock advances while awake: {a} -> {b}");
         assert!(b <= a + 2_000, "awake clock does not run away: {a} -> {b}");
+    }
+
+    /// A long gap between reads credits running organs instead of reporting them all stalled;
+    /// a normal cadence changes nothing and a stopped organ stays stopped.
+    #[test]
+    fn a_frozen_reader_credits_running_organs() {
+        let pulses = [AtomicU64::new(0), AtomicU64::new(1_001)];
+        let look = AtomicU64::new(0);
+        forgive_freeze(&pulses, &look, 1_000);
+        forgive_freeze(&pulses, &look, 1_500);
+        forgive_freeze(&pulses, &look, 1_500 + FREEZE_GAP_MS);
+        assert_eq!(pulses[1].load(Ordering::Relaxed), 1_001, "the watcher's cadence is not a freeze");
+        forgive_freeze(&pulses, &look, 90_000);
+        assert_eq!(pulses[1].load(Ordering::Relaxed), 90_001, "running organ credited after a freeze");
+        assert_eq!(pulses[0].load(Ordering::Relaxed), 0, "a stopped organ stays stopped");
+        forgive_freeze(&pulses, &look, 90_400);
+        assert_eq!(pulses[1].load(Ordering::Relaxed), 90_001, "credit is once per freeze");
     }
 
     #[test]

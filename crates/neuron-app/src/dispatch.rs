@@ -364,6 +364,12 @@ impl LiveRuntime {
 
     /// Signal the worker to stop and join it. Disarms input and is idempotent.
     pub fn stop(&mut self) {
+        self.stop_within(None);
+    }
+
+    /// [`stop`](Self::stop), but give up on the join after `deadline` and leave the thread to
+    /// process exit. For quit only, so a worker wedged in a device call cannot hang it.
+    pub fn stop_within(&mut self, deadline: Option<Duration>) {
         {
             let mut live = LIVE_TX
                 .lock()
@@ -378,7 +384,14 @@ impl LiveRuntime {
         // this join fast instead of stalling out the rest of a stale interval.
         neuron::controls::wake_pump();
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            match deadline {
+                Some(d) => {
+                    let _ = neuron_host::worker::join_bounded(h, d, "live dispatch");
+                }
+                None => {
+                    let _ = h.join();
+                }
+            }
         }
         // A normal worker exit restores stock in `run_worker`. Cover only spawn failure or a
         // teardown that unwound before that footer; repeated `stop`/Drop calls stay idempotent.
