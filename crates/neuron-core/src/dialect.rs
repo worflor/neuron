@@ -438,7 +438,7 @@ impl Dialect for RazerAudioDialect {
             None,
             Heuristic(0),
             String::new(),
-            0,
+            None,
         ))
     }
 

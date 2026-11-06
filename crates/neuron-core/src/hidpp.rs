@@ -459,7 +459,7 @@ impl Dialect for HidppDialect {
             None,
             Heuristic(0),
             String::new(),
-            roundtrip_ms,
+            Some(roundtrip_ms),
         ))
     }
 
