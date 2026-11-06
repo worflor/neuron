@@ -717,6 +717,11 @@ impl Registry {
                                 if crate::dialect::by_id(&def.dialect).is_none() {
                                     continue;
                                 }
+                                if origin == DefOrigin::Auto
+                                    && crate::synth::retire_stale_auto_def(&p, &txt, &def)
+                                {
+                                    continue;
+                                }
                                 if !subsumed(&devices, &def) {
                                     devices.push(def);
                                 }

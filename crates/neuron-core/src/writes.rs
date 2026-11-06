@@ -1380,13 +1380,18 @@ pub fn set_snap_tap(d: &Device, pairs: &[SnapTapPair], enable: bool) -> Result<(
 #[must_use]
 pub fn lighting_landed(d: &Device, def: &DeviceDef, expected_effect: u8) -> Option<bool> {
     let cmd = def.command("lighting_state")?;
-    let got = d.exec_dynamic(cmd.class, cmd.id, cmd.size, &cmd.args).ok()?;
     match cmd.class {
-        // MATRIX: [varstore, led, effect, …] — the effect byte is the exact landed proof.
-        0x0F => Some(got[2] == expected_effect),
+        // MATRIX: [varstore, led, effect, …] — the effect byte is the exact landed proof, read from
+        // the same varstore/LED the lighting block paints (a different LED reports its own state).
+        0x0F => {
+            let l = def.lighting.as_ref()?;
+            let got = d.exec_dynamic(cmd.class, cmd.id, cmd.size, &[l.varstore, l.led_id]).ok()?;
+            Some(got[2] == expected_effect)
+        }
         // LEGACY (and any other era): coarse — the 0x03/0x88 state has no clean effect byte, so a
         // nonzero state = lit = landed; an all-zero state = the write no-op'd. Honest and blunt.
         _ => {
+            let got = d.exec_dynamic(cmd.class, cmd.id, cmd.size, &cmd.args).ok()?;
             let size = (cmd.size as usize).clamp(1, got.len());
             Some(got[..size].iter().any(|&b| b != 0))
         }
@@ -2249,5 +2254,24 @@ mod tests {
             .expect("the honest phantom accepts the write");
         assert_eq!(classify(LANDED_PID, &d.dpi_unit, 800), Origin::Echo(Cause::Momentary));
         forget(LANDED_PID, &d.dpi_unit);
+    }
+
+    /// The matrix landing check reads `lighting_state` at the varstore/LED the block paints.
+    #[test]
+    fn matrix_landing_check_reads_the_painted_led() {
+        for led in [0x00u8, 0x04] {
+            let mut def: crate::registry::DeviceDef =
+                toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();
+            def.lighting.as_mut().unwrap().led_id = led;
+            let phantom = Arc::new(
+                MockDevice::razer(0x00A8, "phantom matrix board")
+                    .answering(0x0F, 0x82, &[0x00, led, 0x08]),
+            );
+            let d = Device::with_transport(def.clone(), 0x00A8, Box::new(phantom.handle()));
+            assert_eq!(lighting_landed(&d, &def, 0x08), Some(true));
+            assert_eq!(lighting_landed(&d, &def, 0x01), Some(false));
+            let req = phantom.log().into_iter().next().expect("one state read was sent");
+            assert_eq!((req[7], req[8], req[9], req[10]), (0x0F, 0x82, 0x00, led), "{req:02x?}");
+        }
     }
 }

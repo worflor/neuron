@@ -192,6 +192,12 @@ license = "GPL-3.0-or-later"
 sha = "48c17934a6a1313ee6efc1e68175c39f29565a13"
 note = "neuron's own code (cites are to the working tree on top of this commit). Cited only on derived facts, to point at where neuron states its own reconstruction; never used to raise a grade."
 
+[sources.synapse3-modules]
+url = "https://cdn.razersynapse.com/"
+license = "Proprietary (static reading for interoperability; facts only)"
+sha = "a7b9e9545c6dc60fb420e7e34c2885ff2fd8ba33bd64d6fbefaa2fc500d31146"
+note = "Razer-signed Synapse 3 device installers read statically, never run. sha is the BlackWidow V3 package (Razer_590_0_Setup_v3.9.0331.030402.exe, RzCtl_024E.dll); the V4 X package (Razer_659_0_Setup_v3.9.0806.072600.exe, RzCtl_0293.dll) is sha256 719beeff347ccf62e282c784ddf1861477c0a1390785890c720e253c221e2427. Calibrated on RzCtl_0221 / RzCtl_00A8 against neuron's live facts: no opcode contradictions. Cites name the module and what its lighting code passes."
+
 [sources.logitech-cpg-docs]
 url = "https://github.com/Logitech/cpg-docs"
 license = "NOASSERTION"
@@ -1327,6 +1333,7 @@ evidence = [
 ]
 conflicts = [
   "neuron labels 0x03 wave and 0x04 spectrum; openrazer, OpenRGB, uchroma, OpenSnek and razerqdhid all say 0x03 spectrum, 0x04 wave. UNSETTLED: on a 2-LED mouse a spectrum cycle can look like a gradient. Write 0x04 with a direction byte and watch whether the two zones differ in hue.",
+  "Synapse's shared extended-lighting code (RzCtl_024E / RzCtl_0293, sources.synapse3-modules) also maps spectrum 0x03, wave 0x04. Synthesized keyboard defs use that order; the Naga TOML and synthesized mice keep neuron's order until the hardware check above.",
 ]
 
 [[fact]]
@@ -1347,6 +1354,7 @@ evidence = [
 ]
 conflicts = [
   "arg[1]: neuron sends led 0x04; openrazer and OpenRGB send 0x00 there. Both render per neuron and OpenRGB users.",
+  "BlackWidow V3: a capture of Synapse shows arg[1] = 0x00 on every row, data_size 0x47 for 22 columns (synth-lighting-blocks evidence); synthesized keyboard defs send 0x00.",
   "OpenSnek's V3 Pro needs a pad byte after stop_col or colours shift; neuron sends none. Device-specific; not seen on the Naga.",
   "OpenRGB models the Naga V2 Pro as 1x2 (logo, numpad), matching neuron's rows=1 cols=2 guess.",
 ]
@@ -2476,14 +2484,17 @@ conflicts = [
 key = "razer/enum/synth-lighting-blocks"
 dialect = "razer"
 kind = "enum"
-layout = "matrix: effect 0F/02 size 0x0C [0,4] + custom 0F/03 size 0x40 [0,4], custom_id 0x08; legacy: effect 03/0A size 8 tx 0x3F + custom 03/0B size 0x46 [0xFF] tx 0x3F, custom_id 0x05"
+layout = "matrix mouse (DPI answered): effect 0F/02 [0,4] + custom 0F/03 [0,4] + brightness 0F/04 [0,4], wave 0x03 / spectrum 0x04; matrix keyboard (no DPI): effect 0F/02 [0,0] + custom 0F/03 [0,0] + brightness 0F/04 [0,0], brightness read 0F/84 [0,5], spectrum 0x03 / wave 0x04; custom_id 0x08 both; legacy: effect 03/0A size 8 tx 0x3F + custom 03/0B size 0x46 [0xFF] tx 0x3F, custom_id 0x05. Emitted files carry '# synth-version: 2'; an unversioned 6x22 matrix file on LED 0x04 is set aside as .toml.v1.bak and re-synthesized."
 meaning = "Lighting setters baked into auto defs from curated ones; only getter presence is probed."
 grade = "derived"
 evidence = [
   { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L361-L420", what = "unprobed setters, corrected after the fact by first_light_heal" },
+  { kind = "source", src = "synapse3-modules", at = "RzCtl_024E.dll / RzCtl_0293.dll GetProductConfig + extended lighting class", what = "BlackWidow V3 and V4 X: 6x22 matrix, VARSTORE flag clear (NOSTORE); whole-device 0F/02 and 0F/03 carry LED 0x00; custom activation [00,00,08]; 0F/04 write LED 0x00; 0F/84 / 0F/82 reads default to LED 0x05; effect ids static 01 breathing 02 spectrum 03 wave 04 reactive 05; V3 device table lists logo zone 0x04" },
+  { kind = "capture", what = "Synapse 3 streaming every Quick Option to a BlackWidow V3 (1532:024E), usbmon capture BWV3QuickOptionsEverySubOptionToggledInOrderTopToBottom.pcapng.tar.gz in github.com/justZaduma/upload at 230dfe6 (sha256 9976541c...), linked from openrazer#1319: 10,104 x 0F/03 at tx 0x1F, wIndex 3, data_size 0x47, args [00, 00, row 0-5, 00, 0x15, RGB x 22]" },
 ]
 conflicts = [
   "These setters reach unknown hardware ungated; the kind is enum, so the gating test does not see them.",
+  "Keyboard LED: openrazer sends VARSTORE + BACKLIGHT 0x05 for BlackWidow V3/V4 X effects and brightness; Synapse's own modules send NOSTORE + 0x00. neuron follows Synapse (volatile). UNVERIFIED on a V3/V4 X: no such board on the desk.",
 ]
 
 # ------------------------------------------------------------------------------------------------

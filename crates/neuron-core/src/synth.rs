@@ -31,7 +31,7 @@ use crate::registry::{CommandSpec, ControlInterface, DefOrigin, DeviceDef, Mode,
 use crate::transport::{self, HidDeviceInfo, Transport};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The `razer_report` bus signature — now OWNED by the dialect that defines the family
@@ -354,37 +354,44 @@ fn cmd_tx(class: u8, id: u8, size: u8, args: &[u8], tx: u8) -> CommandSpec {
     }
 }
 
-/// The matrix (extended, class 0x0F) lighting block — Naga-proven values. `custom_id` MUST be
-/// 0x08 on this era (0x05 is a real native effect there — REACTIVE on the Naga — and using it
-/// as the display id painted-then-un-painted every streamed frame).
-fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool) -> LightingDef {
+/// The matrix (extended, class 0x0F) lighting block. `custom_id` MUST be 0x08 on this era (0x05
+/// is a real native effect there — REACTIVE on the Naga — and using it as the display id
+/// painted-then-un-painted every streamed frame).
+///
+/// Mice keep the Naga-proven values: LED 0x04 (logo region) and its effect-id table. Keyboards
+/// (no DPI) take what Synapse's own BlackWidow V3/V4 X middleware sends: NOSTORE + LED 0x00 (the
+/// whole device) for effects, frame rows and brightness, with spectrum 0x03 / wave 0x04. On the
+/// V3, 0x04 is the logo zone, so the Naga values recoloured only the logo. Ledger
+/// `razer/enum/synth-lighting-blocks` carries the evidence.
+fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool, keyboard: bool) -> LightingDef {
+    let (led, wave, spectrum) = if keyboard { (0x00, 0x04, 0x03) } else { (0x04, 0x03, 0x04) };
     LightingDef {
         protocol: Protocol::Matrix,
         rows,
         cols,
         varstore: 0x00,
-        led_id: 0x04,
+        led_id: led,
         effects: [
             ("off", 0x00u8),
             ("static", 0x01),
             ("breathing", 0x02),
-            ("wave", 0x03),
-            ("spectrum", 0x04),
+            ("wave", wave),
+            ("spectrum", spectrum),
             ("reactive", 0x05),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect(),
         custom_id: 0x08,
-        effect: cmd(0x0F, 0x02, 0x0C, &[0x00, 0x04]),
-        custom_frame: Some(cmd(0x0F, 0x03, 0x40, &[0x00, 0x04])),
+        effect: cmd(0x0F, 0x02, 0x0C, &[0x00, led]),
+        custom_frame: Some(cmd(0x0F, 0x03, 0x40, &[0x00, led])),
         // The matrix dialect HAS a brightness getter (0x0F/0x84 — the same probe that gates the
         // top-level `set_brightness` command), so the block's brightness rides that SAME evidence:
         // emit it only when the getter answered. `lighting.brightness` is now a WRITE path
         // (`DeviceDef::supports(SetBrightness)` reads it), so an unanswered getter must mean NO
         // brightness write anywhere in the def — leave it `None` and `supports(SetBrightness)`
         // honestly reads false rather than promising an unproven write.
-        brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, 0x04])),
+        brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, led])),
     }
 }
 
@@ -492,12 +499,24 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     // flagged loudly in the emitted file. Wrong dims degrade custom frames (partial paint),
     // never native effects, which are whole-device.
     let has_dpi = commands.contains_key("dpi");
+    // A keyboard's backlight is region 0x05, which Synapse reads for 0F/84; the Naga-shaped
+    // catalog probe reads 0x04, which is the logo (or nothing) on a keyboard. Read-only.
+    if !has_dpi && timed_exec(t, 0x0F, 0x84, 0x03, &[0x00, 0x05], PROBE_POLLS).is_some() {
+        matrix = true;
+        commands.insert("brightness".to_string(), cmd(0x0F, 0x84, 0x03, &[0x00, 0x05]));
+        commands
+            .entry("set_brightness".to_string())
+            .or_insert_with(|| cmd(0x0F, 0x04, 0x03, &[]));
+    }
     let lighting = if matrix {
         let (rows, cols) = if has_dpi { (1, 2) } else { (6, 22) };
         let brightness_proven = commands.get("brightness").is_some_and(|c| {
-            c.class == 0x0F && c.id == 0x84 && c.size == 0x03 && c.args == [0x00, 0x04]
+            c.class == 0x0F
+                && c.id == 0x84
+                && c.size == 0x03
+                && (c.args == [0x00, 0x04] || (!has_dpi && c.args == [0x00, 0x05]))
         });
-        Some(matrix_lighting(rows, cols, brightness_proven))
+        Some(matrix_lighting(rows, cols, brightness_proven, !has_dpi))
     } else if legacy {
         let brightness_proven = commands.get("brightness").is_some_and(|c| {
             c.class == 0x03 && c.id == 0x83 && c.size == 0x03 && c.args == [0x01, 0x05]
@@ -698,6 +717,7 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
             comment_safe(&d.name)
         ));
     }
+    out.push_str(&format!("{VERSION_MARK}{SYNTH_VERSION}\n"));
     if !notes.serial.is_empty() {
         out.push_str(&format!("# Probed unit serial: {}\n", comment_safe(&notes.serial)));
     }
@@ -857,6 +877,35 @@ pub struct Adopted {
 pub struct Adoption {
     pub adopted: Vec<Adopted>,
     pub skipped: Vec<String>,
+}
+
+/// Bumped when synthesis changes the bytes it emits for hardware it may already have adopted.
+pub const SYNTH_VERSION: u32 = 2;
+
+/// The emitted header line carrying [`SYNTH_VERSION`].
+const VERSION_MARK: &str = "# synth-version: ";
+
+/// Set aside an auto def from a synthesis that aimed matrix keyboard lighting at the Naga logo
+/// region: no version line, matrix lighting on the 6x22 keyboard grid, effects on LED 0x04. The
+/// file is renamed to `<name>.toml.v1.bak` and the device becomes unknown, so the next adoption
+/// pass rebuilds it. A file edited away from that shape, or whose backup already exists (a
+/// restored copy), is left alone. Returns true when the file was set aside.
+pub(crate) fn retire_stale_auto_def(path: &Path, text: &str, def: &DeviceDef) -> bool {
+    if text.contains(VERSION_MARK) {
+        return false;
+    }
+    let Some(l) = def.lighting.as_ref() else {
+        return false;
+    };
+    let stale = l.protocol == Protocol::Matrix
+        && (l.rows, l.cols) == (6, 22)
+        && l.led_id == 0x04
+        && l.effect.args == [0x00, 0x04];
+    if !stale {
+        return false;
+    }
+    let backup = path.with_extension("toml.v1.bak");
+    !backup.exists() && std::fs::rename(path, &backup).is_ok()
 }
 
 /// Where an auto-synthesized def lives (in the run root, like every other config path). Keyed by
@@ -1089,17 +1138,27 @@ mod tests {
     /// A scripted `razer_report` device: answers SUCCESS (with canned args) for the (class, id)
     /// pairs it "supports", UNSUPPORTED for everything else — the same yes/no contract the
     /// real firmware gives the probe.
+    /// The pending request: (class, id, data size, first two args).
+    type Pending = (u8, u8, u8, [u8; 2]);
+
     struct MockDevice {
         supports: Vec<(u8, u8, [u8; 80])>,
-        last: Mutex<Option<(u8, u8, u8)>>,
+        /// (class, id, first two args) requests refused even though the opcode is supported.
+        refused: Vec<(u8, u8, [u8; 2])>,
+        last: Mutex<Option<Pending>>,
     }
 
     impl MockDevice {
         fn new(cmds: &[(u8, u8)]) -> Self {
             MockDevice {
                 supports: cmds.iter().map(|&(c, i)| (c, i, [0u8; 80])).collect(),
+                refused: Vec::new(),
                 last: Mutex::new(None),
             }
+        }
+        fn refusing_args(mut self, class: u8, id: u8, args: [u8; 2]) -> Self {
+            self.refused.push((class, id, args));
+            self
         }
         fn with_args(mut self, class: u8, id: u8, args: &[u8]) -> Self {
             for (c, i, a) in &mut self.supports {
@@ -1113,15 +1172,16 @@ mod tests {
 
     impl Transport for MockDevice {
         fn set_feature(&self, buf: &[u8]) -> anyhow::Result<()> {
-            *self.last.lock().unwrap() = Some((buf[7], buf[8], buf[6]));
+            *self.last.lock().unwrap() = Some((buf[7], buf[8], buf[6], [buf[9], buf[10]]));
             Ok(())
         }
         fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
-            let Some((class, id, size)) = *self.last.lock().unwrap() else {
+            let Some((class, id, size, head)) = *self.last.lock().unwrap() else {
                 anyhow::bail!("no pending command");
             };
             let mut rep = Report::command(PROBE_TX, class, id, size);
-            match self.supports.iter().find(|(c, i, _)| *c == class && *i == id) {
+            let refused = self.refused.contains(&(class, id, head));
+            match self.supports.iter().find(|(c, i, _)| *c == class && *i == id && !refused) {
                 Some((_, _, args)) => {
                     rep.status = 0x02; // SUCCESS
                     rep.args = *args;
@@ -1469,6 +1529,51 @@ mod tests {
         assert_eq!(proven_set, keys, "proven_commands must equal def.commands keys");
     }
 
+    /// A matrix-era keyboard (no DPI) shaped like the `BlackWidow` V3 / V4 X gets the bytes
+    /// Synapse's own middleware sends those boards, not the Naga's logo-region values.
+    #[test]
+    fn matrix_keyboard_targets_the_whole_board_not_the_logo() {
+        let kbd = MockDevice::new(&[
+            (0x00, 0x81), (0x00, 0x82), (0x00, 0x84), (0x0F, 0x84), (0x0F, 0x82),
+        ]);
+        let s = synthesize(&kbd, &ctx(0x024E, "Razer BlackWidow V3")).unwrap();
+        let d = &s.def;
+        assert_eq!(d.transaction_id, 0x1F);
+        let l = d.lighting.as_ref().unwrap();
+        assert_eq!(l.protocol, Protocol::Matrix);
+        assert_eq!((l.rows, l.cols, l.varstore, l.led_id), (6, 22, 0x00, 0x00));
+        assert_eq!(l.effect.args, [0x00, 0x00]);
+        assert_eq!(l.custom_frame.as_ref().unwrap().args, [0x00, 0x00]);
+        assert_eq!(l.custom_display_report().args, [0x00, 0x00, 0x08]);
+        assert_eq!(l.effects["spectrum"], 0x03);
+        assert_eq!(l.effects["wave"], 0x04);
+        assert_eq!(l.brightness.as_ref().unwrap().args, [0x00, 0x00], "write the whole board");
+        let get = d.command("brightness").unwrap();
+        assert_eq!((get.class, get.id, &get.args[..]), (0x0F, 0x84, &[0x00u8, 0x05][..]), "read the backlight");
+        assert!(d.command("set_brightness").is_some());
+    }
+
+    /// A keyboard whose only matrix evidence is the backlight-region brightness read (no logo
+    /// zone, no state getter) is still classed matrix, not left without lighting.
+    #[test]
+    fn backlight_brightness_alone_proves_a_matrix_keyboard() {
+        let kbd = MockDevice::new(&[(0x00, 0x81), (0x00, 0x84), (0x0F, 0x84)])
+            .refusing_args(0x0F, 0x84, [0x00, 0x04]);
+        let s = synthesize(&kbd, &ctx(0x0293, "Razer BlackWidow V4 X")).unwrap();
+        let l = s.def.lighting.as_ref().expect("backlight read proves matrix lighting");
+        assert_eq!((l.protocol, l.led_id), (Protocol::Matrix, 0x00));
+        assert!(l.brightness.is_some());
+    }
+
+    /// A mouse never takes the keyboard backlight probe.
+    #[test]
+    fn mice_skip_the_keyboard_backlight_probe() {
+        let mouse = MockDevice::new(&[(0x00, 0x81), (0x04, 0x85), (0x0F, 0x84)])
+            .refusing_args(0x0F, 0x84, [0x00, 0x04]);
+        let s = synthesize(&mouse, &ctx(0x00FF, "mouse")).unwrap();
+        assert!(s.def.lighting.is_none(), "only the logo read counts as mouse lighting evidence");
+    }
+
     #[test]
     fn unprobed_def_header_claims_neither_answers_nor_a_measurement() {
         let def: DeviceDef = toml::from_str(
@@ -1499,5 +1604,47 @@ mod tests {
         let text = emit_toml(&s);
         assert!(text.contains("every command below answered on the real hardware"));
         assert!(text.contains("# Measured command round-trip: ~"));
+        assert!(text.contains(&format!("{VERSION_MARK}{SYNTH_VERSION}")));
+    }
+
+    /// A pre-version keyboard auto def aimed at the Naga logo region is set aside once; versioned,
+    /// edited and mouse-shaped files stay where they are.
+    #[test]
+    fn stale_keyboard_auto_defs_are_set_aside_once() {
+        let dir = std::env::temp_dir().join(format!("neuron-retire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kbd = MockDevice::new(&[(0x00, 0x81), (0x00, 0x84), (0x0F, 0x84), (0x0F, 0x82)]);
+        let fresh = emit_toml(&synthesize(&kbd, &ctx(0x024E, "Razer BlackWidow V3")).unwrap());
+        // The old shape: Naga logo bytes on a keyboard grid, no version line.
+        let old: String = fresh
+            .lines()
+            .filter(|l| !l.starts_with(VERSION_MARK))
+            .map(|l| {
+                l.replace("args = [0x00, 0x00]", "args = [0x00, 0x04]")
+                    .replace("led_id = 0x00", "led_id = 0x04")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old_def: DeviceDef = toml::from_str(&old).unwrap();
+        assert_eq!(old_def.lighting.as_ref().unwrap().led_id, 0x04, "fixture reproduces the old shape");
+
+        let path = dir.join("razer-024e.toml");
+        std::fs::write(&path, &old).unwrap();
+        assert!(retire_stale_auto_def(&path, &old, &old_def));
+        assert!(!path.exists());
+        assert!(dir.join("razer-024e.toml.v1.bak").exists());
+        // A restored copy is respected: the backup already exists, so it stays.
+        std::fs::write(&path, &old).unwrap();
+        assert!(!retire_stale_auto_def(&path, &old, &old_def));
+        assert!(path.exists());
+
+        let new_def: DeviceDef = toml::from_str(&fresh).unwrap();
+        assert!(!retire_stale_auto_def(&dir.join("a.toml"), &fresh, &new_def), "versioned");
+        let mut edited = old_def.clone();
+        edited.lighting.as_mut().unwrap().led_id = 0x05;
+        assert!(!retire_stale_auto_def(&dir.join("b.toml"), &old, &edited), "hand-edited");
+        let mouse = synthesize(&mock_matrix_mouse(), &ctx(0x00A8, "Razer Naga V2 Pro")).unwrap();
+        assert!(!retire_stale_auto_def(&dir.join("c.toml"), "", &mouse.def), "mouse grid");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
