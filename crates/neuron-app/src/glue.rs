@@ -9276,6 +9276,13 @@ fn desired_lighting_snapshot(pid: u16) -> Option<crate::prefs::DeviceLight> {
 #[cfg(test)]
 pub fn reset_lighting_cache() { LIGHT_DESIRED.with(|p| p.borrow_mut().clear()); }
 
+/// Release the UI thread's handle to the shared runtime at shutdown, so whatever it owns is dropped
+/// while worker threads still exist rather than during thread-local teardown at process exit.
+pub fn release_ui_shared() {
+    let shared = UI_SHARED.with(|s| s.borrow_mut().take());
+    drop(shared);
+}
+
 /// Cancel the UI debounce and enqueue each pending device snapshot for durable serial persistence.
 /// Shutdown joins the metadata service after this UI-thread snapshot has been flushed.
 pub fn flush_lighting_save() {

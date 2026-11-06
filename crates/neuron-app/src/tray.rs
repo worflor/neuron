@@ -93,6 +93,7 @@ impl Tray {
 
     pub fn sync(&self, _snap: &TraySnapshot, _force: bool) {}
     pub fn install_wake(&self, _wake: impl Fn() + 'static) {}
+    pub fn uninstall_wake(&self) {}
 
     pub fn poll(&self) -> Vec<TrayAction> {
         Vec::new()
@@ -184,6 +185,13 @@ impl Tray {
                 wake_event_loop();
             }
         }));
+    }
+
+    /// Drop the installed wake closure. It can own runtime state whose Drop joins worker threads;
+    /// left in the thread-local, that Drop runs during process teardown after Windows has already
+    /// killed those threads, and the join panics.
+    pub fn uninstall_wake(&self) {
+        EVENT_WAKE.with(|slot| slot.borrow_mut().take());
     }
 
     /// Rebuild the menu if the live truth differs from what's shown (or `force`, which repairs
