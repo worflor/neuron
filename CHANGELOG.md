@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Worker heartbeat ages now exclude time the PC spends asleep, and a gap of more than five seconds between heartbeat checks is treated as the whole app having been frozen rather than as each worker stalling. Waking from sleep or Modern Standby should no longer raise an "internal stall" warning or write a stall dump to the crash log. Verified by unit tests while awake; the resume path itself has not been exercised in an automated run.
+- A stall dump now records each watched worker thread's scheduler state, wait reason and CPU time, then the CPU each used over the next second, so a stall reads as stuck, busy or starved. Most stall dumps in the owner's log happened while the PC was awake; their cause is not yet known.
 - Generated device files no longer claim that a round-trip was measured when none was, and say that their setters were paired with an answering getter but never sent. A file for a dialect that probed nothing no longer claims any command answered.
 - The device report form asks whether Windows Dynamic Lighting is on and accepts Neuron's generated device file.
 - Added a source-derived BlackWidow V4 X descriptor fixture from two identical public upstream dumps. It pins one control pipe, the M-key report collections and a Windows Dynamic Lighting LampArray. No V4 X support is claimed.

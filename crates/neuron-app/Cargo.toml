@@ -92,6 +92,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_Debug",  # SetUnhandledExceptionFilter — native faults leave a trace
     "Win32_System_Kernel",             # EXCEPTION_POINTERS/CONTEXT for the SEH filter
     "Win32_System_WindowsProgramming", # QueryUnbiasedInterruptTime — heartbeat ages exclude sleep
+    "Wdk_System_SystemInformation",    # NtQuerySystemInformation — a stall dump reads the silent thread's state
     # synapse purge: stop respawning services, then terminate every process
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot — enumerate live processes by name
     "Win32_System_RemoteDesktop",        # ProcessIdToSessionId — scope shutdown to this logon session.
