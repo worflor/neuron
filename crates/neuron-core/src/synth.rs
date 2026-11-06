@@ -360,11 +360,12 @@ fn cmd_tx(class: u8, id: u8, size: u8, args: &[u8], tx: u8) -> CommandSpec {
 ///
 /// Mice keep the Naga-proven values: LED 0x04 (logo region) and its effect-id table. Keyboards
 /// (no DPI) take what Synapse's own BlackWidow V3/V4 X middleware sends: NOSTORE + LED 0x00 (the
-/// whole device) for effects, frame rows and brightness, with spectrum 0x03 / wave 0x04. On the
-/// V3, 0x04 is the logo zone, so the Naga values recoloured only the logo. Ledger
-/// `razer/enum/synth-lighting-blocks` carries the evidence.
+/// whole device; 0x04 is only the V3's logo zone) for effects and frame rows, with spectrum 0x03 /
+/// wave 0x04. Keyboard brightness writes and reads the backlight region 0x05, so the read-back
+/// checks the region it wrote. Ledger `razer/enum/synth-lighting-blocks` carries the evidence.
 fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool, keyboard: bool) -> LightingDef {
     let (led, wave, spectrum) = if keyboard { (0x00, 0x04, 0x03) } else { (0x04, 0x03, 0x04) };
+    let brightness_region = if keyboard { 0x05 } else { led };
     LightingDef {
         protocol: Protocol::Matrix,
         rows,
@@ -391,7 +392,7 @@ fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool, keyboard: bool) 
         // (`DeviceDef::supports(SetBrightness)` reads it), so an unanswered getter must mean NO
         // brightness write anywhere in the def — leave it `None` and `supports(SetBrightness)`
         // honestly reads false rather than promising an unproven write.
-        brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, led])),
+        brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, brightness_region])),
     }
 }
 
@@ -453,7 +454,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         })
         .collect();
     samples.sort_unstable();
-    let roundtrip_ms = samples.get(samples.len() / 2).copied().unwrap_or(0);
+    let roundtrip_ms = samples.get(samples.len() / 2).copied();
 
     // Catalog probe: keep what answers. First-wins on name collisions (the two eras' state
     // getters share "lighting_state"; matrix precedes legacy in the catalog).
@@ -501,20 +502,20 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     let has_dpi = commands.contains_key("dpi");
     // A keyboard's backlight is region 0x05, which Synapse reads for 0F/84; the Naga-shaped
     // catalog probe reads 0x04, which is the logo (or nothing) on a keyboard. Read-only.
-    if !has_dpi && timed_exec(t, 0x0F, 0x84, 0x03, &[0x00, 0x05], PROBE_POLLS).is_some() {
+    if !has_dpi && !legacy && timed_exec(t, 0x0F, 0x84, 0x03, &[0x00, 0x05], PROBE_POLLS).is_some() {
         matrix = true;
         commands.insert("brightness".to_string(), cmd(0x0F, 0x84, 0x03, &[0x00, 0x05]));
-        commands
-            .entry("set_brightness".to_string())
-            .or_insert_with(|| cmd(0x0F, 0x04, 0x03, &[]));
+    }
+    // The top-level setter writes the Naga's region 0x04 (capability::set_brightness), which is a
+    // keyboard's logo; keyboard brightness goes through the lighting block instead.
+    if matrix && !has_dpi {
+        commands.remove("set_brightness");
     }
     let lighting = if matrix {
         let (rows, cols) = if has_dpi { (1, 2) } else { (6, 22) };
+        let region = if has_dpi { 0x04 } else { 0x05 };
         let brightness_proven = commands.get("brightness").is_some_and(|c| {
-            c.class == 0x0F
-                && c.id == 0x84
-                && c.size == 0x03
-                && (c.args == [0x00, 0x04] || (!has_dpi && c.args == [0x00, 0x05]))
+            c.class == 0x0F && c.id == 0x84 && c.size == 0x03 && c.args == [0x00, region]
         });
         Some(matrix_lighting(rows, cols, brightness_proven, !has_dpi))
     } else if legacy {
@@ -542,7 +543,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         comment_safe(ctx.product.trim())
     };
     let wireless_capable = commands.contains_key("battery_level");
-    let stream_wait_us = stream_wait_for(roundtrip_ms, wireless_capable);
+    let stream_wait_us = stream_wait_for(roundtrip_ms.unwrap_or(0), wireless_capable);
     // The evidence twins, captured at the SAME points the def's data is computed: dims mirror the
     // lighting block's guessed rows/cols (None when there's no block — nothing to warn about),
     // proven_commands mirror the answered command map. Both DUPLICATE what lands in the def; the
@@ -586,7 +587,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     Some(Synthesis {
         def,
         serial,
-        roundtrip_ms: Some(roundtrip_ms),
+        roundtrip_ms,
         tx: Heuristic(transaction_id),
         dims,
         stream_wait: Heuristic(stream_wait_us),
@@ -713,7 +714,8 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
     } else {
         out.push_str(&format!(
             "# Device definition — {} (AUTO-SYNTHESIZED by probing the device's getter space\n\
-             # through its wire dialect; every command below answered on the real hardware).\n",
+             # through its wire dialect; every getter below answered on the real hardware, and\n\
+             # each setter is paired with an answering getter but was never sent).\n",
             comment_safe(&d.name)
         ));
     }
@@ -805,8 +807,9 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
 ///
 /// The notes carry the SAME caveats [`emit_toml`] derives EXCEPT the tx line, which now records
 /// the proof. Serial + measured round-trip aren't recoverable from the def alone (they were probe
-/// facts, not stored fields), so the header re-emits them empty/0 — the honest cost of healing
-/// from the loaded def rather than a fresh probe; the tx proof is the line that matters here.
+/// facts, not stored fields), so the header omits the serial and says the round-trip was not
+/// measured — the honest cost of healing from the loaded def rather than a fresh probe; the tx
+/// proof is the line that matters here.
 pub fn heal_auto_tx(dialect_id: &str, pid: u16, def: &DeviceDef, verified_tx: u8) -> Result<()> {
     let mut healed = def.clone();
     healed.transaction_id = verified_tx;
@@ -877,6 +880,8 @@ pub struct Adopted {
 pub struct Adoption {
     pub adopted: Vec<Adopted>,
     pub skipped: Vec<String>,
+    /// Outdated generated files moved aside (their backup paths) so this pass could rebuild them.
+    pub retired: Vec<PathBuf>,
 }
 
 /// Bumped when synthesis changes the bytes it emits for hardware it may already have adopted.
@@ -885,27 +890,55 @@ pub const SYNTH_VERSION: u32 = 2;
 /// The emitted header line carrying [`SYNTH_VERSION`].
 const VERSION_MARK: &str = "# synth-version: ";
 
-/// Set aside an auto def from a synthesis that aimed matrix keyboard lighting at the Naga logo
-/// region: no version line, matrix lighting on the 6x22 keyboard grid, effects on LED 0x04. The
-/// file is renamed to `<name>.toml.v1.bak` and the device becomes unknown, so the next adoption
-/// pass rebuilds it. A file edited away from that shape, or whose backup already exists (a
-/// restored copy), is left alone. Returns true when the file was set aside.
-pub(crate) fn retire_stale_auto_def(path: &Path, text: &str, def: &DeviceDef) -> bool {
-    if text.contains(VERSION_MARK) {
+/// The synthesis version an auto file was written by; files without the mark predate it (1).
+fn synth_version(text: &str) -> u32 {
+    text.lines()
+        .find_map(|l| l.strip_prefix(VERSION_MARK))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1)
+}
+
+/// Where [`retire_stale_auto_def`] keeps a set-aside file.
+fn stale_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("toml.v1.bak")
+}
+
+/// Is this auto def a version-1 synthesis that aimed no-DPI matrix lighting at the Naga logo
+/// region (6x22 grid, effects on LED 0x04)? A file whose lighting was edited away from that shape
+/// is kept, and so is one whose backup already exists (a deliberately restored copy). Other edits
+/// are not detectable; they survive in the backup. Pure: touches nothing.
+pub(crate) fn is_stale_auto_def(path: &Path, text: &str, def: &DeviceDef) -> bool {
+    if synth_version(text) >= 2 {
         return false;
     }
     let Some(l) = def.lighting.as_ref() else {
         return false;
     };
-    let stale = l.protocol == Protocol::Matrix
+    l.protocol == Protocol::Matrix
         && (l.rows, l.cols) == (6, 22)
         && l.led_id == 0x04
-        && l.effect.args == [0x00, 0x04];
-    if !stale {
-        return false;
+        && l.effect.args == [0x00, 0x04]
+        && !stale_backup_path(path).exists()
+}
+
+/// Move a stale auto def (see [`is_stale_auto_def`]) to `<name>.toml.v1.bak` so adoption can
+/// rebuild it. Never replaces an existing backup. `Ok(None)` when the file is not stale.
+fn retire_stale_auto_def(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let text = std::fs::read_to_string(path)?;
+    let Ok(def) = toml::from_str::<DeviceDef>(&text) else {
+        return Ok(None);
+    };
+    if !is_stale_auto_def(path, &text, &def) {
+        return Ok(None);
     }
-    let backup = path.with_extension("toml.v1.bak");
-    !backup.exists() && std::fs::rename(path, &backup).is_ok()
+    let backup = stale_backup_path(path);
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&backup)?;
+        f.write_all(text.as_bytes())?;
+    }
+    std::fs::remove_file(path)?;
+    Ok(Some(backup))
 }
 
 /// Where an auto-synthesized def lives (in the run root, like every other config path). Keyed by
@@ -976,6 +1009,21 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
             continue;
         }
         let file = auto_def_path(d.id(), i.pid);
+        if file.exists() {
+            match retire_stale_auto_def(&file) {
+                Ok(Some(backup)) => out.retired.push(backup),
+                Ok(None) => {}
+                Err(e) => {
+                    tried.push(key);
+                    out.skipped.push(format!(
+                        "pid {:04x}: setting aside the outdated {} failed: {e}",
+                        i.pid,
+                        file.display()
+                    ));
+                    continue;
+                }
+            }
+        }
         if file.exists() {
             // The registry didn't match it, yet its auto file exists — the file is broken or
             // shadow-named. Never clobber user-owned config; report and move on.
@@ -1135,12 +1183,12 @@ mod tests {
     use crate::protocol::{Report, BUF_LEN};
     use std::sync::Mutex;
 
-    /// A scripted `razer_report` device: answers SUCCESS (with canned args) for the (class, id)
-    /// pairs it "supports", UNSUPPORTED for everything else — the same yes/no contract the
-    /// real firmware gives the probe.
     /// The pending request: (class, id, data size, first two args).
     type Pending = (u8, u8, u8, [u8; 2]);
 
+    /// A scripted `razer_report` device: answers SUCCESS (with canned args) for the (class, id)
+    /// pairs it "supports", UNSUPPORTED for everything else — the same yes/no contract the
+    /// real firmware gives the probe.
     struct MockDevice {
         supports: Vec<(u8, u8, [u8; 80])>,
         /// (class, id, first two args) requests refused even though the opcode is supported.
@@ -1547,10 +1595,30 @@ mod tests {
         assert_eq!(l.custom_display_report().args, [0x00, 0x00, 0x08]);
         assert_eq!(l.effects["spectrum"], 0x03);
         assert_eq!(l.effects["wave"], 0x04);
-        assert_eq!(l.brightness.as_ref().unwrap().args, [0x00, 0x00], "write the whole board");
+        assert_eq!(l.brightness.as_ref().unwrap().args, [0x00, 0x05], "write the backlight");
         let get = d.command("brightness").unwrap();
         assert_eq!((get.class, get.id, &get.args[..]), (0x0F, 0x84, &[0x00u8, 0x05][..]), "read the backlight");
-        assert!(d.command("set_brightness").is_some());
+        assert!(d.command("set_brightness").is_none(), "the top-level setter writes the logo region");
+        assert!(d.supports(crate::registry::Capability::SetBrightness));
+    }
+
+    /// The brightness write a synthesized keyboard actually takes, through the same entry point
+    /// the slider and `neuron brightness` use: backlight region 0x05, NOSTORE, read back there.
+    #[test]
+    fn keyboard_brightness_writes_and_verifies_the_backlight() {
+        use crate::transport::mock::MockDevice as Phantom;
+        let kbd = MockDevice::new(&[(0x00, 0x81), (0x00, 0x84), (0x0F, 0x84), (0x0F, 0x82)]);
+        let def = synthesize(&kbd, &ctx(0x024E, "Razer BlackWidow V3")).unwrap().def;
+        let phantom = std::sync::Arc::new(
+            Phantom::razer(0x024E, "Razer BlackWidow V3")
+                .answering(0x0F, 0x04, &[])
+                .answering(0x0F, 0x84, &[0x00, 0x05, 127]),
+        );
+        let dev = crate::device::Device::with_transport(def, 0x024E, Box::new(phantom.handle()));
+        crate::capability::set_brightness(&dev, 50, crate::capability::Store::Persist).unwrap();
+        let sent: Vec<_> = phantom.log().iter().map(|r| (r[7], r[8], r[9], r[10])).collect();
+        assert_eq!(sent, [(0x0F, 0x04, 0x00, 0x05), (0x0F, 0x84, 0x00, 0x05)], "{sent:02x?}");
+        assert_eq!(phantom.log()[0][11], 127, "level byte");
     }
 
     /// A keyboard whose only matrix evidence is the backlight-region brightness read (no logo
@@ -1591,7 +1659,7 @@ mod tests {
             def, Vec::new(), Heuristic(0x1F), None, Heuristic(0), String::new(), None,
         );
         let text = emit_toml(&s);
-        assert!(!text.contains("every command below answered"), "{text}");
+        assert!(!text.contains("every getter below answered"), "{text}");
         assert!(!text.contains("Measured"), "{text}");
         assert!(text.contains("stream_wait_us = 0 (not measured)"), "{text}");
         let back: DeviceDef = toml::from_str(&text).expect("emitted file parses");
@@ -1602,49 +1670,213 @@ mod tests {
     fn probed_def_header_keeps_its_measurement() {
         let s = synthesize(&mock_legacy_keyboard(), &ctx(0x0221, "")).unwrap();
         let text = emit_toml(&s);
-        assert!(text.contains("every command below answered on the real hardware"));
+        assert!(text.contains("every getter below answered on the real hardware"));
         assert!(text.contains("# Measured command round-trip: ~"));
         assert!(text.contains(&format!("{VERSION_MARK}{SYNTH_VERSION}")));
     }
 
-    /// A pre-version keyboard auto def aimed at the Naga logo region is set aside once; versioned,
-    /// edited and mouse-shaped files stay where they are.
+    /// A version-1 keyboard file: the old synthesis aimed every lighting write and the brightness
+    /// read at the Naga logo region and kept the top-level setter. No version line.
+    fn v1_keyboard_file() -> String {
+        let kbd = MockDevice::new(&[(0x00, 0x81), (0x00, 0x84), (0x0F, 0x84), (0x0F, 0x82)]);
+        let mut s = synthesize(&kbd, &ctx(0x024E, "Razer BlackWidow V3")).unwrap();
+        let l = s.def.lighting.as_mut().unwrap();
+        l.led_id = 0x04;
+        l.effect.args = vec![0x00, 0x04];
+        l.custom_frame.as_mut().unwrap().args = vec![0x00, 0x04];
+        l.brightness.as_mut().unwrap().args = vec![0x00, 0x04];
+        s.def.commands.get_mut("brightness").unwrap().args = vec![0x00, 0x04];
+        s.def.commands.insert("set_brightness".into(), cmd(0x0F, 0x04, 0x03, &[]));
+        emit_toml(&s).lines().filter(|l| !l.starts_with(VERSION_MARK)).map(|l| format!("{l}\n")).collect()
+    }
+
     #[test]
-    fn stale_keyboard_auto_defs_are_set_aside_once() {
-        let dir = std::env::temp_dir().join(format!("neuron-retire-{}", std::process::id()));
+    fn synth_version_reads_the_mark_and_defaults_to_one() {
+        assert_eq!(synth_version(&v1_keyboard_file()), 1);
+        assert_eq!(synth_version(&format!("# a\n{VERSION_MARK}{SYNTH_VERSION}\nname = \"x\"\n")), SYNTH_VERSION);
+        assert_eq!(synth_version(&format!("{VERSION_MARK}junk\n")), 1);
+    }
+
+    /// Only an unversioned 6x22 matrix file on LED 0x04 is stale; versioned, lighting-edited and
+    /// mouse-shaped files are not, and judging staleness writes nothing.
+    #[test]
+    fn stale_auto_defs_are_recognised_without_touching_them() {
+        let dir = std::env::temp_dir().join(format!("neuron-stale-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("razer-024e.toml");
+        let old = v1_keyboard_file();
+        std::fs::write(&path, &old).unwrap();
+        let old_def: DeviceDef = toml::from_str(&old).unwrap();
+        assert!(is_stale_auto_def(&path, &old, &old_def));
+        assert!(path.exists(), "judging staleness writes nothing");
+
         let kbd = MockDevice::new(&[(0x00, 0x81), (0x00, 0x84), (0x0F, 0x84), (0x0F, 0x82)]);
         let fresh = emit_toml(&synthesize(&kbd, &ctx(0x024E, "Razer BlackWidow V3")).unwrap());
-        // The old shape: Naga logo bytes on a keyboard grid, no version line.
-        let old: String = fresh
-            .lines()
-            .filter(|l| !l.starts_with(VERSION_MARK))
-            .map(|l| {
-                l.replace("args = [0x00, 0x00]", "args = [0x00, 0x04]")
-                    .replace("led_id = 0x00", "led_id = 0x04")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let old_def: DeviceDef = toml::from_str(&old).unwrap();
-        assert_eq!(old_def.lighting.as_ref().unwrap().led_id, 0x04, "fixture reproduces the old shape");
-
-        let path = dir.join("razer-024e.toml");
-        std::fs::write(&path, &old).unwrap();
-        assert!(retire_stale_auto_def(&path, &old, &old_def));
-        assert!(!path.exists());
-        assert!(dir.join("razer-024e.toml.v1.bak").exists());
-        // A restored copy is respected: the backup already exists, so it stays.
-        std::fs::write(&path, &old).unwrap();
-        assert!(!retire_stale_auto_def(&path, &old, &old_def));
-        assert!(path.exists());
-
-        let new_def: DeviceDef = toml::from_str(&fresh).unwrap();
-        assert!(!retire_stale_auto_def(&dir.join("a.toml"), &fresh, &new_def), "versioned");
+        assert!(!is_stale_auto_def(&path, &fresh, &toml::from_str(&fresh).unwrap()), "versioned");
         let mut edited = old_def.clone();
         edited.lighting.as_mut().unwrap().led_id = 0x05;
-        assert!(!retire_stale_auto_def(&dir.join("b.toml"), &old, &edited), "hand-edited");
-        let mouse = synthesize(&mock_matrix_mouse(), &ctx(0x00A8, "Razer Naga V2 Pro")).unwrap();
-        assert!(!retire_stale_auto_def(&dir.join("c.toml"), "", &mouse.def), "mouse grid");
+        assert!(!is_stale_auto_def(&path, &old, &edited), "lighting edited by hand");
+        let mouse = emit_toml(&synthesize(&mock_matrix_mouse(), &ctx(0x00A8, "Razer Naga V2 Pro")).unwrap());
+        let mouse_v1: String = mouse.lines().filter(|l| !l.starts_with(VERSION_MARK)).collect::<Vec<_>>().join("\n");
+        assert!(!is_stale_auto_def(&path, &mouse_v1, &toml::from_str(&mouse_v1).unwrap()), "mouse grid");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Adoption moves a stale file aside once, never over an existing backup, and a restored copy
+    /// (backup present) is then left in place and loads as before.
+    #[test]
+    fn stale_auto_defs_are_set_aside_once() {
+        let dir = std::env::temp_dir().join(format!("neuron-retire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("razer-024e.toml");
+        let backup = dir.join("razer-024e.toml.v1.bak");
+        let old = v1_keyboard_file();
+        std::fs::write(&path, &old).unwrap();
+        assert_eq!(retire_stale_auto_def(&path).unwrap(), Some(backup.clone()));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), old, "backup keeps the file byte for byte");
+
+        std::fs::write(&path, &old).unwrap();
+        assert_eq!(retire_stale_auto_def(&path).unwrap(), None, "a restored copy stays");
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), old);
+
+        let other = dir.join("razer-0293.toml");
+        std::fs::write(&other, "not toml [").unwrap();
+        assert_eq!(retire_stale_auto_def(&other).unwrap(), None, "an unparseable file is not ours to move");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Synthesis over arbitrary answer sets: the probe stays read-only, every emitted file
+    /// reloads to the def it came from, and the lighting block agrees with the device class.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Every opcode the probe can ask about, plus the parrot canary.
+        const POOL: &[(u8, u8)] = &[
+            (0x00, 0x82), (0x00, 0x84), (0x00, 0x85), (0x00, 0xC0),
+            (0x04, 0x85), (0x04, 0x83), (0x04, 0x86),
+            (0x07, 0x80), (0x07, 0x84),
+            (0x06, 0x8E), (0x06, 0x80), (0x06, 0x8D),
+            (0x0F, 0x84), (0x0F, 0x82),
+            (0x03, 0x80), (0x03, 0x83), (0x03, 0x88), (0x03, 0x89),
+            (CANARY.0, CANARY.1),
+        ];
+
+        /// Answers SUCCESS for `supports` unless the (class, id, first two args) is refused, and
+        /// records every request it was sent.
+        #[derive(Debug)]
+        struct Fuzz {
+            supports: Vec<(u8, u8)>,
+            refused: Vec<(u8, u8, [u8; 2])>,
+            serial: [u8; 80],
+            sent: Mutex<Vec<Pending>>,
+        }
+
+        impl Transport for Fuzz {
+            fn set_feature(&self, buf: &[u8]) -> anyhow::Result<()> {
+                self.sent.lock().unwrap().push((buf[7], buf[8], buf[6], [buf[9], buf[10]]));
+                Ok(())
+            }
+            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
+                let Some(&(class, id, size, head)) = self.sent.lock().unwrap().last() else {
+                    anyhow::bail!("no pending command");
+                };
+                let mut rep = Report::command(PROBE_TX, class, id, size);
+                let ok = (class, id) == (0x00, 0x81)
+                    || (self.supports.contains(&(class, id)) && !self.refused.contains(&(class, id, head)));
+                rep.status = if ok { 0x02 } else { 0x05 };
+                if (class, id) == (0x00, 0x82) {
+                    rep.args = self.serial;
+                }
+                let out = rep.to_buf();
+                let n = buf.len().min(BUF_LEN);
+                buf[..n].copy_from_slice(&out[..n]);
+                Ok(n)
+            }
+        }
+
+        fn device() -> impl Strategy<Value = Fuzz> {
+            (
+                proptest::sample::subsequence(POOL, 0..=POOL.len()),
+                any::<bool>(),
+                any::<bool>(),
+                proptest::collection::vec(any::<u8>(), 80),
+            )
+                .prop_map(|(supports, refuse_logo, refuse_backlight, serial)| {
+                    let mut refused = Vec::new();
+                    if refuse_logo {
+                        refused.push((0x0F, 0x84, [0x00, 0x04]));
+                    }
+                    if refuse_backlight {
+                        refused.push((0x0F, 0x84, [0x00, 0x05]));
+                    }
+                    Fuzz {
+                        supports,
+                        refused,
+                        serial: serial.try_into().unwrap(),
+                        sent: Mutex::new(Vec::new()),
+                    }
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+            #[test]
+            fn synthesis_holds_its_invariants(
+                dev in device(),
+                product in proptest::collection::vec(any::<char>(), 0..40),
+                pid in any::<u16>(),
+            ) {
+                let product: String = product.into_iter().collect();
+                let s = synthesize(&dev, &ctx(pid, &product));
+                let sent = dev.sent.lock().unwrap().clone();
+                for &(class, id, ..) in &sent {
+                    prop_assert!(id >= 0x80, "probe sent a setter-shaped command {class:02X}/{id:02X}");
+                }
+                let Some(s) = s else {
+                    return Ok(());
+                };
+                prop_assert!(!dev.supports.contains(&(CANARY.0, CANARY.1)), "a parrot was adopted");
+
+                let text = emit_toml(&s);
+                prop_assert_eq!(text.matches(VERSION_MARK).count(), 1);
+                let mut back: DeviceDef = toml::from_str(&text)
+                    .map_err(|e| TestCaseError::fail(format!("{e}\n{text}")))?;
+                back.origin = s.def.origin.clone();
+                prop_assert_eq!(&back, &s.def);
+                prop_assert!(!is_stale_auto_def(Path::new("unwritten.toml"), &text, &back));
+
+                let d = &s.def;
+                for (set, get) in [
+                    ("set_polling", "polling_rate"), ("set_polling2", "polling2"),
+                    ("set_dpi", "dpi"), ("set_dpi_stages", "dpi_stages"),
+                    ("set_brightness", "brightness"), ("set_game_mode", "game_mode"),
+                ] {
+                    prop_assert!(!d.commands.contains_key(set) || d.commands.contains_key(get), "{set} without {get}");
+                }
+                let mouse = d.commands.contains_key("dpi");
+                if let Some(l) = &d.lighting {
+                    if let Some(b) = &l.brightness {
+                        let get = d.command("brightness");
+                        prop_assert!(get.is_some_and(|g| g.class == b.class), "brightness write without its getter");
+                    }
+                    if l.protocol == Protocol::Matrix {
+                        if let (Some(b), Some(get)) = (&l.brightness, d.command("brightness")) {
+                            prop_assert_eq!(&b.args, &get.args, "brightness writes one region and reads another");
+                        }
+                        prop_assert!(mouse || !d.commands.contains_key("set_brightness"), "keyboard kept the logo setter");
+                        prop_assert_eq!(l.led_id, if mouse { 0x04 } else { 0x00 });
+                        prop_assert_eq!(&l.effect.args, &vec![0x00, l.led_id]);
+                        prop_assert_eq!((l.rows, l.cols), if mouse { (1, 2) } else { (6, 22) });
+                    }
+                }
+                if mouse {
+                    prop_assert!(!sent.iter().any(|p| (p.0, p.1, p.3) == (0x0F, 0x84, [0x00, 0x05])), "mouse probed the keyboard backlight");
+                }
+            }
+        }
     }
 }

@@ -717,8 +717,10 @@ impl Registry {
                                 if crate::dialect::by_id(&def.dialect).is_none() {
                                     continue;
                                 }
+                                // An outdated generated file stays unloaded; adoption moves it aside
+                                // and rebuilds it. Loading never writes.
                                 if origin == DefOrigin::Auto
-                                    && crate::synth::retire_stale_auto_def(&p, &txt, &def)
+                                    && crate::synth::is_stale_auto_def(&p, &txt, &def)
                                 {
                                     continue;
                                 }
