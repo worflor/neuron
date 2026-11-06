@@ -39,6 +39,31 @@ pub fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Milliseconds of AWAKE time since the first call — the heartbeat clock. Windows' `Instant`
+/// (QPC) keeps counting through sleep/hibernate, so a worker parked in a wait across a suspend
+/// would read as silent for the whole nap; unbiased interrupt time stops while the system sleeps.
+/// Other platforms' `Instant` (CLOCK_MONOTONIC, mach_absolute_time) already excludes suspend.
+#[cfg(windows)]
+fn awake_ms() -> u64 {
+    fn unbiased_ms() -> u64 {
+        let mut t100ns = 0u64;
+        // SAFETY: the out-pointer is a live, aligned u64 for the duration of the call.
+        unsafe {
+            windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime(&raw mut t100ns)
+        };
+        t100ns / 10_000
+    }
+    static BASE: OnceLock<u64> = OnceLock::new();
+    let base = *BASE.get_or_init(unbiased_ms);
+    unbiased_ms().saturating_sub(base)
+}
+
+#[cfg(not(windows))]
+fn awake_ms() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 #[cfg(windows)]
 #[inline]
 fn tid() -> u32 {
@@ -158,7 +183,7 @@ pub mod organ {
 const ORGANS: usize = 4;
 const ORGAN_NAMES: [&str; ORGANS] = ["live dispatch", "weave service", "knockback", "whiteboard"];
 
-/// `0` = not running (never started or deliberately cleared); else last-beat `now_ms`+1.
+/// `0` = not running (never started or deliberately cleared); else last-beat `awake_ms`+1.
 static PULSES: [AtomicU64; ORGANS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -168,7 +193,7 @@ static PULSES: [AtomicU64; ORGANS] = [
 
 /// Beat the heart of `organ::*`. Call from the worker's own loop — one relaxed store.
 pub fn pulse(organ: usize) {
-    PULSES[organ].store(now_ms() + 1, Ordering::Relaxed);
+    PULSES[organ].store(awake_ms() + 1, Ordering::Relaxed);
 }
 
 /// Mark an organ stopped on purpose (a session ending is not a stall).
@@ -185,7 +210,7 @@ pub const SESSION_STALL_MS: u64 = 1500;
 /// never started).
 pub fn beat_age(organ: usize) -> Option<u64> {
     let last = PULSES[organ].load(Ordering::Relaxed);
-    (last != 0).then(|| now_ms().saturating_sub(last - 1))
+    (last != 0).then(|| awake_ms().saturating_sub(last - 1))
 }
 
 /// True if `organ` is RUNNING but has gone silent past [`SESSION_STALL_MS`] — a session whose
@@ -233,7 +258,7 @@ pub fn crash_dump_count() -> usize {
 /// Every running organ whose heart has been silent longer than `max_age_ms`:
 /// `(name, silent_for_ms)`. Cold path — the UI timer calls this once a second.
 pub fn stalls(max_age_ms: u64) -> Vec<(&'static str, u64)> {
-    let now = now_ms();
+    let now = awake_ms();
     let mut out = Vec::new();
     for (i, p) in PULSES.iter().enumerate() {
         let last = p.load(Ordering::Relaxed);
@@ -260,6 +285,7 @@ pub fn dump(w: &mut dyn std::io::Write) {
         "── flight recorder ── uptime {:.1}s",
         now as f64 / 1000.0
     );
+    let awake = awake_ms();
     for (i, p) in PULSES.iter().enumerate() {
         let last = p.load(Ordering::Relaxed);
         if last == 0 {
@@ -269,7 +295,7 @@ pub fn dump(w: &mut dyn std::io::Write) {
                 w,
                 "  organ {:<13} beat {:.1}s ago",
                 ORGAN_NAMES[i],
-                now.saturating_sub(last - 1) as f64 / 1000.0
+                awake.saturating_sub(last - 1) as f64 / 1000.0
             );
         }
     }
@@ -383,6 +409,16 @@ mod tests {
         dump(&mut buf);
         saw_event |= check_snapshot(&buf);
         assert!(saw_event, "events survive the stampede");
+    }
+
+    #[test]
+    fn heartbeat_clock_tracks_awake_time() {
+        let a = awake_ms();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let b = awake_ms();
+        // Unbiased interrupt time ticks at the system timer (~15.6 ms), so allow one tick of slop.
+        assert!(b >= a + 100, "awake clock advances while awake: {a} -> {b}");
+        assert!(b <= a + 2_000, "awake clock does not run away: {a} -> {b}");
     }
 
     #[test]
