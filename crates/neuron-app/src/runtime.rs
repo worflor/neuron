@@ -623,6 +623,9 @@ impl AppRuntime {
             // when two families share a pid: this worker's key never selects the other's pipe.
             if let Ok(reg) = Registry::load() {
                 if let Ok(a) = neuron::synth::adopt_keys(&reg, &unknown) {
+                    for b in &a.retired {
+                        eprintln!("[adopt] set aside an outdated generated file: {}", b.display());
+                    }
                     if !a.adopted.is_empty() {
                         dirty.store(true, Ordering::SeqCst);
                     }

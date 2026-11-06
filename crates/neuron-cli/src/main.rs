@@ -3834,6 +3834,9 @@ fn adopt_and_reload() -> Option<Registry> {
     for s in &a.skipped {
         eprintln!("adoption skipped {s}");
     }
+    for b in &a.retired {
+        eprintln!("set aside an outdated generated file: {}", b.display());
+    }
     if a.adopted.is_empty() {
         return None;
     }
@@ -4359,6 +4362,9 @@ fn discover_cmd(emit: bool) {
                 for s in &a.skipped {
                     println!("skipped {s}");
                 }
+                for b in &a.retired {
+                    println!("set aside an outdated generated file: {}", b.display());
+                }
                 if a.adopted.is_empty() {
                     println!("nothing to adopt: every connected device is already in the registry.");
                 }
@@ -4415,6 +4421,9 @@ fn adopt_cmd(reg: &Registry, dry_run: bool) -> Result<()> {
     let a = neuron::synth::adopt_unknown(reg)?;
     for s in &a.skipped {
         println!("skipped {s}");
+    }
+    for b in &a.retired {
+        println!("set aside an outdated generated file: {}", b.display());
     }
     if a.adopted.is_empty() {
         println!("nothing to adopt: every connected device is already in the registry.");

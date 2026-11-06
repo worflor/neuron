@@ -556,7 +556,7 @@ layout = "matrix-era or no lighting -> 0x1F; legacy-only lighting -> 0xFF with 0
 meaning = "Synthesized-def tx guess, flagged HEURISTIC in the emitted file."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L511-L515", what = "neuron's heuristic" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L530-L534", what = "neuron's heuristic" },
 ]
 
 [[fact]]
@@ -2484,17 +2484,18 @@ conflicts = [
 key = "razer/enum/synth-lighting-blocks"
 dialect = "razer"
 kind = "enum"
-layout = "matrix mouse (DPI answered): effect 0F/02 [0,4] + custom 0F/03 [0,4] + brightness 0F/04 [0,4], wave 0x03 / spectrum 0x04; matrix keyboard (no DPI): effect 0F/02 [0,0] + custom 0F/03 [0,0] + brightness 0F/04 [0,0], brightness read 0F/84 [0,5], spectrum 0x03 / wave 0x04; custom_id 0x08 both; legacy: effect 03/0A size 8 tx 0x3F + custom 03/0B size 0x46 [0xFF] tx 0x3F, custom_id 0x05. Emitted files carry '# synth-version: 2'; an unversioned 6x22 matrix file on LED 0x04 is set aside as .toml.v1.bak and re-synthesized."
+layout = "matrix mouse (DPI answered): effect 0F/02 [0,4] + custom 0F/03 [0,4] + brightness 0F/04 [0,4], wave 0x03 / spectrum 0x04; matrix keyboard (no DPI): effect 0F/02 [0,0] + custom 0F/03 [0,0], brightness write 0F/04 [0,5] and read 0F/84 [0,5] through the lighting block (no top-level set_brightness), spectrum 0x03 / wave 0x04; custom_id 0x08 both; legacy: effect 03/0A size 8 tx 0x3F + custom 03/0B size 0x46 [0xFF] tx 0x3F, custom_id 0x05. Emitted files carry '# synth-version: 2'; an unversioned 6x22 matrix file on LED 0x04 is left unloaded, then moved to .toml.v1.bak and re-synthesized by adoption."
 meaning = "Lighting setters baked into auto defs from curated ones; only getter presence is probed."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L361-L420", what = "unprobed setters, corrected after the fact by first_light_heal" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L356-L427", what = "unprobed setters, corrected after the fact by first_light_heal" },
   { kind = "source", src = "synapse3-modules", at = "RzCtl_024E.dll / RzCtl_0293.dll GetProductConfig + extended lighting class", what = "BlackWidow V3 and V4 X: 6x22 matrix, VARSTORE flag clear (NOSTORE); whole-device 0F/02 and 0F/03 carry LED 0x00; custom activation [00,00,08]; 0F/04 write LED 0x00; 0F/84 / 0F/82 reads default to LED 0x05; effect ids static 01 breathing 02 spectrum 03 wave 04 reactive 05; V3 device table lists logo zone 0x04" },
   { kind = "capture", what = "Synapse 3 streaming every Quick Option to a BlackWidow V3 (1532:024E), usbmon capture BWV3QuickOptionsEverySubOptionToggledInOrderTopToBottom.pcapng.tar.gz in github.com/justZaduma/upload at 230dfe6 (sha256 9976541c...), linked from openrazer#1319: 10,104 x 0F/03 at tx 0x1F, wIndex 3, data_size 0x47, args [00, 00, row 0-5, 00, 0x15, RGB x 22]" },
 ]
 conflicts = [
   "These setters reach unknown hardware ungated; the kind is enum, so the gating test does not see them.",
   "Keyboard LED: openrazer sends VARSTORE + BACKLIGHT 0x05 for BlackWidow V3/V4 X effects and brightness; Synapse's own modules send NOSTORE + 0x00. neuron follows Synapse (volatile). UNVERIFIED on a V3/V4 X: no such board on the desk.",
+  "Keyboard brightness region: Synapse writes 0F/04 at LED 0x00 and reads 0F/84 at 0x05; openrazer writes and reads 0x05. neuron writes and reads 0x05 (NOSTORE) so the read-back checks the region it wrote.",
 ]
 
 # ------------------------------------------------------------------------------------------------
