@@ -279,8 +279,9 @@ pub struct Synthesis {
     pub def: DeviceDef,
     /// Device serial (when the serial getter answered) — file-comment provenance.
     pub serial: String,
-    /// Median measured command round-trip (ms) — the basis of `stream_wait_us`.
-    pub roundtrip_ms: u64,
+    /// Median measured command round-trip (ms) — the basis of `stream_wait_us`. `None` when the
+    /// dialect timed no command (nothing measured, so the file must not claim a measurement).
+    pub roundtrip_ms: Option<u64>,
     /// The transaction id — ALWAYS era-inference (writes don't echo honesty, so tx can't be
     /// probe-proven), hence `Heuristic`. Duplicates `def.transaction_id`.
     pub tx: Heuristic<u8>,
@@ -314,7 +315,7 @@ impl Synthesis {
         dims: Option<Heuristic<(u8, u8)>>,
         stream_wait: Heuristic<u64>,
         serial: String,
-        roundtrip_ms: u64,
+        roundtrip_ms: Option<u64>,
     ) -> Self {
         // A probe may not claim evidence for a command it did not EMIT: every answered name must be
         // a key in the def's command map, or the mint would be laundering an unobserved name into
@@ -566,7 +567,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     Some(Synthesis {
         def,
         serial,
-        roundtrip_ms,
+        roundtrip_ms: Some(roundtrip_ms),
         tx: Heuristic(transaction_id),
         dims,
         stream_wait: Heuristic(stream_wait_us),
@@ -628,8 +629,9 @@ struct EmitNotes {
     /// Probed unit serial (empty ⇒ the serial comment line is omitted). A heal has no re-probe,
     /// so it passes empty — the tx line carries the proof instead.
     serial: String,
-    /// Measured command round-trip (ms) for the header's `~Nms -> stream_wait_us` line.
-    roundtrip_ms: u64,
+    /// Measured command round-trip (ms) for the header's `~Nms -> stream_wait_us` line; `None`
+    /// (no measurement this pass) omits the claim.
+    roundtrip_ms: Option<u64>,
     /// The "HEURISTIC fields worth checking" caveat lines, in order — each a full `#   - …`
     /// comment (already control-safe). The `transaction_id` line is the one the heal rewrites.
     heuristic_lines: Vec<String>,
@@ -683,21 +685,34 @@ pub fn emit_toml(s: &Synthesis) -> String {
 /// the def means the healed tx (already set on `def`) appears in the `transaction_id = …` line.
 fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "# Device definition — {} (AUTO-SYNTHESIZED by probing the device's getter space\n\
-         # through its wire dialect; every command below answered on the real hardware).\n",
-        comment_safe(&d.name)
-    ));
+    if d.commands.is_empty() {
+        out.push_str(&format!(
+            "# Device definition — {} (AUTO-SYNTHESIZED through its wire dialect; no commands\n\
+             # are known for it, so none are declared).\n",
+            comment_safe(&d.name)
+        ));
+    } else {
+        out.push_str(&format!(
+            "# Device definition — {} (AUTO-SYNTHESIZED by probing the device's getter space\n\
+             # through its wire dialect; every command below answered on the real hardware).\n",
+            comment_safe(&d.name)
+        ));
+    }
     if !notes.serial.is_empty() {
         out.push_str(&format!("# Probed unit serial: {}\n", comment_safe(&notes.serial)));
     }
-    out.push_str(&format!(
-        "# Measured command round-trip: ~{}ms -> stream_wait_us = {}.\n\
-         # This file is CONFIG, not discovery: edit freely (it is never overwritten), or copy\n\
+    match notes.roundtrip_ms {
+        Some(ms) => out.push_str(&format!(
+            "# Measured command round-trip: ~{ms}ms -> stream_wait_us = {}.\n",
+            d.stream_wait_us
+        )),
+        None => out.push_str(&format!("# stream_wait_us = {} (not measured).\n", d.stream_wait_us)),
+    }
+    out.push_str(
+        "# This file is CONFIG, not discovery: edit freely (it is never overwritten), or copy\n\
          # it into devices/ to promote it to a curated def that shadows this one.\n\
          # HEURISTIC fields worth checking on a new board:\n",
-        notes.roundtrip_ms, d.stream_wait_us
-    ));
+    );
     for line in &notes.heuristic_lines {
         out.push_str(line);
         out.push('\n');
@@ -798,7 +813,7 @@ pub fn heal_auto_tx(dialect_id: &str, pid: u16, def: &DeviceDef, verified_tx: u8
         &healed,
         &EmitNotes {
             serial: String::new(),
-            roundtrip_ms: 0,
+            roundtrip_ms: None,
             heuristic_lines,
         },
     );
@@ -1168,10 +1183,11 @@ mod tests {
         }
     }
 
-    /// A matrix-era wireless mouse shaped like the Naga V2 Pro (getter space only).
+    /// A matrix-era wireless mouse shaped like the Naga V2 Pro (getter space only). 0x00/0xC0 is
+    /// absent: the live Naga dongle answered it UNSUPPORTED (ledger `razer/00/c0`).
     fn mock_matrix_mouse() -> MockDevice {
         MockDevice::new(&[
-            (0x00, 0x81), (0x00, 0x82), (0x00, 0x84), (0x00, 0x85), (0x00, 0xC0),
+            (0x00, 0x81), (0x00, 0x82), (0x00, 0x84), (0x00, 0x85),
             (0x04, 0x85), (0x04, 0x83), (0x04, 0x86),
             (0x07, 0x80), (0x07, 0x84),
             (0x06, 0x8E), (0x06, 0x80), (0x06, 0x8D),
@@ -1199,7 +1215,7 @@ mod tests {
             toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();
         for name in [
             "firmware_version", "serial", "device_mode", "polling_rate", "set_polling",
-            "polling2", "set_polling2", "dpi", "set_dpi", "dpi_stages", "set_dpi_stages",
+            "dpi", "set_dpi", "dpi_stages", "set_dpi_stages",
             "dpi_stages_active", "battery_level", "charging_status", "storage_info",
             "brightness", "set_brightness", "lighting_state",
         ] {
@@ -1213,6 +1229,10 @@ mod tests {
             );
         }
         assert_eq!(d.transaction_id, naga.transaction_id, "matrix era tx");
+        // The curated def declares polling2 despite that UNSUPPORTED reply (a recorded ledger
+        // conflict); synthesis follows the reply and emits neither the getter nor its setter.
+        assert!(d.command("polling2").is_none());
+        assert!(d.command("set_polling2").is_none());
         let (l, nl) = (d.lighting.as_ref().unwrap(), naga.lighting.as_ref().unwrap());
         assert_eq!(l.protocol, Protocol::Matrix);
         assert_eq!((l.led_id, l.custom_id, l.varstore), (nl.led_id, nl.custom_id, nl.varstore));
@@ -1401,7 +1421,15 @@ mod tests {
         // SAME registry-driven gate the GUI/CLI use — synthesis feeds that gate, so the
         // names must line up exactly (a typo here would silently grey-out real features).
         use crate::registry::Capability;
-        let s = synthesize(&mock_matrix_mouse(), &ctx(0x00A8, "n")).unwrap();
+        // A HyperPolling-capable mouse (answers 0x00/0xC0, unlike the Naga dongle).
+        let mouse = MockDevice::new(&[
+            (0x00, 0x81), (0x00, 0x82), (0x00, 0x84), (0x00, 0x85), (0x00, 0xC0),
+            (0x04, 0x85), (0x04, 0x83), (0x04, 0x86),
+            (0x07, 0x80), (0x07, 0x84),
+            (0x06, 0x8E), (0x06, 0x80), (0x06, 0x8D),
+            (0x0F, 0x84), (0x0F, 0x82),
+        ]);
+        let s = synthesize(&mouse, &ctx(0x00B3, "n")).unwrap();
         for cap in [
             Capability::Dpi, Capability::SetDpi, Capability::DpiStages,
             Capability::SetDpiStages, Capability::Polling, Capability::SetPolling,
@@ -1439,5 +1467,37 @@ mod tests {
         let keys: BTreeSet<&str> = s.def.commands.keys().map(String::as_str).collect();
         let proven_set: BTreeSet<&str> = proven.iter().map(String::as_str).collect();
         assert_eq!(proven_set, keys, "proven_commands must equal def.commands keys");
+    }
+
+    #[test]
+    fn unprobed_def_header_claims_neither_answers_nor_a_measurement() {
+        let def: DeviceDef = toml::from_str(
+            "name = \"Razer Seiren V3 Mini\"\n\
+             codename = \"auto-056a\"\n\
+             dialect = \"razer-audio\"\n\
+             vendor_id = 0x1532\n\
+             transaction_id = 0x1F\n\
+             [[modes]]\nname = \"default\"\nproduct_id = 0x056A\n\
+             [control_interface]\nusage_page = 0x000C\nusage = 0x0001\nfeature_report_len = 64\n\
+             [commands]\n",
+        )
+        .unwrap();
+        let s = Synthesis::from_probe(
+            def, Vec::new(), Heuristic(0x1F), None, Heuristic(0), String::new(), None,
+        );
+        let text = emit_toml(&s);
+        assert!(!text.contains("every command below answered"), "{text}");
+        assert!(!text.contains("Measured"), "{text}");
+        assert!(text.contains("stream_wait_us = 0 (not measured)"), "{text}");
+        let back: DeviceDef = toml::from_str(&text).expect("emitted file parses");
+        assert!(back.commands.is_empty());
+    }
+
+    #[test]
+    fn probed_def_header_keeps_its_measurement() {
+        let s = synthesize(&mock_legacy_keyboard(), &ctx(0x0221, "")).unwrap();
+        let text = emit_toml(&s);
+        assert!(text.contains("every command below answered on the real hardware"));
+        assert!(text.contains("# Measured command round-trip: ~"));
     }
 }

@@ -4400,8 +4400,10 @@ fn adopt_cmd(reg: &Registry, dry_run: bool) -> Result<()> {
             let known = reg
                 .find_by_pid(i.vid, i.pid).map_or_else(|| "unknown: `neuron adopt` would write this".into(), |d| format!("known: curated def '{}' would shadow this", d.name));
             println!(
-                "# ── pid {:04x} · round-trip ~{}ms · {} ──────────────────────\n",
-                i.pid, s.roundtrip_ms, known
+                "# ── pid {:04x} · round-trip {} · {} ──────────────────────\n",
+                i.pid,
+                s.roundtrip_ms.map_or_else(|| "not measured".to_string(), |ms| format!("~{ms}ms")),
+                known
             );
             println!("{}", neuron::synth::emit_toml(&s));
         }
