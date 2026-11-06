@@ -662,6 +662,7 @@ mod tests {
                 product: d.product.clone(),
                 report_descriptor_hex: None,
                 collections: Vec::new(),
+                provenance: None,
             });
             if entry.product.is_empty() {
                 entry.product = d.product.clone();

@@ -1,0 +1,73 @@
+{
+  "source": "linux-report-descriptor",
+  "vid": 5426,
+  "pid": 659,
+  "product": "Razer BlackWidow V4 X",
+  "report_descriptor_hex": "05010906a101050719e029e715002501750195088102810119002aff00150026ff007508950681000508190129031500250175019503910295059101c005010906a1018501050719e029e715002501750195088102190029a015002501750195a08102c0050c0901a101850219002a3c021500263c02950175108100750895138101c005010980a1018503198129831500250175019503810295058101750895148101c005010900a10185040903150026ff00350046ff00750895158100c005010900a10185050903150026ff00350046ff00750895158100c005010902a1010901a100050919012905150025017501950581027501950381030600ff0940750895021581257f8102050109381581257f7508950181060930093116008026ff7f751095028106c00600ff0902150025017508955ab101c005590901a10185010902a1020903150027ffff000075109501b10309040905090609070908150027ffffff7f75209505b103c085020920a1020921150027ffff000075109501b102c085030922a1020921150027ffff000075109501b10209230924092509270926150027ffffff7f75209505b10209280929092a092c092d150026ff0075089505b102c085040950a102090309551500250875089502b1020921150027ffff000075109508b102095109520953095109520953095109520953095109520953095109520953095109520953095109520953095109520953150026ff0075089518b102c085050960a10209551500250875089501b10209610962150027ffff000075109502b102095109520953150026ff0075089503b102c085060970a10209711500250175089501b102c085070600ff150026ff0009027508953fb102c0050c0901a101850819d029d715002501750195088102c0",
+  "collections": [
+    {
+      "usage_page": 1,
+      "usage": 6,
+      "feature_len": 0,
+      "input_len": 9,
+      "output_len": 2
+    },
+    {
+      "usage_page": 1,
+      "usage": 6,
+      "feature_len": 0,
+      "input_len": 22,
+      "output_len": 0
+    },
+    {
+      "usage_page": 12,
+      "usage": 1,
+      "feature_len": 0,
+      "input_len": 22,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 128,
+      "feature_len": 0,
+      "input_len": 22,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 0,
+      "feature_len": 0,
+      "input_len": 22,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 0,
+      "feature_len": 0,
+      "input_len": 22,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 2,
+      "feature_len": 91,
+      "input_len": 9,
+      "output_len": 0
+    },
+    {
+      "usage_page": 89,
+      "usage": 1,
+      "feature_len": 64,
+      "input_len": 0,
+      "output_len": 0
+    },
+    {
+      "usage_page": 12,
+      "usage": 1,
+      "feature_len": 0,
+      "input_len": 2,
+      "output_len": 0
+    }
+  ],
+  "provenance": "usbhid-dump of interfaces 0-3 published in openrazer/openrazer#2130 (2024-08) and #2288; both dumps byte-identical, lengths match lsusb wDescriptorLength 61/157/94/348. Not captured on a neuron machine."
+}

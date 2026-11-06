@@ -48,6 +48,10 @@ pub struct Capture {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_descriptor_hex: Option<String>,
     pub collections: Vec<Collection>,
+    /// Where the bytes came from when they were not captured on a neuron machine (e.g. a public
+    /// upstream dump). `None` = captured by neuron's own `#[ignore]`d capture tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
 }
 
 impl Capture {
@@ -236,5 +240,36 @@ mod tests {
         assert_eq!(decode_hex("é0"), None, "non-ASCII input is rejected without slicing UTF-8");
         assert_eq!(decode_hex("0é"), None, "a multibyte digit is rejected safely");
         assert_eq!(decode_hex("Af"), Some(vec![0xAF]), "uppercase hex digits are accepted");
+    }
+
+    /// Source-derived fixture for a board no neuron machine has seen: the `BlackWidow` V4 X
+    /// (descriptors from openrazer#2130 / #2288, see the fixture's `provenance`).
+    #[test]
+    fn blackwidow_v4x_descriptor_shape() {
+        let cap = Capture::read(&Capture::path(0x0293, "linux")).expect("V4 X fixture");
+        assert!(cap.provenance.is_some(), "a fixture neuron did not capture names its source");
+        let parsed = cap.reparse().expect("descriptor parses");
+        assert_eq!(parsed, cap.collections, "stored collections are the parser's output");
+
+        // The razer dialect claims any 91-byte feature collection: exactly one here, inside the
+        // mouse application collection (interface 2) — the usage triple the ledger expects.
+        let control: Vec<_> = parsed
+            .iter()
+            .filter(|c| c.feature_len == crate::dialect::RAZER_FEATURE_LEN)
+            .collect();
+        assert_eq!(control.len(), 1, "one razer_report pipe: {parsed:?}");
+        assert_eq!((control[0].usage_page, control[0].usage), (0x0001, 0x0002));
+
+        // Report IDs 4 and 5 (21-byte vendor key reports, M1-M6 on report 4) each sit in their
+        // own Generic Desktop / usage 0x00 collection — the shape the app's macro-key reader opens.
+        let key_reports = parsed
+            .iter()
+            .filter(|c| (c.usage_page, c.usage, c.input_len) == (0x0001, 0x0000, 22))
+            .count();
+        assert_eq!(key_reports, 2, "{parsed:?}");
+
+        // Interface 3 is a HID LampArray (Lighting And Illumination page): a Windows 11 Dynamic
+        // Lighting device, which the OS can drive independently of razer_report lighting.
+        assert!(parsed.iter().any(|c| (c.usage_page, c.usage) == (0x0059, 0x0001)), "{parsed:?}");
     }
 }
