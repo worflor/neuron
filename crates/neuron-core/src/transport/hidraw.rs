@@ -849,6 +849,7 @@ mod tests {
                 product: product.clone(),
                 report_descriptor_hex: Some(String::new()),
                 collections: Vec::new(),
+                provenance: None,
             });
             if cap.product.is_empty() {
                 cap.product = product;
