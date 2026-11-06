@@ -847,6 +847,11 @@ fn main() {
     glue::flush_lighting_save();
     light_render::shutdown();
     light_metadata::shutdown();
+    // Stop live dispatch while its worker thread still exists. Left in `resident`, the runtime is
+    // reachable from the tray wake thread-local and is dropped during process teardown, after
+    // ExitProcess has already killed the pump, where its join panics.
+    let live = resident.borrow_mut().live.take();
+    drop(live);
     // ── DEVICE-MODE RESTORE (the DPI-16000 trap) ──────────────────────────
     // Driver mode is a scoped LEASE (streams/writes), never a permanent state: while a device is held
     // in it, its onboard buttons/FN defer to software and it wakes with a stale factory volatile plane
@@ -861,6 +866,9 @@ fn main() {
     buttonfw::restore_all();
     neuron::haptics::stop_all();
     restore_devices_to_firmware();
+    // Thread-local holders of runtime state release it here, while worker threads are alive.
+    tray.uninstall_wake();
+    glue::release_ui_shared();
     // keep the tray alive for the whole loop
     drop(tray);
 }
