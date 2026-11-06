@@ -4,6 +4,9 @@
 // See ../../../LICENSE.md.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::float_cmp, clippy::drop_non_drop, clippy::field_reassign_with_default))]
+// Windows `Instant` counts from boot, so `Instant - Duration` panics early in a session; use
+// `timing::ago`. This crate does not inherit the workspace lint table, so the guard lives here.
+#![cfg_attr(not(test), warn(clippy::unchecked_time_subtraction))]
 
 //! Neuron — open, lightweight control for Razer devices. The anti-Synapse.
 //!
