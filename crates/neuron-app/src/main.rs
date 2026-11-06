@@ -691,12 +691,14 @@ fn main() {
                 // EVICTING the very events that caused the stall — the dump became useless. One shot keeps
                 // the pre-stall story intact for diagnosis; the status line still updates the age live.
                 if slow_due {
+                    flight::follow_stall_probe();
                     let stalls = flight::stalls(20_000);
                     if let Some((name, age)) = stalls.first() {
                         let mut last = stall_name.borrow_mut();
                         if last.as_deref() != Some(name) {
                             // a NEW organ went silent — capture the story ONCE, before any spam.
                             flight::dump_to_crash_log("organ stall (app alive)");
+                            flight::probe_stall_threads();
                             *last = Some(name.to_string());
                         }
                         st.set_status_line(

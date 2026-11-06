@@ -191,9 +191,18 @@ static PULSES: [AtomicU64; ORGANS] = [
     AtomicU64::new(0),
 ];
 
-/// Beat the heart of `organ::*`. Call from the worker's own loop — one relaxed store.
+/// The thread each organ last beat from (0 = never), so a stall probe can find it.
+static TIDS: [AtomicU32; ORGANS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Beat the heart of `organ::*`. Call from the worker's own loop — two relaxed stores.
 pub fn pulse(organ: usize) {
     PULSES[organ].store(awake_ms() + 1, Ordering::Relaxed);
+    TIDS[organ].store(tid(), Ordering::Relaxed);
 }
 
 /// Mark an organ stopped on purpose (a session ending is not a stall).
@@ -367,6 +376,219 @@ pub fn dump_to_crash_log(reason: &str) {
     }
 }
 
+// ── stall probes (app alive only: these allocate, so never from a crash path) ──
+
+/// One look at a thread through the kernel's process snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ThreadSample {
+    /// `KTHREAD_STATE`: 1 ready, 2 running, 5 waiting, …
+    state: u32,
+    /// `KWAIT_REASON`, meaningful while waiting.
+    wait: u32,
+    /// Kernel + user CPU time, in 100 ns units.
+    cpu: u64,
+}
+
+/// CPU times taken by [`probe_stall_threads`], for the follow-up delta.
+static PROBE: std::sync::Mutex<Option<(u64, [Option<(u32, u64)>; ORGANS])>> =
+    std::sync::Mutex::new(None);
+
+/// How long after a probe its follow-up reports the CPU each thread used.
+const PROBE_FOLLOW_MS: u64 = 1_000;
+
+/// Sample `tids` (threads of this process) in one kernel snapshot; `None` for any not found.
+#[cfg(windows)]
+fn sample_threads(tids: &[u32]) -> Vec<Option<ThreadSample>> {
+    use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
+    use windows_sys::Win32::System::WindowsProgramming::{SYSTEM_PROCESS_INFORMATION, SYSTEM_THREAD_INFORMATION};
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    let mut out = vec![None; tids.len()];
+    let mut buf: Vec<u64> = vec![0; 64 * 1024];
+    loop {
+        let bytes = (buf.len() * 8) as u32;
+        let mut needed = 0u32;
+        // SAFETY: `buf` is a live, 8-aligned buffer of `bytes` bytes for the duration of the call.
+        let status = unsafe {
+            NtQuerySystemInformation(SystemProcessInformation, buf.as_mut_ptr().cast(), bytes, &raw mut needed)
+        };
+        if status == STATUS_INFO_LENGTH_MISMATCH && buf.len() < 16 * 1024 * 1024 {
+            buf = vec![0; (needed as usize / 8 + 8 * 1024).max(buf.len() * 2)];
+            continue;
+        }
+        if status < 0 {
+            return out;
+        }
+        break;
+    }
+    let me = std::process::id() as usize;
+    let base = buf.as_ptr().cast::<u8>();
+    let end = buf.len() * 8;
+    let mut offset = 0usize;
+    loop {
+        if offset + std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>() > end {
+            return out;
+        }
+        // SAFETY: the kernel filled `buf` with a chain of SYSTEM_PROCESS_INFORMATION records, each
+        // followed by its NumberOfThreads SYSTEM_THREAD_INFORMATION entries; the bounds check above
+        // keeps the read inside `buf`, and `read_unaligned` copies the plain-data record.
+        let proc_info: SYSTEM_PROCESS_INFORMATION =
+            unsafe { std::ptr::read_unaligned(base.add(offset).cast()) };
+        if proc_info.UniqueProcessId as usize == me {
+            let threads_at = offset + std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>();
+            let count = proc_info.NumberOfThreads as usize;
+            if threads_at + count * std::mem::size_of::<SYSTEM_THREAD_INFORMATION>() > end {
+                return out;
+            }
+            for i in 0..count {
+                let at = threads_at + i * std::mem::size_of::<SYSTEM_THREAD_INFORMATION>();
+                // SAFETY: bounds checked above; the entries follow the process record.
+                let t: SYSTEM_THREAD_INFORMATION =
+                    unsafe { std::ptr::read_unaligned(base.add(at).cast()) };
+                let id = t.ClientId.UniqueThread as usize as u32;
+                if let Some(slot) = tids.iter().position(|&want| want != 0 && want == id) {
+                    // Reserved1 is [KernelTime, UserTime, CreateTime].
+                    let cpu = (t.Reserved1[0].max(0) + t.Reserved1[1].max(0)) as u64;
+                    out[slot] = Some(ThreadSample { state: t.ThreadState, wait: t.WaitReason, cpu });
+                }
+            }
+            return out;
+        }
+        if proc_info.NextEntryOffset == 0 {
+            return out;
+        }
+        offset += proc_info.NextEntryOffset as usize;
+    }
+}
+
+#[cfg(not(windows))]
+fn sample_threads(tids: &[u32]) -> Vec<Option<ThreadSample>> {
+    vec![None; tids.len()]
+}
+
+fn state_name(s: u32) -> &'static str {
+    match s {
+        0 => "initialized",
+        1 => "ready",
+        2 => "running",
+        3 => "standby",
+        4 => "terminated",
+        5 => "waiting",
+        6 => "transition",
+        7 => "deferred-ready",
+        _ => "state?",
+    }
+}
+
+/// The wait reasons a stalled user-mode worker can plausibly be in; others print as a number.
+fn wait_name(w: u32) -> &'static str {
+    match w {
+        0 | 7 => "executive (kernel object or I/O)",
+        2 | 9 => "page-in",
+        4 | 11 => "sleep",
+        5 | 12 => "suspended",
+        6 => "user wait (handle)",
+        13 => "user wait (window messages)",
+        15 => "queue",
+        16 | 17 => "lpc/alpc",
+        27 => "resource",
+        28 => "push lock",
+        29 | 34 | 35 => "mutex",
+        37 => "alert by thread id (Rust lock or condvar)",
+        _ => "",
+    }
+}
+
+fn write_sample(w: &mut dyn std::io::Write, name: &str, tid: u32, s: Option<ThreadSample>) {
+    match s {
+        None => {
+            let _ = writeln!(w, "  thread {name:<13} tid {tid} not found");
+        }
+        Some(s) if s.state == 5 => {
+            let _ = writeln!(
+                w,
+                "  thread {name:<13} tid {tid} waiting, reason {} {}, cpu {:.2}s",
+                s.wait,
+                wait_name(s.wait),
+                s.cpu as f64 / 1e7
+            );
+        }
+        Some(s) => {
+            let _ = writeln!(
+                w,
+                "  thread {name:<13} tid {tid} {}, cpu {:.2}s",
+                state_name(s.state),
+                s.cpu as f64 / 1e7
+            );
+        }
+    }
+}
+
+/// The running organs' (index, thread id) pairs.
+fn running_organ_tids() -> Vec<(usize, u32)> {
+    (0..ORGANS)
+        .filter(|&i| PULSES[i].load(Ordering::Relaxed) != 0)
+        .map(|i| (i, TIDS[i].load(Ordering::Relaxed)))
+        .filter(|&(_, tid)| tid != 0)
+        .collect()
+}
+
+fn append_to_crash_log(write: impl FnOnce(&mut dyn std::io::Write)) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crash_log_path()) {
+        write(&mut f);
+    }
+}
+
+/// After a stall dump: append each running organ's thread state, wait reason and CPU time to the
+/// crash log, and arm [`follow_stall_probe`]. A stalled thread that is waiting with flat CPU is
+/// stuck; one that is running or ready is busy or starved.
+pub fn probe_stall_threads() {
+    let organs = running_organ_tids();
+    let tids: Vec<u32> = organs.iter().map(|&(_, t)| t).collect();
+    let samples = sample_threads(&tids);
+    let mut cpu = [None; ORGANS];
+    append_to_crash_log(|w| {
+        let _ = writeln!(w, "── stall threads ──");
+        for (&(organ, tid), s) in organs.iter().zip(&samples) {
+            write_sample(w, ORGAN_NAMES[organ], tid, *s);
+            cpu[organ] = s.map(|s| (tid, s.cpu));
+        }
+    });
+    *PROBE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((awake_ms(), cpu));
+}
+
+/// Call from the watcher tick. Once, [`PROBE_FOLLOW_MS`] after a probe, append how much CPU each
+/// probed thread used since and its state now.
+pub fn follow_stall_probe() {
+    let probe = {
+        let mut g = PROBE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *g {
+            Some((at, _)) if awake_ms().saturating_sub(at) >= PROBE_FOLLOW_MS => g.take(),
+            _ => None,
+        }
+    };
+    let Some((at, before)) = probe else {
+        return;
+    };
+    let probed: Vec<(usize, u32, u64)> = before
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.map(|(tid, cpu)| (i, tid, cpu)))
+        .collect();
+    let tids: Vec<u32> = probed.iter().map(|&(_, t, _)| t).collect();
+    let samples = sample_threads(&tids);
+    let elapsed = awake_ms().saturating_sub(at);
+    append_to_crash_log(|w| {
+        let _ = writeln!(w, "── stall threads, {:.1}s later ──", elapsed as f64 / 1000.0);
+        for (&(organ, tid, cpu), s) in probed.iter().zip(&samples) {
+            let used = s.map(|s| s.cpu.saturating_sub(cpu) / 10_000);
+            write_sample(w, ORGAN_NAMES[organ], tid, *s);
+            if let Some(ms) = used {
+                let _ = writeln!(w, "    used {ms} ms of cpu in that time");
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +668,55 @@ mod tests {
         // Unbiased interrupt time ticks at the system timer (~15.6 ms), so allow one tick of slop.
         assert!(b >= a + 100, "awake clock advances while awake: {a} -> {b}");
         assert!(b <= a + 2_000, "awake clock does not run away: {a} -> {b}");
+    }
+
+    /// The probe sees a parked thread as waiting with flat CPU and a spinning one burning CPU.
+    #[cfg(windows)]
+    #[test]
+    fn stall_probe_tells_a_waiting_thread_from_a_busy_one() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::channel;
+        use std::sync::Arc;
+        let (tids, tid_rx) = channel::<(bool, u32)>();
+        let (release, parked) = channel::<()>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let tids = tids.clone();
+            std::thread::spawn(move || {
+                tids.send((false, tid())).unwrap();
+                let _ = parked.recv();
+            })
+        };
+        let spinner = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                tids.send((true, tid())).unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        };
+        let (mut wait_tid, mut spin_tid) = (0, 0);
+        for _ in 0..2 {
+            let (busy, t) = tid_rx.recv().unwrap();
+            if busy { spin_tid = t } else { wait_tid = t }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let before = sample_threads(&[wait_tid, spin_tid, u32::MAX]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after = sample_threads(&[wait_tid, spin_tid]);
+        stop.store(true, Ordering::Relaxed);
+        release.send(()).unwrap();
+        waiter.join().unwrap();
+        spinner.join().unwrap();
+
+        assert_eq!(before[2], None, "a thread id that is not ours is not found");
+        let (w0, w1) = (before[0].unwrap(), after[0].unwrap());
+        let (s0, s1) = (before[1].unwrap(), after[1].unwrap());
+        assert_eq!(w1.state, 5, "a parked thread reads as waiting: {w1:?}");
+        assert_ne!(s1.state, 5, "a spinning thread is running or ready: {s1:?}");
+        assert!(s1.cpu > s0.cpu, "the spinner used cpu: {s0:?} -> {s1:?}");
+        assert!(w1.cpu - w0.cpu < s1.cpu - s0.cpu, "the waiter used less cpu than the spinner");
     }
 
     /// A long gap between reads credits running organs instead of reporting them all stalled;
