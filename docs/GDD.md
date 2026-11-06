@@ -215,6 +215,8 @@ don't want to write python? the GUI has a **block builder**: drag typed nodes (t
 
 **beacons: a macro can stop and ask you something.** `neuron.ask("deploy it?")` pauses just that one macro and floats a quiet line at the top of your monitor: no focus steal, no dialog box. hold your cast trigger and an answer wheel appears under the cursor: flick west for yes, east for no, up or down to pass (the macro takes its default). bailing costs nothing. answering doesn't synthesise any input, so `ask` and `notify` work even in SAFE mode. a macro can talk to you while every keystroke is disarmed. and on the CLI the same question just shows up in your terminal (`[beacon] asks: deploy it?  [y/n]`), so it works headless too.
 
+every helper, with an example of each, is in [the macro API reference](reference/MACROS.md).
+
 ## won't surprise you
 
 neuron can send input, change hardware settings and run Python. these are the rules it follows.
