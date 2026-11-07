@@ -129,6 +129,9 @@ pub type DocumentParseResult = Result<MacroDocument, ParseError>;
 /// Hard ceiling on a single blocking macro invocation (test-run / CLI). The input path uses
 /// [`fire_async`] and never waits at all.
 pub const FIRE_BUDGET: Duration = Duration::from_millis(2500);
+/// Ceiling on an editor/CLI check or parse. A timeout retires the whole session (and with it every
+/// warm macro on that lane), so a slow parse on a busy machine gets more room than a fire does.
+const EDIT_BUDGET: Duration = Duration::from_secs(10);
 const TRANSFORM_TEXT_BUDGET: Duration = Duration::from_secs(300);
 /// How long to wait for the sidecar to come warm (boot + register every macro) before giving up.
 const WARM_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1214,7 +1217,7 @@ impl MacroHost {
             self.retire_control_session(&shared);
             return Err("sidecar pipe broken".into());
         }
-        match rx.recv_timeout(FIRE_BUDGET) {
+        match rx.recv_timeout(EDIT_BUDGET) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => Ok(v
                 .get("defs")
                 .and_then(Value::as_array)
@@ -1258,7 +1261,7 @@ impl MacroHost {
             self.retire_control_session(&shared);
             return Err(host_err("sidecar pipe broken"));
         }
-        match rx.recv_timeout(FIRE_BUDGET) {
+        match rx.recv_timeout(EDIT_BUDGET) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
                 let nodes = v.get("nodes").cloned().unwrap_or(Value::Null);
                 let body = serde_json::from_value::<Vec<MacroNode>>(nodes)
