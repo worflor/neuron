@@ -178,6 +178,26 @@ if ($task) {
     }
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
 }
+# The task leaves Running before its process releases the image, which would fail the rename below.
+$brokerExe = [IO.Path]::GetFullPath((Join-Path $dir 'neuron-chroma-broker.exe'))
+for ($attempt = 0; ; $attempt++) {
+    $holding = $false
+    foreach ($process in [Diagnostics.Process]::GetProcessesByName('neuron-chroma-broker')) {
+        try {
+            if ([string]::Equals([IO.Path]::GetFullPath($process.MainModule.FileName), $brokerExe,
+                    [StringComparison]::OrdinalIgnoreCase)) { $holding = $true }
+        } catch {
+            $exited = $false
+            try { $process.Refresh(); $exited = $process.HasExited } catch { $exited = $false }
+            if (-not $exited) { $holding = $true }
+        } finally {
+            $process.Dispose()
+        }
+    }
+    if (-not $holding) { break }
+    if ($attempt -ge 30) { throw 'a broker process is still running from the installation path' }
+    Start-Sleep -Milliseconds 200
+}
 if (Test-Path -LiteralPath $dir) {
     $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop
     if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
