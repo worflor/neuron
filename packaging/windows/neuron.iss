@@ -324,19 +324,28 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode <> 1);
 end;
 
-function ChromaTransactionPresent(): Boolean;
+{ 0 means none, 1 means a transaction exists, and 2 means the query failed. }
+function ChromaTransactionPresent(): Integer;
 var
   ResultCode: Integer;
   Params: String;
 begin
-  Params := '-NoProfile -NonInteractive -Command "$p=' +
+  Params := '-NoProfile -NonInteractive -Command "$ErrorActionPreference=''Stop'';$p=' +
     PowerShellLiteral(ExpandConstant('{commonpf64}')) + ';' +
-    '$d=Get-ChildItem -LiteralPath $p -Directory -Force -ErrorAction SilentlyContinue|' +
+    'try{$d=Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop|' +
     'Where-Object{$_.Name -like ''NeuronChromaBroker.installing-*'' -or ' +
-    '$_.Name -like ''NeuronChromaBroker.removing-*''}|Select-Object -First 1;' +
-    'if($d){exit 0};exit 1"';
-  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+    '$_.Name -like ''NeuronChromaBroker.removing-*'' -or ' +
+    '$_.Name -like ''NeuronChromaBroker.recovery-*''}|Select-Object -First 1;' +
+    'if($d){exit 1};exit 0}catch{exit 2}"';
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Result := 2
+  else if ResultCode = 0 then
+    Result := 0
+  else if ResultCode = 1 then
+    Result := 1
+  else
+    Result := 2;
 end;
 
 procedure RemoveUserAutostartTasks();
@@ -609,6 +618,7 @@ var
   Params: String;
   OwnerSid: String;
   OtherCopyState: Integer;
+  ChromaTransactionState: Integer;
 begin
   if CurUninstallStep <> usUninstall then Exit;
   RestartTray := NeuronTrayRunning();
@@ -628,9 +638,14 @@ begin
     Log('Keeping the shared Chroma broker and other startup target for the remaining Neuron copy');
     Exit;
   end;
+  ChromaTransactionState := ChromaTransactionPresent();
+  if ChromaTransactionState = 2 then begin
+    RestartInstalledTray();
+    RaiseException('Neuron could not inspect Chroma broker transaction state. No files were removed.');
+  end;
   ProtectedDir := ExpandConstant('{commonpf64}\NeuronChromaBroker');
   if (not DirExists(ProtectedDir)) and (not ChromaTaskPresent()) and
-     (not ChromaTransactionPresent()) then begin
+     (ChromaTransactionState = 0) then begin
     Log('No protected Chroma broker to remove');
     if not RemoveUserAutostartTasksAndVerify() then begin
       if (not RemoveAutostartTasksElevated()) or (InspectUserAutostartTasks() <> 0) then begin
