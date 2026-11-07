@@ -237,6 +237,7 @@ function Initialize-Fixture([string]$Name, [bool]$OldState = $true, [bool]$Enabl
     $Script:FaultTriggered = $false
     $Script:ProcessImagePaths = @()
     $Script:ProcessQueryFailure = $false
+    $Script:LingerAfterStop = 0
     $Script:PendingRepairBytes = $null
     $Script:PendingRepairReceiptBytes = $null
     $Script:PendingRepairTaskJson = $null
@@ -736,7 +737,7 @@ if ($parseErrors.Count -gt 0) { throw ($parseErrors | ForEach-Object { $_.Messag
 $productionFunctions = @(
     'Test-OwnershipRecord', 'Assert-RegularFileIfPresent', 'Get-OptionalScheduledTask',
     'Remove-RecognizedTransactionDirectory', 'New-StagedBrokerPayload', 'Get-BrokerProcessImagePaths',
-    'Assert-NoBrokerProcessAtPath', 'Install-PendingBrokerRepair',
+    'Test-BrokerProcessAtPath', 'Assert-NoBrokerProcessAtPath', 'Install-PendingBrokerRepair',
     'Get-BrokerTaskSnapshot', 'Get-NormalizedBrokerTaskXml', 'Restore-BrokerTaskSnapshot', 'Prepare-BrokerCandidate',
     'Copy-ProtectedBrokerFile', 'Capture-BrokerPriorState', 'Stop-BrokerTask',
     'Restore-BrokerTaskRuntimeState', 'Publish-BrokerCandidate', 'Install-BrokerTask',
@@ -753,6 +754,11 @@ function script:Get-BrokerProcessImagePaths {
     param()
     Add-FixtureEvent 'ProcessQuery'
     if ($Script:ProcessQueryFailure) { throw 'injected process image query failure' }
+    if ($Script:LingerAfterStop -gt 0 -and ($Script:Events -contains 'StopTask')) {
+        $Script:LingerAfterStop--
+        Add-FixtureEvent 'ProcessLingers'
+        return @($Script:Executable)
+    }
     return @($Script:ProcessImagePaths)
 }
 
@@ -764,7 +770,7 @@ $productionCommands = @(
     'Get-CimInstance', 'Get-Content', 'Get-FileHash', 'Get-Item', 'Get-Process',
     'Get-NormalizedBrokerTaskXml', 'Get-OptionalScheduledTask', 'Get-ScheduledTask',
     'Install-BrokerTask', 'Install-PendingBrokerRepair', 'Install-ProtectedBrokerReplacement',
-    'New-StagedBrokerPayload', 'Assert-NoBrokerProcessAtPath',
+    'New-StagedBrokerPayload', 'Test-BrokerProcessAtPath', 'Assert-NoBrokerProcessAtPath',
     'Join-Path',
     'New-Item', 'New-Object', 'New-ScheduledTaskAction', 'New-ScheduledTaskPrincipal',
     'New-ScheduledTaskSettingsSet', 'New-ScheduledTaskTrigger', 'New-TimeSpan', 'Out-Null',
@@ -842,6 +848,28 @@ try {
     Assert-ByteFile $Script:Executable $Script:OldBinary 'stop timeout executable stayed unchanged'
     Assert-ByteFile $Script:Receipt $Script:OldReceipt 'stop timeout receipt stayed unchanged'
     Assert ((Get-RecoveryDirectories).Count -eq 0) 'stop timeout leaked a recovery directory'
+
+    Initialize-Fixture 'process-outlives-task-stop'
+    $Script:LingerAfterStop = 3
+    $result = Invoke-Replacement ''
+    Assert (-not $result.Failed) ('lingering broker process failed replacement: ' + $result.Message)
+    $events = @($Script:Events)
+    $lastLinger = [array]::LastIndexOf($events, 'ProcessLingers')
+    $firstPublish = -1
+    for ($i = 0; $i -lt $events.Count; $i++) {
+        if ($events[$i] -like 'Replace:*>neuron-chroma-broker.exe') { $firstPublish = $i; break }
+    }
+    Assert ($lastLinger -ge 0 -and $firstPublish -gt $lastLinger) 'executable was replaced while the old broker process still held it'
+    Assert-ByteFile $Script:Executable $Script:NewBinary 'lingering broker process replacement executable'
+
+    Initialize-Fixture 'process-never-exits'
+    $Script:LingerAfterStop = 1000
+    $result = Invoke-Replacement ''
+    Assert $result.Failed 'a broker process that never exits did not fail replacement'
+    Assert (@($Script:Events | Where-Object { $_ -like 'Replace:*>neuron-chroma-broker.exe' }).Count -eq 0) 'a broker process that never exits still saw executable publication'
+    $Script:LingerAfterStop = 0
+    Assert-OriginalReplacementState 'process never exits'
+    Assert ((Get-RecoveryDirectories).Count -eq 0) 'process never exits leaked a recovery directory'
 
     Initialize-Fixture 'rollback-keeps-trusted-backup'
     $Script:SecondaryFaults = @('RestoreReceiptCorrupt')
