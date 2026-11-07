@@ -186,7 +186,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         $invokeArgs[$name] = $true
         continue
     }
-    if ($name -eq 'ZipPath' -and ($i + 1) -lt $args.Count) {
+    if ($name -in @('ZipPath', 'Version') -and ($i + 1) -lt $args.Count) {
         $i++
         $invokeArgs[$name] = $args[$i]
         continue
@@ -298,6 +298,8 @@ try {
     Assert ((Compare-ReleaseVersion $null 'v0.1.5') -eq 'unknown') 'unknown versions must stay unknown'
 
     $current = New-Copy 'current' 'v0.1.5' 'portable'
+    $result = Invoke-UpdaterFixture $current 'check' @('-Version', '..\..\..\..\repos/evil/x/releases/latest')
+    Assert ($result.Output -match 'BAD_VERSION' -and $result.Output -notmatch 'latest_version') ('a path-shaped -Version must be refused before any release lookup: ' + $result.Output)
     $result = Invoke-UpdaterFixture $current 'apply'
     Assert ($result.Code -eq 0 -and $result.Output -match 'RESULT: up-to-date') ('same-version apply must avoid reinstall: ' + $result.Output)
     Assert ($result.Scratch.Count -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $current '.neuron-update-backup'))) 'no-op updates must create neither scratch directories nor backups'

@@ -696,6 +696,12 @@ if ($ZipPath) {
     $setup = Join-Path (Split-Path -Parent $zip) ((Split-Path -Leaf $zip) -replace '\.zip$', '-setup.exe')
     Say 'source' "local file $zip"
 } else {
+    # The tag becomes part of an API route; anything but a version could walk that route to
+    # another repository's release.
+    if ($Version -and $Version -notmatch '^v?\d+\.\d+\.\d+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
+        Flag 'BAD_VERSION' "'$Version' is not a version such as v0.1.6"
+        Finish 'error'
+    }
     $rel = Get-Release $Version
     if (-not $rel) {
         Flag 'NO_RELEASE_INFO' "could not read releases from GitHub (offline, rate-limited, the repo is private, or tag '$Version' does not exist)"
@@ -742,6 +748,14 @@ if ($ZipPath) {
         $download = & gh release download $target --repo $Repo --dir $work @patterns --clobber 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0) { Flag 'DOWNLOAD_FAILED' "gh could not download release $target`: $($download.Trim())"; Finish 'error' }
     } else {
+        # gh downloads with --repo pinned; the API's URLs are only trusted when they point there too.
+        $assetPrefix = "https://github.com/$Repo/releases/download/"
+        foreach ($asset in @($zipAsset, $setupAsset, $sumAsset) | Where-Object { $_ }) {
+            if (-not ([string]$asset.browser_download_url).StartsWith($assetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                Flag 'FOREIGN_ASSET' "$($asset.name) is not served from $assetPrefix (STOP)"
+                Finish 'blocked'
+            }
+        }
         Invoke-WebRequest -Uri $zipAsset.browser_download_url -OutFile $zip -UseBasicParsing -Headers @{ 'User-Agent' = 'neuron-lazy-update' }
         Invoke-WebRequest -Uri $sumAsset.browser_download_url -OutFile $sums -UseBasicParsing -Headers @{ 'User-Agent' = 'neuron-lazy-update' }
         if ($setupAsset) {
@@ -791,11 +805,16 @@ if (($packageBrokerHash -and -not $packageInstallerHash) -or
 $unattestedLocalBuild = $target -match '^v\d+\.\d+\.\d+$' -and (Parse-Version $target) -le [version]'0.1.2'
 if (-not $ZipPath -and (Get-Command gh -ErrorAction SilentlyContinue)) {
     $ErrorActionPreference = 'Continue'
-    $att = & gh attestation verify $zip --repo $Repo 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) { Say 'attestation' 'ok' }
-    elseif ($unattestedLocalBuild -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' "$target has no provenance attestation. The checksum matched, but build provenance could not be verified." }
-    elseif ($att -match 'auth login|not logged') { Flag 'ATTESTATION_SKIPPED' 'gh is installed but not logged in, so provenance was not checked. The checksum still matched.' }
-    else { Flag 'ATTESTATION_FAILED' "gh attestation verify failed (STOP): $($att.Trim())"; Finish 'blocked' }
+    # The setup program is what actually runs, so it is verified alongside the zip.
+    $attested = @($zip) + @($setup | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    foreach ($subject in $attested) {
+        $label = Split-Path -Leaf $subject
+        $att = & gh attestation verify $subject --repo $Repo 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) { Say 'attestation' "ok ($label)" }
+        elseif ($unattestedLocalBuild -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' "$target has no provenance attestation for $label. The checksum matched, but build provenance could not be verified."; break }
+        elseif ($att -match 'auth login|not logged') { Flag 'ATTESTATION_SKIPPED' 'gh is installed but not logged in, so provenance was not checked. The checksum still matched.'; break }
+        else { Flag 'ATTESTATION_FAILED' "gh attestation verify failed for $label (STOP): $($att.Trim())"; Finish 'blocked' }
+    }
 } elseif (-not $ZipPath) {
     Say 'attestation' 'skipped (gh not installed; checksum matched)'
 }
