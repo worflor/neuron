@@ -16,8 +16,8 @@
 //! Asset:  cpython-<PYVER>+<TAG>-<TRIPLE>-install_only_stripped.tar.gz
 //! URL:    https://github.com/astral-sh/python-build-standalone/releases/download/<TAG>/<asset>
 //!         (the literal `+` in the asset name is `%2B` in the URL).
-//! Integrity: this release ships ONE `SHA256SUMS` manifest (NOT per-asset `.sha256` siblings —
-//! verified against the real release). We fetch it, find the line for our asset, and compare.
+//! Integrity: each triple's digest is pinned in [`pinned_sha`], copied from the release's
+//! `SHA256SUMS`. A download and every cached tarball must match it.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -62,9 +62,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", tarball.display());
 
     if !tarball.exists() {
-        // Cache miss: download the tarball + the release SHA256SUMS manifest, verify, then commit.
+        // Cache miss: download the tarball, check it against the pinned digest, then commit.
         ensure_tarball(&tarball, triple, &asset);
     }
+    verify_cached(&tarball, triple);
 
     // SLIM the verified upstream tarball into a sibling `<asset>.slim.tar.gz` (stream-filter; see
     // `slim_tarball`). The crate embeds THIS one — dropping ~100 MB uncompressed of runtime-useless
@@ -358,7 +359,7 @@ fn repo_vendor_cache() -> PathBuf {
         .join("pbs-cache")
 }
 
-/// Download `asset` (+ verify against the release SHA256SUMS manifest), writing it to
+/// Download `asset` (+ verify against its pinned digest), writing it to
 /// `dest` through a sibling temp file so a killed build never leaves a
 /// half-tarball that looks cached. Panics with a clear message on any failure — a broken bundle
 /// must fail the build, not ship a Python that isn't there.
@@ -376,11 +377,10 @@ fn ensure_tarball(dest: &Path, triple: &str, asset: &str) {
     );
     // The literal `+` in the asset name must be percent-encoded in the URL path.
     let asset_url = format!("{base}/{}", asset.replace('+', "%2B"));
-    let sums_url = format!("{base}/SHA256SUMS");
 
     println!("cargo:warning=neuron: downloading CPython {PYVER} for {triple} (one-time, ~46 MB)…");
 
-    let want = expected_sha(&sums_url, asset);
+    let want = pinned_sha(triple);
     let bytes = http_get(&asset_url);
 
     let got = {
@@ -390,8 +390,8 @@ fn ensure_tarball(dest: &Path, triple: &str, asset: &str) {
     };
     if got != want {
         panic!(
-            "neuron: SHA256 MISMATCH for {asset}\n  expected (SHA256SUMS): {want}\n  \
-             downloaded:           {got}\nRefusing to bundle a tampered/corrupt interpreter."
+            "neuron: SHA256 MISMATCH for {asset}\n  pinned:     {want}\n  \
+             downloaded: {got}\nRefusing to bundle a tampered/corrupt interpreter."
         );
     }
 
@@ -407,23 +407,40 @@ fn ensure_tarball(dest: &Path, triple: &str, asset: &str) {
     );
 }
 
-/// Fetch the SHA256SUMS manifest and return the expected hex digest for `asset` (the line is
-/// `<hex>␠␠<filename>`). Panics if the asset isn't listed.
-fn expected_sha(sums_url: &str, asset: &str) -> String {
-    let body = http_get(sums_url);
-    let text = String::from_utf8(body).expect("SHA256SUMS is utf-8 text");
-    for line in text.lines() {
-        // Format: "<64-hex>  <filename>" (two spaces). Match on the trailing filename so a
-        // substring of another asset name can't collide.
-        let mut parts = line.split_whitespace();
-        let (Some(hexsum), Some(name)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        if name == asset {
-            return hexsum.to_ascii_lowercase();
-        }
+/// SHA-256 of each `install_only_stripped` tarball for TAG and PYVER, pinned in source so a
+/// replaced upstream release or a poisoned build cache cannot be embedded. Taken from the
+/// release's SHA256SUMS on 2026-11-07 and matched against the cached x86_64 Windows and Linux
+/// tarballs. Changing TAG or PYVER means re-pinning every row.
+fn pinned_sha(triple: &str) -> &'static str {
+    match triple {
+        "x86_64-pc-windows-msvc" => "99dce0b23bf3c3b28d350cdd7bfe3cd3be51cc4f285faae7c0df110d106d1a8d",
+        "aarch64-pc-windows-msvc" => "45cef3d23be2bbf950e33f1ed2517aaab5b5efb2f1bf2ae5b2c16ad9a7acc176",
+        "x86_64-apple-darwin" => "c56c2dfe3fb5569430f4eabcff1fc1334c66db708bf17c103eef3dd237f3e3ab",
+        "aarch64-apple-darwin" => "f0a7fa7decc75df2b1a789329a44f657c4a15c0a683f197ce46a5cb621bc6ef4",
+        "x86_64-unknown-linux-gnu" => "6682afef6b510037a0ad84e61150e5121af2e2785c9ca27b047e029270a840fe",
+        "aarch64-unknown-linux-gnu" => "eb85c6903552b1cb40b183a119681a9326fa97e31cf0e4b8c78bf26735ff1552",
+        "x86_64-unknown-linux-musl" => "cca04a9f21a8efb43f1da1f4d1b55da04e9af23e8ce6259f58c94b4ef1fa48a6",
+        "aarch64-unknown-linux-musl" => "f9153de0832a08a98cde89f7f5f2cc376544813c05bd2737279a1c8e3cb97913",
+        other => panic!("neuron: no pinned CPython digest for `{other}`; add one to build.rs::pinned_sha"),
     }
-    panic!("neuron: {asset} not found in SHA256SUMS manifest ({sums_url})");
+}
+
+/// Hash a cached tarball and refuse it unless it matches the pin. The cache directory is restored
+/// from CI caches and lives in the checkout, so its presence alone proves nothing.
+fn verify_cached(tarball: &Path, triple: &str) {
+    let bytes = std::fs::read(tarball)
+        .unwrap_or_else(|e| panic!("read cached tarball {}: {e}", tarball.display()));
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    let got = hex(&h.finalize());
+    let want = pinned_sha(triple);
+    if got != want {
+        panic!(
+            "neuron: cached CPython tarball {} does not match its pinned digest\n  pinned: {want}\n  \
+             cached: {got}\nDelete it to re-download, or investigate how it changed.",
+            tarball.display()
+        );
+    }
 }
 
 /// Blocking HTTP GET → bytes. `ureq` (rustls) follows redirects (GitHub release assets 302 to a
