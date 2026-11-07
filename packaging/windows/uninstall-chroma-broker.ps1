@@ -8,6 +8,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Elevated: autoload cmdlets (ScheduledTasks, ...) only from administrator-writable module folders,
+# never from the user's Documents, which a limited process can plant.
+$env:PSModulePath = @(
+    (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'),
+    (Join-Path $PSHOME 'Modules'),
+    (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules')
+) -join ';'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
