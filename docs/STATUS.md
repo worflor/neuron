@@ -16,28 +16,11 @@ Lighting scene changes now dissolve through the persistent base renderer. Softwa
 
 The table below grades what actually works. [The README](../README.md#honesty-proven-gated-absent) has the device-write ledger.
 
-The v0.1.6 candidate separates active repository builds from installed checkpoints,
-preserves other-copy startup ownership during checkpoint setup/removal, and adds offline copy
-inventory. Windows PowerShell fixtures exercise copy selection and the installer's actual ownership
-commands with fake tasks/processes. The revised Inno Setup source compiles; real setup/UAC/uninstall
-transitions have not yet been checked in a clean Windows VM. These changes are not in v0.1.5.
-
-The v0.1.6 release remains a draft. During Windows installation testing on 2026-10-16,
-Microsoft Defender blocked its Chroma broker and setup stopped before replacing the app payload.
-The previous broker was restored and verified. The detection remains unresolved; no protection
-setting was changed. The replacement installer now stages the candidate before stopping the old
-broker and retains protected rollback state. Uninstall preserves unresolved recovery state;
-pending-only first installs can resume after ownership and process checks. Isolated failure fixtures
-pass in Windows PowerShell 5.1 and PowerShell 7; they do not establish that the blocked binary is safe.
-The helper at `253f7db` was separately checked through real UAC on its successful replacement path with
-the verified v0.1.5 broker. Broker files, task definition and permissions matched afterward;
-the running source app, startup tasks, configuration and installed checkpoint were preserved.
-On 2026-11-07 the merged helper was checked through real UAC on the owner's desk: a candidate that
-exits at once failed the replacement after publication, and the previous executable, receipt, task
-definition, permissions and running broker were restored exactly. That run found the installer
-replacing the executable before the stopped broker's process had released it, which left the old
-binary beside it as a `~RF*.TMP` file; the installer now waits for that process to exit. A repeat
-of the failure run and a successful replacement under a running broker left no stray file.
+The v0.1.7 candidate (unreleased) includes the unpublished v0.1.6 and the changes in the
+[changelog](../CHANGELOG.md). v0.1.6 stayed a draft after Microsoft Defender flagged its Chroma
+broker during installation testing; the v0.1.7 broker is scanned before publishing. Broker
+replacement and rollback were checked through real UAC on 2026-11-07. Setup, update and uninstall in
+a clean Windows VM remain unchecked.
 
 | grade | meaning |
 |---|---|
@@ -62,9 +45,9 @@ of the failure run and a successful replacement under a running broker left no s
 | Synapse import, purge and discover | 🟢 solid | Plaintext export import, Windows purge and device discovery are implemented. Encrypted Synapse cloud profiles are not supported; a Synapse 3 layout is read instead from the mapping log its service writes, which holds only what the last Synapse session set (keys and mouse buttons; macros, modifier chords and DKM-addressed buttons are reported, not imported). |
 | Notifications | 🟢 solid | Visual cards and optional audio confirm committed changes. |
 | Profiles | 🟡 works, polishing | Capture, apply, rename and app-based switching are implemented. A profile groups settings, lighting and binds; a recent pass fixed lifecycle edges that need continued use. |
-| Device adoption | 🟡 works, polishing | Capability probing synthesizes definitions for unfamiliar `razer_report` devices and direct-attached Logitech HID++ devices. The Naga V2 Pro and BlackWidow Chroma V2 are hardware-verified; HID++ adoption is read-only and has no hardware verification. |
+| Device adoption | 🟡 works, polishing | Capability probing synthesizes definitions for unfamiliar `razer_report` devices and direct-attached Logitech HID++ devices. The Naga V2 Pro and BlackWidow Chroma V2 are hardware-verified; HID++ adoption is read-only and has no hardware verification. Device files load only within the commands Neuron's protocol knowledge gives each name. |
 | Lighting | 🟡 works, polishing | Firmware effects, per-key frames, pattern × spectrum layers, and live data layers are implemented. Wildlife adds a deterministic seasonal cellular pattern and read-side key feedback; it has not yet been visually checked on real hardware. The newer layer editing and data feeds need more everyday use. The v0.1.5 candidate adds gradient presets and per-effect pairing chips: the owner checked them in the running app, and a software-renderer test draws the page and hovers a chip. Not checked on other hardware. |
-| Macros and beacons | 🟡 works, polishing | BOUND and RAW CPython workers start on demand and then stay warm. Ask/notify, persistent state, macro composition and a source-preserving block editor are implemented. [The API reference](reference/MACROS.md) covers every helper; long-run ergonomics need work. RAW Python is unsandboxed. |
+| Macros and beacons | 🟡 works, polishing | BOUND and RAW CPython workers start on demand and then stay warm. Ask/notify, persistent state, macro composition and a source-preserving block editor are implemented. [The API reference](reference/MACROS.md) covers every helper; long-run ergonomics need work. BOUND runs behind a runtime wall that refuses file, process, network and native access; RAW Python is unsandboxed. |
 | Main GUI | 🟡 works, polishing | The Slint window defaults to FemtoVG/OpenGL. The software UI renderer is compiled in and can be forced with `NEURON_RENDERER=software`. The opt-in WGPU UI renderer builds, but measured idle CPU and memory were higher on the development machine; it does not accelerate overlays or material shading. Windows overlay instruments still compose pixels on the CPU. |
 | Reliability and recovery | 🟡 works, polishing | Flight recorder, crash log and read-only diagnostics are wired. Windows auto-relaunch is implemented but has not been exercised by a real crash or hang. |
 | Onboard memory | 🟠 partial | Storage accounting and volatile writes work. Full onboard profile-slot persistence and scroll feel-curves are not complete. |

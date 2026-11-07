@@ -2,40 +2,41 @@
 
 ## Unreleased
 
-- Device definition files in `devices/` and `devices/auto/` are now bounded by Neuron's protocol knowledge when they load. A named command must use an opcode the synthesis catalog or a built-in definition gives that name, any other command must be a read the protocol ledger records, lighting may only write the opcodes synthesis emits, Razer dialects must name Razer's vendor id, and `stream_wait_us` is capped. Previously a crafted file could aim a getter that runs automatically at startup, such as the firmware read, at the device-mode switch. Everything synthesis produces passes by construction (checked across random synthesized devices), so discovery of new devices is unaffected. A refused or unparseable file is now reported instead of skipped silently.
-- The elevated Synapse purge no longer runs the run-root migration, and the elevated Chroma broker scripts load modules only from administrator-writable folders.
-- A macro parse or syntax check now has a 10-second budget instead of the 2.5-second fire budget; a timeout there retires the whole Python session, which on a busy machine could stop warm RAW macros because the editor parsed something large.
+### Security
+- BOUND macros run behind a runtime wall that refuses file, process, network, native-library and new-module access by any route, closing an escape through string-based reflection. BOUND ignores `PYTHONPATH`, `PYTHONHOME` and user site packages.
+- `neuron apply` and `profile import` list and refuse RAW macros, command-running binds, path screenshots and onboard-memory profiles a file adds, unless `--allow-code` is passed.
+- Device definition files are bounded at load by Neuron's protocol knowledge: command opcodes per name, lighting writes, vendor id and settle wait. Refused and unparseable files are reported.
+- The Chroma REST server refuses requests whose `Host` is not a loopback name.
+- The updater validates `-Version`, downloads only from this repository's releases and verifies the setup program's attestation. The bundled CPython digest is pinned in source, and CI release builds re-derive the embedded runtime from the pinned tarball.
+- Elevated helpers no longer copy or load from user-writable folders.
 
-- A shared setup document or profile could install a RAW macro, or a bind that runs a command or program, and attach it to a trigger such as switching apps; `--dry-run` only reported "1 of 1 macros differ". `neuron apply` and `neuron profile import` now list every RAW macro, command-running bind, path screenshot and onboard-memory profile a file adds, and refuse them unless `--allow-code` is passed. Items already installed don't count, so re-applying one's own dump is unaffected; restoring it onto a fresh machine needs the flag.
-- BOUND macro processes ignore `PYTHONPATH`, `PYTHONHOME` and the user site directory, so a `.pth` or `sitecustomize` file can no longer run before the BOUND runtime wall is in place. RAW keeps them.
-- The updater refuses a `-Version` that isn't a version string, only downloads from this repository's release URLs, and checks the provenance attestation of the setup program it runs as well as the zip.
-- The bundled CPython's digest is pinned in source for every supported platform, and a cached tarball is re-hashed against it on each build instead of being trusted because it exists.
-- `neuron apply` names the section and folder when a write fails, instead of a bare "Access is denied".
+### Macros
+- BOUND macros can use `signal` and the OBS helpers; `obs_request` is RAW-only.
+- Effect helpers return `True` or the host's confirmation on success and a falsy `"[reason]"` otherwise, in both modes. BOUND input helpers previously returned `"ok"`.
+- `datetime.strptime` works in BOUND macros. Dry runs no longer change live Signal lighting. Parse and check wait up to 10 s, so a slow parse no longer restarts the Python session.
+- Added the macro API reference (`docs/reference/MACROS.md`).
 
-- BOUND macros could escape their sandbox. String-driven reflection such as `operator.attrgetter("__class__...")` passed the source checks and reached Python's real builtins, so a shared BOUND macro could open files or start programs with the user's authority, even with input disarmed. The BOUND process now installs a runtime wall that refuses file, process, network, native-library and new-module access whatever route reaches them, and the host refuses RAW-only actions from the BOUND process. Verified by an end-to-end test that performs the escape and checks each operation is refused, and that fails without the wall.
-- The Chroma REST server (127.0.0.1:54235) now refuses requests whose `Host` is not a loopback name, so a web page that rebinds its domain to 127.0.0.1 can no longer drive or read Chroma sessions. Checked against the running app before the fix; a forged `Host` opened a session.
-- `neuron apply` rejects an unknown section instead of reporting "nothing to change", so a misspelled `[macro]` no longer applies nothing silently.
+### Devices
+- Generated definitions for DPI-less keyboards on the 0x0F lighting protocol (BlackWidow V3, V4 X) target the whole board and the backlight. Unverified on those boards. Older generated files of that shape are rebuilt on the next adoption, with a `.v1.bak` backup.
+- Generated device files no longer record round-trips or answers that were never measured.
+- The device report form asks about Windows Dynamic Lighting and accepts the generated device file.
 
-- Worker heartbeat ages now exclude time the PC spends asleep, and a gap of more than five seconds between heartbeat checks is treated as the whole app having been frozen rather than as each worker stalling. Waking from sleep or Modern Standby should no longer raise an "internal stall" warning or write a stall dump to the crash log. A worker that was already silent before such a gap keeps its age rather than being reset. Verified by unit tests while awake; the resume path itself has not been exercised in an automated run.
-- BOUND macros (the default mode) can now use the OBS helpers and `neuron.signal`. They were missing from the module's export list, which BOUND uses as its capability list, so calls failed with "bound neuron has no capability". Effect helpers now return the same shapes in both modes: `True` or the host's confirmation when the effect happened, and a falsy `"[reason]"` string when it did not. BOUND input helpers used to return `"ok"`, so a macro that compared a result with `"ok"` should test its truth instead. `obs_request`, which reaches the whole obs-websocket API, stays RAW-only like `run`, and a dry run no longer changes live Signal lighting. Host-side failures such as a failed brightness write used to come back as plain text that looked like success, and a BOUND `focus` on a missing window reported success. Verified by an end-to-end test of both modes with input disarmed, and on the owner's desk with input armed: a BOUND macro on a keyboard M-key typed its key, `key` returned `True`, an out-of-range `signal` returned its bracketed reason and `obs_connected` returned `False` with OBS closed.
-- A stall dump now records each watched worker thread's scheduler state, wait reason and CPU time, then the CPU each used over the next second, so a stall reads as stuck, busy or starved. Most stall dumps in the owner's log happened while the PC was awake; their cause is not yet known.
-- Generated device files no longer claim that a round-trip was measured when none was, and say that their setters were paired with an answering getter but never sent. A file for a dialect that probed nothing no longer claims any command answered.
-- The device report form asks whether Windows Dynamic Lighting is on and accepts Neuron's generated device file.
-- Added a source-derived BlackWidow V4 X descriptor fixture from two identical public upstream dumps. It pins one control pipe, the M-key report collections and a Windows Dynamic Lighting LampArray. No V4 X support is claimed.
-- The full validation gate now fails `neuron-core` lint on unchecked `Instant - Duration` subtraction, the pattern behind an early-session panic fixed in September; the other crates already had this lint.
-- Generated definitions for devices without DPI on the extended (0x0F) lighting protocol, such as the BlackWidow V3 and V4 X keyboards, now target the whole board instead of the logo region. Effects and custom-frame rows carry the bytes Razer's own Synapse modules send those boards, and spectrum and wave ids follow the same source. Brightness is written and read back on the backlight region, which Synapse reads and openrazer writes. Only a device whose backlight getter answers is treated as a keyboard; other DPI-less matrix devices, such as docks and mats, keep their earlier logo-region values. The custom-frame row layout matches a public capture of Synapse driving a V3. Mice keep their existing values. Unverified on a V3 or V4 X; no support is claimed.
-- A generated definition from earlier versions with the old logo-region bytes on the keyboard grid is no longer loaded. The next adoption pass moves it to `.toml.v1.bak`, rebuilds it, and reports the move. A file whose lighting was edited by hand, or whose backup already exists, is kept and loads as before; other edits stay in the backup. Generated files now carry a `synth-version` line.
-- Quitting from the tray stops live dispatch first, with a two-second limit on waiting for its worker, and releases the tray's hold on runtime state before exit. On Windows, a graceful quit previously panicked in process teardown when the runtime joined an already-terminated thread. A tray quit of the release build on the owner's desk exited without a panic or crash-log entry.
+### Reliability
+- Sleep and Modern Standby no longer cause false stall warnings. Stall dumps record each worker's thread state, wait reason and CPU use.
+- Quitting from the tray no longer panics during teardown.
+- Chroma broker updates stage and verify the replacement before stopping the working copy and restore it on failure; checked through real UAC. Uninstall keeps unresolved recovery state.
 
-## v0.1.6
+### Setup documents
+- `neuron apply` rejects unknown sections and names the section and folder when a write fails.
+
+## v0.1.6 (tagged, not published; included in v0.1.7)
 
 - Preserved lighting ownership across host recovery and fixed OpenRGB single-LED updates after surface resizing.
 - Refreshed macro-key eligibility after keyboard adoption, with held-key state shared correctly across sibling collections and aliases.
-- Rejected malformed Razer discovery replies and incomplete HID++ replies, while preserving Windows' padded short-report handling. Added source-derived offline protocol, adoption and reconnect regressions; no new hardware support is claimed.
-- Added offline Windows copy inventory (`neuron-update.ps1 -Action status`, with `-Json` for agents), separating the running repo build, installed release checkpoint, startup target and config paths. Version checks read passive package metadata; unknown source-build versions remain unknown. Ambiguous startup targets can be inspected without selecting an update destination.
-- Repository builds preserve another copy's Windows startup target; `release.ps1 -UseAtStartup` makes reassignment explicit. New checkpoint installers preserve other running/startup copies, and checkpoint uninstall retains their startup target and shared Chroma broker. User configuration stays separate from payload removal. Real setup/UAC/uninstall transitions still need a clean Windows VM run.
-- Already-current updates avoid redundant downloads and backups, updater scratch directories are cleaned on reported outcomes, and local packaging requires `-ReplaceExisting` to overwrite existing versioned assets. Local packages retain version-specific checksum files. Windows lifecycle fixtures run in the normal validation gate; app tests keep line-table debug information to reduce build memory.
-- Chroma broker updates verify a protected replacement before stopping the working copy. Failed replacements restore the previous files and task; failed rollback retains a protected recovery copy for inspection. Uninstall preserves unresolved recovery state, and interrupted first installs can resume from their verified ownership record. The replacement and uninstall wait for the old broker's process to exit before touching its executable, a process that exits mid-check no longer fails the transaction, rollback leaves an unchanged executable alone, and cleanup removes its ownership marker last with retries. Failure rollback and a successful replacement were checked through real UAC on Windows 11.
+- Rejected malformed Razer discovery replies and incomplete HID++ replies, while preserving Windows' padded short-report handling.
+- Added offline Windows copy inventory (`neuron-update.ps1 -Action status`, `-Json` for agents), separating the running repo build, installed checkpoint, startup target and config paths.
+- Repository builds, installers and uninstall preserve other copies' startup target and the shared Chroma broker; `release.ps1 -UseAtStartup` makes reassignment explicit. User configuration stays separate from payload removal.
+- Already-current updates skip redundant downloads and backups; updater scratch directories are cleaned up.
 
 ## v0.1.5
 
