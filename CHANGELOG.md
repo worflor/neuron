@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Device definition files in `devices/` and `devices/auto/` are now bounded by Neuron's protocol knowledge when they load. A named command must use an opcode the synthesis catalog or a built-in definition gives that name, any other command must be a read the protocol ledger records, lighting may only write the opcodes synthesis emits, Razer dialects must name Razer's vendor id, and `stream_wait_us` is capped. Previously a crafted file could aim a getter that runs automatically at startup, such as the firmware read, at the device-mode switch. Everything synthesis produces passes by construction (checked across random synthesized devices), so discovery of new devices is unaffected. A refused or unparseable file is now reported instead of skipped silently.
+- The elevated Synapse purge no longer runs the run-root migration, and the elevated Chroma broker scripts load modules only from administrator-writable folders.
+- A macro parse or syntax check now has a 10-second budget instead of the 2.5-second fire budget; a timeout there retires the whole Python session, which on a busy machine could stop warm RAW macros because the editor parsed something large.
+
 - A shared setup document or profile could install a RAW macro, or a bind that runs a command or program, and attach it to a trigger such as switching apps; `--dry-run` only reported "1 of 1 macros differ". `neuron apply` and `neuron profile import` now list every RAW macro, command-running bind, path screenshot and onboard-memory profile a file adds, and refuse them unless `--allow-code` is passed. Items already installed don't count, so re-applying one's own dump is unaffected; restoring it onto a fresh machine needs the flag.
 - BOUND macro processes ignore `PYTHONPATH`, `PYTHONHOME` and the user site directory, so a `.pth` or `sitecustomize` file can no longer run before the BOUND runtime wall is in place. RAW keeps them.
 - The updater refuses a `-Version` that isn't a version string, only downloads from this repository's release URLs, and checks the provenance attestation of the setup program it runs as well as the zip.
