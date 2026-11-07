@@ -91,6 +91,10 @@ pub enum ProfileCmd {
         /// overwrite a profile of the same name
         #[arg(long)]
         replace: bool,
+        /// accept binds that run commands or programs, and onboard-memory writes, that the
+        /// profile adds; without it they are listed and refused
+        #[arg(long)]
+        allow_code: bool,
     },
     /// Which profile a focused app switches to
     Route {
@@ -296,7 +300,7 @@ pub fn run(cmd: ProfileCmd, reg: &Registry) -> Result<()> {
             }
             Ok(())
         }
-        ProfileCmd::Import { file, replace } => {
+        ProfileCmd::Import { file, replace, allow_code } => {
             let spec = if file == "-" { "-".to_string() } else { format!("@{file}") };
             let text = crate::spec::read_spec(&spec)?;
             let b: ProfileBundle = if text.trim_start().starts_with('{') {
@@ -314,7 +318,7 @@ pub fn run(cmd: ProfileCmd, reg: &Registry) -> Result<()> {
             if neuron::authoring::has_errors(&layer_issues) {
                 bail!("{}", layer_issues.iter().map(|x| x.message.as_str()).collect::<Vec<_>>().join("; "));
             }
-            let landed = manage::import_bundle(&b, replace).map_err(anyhow::Error::msg)?;
+            let landed = manage::import_bundle(&b, replace, allow_code).map_err(anyhow::Error::msg)?;
             let back = manage::export_profile(&landed).map_err(anyhow::Error::msg)?;
             live::finish(bundle_json(&back), format!("imported '{landed}'"));
             Ok(())

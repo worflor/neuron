@@ -238,7 +238,7 @@ dpi-stages, polling, brightness, idle-secs, in-game-polling, disable-alt-tab, di
 disable-alt-esc, persist; `unset` clears an optional one); `profile save NAME --dpi ...`; `profile apply
 NAME [--live]` (`--live` has the running app apply it through its own device session); `profile rename
 FROM TO` (binds and routes follow); `profile delete NAME --yes`; `profile capture NAME` (reads the
-hardware); `profile export NAME [--out F]`; `profile import FILE [--replace]`.
+hardware); `profile export NAME [--out F]`; `profile import FILE [--replace] [--allow-code]`.
 
 `profile route list|add APP PROFILE|rm INDEX|mv FROM TO|default PROFILE|--clear`: which focused app
 switches to which profile. First match wins; `default` is where a non-matching app returns.
@@ -292,12 +292,18 @@ whether the app runs, the active profile and counts. `reload` signals the app.
 and binds), `badges`, `macros` (sources) with their option values, `app` (preferences, secrets removed),
 and with `--vault` the glyph shapes.
 
-`neuron apply FILE [--dry-run] [--prune] [--strict] [--check-macros]` makes the machine match the
-document. A section in the document is authoritative for that part; a section left out is untouched.
-Everything is validated first and nothing is written if anything is wrong. Applying is idempotent: a
-section already equal to disk is reported `unchanged` and not rewritten. `--prune` also deletes profiles,
-macros, badges and preference keys the document omits; `--strict` makes unresolved macro/profile names
-errors. The reply lists each section with `unchanged`, `updated` or `would-update`.
+`neuron apply FILE [--dry-run] [--prune] [--strict] [--check-macros] [--allow-code]` makes the
+machine match the document. A section in the document is authoritative for that part; a section left
+out is untouched. Everything is validated first and nothing is written if anything is wrong. Applying
+is idempotent: a section already equal to disk is reported `unchanged` and not rewritten. `--prune`
+also deletes profiles, macros, badges and preference keys the document omits; `--strict` makes
+unresolved macro/profile names errors. The reply lists each section with `unchanged`, `updated` or
+`would-update`.
+
+A document that adds RAW macros, binds that run a command, shell script or program, screenshots
+saved to a path, or profiles that write onboard memory is refused, with each item listed, unless
+`--allow-code` is given. Items already installed don't count, so re-applying your own dump needs no
+flag; restoring it onto a fresh machine does. `profile import` follows the same rule.
 
 ## JSON shapes
 

@@ -141,14 +141,25 @@ pub fn export_profile(name: &str) -> Result<ProfileBundle, String> {
 }
 
 /// Write a bundle as a profile. An existing profile of that name is replaced only with `replace`.
-/// Returns the name it landed under.
-pub fn import_bundle(b: &ProfileBundle, replace: bool) -> Result<String, String> {
+/// Binds that run code and onboard-memory writes it adds are refused unless `allow_code`; see
+/// [`crate::setup::code_it_adds`]. Returns the name it landed under.
+pub fn import_bundle(b: &ProfileBundle, replace: bool, allow_code: bool) -> Result<String, String> {
     let name = b.profile.name.trim();
     if let Some(why) = crate::profile::name_conflict(name) {
         return Err(why);
     }
     if Profile::path(name).exists() && !replace {
         return Err(format!("profile '{name}' already exists (pass --replace to overwrite it)"));
+    }
+    if !allow_code {
+        let doc = crate::setup::Setup { profiles: Some(vec![b.clone()]), ..crate::setup::Setup::default() };
+        let found = crate::setup::code_it_adds(&doc);
+        if !found.is_empty() {
+            return Err(format!(
+                "this profile {}; pass --allow-code only if you trust where it came from",
+                found.join("; ")
+            ));
+        }
     }
     save_bundle(b)?;
     Ok(name.to_string())
