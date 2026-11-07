@@ -639,6 +639,12 @@ fn subsumed(existing: &[DeviceDef], def: &DeviceDef) -> bool {
     })
 }
 
+/// The definitions compiled into the binary.
+pub(crate) const BUILTINS: &[&str] = &[
+    include_str!("../devices/razer-naga-v2-pro.toml"),
+    include_str!("../devices/razer-blackwidow-chroma-v2.toml"),
+];
+
 impl Registry {
     /// Razer event PIDs eligible for deferred macro-key input. DPI-device ownership
     /// takes precedence, including receiver aliases; firmware custody stays untouched.
@@ -660,10 +666,6 @@ impl Registry {
         // (probe → `crate::synth` → devices/auto/) — the live end-to-end test for auto-adoption
         // on hardware that normally has a curated def. Off (unset) in any real run.
         if std::env::var("NEURON_PURE_DISCOVERY").map_or(true, |v| v != "1") {
-            const BUILTINS: &[&str] = &[
-                include_str!("../devices/razer-naga-v2-pro.toml"),
-                include_str!("../devices/razer-blackwidow-chroma-v2.toml"),
-            ];
             for src in BUILTINS {
                 let def = toml::from_str::<DeviceDef>(src)?;
                 // Builtins are compile-embedded with KNOWN dialect ids — unlike external files they
@@ -702,8 +704,21 @@ impl Registry {
                     let p = entry.path();
                     if p.extension().is_some_and(|x| x == "toml") && p.is_file() {
                         if let Ok(txt) = std::fs::read_to_string(&p) {
-                            if let Ok(mut def) = toml::from_str::<DeviceDef>(&txt) {
+                            let mut def = match toml::from_str::<DeviceDef>(&txt) {
+                                Ok(def) => def,
+                                Err(e) => {
+                                    eprintln!("neuron: ignoring device file {}: {e}", p.display());
+                                    continue;
+                                }
+                            };
+                            {
                                 def.origin = origin.clone();
+                                // A file is an output of discovery, never a source of authority:
+                                // what it may send is bounded by Neuron's protocol knowledge.
+                                if let Err(why) = crate::defcheck::check(&def) {
+                                    eprintln!("neuron: ignoring device file {}: {why}", p.display());
+                                    continue;
+                                }
                                 // REJECT UNROUTABLE at the LOAD boundary: a def we cannot ROUTE (its
                                 // `dialect` resolves to no registered family — a typo or a stale
                                 // user-editable auto file) is dead weight that would OCCUPY its pid.

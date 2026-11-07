@@ -426,6 +426,30 @@ fn legacy_lighting(rows: u8, cols: u8, brightness_proven: bool) -> LightingDef {
     }
 }
 
+/// Every `(command name, class, id)` synthesis can emit for a Razer device: catalog getters and
+/// their paired setters, plus the keyboard backlight getter. Device files are checked against
+/// this, so it grows with the catalog rather than with a list of devices.
+pub(crate) fn known_commands() -> Vec<(&'static str, u8, u8)> {
+    let mut out = vec![("brightness", 0x0F, 0x84)];
+    for e in CATALOG {
+        out.push((e.name, e.class, e.id));
+        out.extend(e.setters.iter().map(|s| (s.name, s.class, s.id)));
+    }
+    out
+}
+
+/// Every `(class, id)` a synthesized lighting block writes (effect, custom frame, brightness)
+/// across the matrix mouse, matrix keyboard and legacy shapes.
+pub(crate) fn lighting_opcodes() -> Vec<(u8, u8)> {
+    let mut out = Vec::new();
+    for l in [matrix_lighting(1, 2, true, false), matrix_lighting(6, 22, true, true), legacy_lighting(6, 22, true)] {
+        out.push((l.effect.class, l.effect.id));
+        out.extend(l.custom_frame.iter().map(|c| (c.class, c.id)));
+        out.extend(l.brightness.iter().map(|c| (c.class, c.id)));
+    }
+    out
+}
+
 /// Probe one Razer control pipe and synthesize its complete [`DeviceDef`]. Read-only.
 /// `None` when the pipe never answers the firmware getter (not a talking `razer_report` pipe —
 /// e.g. a secondary collection that enumerates with the right shape but stays mute).
@@ -1868,6 +1892,9 @@ mod tests {
                 back.origin = s.def.origin.clone();
                 prop_assert_eq!(&back, &s.def);
                 prop_assert!(!is_stale_auto_def(Path::new("unwritten.toml"), &text, &back));
+                // What discovery writes must load: the load-time bound is derived from the same
+                // knowledge synthesis uses, so a device nobody has tested is never refused.
+                prop_assert_eq!(crate::defcheck::check(&back), Ok(()));
 
                 let d = &s.def;
                 for (set, get) in [
