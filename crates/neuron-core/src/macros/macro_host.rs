@@ -2207,6 +2207,12 @@ fn spawn_session(
     let rt = resolve_runtime()?;
 
     let mut cmd = Command::new(&rt.python);
+    // BOUND ignores PYTHON* variables and the user site directory: a `.pth` file or PYTHONPATH
+    // entry would otherwise run before neuron_host.py seals the process. RAW keeps them, since a
+    // RAW macro may rely on packages the user installed.
+    if mode == MacroMode::Bound {
+        cmd.args(["-E", "-s"]);
+    }
     cmd.arg(&rt.host_script)
         .env("NEURON_MACRO_MODE", match mode {
             MacroMode::Raw => "raw",

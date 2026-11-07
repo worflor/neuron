@@ -21,6 +21,16 @@ fn bound_and_raw_are_distinct_authority_domains() {
     std::env::set_current_dir(&tmp).unwrap();
     let _run_pin = neuron::runroot::RunDirPin::to(&tmp);
     std::env::set_var("NEURON_MACRO_STATE", tmp.join("state"));
+    // A sitecustomize on PYTHONPATH runs at interpreter start, before neuron_host.py can seal
+    // BOUND. It leaves a marker named after the sidecar's mode.
+    let site = tmp.join("site");
+    std::fs::create_dir_all(&site).unwrap();
+    std::fs::write(
+        site.join("sitecustomize.py"),
+        "import os\nopen(os.path.join(os.path.dirname(__file__), 'loaded-' + os.environ.get('NEURON_MACRO_MODE', '?')), 'w').close()\n",
+    )
+    .unwrap();
+    std::env::set_var("PYTHONPATH", &site);
 
     let host = macro_host();
     if !host.available() {
@@ -283,6 +293,10 @@ def macro(ctx):
     for label in ["open", "listdir", "import"] {
         assert!(got.contains(&format!("{label}=ran")), "RAW lost {label}: {got}");
     }
+
+    assert!(site.join("loaded-raw").exists(), "the probe never ran, so it proves nothing");
+    assert!(!site.join("loaded-bound").exists(), "BOUND ran code from PYTHONPATH before sealing");
+    std::env::remove_var("PYTHONPATH");
 
     for id in [
         "bound_wall",
