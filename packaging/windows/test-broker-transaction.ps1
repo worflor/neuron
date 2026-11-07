@@ -742,8 +742,8 @@ $productionFunctions = @(
     'Copy-ProtectedBrokerFile', 'Capture-BrokerPriorState', 'Stop-BrokerTask',
     'Restore-BrokerTaskRuntimeState', 'Publish-BrokerCandidate', 'Install-BrokerTask',
     'Commit-BrokerReceipt', 'Verify-BrokerReplacement', 'Restore-BrokerFile',
-    'Restore-BrokerState', 'Cleanup-BrokerTransaction', 'Install-ProtectedBrokerReplacement',
-    'Write-ProtectedRecord'
+    'Restore-BrokerState', 'Cleanup-BrokerTransaction', 'Remove-RecoveryItemWithRetry',
+    'Install-ProtectedBrokerReplacement', 'Write-ProtectedRecord'
 )
 foreach ($name in $productionFunctions) { Import-ProductionFunction $name $name }
 Import-ProductionFunction 'Replace-BrokerFile' 'Invoke-ProductionReplaceBrokerFile'
@@ -775,7 +775,7 @@ $productionCommands = @(
     'New-Item', 'New-Object', 'New-ScheduledTaskAction', 'New-ScheduledTaskPrincipal',
     'New-ScheduledTaskSettingsSet', 'New-ScheduledTaskTrigger', 'New-TimeSpan', 'Out-Null',
     'Out-String', 'Prepare-BrokerCandidate', 'Publish-BrokerCandidate', 'Register-ScheduledTask',
-    'Remove-Item', 'Remove-RecognizedTransactionDirectory', 'Replace-BrokerFile', 'Restore-BrokerFile', 'Restore-BrokerState',
+    'Remove-Item', 'Remove-RecognizedTransactionDirectory', 'Remove-RecoveryItemWithRetry', 'Replace-BrokerFile', 'Restore-BrokerFile', 'Restore-BrokerState',
     'Restore-BrokerTaskRuntimeState', 'Restore-BrokerTaskSnapshot', 'Select-Object', 'Set-ProtectedFileAcl',
     'Start-ScheduledTask', 'Start-Sleep', 'Stop-BrokerTask', 'Stop-ScheduledTask', 'Test-Path',
     'Test-OwnershipRecord', 'Unregister-ScheduledTask', 'Verify-BrokerReplacement', 'Where-Object',
@@ -870,6 +870,23 @@ try {
     $Script:LingerAfterStop = 0
     Assert-OriginalReplacementState 'process never exits'
     Assert ((Get-RecoveryDirectories).Count -eq 0) 'process never exits leaked a recovery directory'
+
+    Initialize-Fixture 'publish-fails-before-replacing'
+    $result = Invoke-Replacement 'PublishFailure'
+    Assert $result.Failed 'publication failure did not fail replacement'
+    Assert (@($Script:Events | Where-Object { $_ -like 'Replace:*>neuron-chroma-broker.exe' }).Count -eq 1) 'rollback replaced an executable that was never changed'
+    Assert-OriginalReplacementState 'publication failure'
+    Assert ((Get-RecoveryDirectories).Count -eq 0) 'publication failure leaked a recovery directory'
+
+    Initialize-Fixture 'cleanup-removes-marker-last'
+    $result = Invoke-Replacement ''
+    Assert (-not $result.Failed) ('cleanup ordering replacement failed: ' + $result.Message)
+    $events = @($Script:Events)
+    $dirRemoval = -1
+    for ($i = 0; $i -lt $events.Count; $i++) {
+        if ($events[$i] -like 'Remove:NeuronChromaBroker.recovery-*') { $dirRemoval = $i }
+    }
+    Assert ($dirRemoval -ge 1 -and $events[$dirRemoval - 1] -eq 'Remove:broker-install.pending') ('recovery cleanup did not remove its ownership marker last: ' + (($events | Where-Object { $_ -like 'Remove:*' }) -join ','))
 
     Initialize-Fixture 'rollback-keeps-trusted-backup'
     $Script:SecondaryFaults = @('RestoreReceiptCorrupt')

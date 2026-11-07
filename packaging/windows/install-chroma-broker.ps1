@@ -224,6 +224,10 @@ function Get-BrokerProcessImagePaths {
             if ([string]::IsNullOrWhiteSpace($path)) { throw 'process image path is empty' }
             $paths.Add([IO.Path]::GetFullPath($path))
         } catch {
+            # A process that exits between enumeration and the module read holds no image.
+            $exited = $false
+            try { $process.Refresh(); $exited = $process.HasExited } catch { $exited = $false }
+            if ($exited) { continue }
             throw "could not verify broker process $($process.Id): $($_.Exception.Message)"
         } finally {
             $process.Dispose()
@@ -713,11 +717,20 @@ function Restore-BrokerFile($backup, $destination, [bool]$present, $expectedHash
         if (Test-Path -LiteralPath $destination) { throw "broker state was not removed: $destination" }
         return
     }
+    if ((Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash -ine $expectedHash) {
+        throw "broker recovery copy changed: $backup"
+    }
+    Assert-RegularFileIfPresent $destination
+    # A failed publication can leave the original in place; replacing it again only adds a
+    # chance for a sharing violation to fail the rollback.
+    if ((Test-Path -LiteralPath $destination -PathType Leaf) -and
+        (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash -ieq $expectedHash) {
+        Set-ProtectedFileAcl $destination $false
+        Assert-ProtectedFileAcl $destination
+        return
+    }
     $temp = "$destination.restore-$PID-$([guid]::NewGuid().ToString('N'))"
     try {
-        if ((Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash -ine $expectedHash) {
-            throw "broker recovery copy changed: $backup"
-        }
         Copy-Item -LiteralPath $backup -Destination $temp -ErrorAction Stop | Out-Null
         Set-ProtectedFileAcl $temp $false
         if ((Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash -ine $expectedHash) {
@@ -774,10 +787,25 @@ function Cleanup-BrokerTransaction($context) {
         }
         Assert-ProtectedFileAcl $child.FullName
     }
-    foreach ($child in $children) {
-        Remove-Item -LiteralPath $child.FullName -Force -ErrorAction Stop
+    # The ownership marker goes last so an interrupted cleanup still leaves an owned directory.
+    $ordered = @($children | Where-Object { $_.Name -ne 'broker-install.pending' }) +
+        @($children | Where-Object { $_.Name -eq 'broker-install.pending' })
+    foreach ($child in $ordered) {
+        Remove-RecoveryItemWithRetry $child.FullName
     }
-    Remove-Item -LiteralPath $context.RecoveryDirectory -Force -ErrorAction Stop
+    Remove-RecoveryItemWithRetry $context.RecoveryDirectory
+}
+
+function Remove-RecoveryItemWithRetry($path) {
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -ge 5) { throw }
+            Start-Sleep -Milliseconds 200
+        }
+    }
 }
 
 function Install-ProtectedBrokerReplacement($Source, $ExpectedSha256, $OwnerSid, $ProgramFiles,
