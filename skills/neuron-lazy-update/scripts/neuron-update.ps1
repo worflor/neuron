@@ -698,7 +698,7 @@ if ($ZipPath) {
 } else {
     # The tag becomes part of an API route; anything but a version could walk that route to
     # another repository's release.
-    if ($Version -and $Version -notmatch '^v?\d+\.\d+\.\d+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
+    if ($Version -and $Version -cnotmatch '\Av?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?\z') {
         Flag 'BAD_VERSION' "'$Version' is not a version such as v0.1.6"
         Finish 'error'
     }

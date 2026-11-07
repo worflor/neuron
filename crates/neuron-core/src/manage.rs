@@ -156,7 +156,7 @@ pub fn import_bundle(b: &ProfileBundle, replace: bool, allow_code: bool) -> Resu
         let found = crate::setup::code_it_adds(&doc);
         if !found.is_empty() {
             return Err(format!(
-                "this profile {}; pass --allow-code only if you trust where it came from",
+                "profile import refused: {}. Pass --allow-code if you trust where it came from",
                 found.join("; ")
             ));
         }

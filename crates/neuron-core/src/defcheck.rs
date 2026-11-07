@@ -4,14 +4,11 @@
 
 //! Load-time bounds for device definitions read from the run root.
 //!
-//! Neuron derives a device's definition from the device itself (`crate::synth`), so a file on disk
-//! is a record of discovery, not a grant of authority. What a file may make Neuron send is bounded
-//! by Neuron's protocol knowledge: a named command may only use an opcode that synthesis or a
-//! built-in definition uses for that name, an unnamed extra may only be a read the protocol ledger
-//! knows, and lighting writes may only use the opcodes synthesis emits. Everything Neuron
-//! synthesizes passes by construction, and the bound widens whenever the catalog or ledger learns
-//! something. A file that aims a getter at the device-mode switch, or a lighting effect at an
-//! unknown class, is refused before any byte reaches a device.
+//! A definition file records discovery; it does not grant authority. A named command may only use
+//! an opcode synthesis or a built-in definition gives that name, any other command must be a read
+//! the protocol ledger records, and lighting may only write opcodes synthesis emits. The bound is
+//! derived from the same knowledge synthesis uses, so everything synthesized passes and the bound
+//! grows with the catalog and ledger.
 
 use crate::registry::DeviceDef;
 use std::collections::{BTreeMap, BTreeSet};

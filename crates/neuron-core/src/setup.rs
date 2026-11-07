@@ -426,7 +426,6 @@ pub fn validate(doc: &Setup) -> Vec<Issue> {
     out
 }
 
-/// Make the machine match `doc`. Validation runs first; any error stops the apply before a write.
 /// Collect actions that run code or write outside the run root, wherever they sit in a document's
 /// JSON form: top-level rules, profile rules, cast wedges and rhythms, legacy bindings, and steps
 /// nested in sequences or turbo.
@@ -500,6 +499,7 @@ fn write_failed(section: &str, e: impl std::fmt::Display) -> String {
     format!("writing the {section} section in {}: {e}", crate::runroot::run_root().display())
 }
 
+/// Make the machine match `doc`. Validation runs first; any error stops the apply before a write.
 pub fn apply(doc: &Setup, opts: ApplyOpts) -> Result<ApplyReport, String> {
     let issues = validate(doc)
         .into_iter()
@@ -510,7 +510,9 @@ pub fn apply(doc: &Setup, opts: ApplyOpts) -> Result<ApplyReport, String> {
         report.issues.push(if opts.allow_code {
             Issue::warning(item)
         } else {
-            Issue::error(format!("{item} (pass --allow-code only if you trust where this file came from)"))
+            Issue::error(format!(
+                "{item} (pass --allow-code if you trust this file; restoring your own backup onto a fresh machine needs it too)"
+            ))
         });
     }
     if authoring::has_errors(&report.issues) {

@@ -540,7 +540,8 @@ fn parse_http_request(buf: &[u8]) -> Option<(HttpRequest, usize)> {
 }
 
 /// A `Host` naming this machine's loopback, with or without a port. A request without one (an
-/// HTTP/1.0 client) is not from a browser, which always sends it.
+/// HTTP/1.0 client) is not from a browser, which always sends it. `chromasdk.io` is the name
+/// Razer's web SDK uses for the local server; its owner points it at 127.0.0.1.
 fn host_is_loopback(host: Option<&str>) -> bool {
     let Some(host) = host else { return true };
     let name = if let Some(rest) = host.strip_prefix('[') {
@@ -548,7 +549,11 @@ fn host_is_loopback(host: Option<&str>) -> bool {
     } else {
         host.rsplit_once(':').map_or(host, |(name, _)| name)
     };
-    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
+    let name = name.strip_suffix('.').unwrap_or(name);
+    name.eq_ignore_ascii_case("localhost")
+        || name.eq_ignore_ascii_case("chromasdk.io")
+        || name == "127.0.0.1"
+        || name == "::1"
 }
 
 fn write_http_response(stream: &mut TcpStream, resp: &HttpResponse) -> std::io::Result<()> {
@@ -1030,7 +1035,8 @@ mod tests {
     #[test]
     fn chroma_accepts_only_loopback_host_names() {
         for ok in [None, Some("localhost"), Some("LOCALHOST:54235"), Some("127.0.0.1:54235"),
-                   Some("127.0.0.1"), Some("[::1]:54235"), Some("[::1]")] {
+                   Some("127.0.0.1"), Some("[::1]:54235"), Some("[::1]"), Some("localhost.:54235"),
+                   Some("chromasdk.io:54235")] {
             assert!(host_is_loopback(ok), "{ok:?}");
         }
         for bad in [Some("evil.example"), Some("evil.example:54235"), Some("localhost.evil.example"),

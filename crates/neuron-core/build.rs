@@ -102,7 +102,10 @@ fn ensure_slim(src: &Path, slim: &Path, build_rs: &Path) {
         .unwrap_or_else(|e| panic!("neuron: hash build script {}: {e}", build_rs.display()));
     let stamp = slim.with_extension("slim-inputs");
     let identity = slim_identity(&source_hash, &build_hash);
-    if !needs_reslim(slim, &stamp, &identity) {
+    // CI restores this directory from a shared cache, where a planted slim file could carry a
+    // matching stamp; release builds therefore always re-slim from the pinned tarball.
+    println!("cargo:rerun-if-env-changed=CI");
+    if std::env::var_os("CI").is_none() && !needs_reslim(slim, &stamp, &identity) {
         return;
     }
     println!(
@@ -407,10 +410,9 @@ fn ensure_tarball(dest: &Path, triple: &str, asset: &str) {
     );
 }
 
-/// SHA-256 of each `install_only_stripped` tarball for TAG and PYVER, pinned in source so a
-/// replaced upstream release or a poisoned build cache cannot be embedded. Taken from the
-/// release's SHA256SUMS on 2026-11-07 and matched against the cached x86_64 Windows and Linux
-/// tarballs. Changing TAG or PYVER means re-pinning every row.
+/// SHA-256 of each `install_only_stripped` tarball for TAG and PYVER, from the release's
+/// SHA256SUMS. Downloads and cached tarballs must match. Changing TAG or PYVER means re-pinning
+/// every row.
 fn pinned_sha(triple: &str) -> &'static str {
     match triple {
         "x86_64-pc-windows-msvc" => "99dce0b23bf3c3b28d350cdd7bfe3cd3be51cc4f285faae7c0df110d106d1a8d",
