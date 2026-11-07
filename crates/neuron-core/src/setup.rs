@@ -39,8 +39,10 @@ pub struct BadgeEntry {
     pub name: Option<String>,
 }
 
-/// The document. Every section is optional; scalars come first so it serializes as TOML.
+/// The document. Every section is optional; scalars come first so it serializes as TOML. An
+/// unknown section is an error, so a misspelled `[macro]` cannot report "nothing to change".
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Setup {
     #[serde(default = "format_one")]
     pub format: u32,
@@ -688,6 +690,16 @@ mod tests {
                 "a second apply changes nothing: {second:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_misspelled_section_is_an_error_not_a_silent_no_op() {
+        let err = parse("[macro]\nm = \"def macro(ctx):\\n    pass\\n\"\n").unwrap_err();
+        assert!(err.contains("unknown field `macro`") && err.contains("macros"), "{err}");
+        let err = parse(r#"{"rulez": []}"#).unwrap_err();
+        assert!(err.contains("unknown field `rulez`"), "{err}");
+        let dumped = to_toml(&Setup::default()).unwrap();
+        assert!(parse(&dumped).is_ok(), "a dumped document still parses");
     }
 
     #[test]
