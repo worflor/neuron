@@ -2644,6 +2644,12 @@ fn run_act(
     use crate::action::{Direction, Intent};
     use crate::capability as cap;
 
+    // `_mode` is the sidecar lane the frame arrived on, not a field the frame carries, so a BOUND
+    // process that forges an act frame still cannot reach a RAW-only verb.
+    if _mode == MacroMode::Bound && verb == "obs_request" {
+        return (false, "[requires RAW]".into());
+    }
+
     // ── SENSE: read-back verbs (never gated — reading state has no side effect) ──────────────────
     match verb {
         "active_profile" => return (true, crate::profile::active()),
@@ -3701,6 +3707,15 @@ mod tests {
         );
         assert!(!ok, "forged effect frame bypassed the host authority check");
         assert_eq!(msg, "[disarmed]");
+    }
+
+    #[test]
+    fn rust_refuses_raw_only_verbs_on_the_bound_lane() {
+        let (ok, msg) = run_act(
+            MacroMode::Bound, "forged_bound", "obs_request", &json!("GetVersion"), false, true, 0,
+        );
+        assert!(!ok, "a BOUND frame reached a RAW-only verb");
+        assert_eq!(msg, "[requires RAW]");
     }
 
     #[test]

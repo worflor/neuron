@@ -126,6 +126,44 @@ def _bound_import(name, globals=None, locals=None, fromlist=(), level=0):
     return _REAL_IMPORT(name, globals, locals, fromlist, level)
 
 
+# The AST policy above keeps ordinary BOUND code honest, but string-driven reflection
+# (operator.attrgetter, str.format fields, a public `sys` on an allowed module) reaches any loaded
+# object. The runtime wall is the boundary: once sealed, this process refuses every audited
+# operation that touches the machine. Audit hooks cannot be removed once added.
+_BOUND_DENIED_EVENTS = {
+    "open", "import", "code.__new__", "object.__setattr__", "object.__delattr__",
+    "pickle.find_class", "marshal.load", "marshal.loads", "builtins.breakpoint",
+    "sys.addaudithook", "cpython.run_command", "cpython.run_file", "cpython.run_module",
+}
+_BOUND_DENIED_PREFIXES = (
+    "os.", "subprocess.", "_winapi.", "ctypes.", "socket.", "winreg.", "msvcrt.", "shutil.",
+    "tempfile.", "glob.", "mmap.", "sqlite3.", "urllib.", "http.", "ftplib.", "smtplib.",
+    "poplib.", "imaplib.", "nntplib.", "telnetlib.", "webbrowser.", "pty.", "fcntl.",
+    "resource.", "syslog.", "_posixsubprocess.", "_wmi.",
+)
+# Loaded before sealing: macros may import these, and stdlib code reaches some lazily (strptime,
+# codec lookups) where a fresh import after sealing would be refused.
+_BOUND_PRELOAD = (
+    "_strptime", "ast", "encodings.ascii", "encodings.latin_1", "encodings.utf_16",
+    "encodings.utf_16_be", "encodings.utf_16_le", "encodings.utf_32", "encodings.cp1252",
+    "encodings.idna", "unicodedata",
+)
+
+
+def _seal_bound_process():
+    for name in sorted(_BOUND_IMPORTS) + list(_BOUND_PRELOAD):
+        try:
+            _REAL_IMPORT(name)
+        except ImportError:
+            pass
+
+    def _wall(event, _args):
+        if event in _BOUND_DENIED_EVENTS or event.startswith(_BOUND_DENIED_PREFIXES):
+            raise PermissionError("%s requires RAW mode" % event)
+
+    sys.addaudithook(_wall)
+
+
 _BOUND_BUILTINS = dict(vars(_builtins))
 for _name in (
     "open", "eval", "exec", "compile", "input", "breakpoint",
@@ -917,6 +955,8 @@ _nh._set_host_dispatch(_dispatch_fire)   # neuron.invoke(wait=False): enqueue on
 
 
 def main():
+    if _BOUND:
+        _seal_bound_process()
     _send({"t": "ready", "py": sys.version.split()[0], "platform": sys.platform,
            "mode": _HOST_MODE})
     while True:

@@ -234,7 +234,59 @@ def macro(ctx):
     let got = host.invoke("raw_obs_request", &ctx);
     assert!(got.contains("obs_request=False/[disarmed]"), "RAW obs_request ignored the arm gate: {got}");
 
+    // String-driven reflection gets past the static policy and reaches the real builtins, so the
+    // runtime wall must refuse every machine-touching operation that follows; RAW keeps them.
+    let escape = r#"def macro(ctx):
+    import operator
+    ag = operator.attrgetter
+    mc = operator.methodcaller
+    bi = None
+    for c in mc("__subclasses__")(ag("__class__.__base__")("")):
+        try:
+            g = ag("__init__.__globals__")(c).get("__builtins__")
+        except Exception:
+            continue
+        if hasattr(g, "get") and g.get("__import__"):
+            bi = g
+            break
+    if bi is None:
+        return "wall:no-vector"
+    imp = bi["__import__"]
+    os = imp("os")
+    sysm = imp("sys")
+    out = []
+    def attempt(label, fn):
+        try:
+            fn()
+            out.append(label + "=ran")
+        except PermissionError:
+            out.append(label + "=refused")
+        except Exception as e:
+            out.append(label + "=" + ag("__class__.__name__")(e))
+    attempt("open", lambda: bi["open"](sysm.executable, "rb").close())
+    attempt("listdir", lambda: os.listdir("."))
+    attempt("import", lambda: imp("socket"))
+"#;
+    let process_steps = r#"    attempt("system", lambda: os.system("exit 0"))
+    attempt("popen", lambda: imp("subprocess").Popen(["cmd", "/c", "exit", "0"]).wait())
+    attempt("ctypes", lambda: sysm.modules["ctypes"].windll.kernel32.GetTickCount())
+"#;
+    let finish = "    return 'wall:' + ','.join(out)\n";
+    host.register("bound_wall", &format!("{escape}{process_steps}{finish}"))
+        .expect("register BOUND escape probe");
+    let got = host.invoke("bound_wall", &ctx);
+    for label in ["open", "listdir", "system", "popen", "ctypes", "import"] {
+        assert!(got.contains(&format!("{label}=refused")), "BOUND wall let {label} through: {got}");
+    }
+    host.register("raw_wall", &format!("# neuron: raw\n{escape}{finish}")).expect("register RAW escape probe");
+    let got = host.invoke("raw_wall", &ctx);
+    for label in ["open", "listdir", "import"] {
+        assert!(got.contains(&format!("{label}=ran")), "RAW lost {label}: {got}");
+    }
+
     for id in [
+        "bound_wall",
+        "raw_wall",
         "raw_obs_request",
         "bound_helper_surface",
         "raw_helper_surface",
