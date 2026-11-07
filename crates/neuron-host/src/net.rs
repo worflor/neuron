@@ -475,6 +475,18 @@ fn serve_chroma_conn(
         };
         buf.drain(..consumed);
 
+        // A page that DNS-rebinds its own name onto 127.0.0.1 becomes same-origin with this server
+        // and could drive and read every session; its requests still carry that foreign Host.
+        if !host_is_loopback(req.host.as_deref()) {
+            handle.publish(
+                "host.chroma.http",
+                Value::Text(format!("{} {} -> 403 foreign host", req.method, req.path)),
+            );
+            let resp = HttpResponse { status: 403, body: "{\"result\":403}".into() };
+            let _ = write_http_response(&mut stream, &resp);
+            return;
+        }
+
         let resp = {
             let mut srv = server.lock().unwrap_or_else(PoisonError::into_inner);
             srv.handle(&req, &mut handle, Instant::now())
@@ -506,10 +518,13 @@ fn parse_http_request(buf: &[u8]) -> Option<(HttpRequest, usize)> {
     // Strip any query string; the Chroma routes are path-only.
     let path = request_line.next()?.split('?').next()?.to_string();
     let mut content_length = 0usize;
+    let mut host = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().ok()?;
+            } else if name.trim().eq_ignore_ascii_case("host") {
+                host = Some(value.trim().to_string());
             }
         }
     }
@@ -521,12 +536,25 @@ fn parse_http_request(buf: &[u8]) -> Option<(HttpRequest, usize)> {
         return None;
     }
     let body = buf[header_end..total].to_vec();
-    Some((HttpRequest { method, path, body }, total))
+    Some((HttpRequest { method, path, body, host }, total))
+}
+
+/// A `Host` naming this machine's loopback, with or without a port. A request without one (an
+/// HTTP/1.0 client) is not from a browser, which always sends it.
+fn host_is_loopback(host: Option<&str>) -> bool {
+    let Some(host) = host else { return true };
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _)| name)
+    };
+    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
 }
 
 fn write_http_response(stream: &mut TcpStream, resp: &HttpResponse) -> std::io::Result<()> {
     let reason = match resp.status {
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         _ => "OK",
     };
@@ -997,6 +1025,36 @@ mod tests {
                 return (status, body);
             }
         }
+    }
+
+    #[test]
+    fn chroma_accepts_only_loopback_host_names() {
+        for ok in [None, Some("localhost"), Some("LOCALHOST:54235"), Some("127.0.0.1:54235"),
+                   Some("127.0.0.1"), Some("[::1]:54235"), Some("[::1]")] {
+            assert!(host_is_loopback(ok), "{ok:?}");
+        }
+        for bad in [Some("evil.example"), Some("evil.example:54235"), Some("localhost.evil.example"),
+                    Some("127.0.0.1.nip.io"), Some(""), Some("[::2]:54235")] {
+            assert!(!host_is_loopback(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn chroma_refuses_a_rebound_host_over_a_real_socket() {
+        let host = Host::spawn().expect("spawn host");
+        let server = ChromaHttpServer::bind("127.0.0.1:0", host.handle()).expect("bind");
+        let mut s = TcpStream::connect(server.addr()).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let body = r#"{"title":"Rebound page"}"#;
+        let req = format!(
+            "POST /razer/chromasdk HTTP/1.1\r\nHost: evil.example:54235\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let (status, _) = read_http(&mut s);
+        assert_eq!(status, 403);
+        assert!(server.sessions().is_empty(), "a foreign Host opened a session");
     }
 
     #[test]

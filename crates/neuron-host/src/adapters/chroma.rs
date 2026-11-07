@@ -91,6 +91,8 @@ pub struct HttpRequest {
     /// Path only, e.g. "/razer/chromasdk/sess/54236/keyboard".
     pub path: String,
     pub body: Vec<u8>,
+    /// The `Host` header, when the client sent one.
+    pub host: Option<String>,
 }
 
 pub struct HttpResponse {
@@ -786,7 +788,7 @@ mod tests {
     }
 
     fn req(method: &str, path: &str, body: serde_json::Value) -> HttpRequest {
-        HttpRequest { method: method.into(), path: path.into(), body: body.to_string().into_bytes() }
+        HttpRequest { method: method.into(), path: path.into(), body: body.to_string().into_bytes(), host: None }
     }
 
     fn open_session(srv: &mut ChromaServer, k: &mut Kernel, now: Instant) -> u64 {
@@ -1316,6 +1318,7 @@ mod tests {
                 method: "PUT".into(),
                 path: format!("/razer/chromasdk/sess/{id}/keyboard"),
                 body: b"{not json".to_vec(),
+                host: None,
             },
             &mut k,
             now,

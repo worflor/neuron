@@ -199,6 +199,7 @@ mod tests {
                 method: "POST".into(),
                 path: "/razer/chromasdk".into(),
                 body: br#"{"title":"Game"}"#.to_vec(),
+                host: None,
             },
             &mut k,
             now,
@@ -211,6 +212,7 @@ mod tests {
                 method: "PUT".into(),
                 path: format!("/razer/chromasdk/sess/{sid}/keyboard"),
                 body: br#"{"effect":"CHROMA_STATIC","param":{"color":255}}"#.to_vec(), // BGR red
+                host: None,
             },
             &mut k,
             now,
