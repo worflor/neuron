@@ -52,6 +52,7 @@ pub mod confirm;
 pub mod compat;
 pub mod controls;
 pub mod curtain;
+pub mod defcheck;
 pub mod device;
 pub mod dialect;
 pub mod dpi_origin;
