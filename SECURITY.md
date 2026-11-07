@@ -25,7 +25,9 @@ treat anything with local code execution as able to paint your keyboard. none of
 
 BOUND and RAW never share an interpreter. a RAW crash cannot corrupt BOUND runtime state, and a BOUND macro cannot invoke a RAW macro as an authority tunnel; RAW may invoke BOUND, which still executes inside BOUND. the process boundary remains a reliability boundary for RAW and an important structural policy boundary for BOUND, but neither tier is marketed as adversarial-code isolation.
 
-**no account, no telemetry, no Neuron cloud.** config is plain TOML on your disk and Neuron itself does not phone home. the built-in runtime network surface is the opt-in loopback OBS connection above; RAW macros can of course open arbitrary network connections because they are ordinary Python. the build script also fetches and sha256-verifies the bundled CPython tarball at build time.
+**shared files are checked for code, device files are not.** `neuron apply` and `profile import` list and refuse RAW macros, binds that run commands or programs, path screenshots and onboard-memory profiles a file adds, unless you pass `--allow-code`. a **device definition** (`devices/*.toml`, `devices/auto/*.toml`) is different: Neuron sends the commands it declares as written, some of them automatically when the device is found, and does not yet check them against the protocol ledger at runtime. only use device files Neuron generated on your own machine or that ship with it. don't drop in one someone sent you.
+
+**no account, no telemetry, no Neuron cloud.** config is plain TOML on your disk and Neuron itself does not phone home. the built-in runtime network surface is the opt-in loopback OBS connection above; RAW macros can of course open arbitrary network connections because they are ordinary Python. the build script also fetches the bundled CPython tarball at build time and checks it, and any cached copy, against a sha256 pinned in source.
 
 ## reporting something
 

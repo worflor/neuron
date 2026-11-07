@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A shared setup document or profile could install a RAW macro, or a bind that runs a command or program, and attach it to a trigger such as switching apps; `--dry-run` only reported "1 of 1 macros differ". `neuron apply` and `neuron profile import` now list every RAW macro, command-running bind, path screenshot and onboard-memory profile a file adds, and refuse them unless `--allow-code` is passed. Items already installed don't count, so re-applying one's own dump is unaffected; restoring it onto a fresh machine needs the flag.
+- BOUND macro processes ignore `PYTHONPATH`, `PYTHONHOME` and the user site directory, so a `.pth` or `sitecustomize` file can no longer run before the BOUND runtime wall is in place. RAW keeps them.
+- The updater refuses a `-Version` that isn't a version string, only downloads from this repository's release URLs, and checks the provenance attestation of the setup program it runs as well as the zip.
+- The bundled CPython's digest is pinned in source for every supported platform, and a cached tarball is re-hashed against it on each build instead of being trusted because it exists.
+- `neuron apply` names the section and folder when a write fails, instead of a bare "Access is denied".
+
 - BOUND macros could escape their sandbox. String-driven reflection such as `operator.attrgetter("__class__...")` passed the source checks and reached Python's real builtins, so a shared BOUND macro could open files or start programs with the user's authority, even with input disarmed. The BOUND process now installs a runtime wall that refuses file, process, network, native-library and new-module access whatever route reaches them, and the host refuses RAW-only actions from the BOUND process. Verified by an end-to-end test that performs the escape and checks each operation is refused, and that fails without the wall.
 - The Chroma REST server (127.0.0.1:54235) now refuses requests whose `Host` is not a loopback name, so a web page that rebinds its domain to 127.0.0.1 can no longer drive or read Chroma sessions. Checked against the running app before the fix; a forged `Host` opened a session.
 - `neuron apply` rejects an unknown section instead of reporting "nothing to change", so a misspelled `[macro]` no longer applies nothing silently.
