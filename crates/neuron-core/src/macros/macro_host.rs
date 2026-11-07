@@ -2694,9 +2694,11 @@ fn run_act(
     // focus windows or drive an external integration while SAFE mode is active.
     let read_only = matches!(
         verb,
-        "active_profile" | "scroll_stage" | "battery" | "current_dpi" | "clipboard_get" | "obs_get" | "signal"
+        "active_profile" | "scroll_stage" | "battery" | "current_dpi" | "clipboard_get" | "obs_get"
     );
-    if !read_only && (
+    // A signal needs no arm, but a dry run must not change live lighting.
+    let ungated = read_only || (verb == "signal" && !mock);
+    if !ungated && (
         mock
         || !macro_host().fire_authorized(accepted_authority, arm_generation)
         || !crate::action::input_armed()

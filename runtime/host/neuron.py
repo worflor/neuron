@@ -582,7 +582,7 @@ def _effect(verb, arg=None, timeout=5.0, gated=True, done=None):
         return _undone(msg)
     if done is not None:
         return done
-    return msg if msg is not None else "ok"
+    return msg or "ok"
 
 
 def _act_outcome(verb, arg=None, timeout=5.0, gated=True):
@@ -730,7 +730,9 @@ def obs_request(request_type, data=None):
     """Fire ANY obs-websocket v5 request — the whole OBS API with no per-request code, e.g.
     obs_request("SaveReplayBuffer") or
     obs_request("SetInputVolume", {"inputName": "Mic/Aux", "inputVolumeDb": -6}).
-    Fire-and-forget: the response body does not come back. Arm-gated."""
+    Fire-and-forget: the response body does not come back. Arm-gated. RAW only."""
+    if _BOUND:
+        return _undone("[requires RAW]")
     if data is None:
         return _effect("obs_request", str(request_type))
     return _effect("obs_request", {"type": str(request_type), "data": data})

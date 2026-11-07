@@ -91,7 +91,9 @@ _BOUND_IMPORTS = {
     "__future__", "collections", "datetime", "functools", "itertools", "json", "math",
     "operator", "random", "re", "statistics", "string", "time",
 }
-_RAW_ONLY_HELPERS = {"run"}
+# obs_request reaches the whole obs-websocket API (stream targets, new sources, plugin vendor
+# requests); the named obs_* helpers cover BOUND's needs.
+_RAW_ONLY_HELPERS = {"run", "obs_request"}
 
 
 def _requires_raw(*_args, **_kwargs):
