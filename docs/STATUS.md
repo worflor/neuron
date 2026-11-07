@@ -32,7 +32,12 @@ pass in Windows PowerShell 5.1 and PowerShell 7; they do not establish that the 
 The helper at `253f7db` was separately checked through real UAC on its successful replacement path with
 the verified v0.1.5 broker. Broker files, task definition and permissions matched afterward;
 the running source app, startup tasks, configuration and installed checkpoint were preserved.
-Native failure rollback remains unverified.
+On 2026-11-07 the merged helper was checked through real UAC on the owner's desk: a candidate that
+exits at once failed the replacement after publication, and the previous executable, receipt, task
+definition, permissions and running broker were restored exactly. That run found the installer
+replacing the executable before the stopped broker's process had released it, which left the old
+binary beside it as a `~RF*.TMP` file; the installer now waits for that process to exit. A repeat
+of the failure run and a successful replacement under a running broker left no stray file.
 
 | grade | meaning |
 |---|---|

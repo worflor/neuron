@@ -232,16 +232,21 @@ function Get-BrokerProcessImagePaths {
     return $paths.ToArray()
 }
 
-function Assert-NoBrokerProcessAtPath($executable) {
+function Test-BrokerProcessAtPath($executable) {
     $target = [IO.Path]::GetFullPath($executable)
     foreach ($path in @(Get-BrokerProcessImagePaths)) {
         if ([string]::IsNullOrWhiteSpace([string]$path)) {
             throw 'could not verify a broker process image path'
         }
         $image = [IO.Path]::GetFullPath([string]$path)
-        if ([string]::Equals($image, $target, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'a broker process is running from the protected installation path'
-        }
+        if ([string]::Equals($image, $target, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Assert-NoBrokerProcessAtPath($executable) {
+    if (Test-BrokerProcessAtPath $executable) {
+        throw 'a broker process is running from the protected installation path'
     }
 }
 
@@ -544,8 +549,11 @@ function Stop-BrokerTask($context, [bool]$verifyPrior = $true) {
     if ($task.Running) {
         Stop-ScheduledTask -TaskName $context.TaskName -ErrorAction SilentlyContinue
     }
+    # The task leaves Running before its process releases the image; replacing the file then
+    # makes File.Replace park the old executable as a ~RF*.TMP beside it.
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
-        if ((Get-ScheduledTask -TaskName $context.TaskName -ErrorAction Stop).State -ne 'Running') { return }
+        if ((Get-ScheduledTask -TaskName $context.TaskName -ErrorAction Stop).State -ne 'Running' -and
+            -not (Test-BrokerProcessAtPath $context.Executable)) { return }
         Start-Sleep -Milliseconds 200
     }
     throw 'previous broker did not stop; task remains disabled'
