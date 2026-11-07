@@ -189,8 +189,10 @@ fn main() {
     // FIRST, before ANY config read: carry a build-tree config universe forward. A self-built
     // install used to keep every profile/macro/gesture in `target\release`, where a routine
     // `cargo clean` destroys them (and the `backups/` safety net with them, since it lived in
-    // there too). Copies once, never clobbers, no-ops afterwards.
-    match neuron::runroot::adopt_legacy_run_root() {
+    // there too). Copies once, never clobbers, no-ops afterwards. The elevated Synapse purge skips
+    // it: an administrator process must not copy along paths a limited process can redirect.
+    let elevated_purge = std::env::args().any(|a| a == "--purge-synapse");
+    match if elevated_purge { Ok(None) } else { neuron::runroot::adopt_legacy_run_root() } {
         Ok(Some((from, to))) => {
             eprintln!("[neuron] carried config forward: {} -> {}", from.display(), to.display());
         }
