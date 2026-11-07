@@ -502,22 +502,26 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     let has_dpi = commands.contains_key("dpi");
     // A keyboard's backlight is region 0x05, which Synapse reads for 0F/84; the Naga-shaped
     // catalog probe reads 0x04, which is the logo (or nothing) on a keyboard. Read-only.
-    if !has_dpi && !legacy && timed_exec(t, 0x0F, 0x84, 0x03, &[0x00, 0x05], PROBE_POLLS).is_some() {
+    // Only an answering backlight getter marks a keyboard. Other DPI-less matrix devices (docks,
+    // mats, stands) keep the logo-region bytes they had before.
+    let backlight = !has_dpi && !legacy
+        && timed_exec(t, 0x0F, 0x84, 0x03, &[0x00, 0x05], PROBE_POLLS).is_some();
+    if backlight {
         matrix = true;
         commands.insert("brightness".to_string(), cmd(0x0F, 0x84, 0x03, &[0x00, 0x05]));
     }
     // The top-level setter writes the Naga's region 0x04 (capability::set_brightness), which is a
     // keyboard's logo; keyboard brightness goes through the lighting block instead.
-    if matrix && !has_dpi {
+    if matrix && backlight {
         commands.remove("set_brightness");
     }
     let lighting = if matrix {
         let (rows, cols) = if has_dpi { (1, 2) } else { (6, 22) };
-        let region = if has_dpi { 0x04 } else { 0x05 };
+        let region = if backlight { 0x05 } else { 0x04 };
         let brightness_proven = commands.get("brightness").is_some_and(|c| {
             c.class == 0x0F && c.id == 0x84 && c.size == 0x03 && c.args == [0x00, region]
         });
-        Some(matrix_lighting(rows, cols, brightness_proven, !has_dpi))
+        Some(matrix_lighting(rows, cols, brightness_proven, backlight))
     } else if legacy {
         let brightness_proven = commands.get("brightness").is_some_and(|c| {
             c.class == 0x03 && c.id == 0x83 && c.size == 0x03 && c.args == [0x01, 0x05]
@@ -1602,6 +1606,22 @@ mod tests {
         assert!(d.supports(crate::registry::Capability::SetBrightness));
     }
 
+    /// A DPI-less matrix device whose backlight getter refuses (a dock, mat or stand) is not a
+    /// keyboard: it keeps the logo-region effects and brightness setter it had before.
+    #[test]
+    fn dpi_less_matrix_device_without_a_backlight_keeps_the_logo_region() {
+        let dock = MockDevice::new(&[(0x00, 0x81), (0x00, 0x82), (0x0F, 0x84), (0x0F, 0x82)])
+            .refusing_args(0x0F, 0x84, [0x00, 0x05]);
+        let d = synthesize(&dock, &ctx(0x007E, "Razer Mouse Dock")).unwrap().def;
+        let l = d.lighting.as_ref().unwrap();
+        assert_eq!((l.protocol, l.led_id), (Protocol::Matrix, 0x04));
+        assert_eq!(l.effect.args, [0x00, 0x04]);
+        assert_eq!((l.effects["wave"], l.effects["spectrum"]), (0x03, 0x04));
+        assert_eq!(d.command("brightness").unwrap().args, [0x00, 0x04]);
+        assert_eq!(l.brightness.as_ref().unwrap().args, [0x00, 0x04]);
+        assert!(d.command("set_brightness").is_some(), "the logo setter is this device's brightness");
+    }
+
     /// The brightness write a synthesized keyboard actually takes, through the same entry point
     /// the slider and `neuron brightness` use: backlight region 0x05, NOSTORE, read back there.
     #[test]
@@ -1858,6 +1878,8 @@ mod tests {
                     prop_assert!(!d.commands.contains_key(set) || d.commands.contains_key(get), "{set} without {get}");
                 }
                 let mouse = d.commands.contains_key("dpi");
+                let keyboard = !mouse && d.command("brightness")
+                    .is_some_and(|g| (g.class, g.id, &g.args[..]) == (0x0F, 0x84, &[0x00u8, 0x05][..]));
                 if let Some(l) = &d.lighting {
                     if let Some(b) = &l.brightness {
                         let get = d.command("brightness");
@@ -1867,8 +1889,8 @@ mod tests {
                         if let (Some(b), Some(get)) = (&l.brightness, d.command("brightness")) {
                             prop_assert_eq!(&b.args, &get.args, "brightness writes one region and reads another");
                         }
-                        prop_assert!(mouse || !d.commands.contains_key("set_brightness"), "keyboard kept the logo setter");
-                        prop_assert_eq!(l.led_id, if mouse { 0x04 } else { 0x00 });
+                        prop_assert!(!keyboard || !d.commands.contains_key("set_brightness"), "keyboard kept the logo setter");
+                        prop_assert_eq!(l.led_id, if keyboard { 0x00 } else { 0x04 });
                         prop_assert_eq!(&l.effect.args, &vec![0x00, l.led_id]);
                         prop_assert_eq!((l.rows, l.cols), if mouse { (1, 2) } else { (6, 22) });
                     }

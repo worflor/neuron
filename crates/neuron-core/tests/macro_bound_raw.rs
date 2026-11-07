@@ -207,6 +207,9 @@ def macro(ctx):
                     neuron.signal(1, 0.0)\n    \
                     out.append('%s/%s' % (bool(done), str(done).startswith('[')))\n    \
                     return 'contract:' + ','.join(out)\n";
+    let obs_request = "def macro(ctx):\n    \
+                       req = neuron.obs_request('GetVersion')\n    \
+                       return 'obs_request=%s/%s' % (bool(req), req)\n";
     for (mode, header) in [("bound", ""), ("raw", "# neuron: raw\n")] {
         host.register(&format!("{mode}_helper_surface"), &format!("{header}{surface}"))
             .expect("register helper surface probe");
@@ -221,7 +224,18 @@ def macro(ctx):
         );
     }
 
+    // The raw obs-websocket passthrough is RAW-only: BOUND refuses it at registration, and RAW
+    // still meets the arm gate.
+    let refused = host.register("bound_obs_request", obs_request)
+        .expect_err("BOUND must refuse obs_request");
+    assert!(refused.contains("requires RAW"), "{refused}");
+    host.register("raw_obs_request", &format!("# neuron: raw\n{obs_request}"))
+        .expect("register RAW obs_request probe");
+    let got = host.invoke("raw_obs_request", &ctx);
+    assert!(got.contains("obs_request=False/[disarmed]"), "RAW obs_request ignored the arm gate: {got}");
+
     for id in [
+        "raw_obs_request",
         "bound_helper_surface",
         "raw_helper_surface",
         "bound_result_contract",

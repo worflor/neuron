@@ -230,13 +230,17 @@ fn look() -> u64 {
     now
 }
 
-/// After a gap longer than [`FREEZE_GAP_MS`] since the previous read, credit every running organ
-/// with a beat at `now`. A worker that really stopped still surfaces one threshold later.
+/// After a gap longer than [`FREEZE_GAP_MS`] since the previous read, move every running organ's
+/// last beat forward by the gap: the frozen time does not count, but an organ already silent at
+/// the previous read keeps that age instead of being reset.
 fn forgive_freeze(pulses: &[AtomicU64], last_look: &AtomicU64, now: u64) {
     let prev = last_look.swap(now + 1, Ordering::Relaxed);
-    if prev != 0 && now.saturating_sub(prev - 1) > FREEZE_GAP_MS {
+    let gap = if prev == 0 { 0 } else { now.saturating_sub(prev - 1) };
+    if gap > FREEZE_GAP_MS {
         for p in pulses {
-            let _ = p.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v != 0).then_some(now + 1));
+            let _ = p.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v != 0).then(|| v.saturating_add(gap).min(now + 1))
+            });
         }
     }
 }
@@ -486,9 +490,10 @@ fn wait_name(w: u32) -> &'static str {
         2 | 9 => "page-in",
         4 | 11 => "sleep",
         5 | 12 => "suspended",
-        6 => "user wait (handle)",
-        13 => "user wait (window messages)",
+        // Any user-mode WaitFor*/MsgWait* call; the reason cannot tell a handle from a message.
+        6 | 13 => "user-mode wait (handle or messages)",
         15 => "queue",
+        21 => "keyed event (lock)",
         16 | 17 => "lpc/alpc",
         27 => "resource",
         28 => "push lock",
@@ -719,21 +724,23 @@ mod tests {
         assert!(w1.cpu - w0.cpu < s1.cpu - s0.cpu, "the waiter used less cpu than the spinner");
     }
 
-    /// A long gap between reads credits running organs instead of reporting them all stalled;
-    /// a normal cadence changes nothing and a stopped organ stays stopped.
+    /// A long gap between reads is not counted against running organs, but an organ that was
+    /// already silent keeps its age; a normal cadence changes nothing and a stopped organ stays
+    /// stopped.
     #[test]
     fn a_frozen_reader_credits_running_organs() {
-        let pulses = [AtomicU64::new(0), AtomicU64::new(1_001)];
+        let pulses = [AtomicU64::new(0), AtomicU64::new(1_001), AtomicU64::new(6_501)];
         let look = AtomicU64::new(0);
         forgive_freeze(&pulses, &look, 1_000);
         forgive_freeze(&pulses, &look, 1_500);
         forgive_freeze(&pulses, &look, 1_500 + FREEZE_GAP_MS);
         assert_eq!(pulses[1].load(Ordering::Relaxed), 1_001, "the watcher's cadence is not a freeze");
         forgive_freeze(&pulses, &look, 90_000);
-        assert_eq!(pulses[1].load(Ordering::Relaxed), 90_001, "running organ credited after a freeze");
+        assert_eq!(pulses[2].load(Ordering::Relaxed), 90_001, "an organ beating at the freeze is fresh after it");
+        assert_eq!(90_000 - (pulses[1].load(Ordering::Relaxed) - 1), 5_500, "a silent organ keeps its pre-freeze age");
         assert_eq!(pulses[0].load(Ordering::Relaxed), 0, "a stopped organ stays stopped");
         forgive_freeze(&pulses, &look, 90_400);
-        assert_eq!(pulses[1].load(Ordering::Relaxed), 90_001, "credit is once per freeze");
+        assert_eq!(pulses[2].load(Ordering::Relaxed), 90_001, "credit is once per freeze");
     }
 
     #[test]

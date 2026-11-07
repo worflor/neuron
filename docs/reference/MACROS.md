@@ -101,7 +101,7 @@ All gated. Key names are names like `"f"`, `"enter"`, `"f5"`, `"ctrl"`, `"shift"
 | `clipboard_set(s)` | put text on the clipboard |
 | `clipboard_get()` | read clipboard text, or `None`; not gated |
 | `sleep(ms)` | wait; not gated |
-| `run(cmd, wait=False)` | RAW only (BOUND returns `"[requires RAW]"`). Runs a shell command; with `wait=True` returns `(exit_code, stdout)` |
+| `run(cmd, wait=False)` | RAW only: a BOUND macro that calls it is refused when it is registered. Runs a shell command; with `wait=True` returns `(exit_code, stdout)` |
 
 ```python
 import neuron
@@ -261,7 +261,7 @@ These need OBS connected under SYSTEM → CONNECTIONS. The control helpers are g
 | `obs_record(mode="toggle")` | `"start"`, `"stop"`, `"toggle"`, or `"pause"` to pause or resume |
 | `obs_replay(mode="save")` | save a clip, or `"start"` / `"stop"` the replay buffer |
 | `obs_mute(input_name="Mic/Aux")` | toggle mute on an OBS input |
-| `obs_request(request_type, data=None)` | send any obs-websocket v5 request; the response is not returned |
+| `obs_request(request_type, data=None)` | RAW only, like `run`. Sends any obs-websocket v5 request; the response is not returned |
 | `obs_connected()`, `obs_scene_name()`, `obs_streaming()`, `obs_recording()` | read OBS state; not gated |
 
 ```python
