@@ -260,6 +260,9 @@ pub struct ApplyOpts {
     /// Treat a macro, profile or route target that resolves to nothing as an error. By default it
     /// is a warning, so a setup that already had a dangling name round-trips through dump and apply.
     pub strict_refs: bool,
+    /// Accept what [`code_it_adds`] lists (RAW macros, command-running binds, onboard writes)
+    /// as warnings instead of refusing the document.
+    pub allow_code: bool,
 }
 
 /// The result of an apply: per-section reports plus any validation issues that stopped it.
@@ -424,12 +427,92 @@ pub fn validate(doc: &Setup) -> Vec<Issue> {
 }
 
 /// Make the machine match `doc`. Validation runs first; any error stops the apply before a write.
+/// Collect actions that run code or write outside the run root, wherever they sit in a document's
+/// JSON form: top-level rules, profile rules, cast wedges and rhythms, legacy bindings, and steps
+/// nested in sequences or turbo.
+fn code_actions(v: &serde_json::Value, out: &mut BTreeSet<String>) {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => {
+            let text = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            match m.get("type").and_then(Value::as_str) {
+                Some("run") => {
+                    out.insert(format!("a bind runs the command `{}`", text("cmd")));
+                }
+                Some("script") => match m.get("kind").and_then(Value::as_str) {
+                    Some("shell") => {
+                        out.insert(format!("a bind runs the shell command `{}`", text("id")));
+                    }
+                    Some("file") => {
+                        out.insert(format!("a bind runs the program or script `{}`", text("id")));
+                    }
+                    _ => {}
+                },
+                Some("screenshot") if m.get("path").is_some_and(|p| !p.is_null()) => {
+                    out.insert(format!("a bind saves screenshots to `{}`", text("path")));
+                }
+                _ => {}
+            }
+            for x in m.values() {
+                code_actions(x, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| code_actions(x, out)),
+        _ => {}
+    }
+}
+
+/// What this document would add that runs code on the machine or writes a device's onboard
+/// memory, compared with what is already installed. Unchanged items are not listed, so applying
+/// one's own dump stays quiet; a shared document has to be opted into with `--allow-code`.
+#[must_use]
+pub fn code_it_adds(doc: &Setup) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut theirs = BTreeSet::new();
+    code_actions(&serde_json::to_value(doc).unwrap_or_default(), &mut theirs);
+    let mut ours = BTreeSet::new();
+    if let Ok(current) = dump(&Section::DEFAULT) {
+        code_actions(&serde_json::to_value(&current).unwrap_or_default(), &mut ours);
+    }
+    found.extend(theirs.difference(&ours).cloned());
+    for (id, src) in doc.macros.iter().flatten() {
+        let raw = crate::macros::policy::mode_from_source(src)
+            .is_ok_and(|m| m == crate::macros::policy::MacroMode::Raw);
+        if raw && crate::macros::macro_host::load_macro(id).as_deref() != Some(src.as_str()) {
+            found.push(format!("macro `{id}` is RAW: unsandboxed Python with your account's access"));
+        }
+    }
+    for b in doc.profiles.iter().flatten() {
+        let already = crate::profile::Profile::load(&b.profile.name).is_ok_and(|p| p.persist);
+        if b.profile.persist && !already {
+            found.push(format!(
+                "profile `{}` writes its DPI and brightness to the device's onboard memory",
+                b.profile.name
+            ));
+        }
+    }
+    found
+}
+
+/// A section write failed: say which section and where, since an OS error alone ("Access is
+/// denied") names no file.
+fn write_failed(section: &str, e: impl std::fmt::Display) -> String {
+    format!("writing the {section} section in {}: {e}", crate::runroot::run_root().display())
+}
+
 pub fn apply(doc: &Setup, opts: ApplyOpts) -> Result<ApplyReport, String> {
     let issues = validate(doc)
         .into_iter()
         .map(|i| if opts.strict_refs { i } else { i.allowing_missing_refs() })
         .collect();
     let mut report = ApplyReport { issues, ..ApplyReport::default() };
+    for item in code_it_adds(doc) {
+        report.issues.push(if opts.allow_code {
+            Issue::warning(item)
+        } else {
+            Issue::error(format!("{item} (pass --allow-code only if you trust where this file came from)"))
+        });
+    }
     if authoring::has_errors(&report.issues) {
         return Ok(report);
     }
@@ -459,35 +542,35 @@ pub fn apply(doc: &Setup, opts: ApplyOpts) -> Result<ApplyReport, String> {
         let cur = RuleStore::Gui.load()?;
         let changed = json(&cur) != json(rules);
         if changed && write {
-            RuleStore::Gui.save(rules)?;
+            RuleStore::Gui.save(rules).map_err(|e| write_failed("rules", e))?;
         }
         push("rules", changed, format!("{} rules", rules.len()));
     }
     if let Some(cast) = &doc.cast {
         let changed = json(&CastConfig::load()) != json(cast);
         if changed && write {
-            authoring::save_cast(cast)?;
+            authoring::save_cast(cast).map_err(|e| write_failed("cast", e))?;
         }
         push("cast", changed, format!("{} wedges, {} glyph binds", cast.radial.len(), cast.gestures.len()));
     }
     if let Some(feel) = &doc.feel {
         let changed = json(&FeelConfig::load()) != json(feel);
         if changed && write {
-            feel.save()?;
+            feel.save().map_err(|e| write_failed("feel", e))?;
         }
         push("feel", changed, "timing windows and stance".into());
     }
     if let Some(bindings) = &doc.bindings {
         let changed = json(&Bindings::load()) != json(bindings);
         if changed && write {
-            bindings.save()?;
+            bindings.save().map_err(|e| write_failed("bindings", e))?;
         }
         push("bindings", changed, format!("{} legacy bindings", bindings.bindings.len()));
     }
     if let Some(gestures) = &doc.gestures {
         let changed = json(&load_vault()?) != json(gestures);
         if changed && write {
-            gestures.save()?;
+            gestures.save().map_err(|e| write_failed("gestures", e))?;
         }
         push("gestures", changed, format!("{} glyph templates", gestures.templates.len()));
     }
@@ -500,7 +583,7 @@ pub fn apply(doc: &Setup, opts: ApplyOpts) -> Result<ApplyReport, String> {
             if crate::macros::macro_host::load_macro(id).as_deref() != Some(src.as_str()) {
                 changed += 1;
                 if write {
-                    crate::macros::macro_host::write_macro_file(id, src)?;
+                    crate::macros::macro_host::write_macro_file(id, src).map_err(|e| write_failed("macros", e))?;
                 }
             }
         }
@@ -536,7 +619,7 @@ pub fn apply(doc: &Setup, opts: ApplyOpts) -> Result<ApplyReport, String> {
             if !same {
                 changed += 1;
                 if write {
-                    crate::manage::save_bundle(b)?;
+                    crate::manage::save_bundle(b).map_err(|e| write_failed("profiles", e))?;
                 }
             }
         }
@@ -557,7 +640,7 @@ pub fn apply(doc: &Setup, opts: ApplyOpts) -> Result<ApplyReport, String> {
     if let Some(apps) = &doc.apps {
         let changed = json(&AppRules::load()) != json(apps);
         if changed && write {
-            apps.save()?;
+            apps.save().map_err(|e| write_failed("apps", e))?;
         }
         push("apps", changed, format!("{} routes", apps.rules.len()));
     }
@@ -674,14 +757,17 @@ mod tests {
         for doc_text in [text, json_text] {
             let _fresh = crate::authoring::test_run_root();
             let doc = parse(&doc_text).unwrap();
-            let opts = ApplyOpts::default();
+            // A fresh root has none of the setup's RAW macros yet, so restoring it is an explicit
+            // choice, the same as importing someone else's.
+            assert!(!code_it_adds(&doc).is_empty(), "the authored RAW macro is new to a fresh root");
+            let opts = ApplyOpts { allow_code: true, ..ApplyOpts::default() };
             let dry = apply(&doc, ApplyOpts { dry_run: true, ..opts }).unwrap();
             assert!(!dry.applied);
             assert!(dry.sections.iter().any(|s| s.status == "would-update"), "a fresh root differs: {dry:?}");
             assert!(crate::profile::list().is_empty(), "a dry run wrote nothing");
 
             let done = apply(&doc, opts).unwrap();
-            assert!(done.applied && done.issues.is_empty(), "{done:?}");
+            assert!(done.applied && !authoring::has_errors(&done.issues), "{done:?}");
             let again = dump(&sections).unwrap();
             assert_eq!(json(&again), json(&doc), "what was applied is exactly what the document said");
             let second = apply(&doc, opts).unwrap();
@@ -690,6 +776,46 @@ mod tests {
                 "a second apply changes nothing: {second:?}"
             );
         }
+    }
+
+    #[test]
+    fn shared_code_is_listed_and_refused_without_allow_code() {
+        let _r = crate::authoring::test_run_root();
+        let raw = "# neuron: raw\ndef macro(ctx):\n    return 1\n";
+        let mut doc = Setup::default();
+        doc.macros = Some([("helper".to_string(), raw.to_string())].into());
+        let hidden = Action::Sequence {
+            steps: vec![crate::action::Step {
+                action: Box::new(Action::Run { cmd: "calc".into() }),
+                delay_ms: 0,
+                hold_ms: 0,
+            }],
+        };
+        doc.rules = Some(vec![Rule::new(Trigger::MicTap, hidden)]);
+        doc.profiles = Some(vec![ProfileBundle {
+            profile: Profile { name: "loud".into(), persist: true, ..Profile::default() },
+            rules: vec![],
+        }]);
+
+        let refused = apply(&doc, ApplyOpts::default()).unwrap();
+        assert!(!refused.applied, "{refused:?}");
+        let said = refused.issues.iter().map(|i| i.message.as_str()).collect::<Vec<_>>().join("\n");
+        for needle in ["macro `helper` is RAW", "runs the command `calc`", "profile `loud` writes"] {
+            assert!(said.contains(needle), "missing {needle:?} in:\n{said}");
+        }
+        assert!(crate::macros::macro_host::load_macro("helper").is_none(), "a refused RAW macro was written");
+        assert!(RuleStore::Gui.load().unwrap().is_empty(), "a refused bind was written");
+
+        let allowed = apply(&doc, ApplyOpts { allow_code: true, ..Default::default() }).unwrap();
+        assert!(allowed.applied, "{allowed:?}");
+        assert!(allowed.issues.iter().all(|i| i.severity == authoring::Severity::Warning));
+
+        // Re-applying what is now installed adds nothing new, so one's own dump needs no flag.
+        let own = dump(&Section::DEFAULT).unwrap();
+        assert!(code_it_adds(&own).is_empty(), "{:?}", code_it_adds(&own));
+        let again = apply(&own, ApplyOpts::default()).unwrap();
+        assert!(again.applied || again.sections.iter().all(|s| s.status == "unchanged"), "{again:?}");
+        assert!(!authoring::has_errors(&again.issues), "{again:?}");
     }
 
     #[test]

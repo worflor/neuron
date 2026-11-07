@@ -126,6 +126,11 @@ neuron apply setup.toml                       # the real thing (dump backup.toml
 removes profiles, macros, badges and preference keys the document omits. Add `--strict` to make a macro
 or profile name that does not exist an error instead of a warning.
 
+A document that adds RAW macros, command- or program-running binds, path screenshots or
+onboard-memory profiles is refused with each item listed. Show the user that list. Pass
+`--allow-code` only after the user, having seen it, says they trust where the file came from;
+never add it on your own to make an apply succeed.
+
 **Bring a Synapse 3 layout across.** Synapse 3 keeps profiles in an encrypted account cache, but its
 service logs every mapping it pushed to a device. `neuron import` (no file) lists those logs; importing one
 previews the user's layer as binds.

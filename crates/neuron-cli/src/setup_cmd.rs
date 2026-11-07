@@ -46,6 +46,10 @@ pub struct ApplyArgs {
     /// a macro, profile or route target that does not exist is an error (default: a warning)
     #[arg(long)]
     strict: bool,
+    /// accept RAW macros, command-running binds and onboard-memory profiles this document adds;
+    /// without it they are listed and refused
+    #[arg(long)]
+    allow_code: bool,
 }
 
 pub fn dump(a: DumpArgs) -> Result<()> {
@@ -73,7 +77,13 @@ pub fn apply(a: ApplyArgs) -> Result<()> {
     let spec = if a.file == "-" { "-".to_string() } else { format!("@{}", a.file) };
     let text = crate::spec::read_spec(&spec)?;
     let doc = setup::parse(&text).map_err(anyhow::Error::msg)?;
-    let report = setup::apply(&doc, ApplyOpts { dry_run: a.dry_run, prune: a.prune, check_macros: a.check_macros, strict_refs: a.strict }).map_err(anyhow::Error::msg)?;
+    let report = setup::apply(&doc, ApplyOpts {
+        dry_run: a.dry_run,
+        prune: a.prune,
+        check_macros: a.check_macros,
+        strict_refs: a.strict,
+        allow_code: a.allow_code,
+    }).map_err(anyhow::Error::msg)?;
     if neuron::authoring::has_errors(&report.issues) {
         if out::json() {
             out::print_json(&serde_json::to_value(&report)?);
