@@ -20,7 +20,11 @@ Neuron runs it in its bundled CPython Macro Host when its trigger fires. This pa
 
 New macros run **BOUND**. Ordinary Python computation works, and machine effects (input, device
 settings, audio, the store) go through the Rust host, which checks the arm gate again before acting.
-Files, processes, sockets and native libraries are not part of BOUND's surface.
+Files, processes, sockets and native libraries are not part of BOUND's surface. Source checks
+refuse the obvious routes, and the BOUND process itself refuses file, process, network,
+native-library and new-module access at runtime, so code that slips past the source checks still
+cannot touch the machine except through the `neuron` helpers. It can still read what that process
+holds, such as environment variables.
 
 A macro whose leading comment header contains this line runs **RAW**:
 

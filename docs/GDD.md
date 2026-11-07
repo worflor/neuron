@@ -193,7 +193,7 @@ a macro is just an `Action` that happens to be a sequence of steps, or a whole p
 
 python is the fun tier. write a file with `def macro(ctx):` and neuron starts bundled CPython on the first macro, a manual arm, or when the Workshop needs it, then keeps the *Macro Host* warm for subsequent macros. normal tray startup does not load RAW Python. plain key→key remaps still never touch Python at all.
 
-new macros start **BOUND**. they get ordinary Python computation plus the public `neuron` capability surface, while machine effects and persistent macro state cross the Rust host boundary. BOUND deliberately withholds ambient filesystem/process/network/native-FFI access from the supported language surface, and Rust independently re-checks the arm/mock gate before effectful broker requests land. this is policy containment for ordinary and agent-authored macros, not a claim that CPython safely contains hostile code.
+new macros start **BOUND**. they get ordinary Python computation plus the public `neuron` capability surface, while machine effects and persistent macro state cross the Rust host boundary. BOUND deliberately withholds ambient filesystem/process/network/native-FFI access from the supported language surface, and Rust independently re-checks the arm/mock gate before effectful broker requests land. this is policy containment for ordinary and agent-authored macros, not a claim that CPython safely contains hostile code. under the source checks, the BOUND process walls itself off at runtime: file, process, network, native-library and new-module access are refused however the code reaches them.
 
 need the whole language with the whole machine? add exactly one source line:
 
