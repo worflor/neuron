@@ -294,11 +294,25 @@ def macro(ctx):
         assert!(got.contains(&format!("{label}=ran")), "RAW lost {label}: {got}");
     }
 
+    // Ordinary computation the wall must leave alone: lazily loaded stdlib paths included.
+    let everyday = "import datetime, random, json, re, statistics\n\
+                    def macro(ctx):\n    \
+                    year = datetime.datetime.strptime('2026-11-07', '%Y-%m-%d').year\n    \
+                    bom = 'x'.encode('utf-8-sig').hex()\n    \
+                    pick = random.Random(7).choice(['a', 'b'])\n    \
+                    data = json.loads(json.dumps({'k': re.sub('a', 'b', 'aa')}))['k']\n    \
+                    mid = statistics.median([1, 2, 3])\n    \
+                    return 'everyday:%s:%s:%s:%s:%s' % (year, bom, pick in 'ab', data, mid)\n";
+    host.register("bound_everyday", everyday).expect("register BOUND everyday probe");
+    let got = host.invoke("bound_everyday", &ctx);
+    assert!(got.contains("everyday:2026:efbbbf78:True:bb:2"), "the wall broke ordinary BOUND code: {got}");
+
     assert!(site.join("loaded-raw").exists(), "the probe never ran, so it proves nothing");
     assert!(!site.join("loaded-bound").exists(), "BOUND ran code from PYTHONPATH before sealing");
     std::env::remove_var("PYTHONPATH");
 
     for id in [
+        "bound_everyday",
         "bound_wall",
         "raw_wall",
         "raw_obs_request",

@@ -121,9 +121,15 @@ def _bound_import(name, globals=None, locals=None, fromlist=(), level=0):
         raise ImportError("relative imports require RAW mode")
     if root == "neuron":
         return _BOUND_NEURON
-    if root not in _BOUND_IMPORTS:
+    if root not in _BOUND_IMPORTS and root not in _STDLIB_INTERNAL_IMPORTS:
         raise ImportError("import %r requires RAW mode" % root)
     return _REAL_IMPORT(name, globals, locals, fromlist, level)
+
+
+# Allowed stdlib modules import these through the calling frame's `__import__`, which in a macro
+# is `_bound_import` (datetime.strptime loads `_strptime`, codec lookup loads `encodings.*`).
+# Macro source still cannot name them: the source check uses `_BOUND_IMPORTS` alone.
+_STDLIB_INTERNAL_IMPORTS = {"_strptime", "encodings"}
 
 
 # The AST policy above keeps ordinary BOUND code honest, but string-driven reflection
@@ -144,9 +150,11 @@ _BOUND_DENIED_PREFIXES = (
 # Loaded before sealing: macros may import these, and stdlib code reaches some lazily (strptime,
 # codec lookups) where a fresh import after sealing would be refused.
 _BOUND_PRELOAD = (
-    "_strptime", "ast", "encodings.ascii", "encodings.latin_1", "encodings.utf_16",
-    "encodings.utf_16_be", "encodings.utf_16_le", "encodings.utf_32", "encodings.cp1252",
-    "encodings.idna", "unicodedata",
+    "_strptime", "ast", "encodings.ascii", "encodings.latin_1", "encodings.utf_8_sig",
+    "encodings.utf_16", "encodings.utf_16_be", "encodings.utf_16_le", "encodings.utf_32",
+    "encodings.utf_32_be", "encodings.utf_32_le", "encodings.cp1252", "encodings.cp437",
+    "encodings.mbcs", "encodings.unicode_escape", "encodings.raw_unicode_escape",
+    "encodings.base64_codec", "encodings.hex_codec", "encodings.idna", "unicodedata",
 )
 
 
@@ -159,7 +167,7 @@ def _seal_bound_process():
 
     def _wall(event, _args):
         if event in _BOUND_DENIED_EVENTS or event.startswith(_BOUND_DENIED_PREFIXES):
-            raise PermissionError("%s requires RAW mode" % event)
+            raise PermissionError("BOUND macros can't use %s; add `# neuron: raw` for full Python" % event)
 
     sys.addaudithook(_wall)
 

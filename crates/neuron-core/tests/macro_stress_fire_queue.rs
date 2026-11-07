@@ -110,7 +110,9 @@ fn drain_notifies(rx: &Receiver<BeaconEvent>, settle: Duration, max: Duration) -
     let mut out = Vec::new();
     let deadline = Instant::now() + max;
     loop {
-        let left = settle.min(deadline.saturating_duration_since(Instant::now()));
+        let until_deadline = deadline.saturating_duration_since(Instant::now());
+        // The quiet period counts only once notifications have started arriving.
+        let left = if out.is_empty() { until_deadline } else { settle.min(until_deadline) };
         if left.is_zero() {
             break;
         }
@@ -128,14 +130,15 @@ fn drain_notifies(rx: &Receiver<BeaconEvent>, settle: Duration, max: Duration) -
 fn drain_log_for(host: &MacroHost, settle: Duration, max: Duration) -> Vec<String> {
     let mut acc = Vec::new();
     let deadline = Instant::now() + max;
-    let mut last = Instant::now();
+    // The quiet period counts only once output has started; a slow first line is not silence.
+    let mut last: Option<Instant> = None;
     loop {
         let batch = host.drain_log();
         if !batch.is_empty() {
             acc.extend(batch);
-            last = Instant::now();
+            last = Some(Instant::now());
         }
-        if Instant::now() >= deadline || last.elapsed() >= settle {
+        if Instant::now() >= deadline || last.is_some_and(|t| t.elapsed() >= settle) {
             break;
         }
         std::thread::sleep(Duration::from_millis(25));
