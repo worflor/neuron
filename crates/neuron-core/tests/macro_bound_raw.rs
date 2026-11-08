@@ -279,7 +279,10 @@ def macro(ctx):
 "#;
     let process_steps = r#"    attempt("system", lambda: os.system("exit 0"))
     attempt("popen", lambda: imp("subprocess").Popen(["cmd", "/c", "exit", "0"]).wait())
-    attempt("ctypes", lambda: sysm.modules["ctypes"].windll.kernel32.GetTickCount())
+    def native():
+        c = sysm.modules.get("ctypes") or imp("ctypes")
+        return c.windll.kernel32.GetTickCount() if sysm.platform == "win32" else c.CDLL(None).getpid()
+    attempt("ctypes", native)
 "#;
     let finish = "    return 'wall:' + ','.join(out)\n";
     host.register("bound_wall", &format!("{escape}{process_steps}{finish}"))
