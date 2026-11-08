@@ -16,25 +16,27 @@
 //! the same core in their own physkey namespace (`0x8000 | button`) behind a separately-installed
 //! `WH_MOUSE_LL` hook; left/right are never claimable.
 //!
-//! ## The hook is device-blind, and its swallow hides the key from Raw Input
+//! ## The hook decides, because its swallow hides the key from Raw Input
 //! The low-level hook can swallow but does not know the device; Raw Input knows the device but
-//! arrives 0.3–2 ms after the hook, and NOT AT ALL for a key the hook swallowed (measured with
-//! `hookorder` and live 2026-09-29; re-observed 2026-11-08). So:
-//!   * **Conditional claims** ([`KeyOut::SwallowWhileHeld`]) are decided at the hook from the held
-//!     registry and delivered as their claim's device ([`Interceptor::on_shift`]); unheld, the key
-//!     is left alone.
-//!   * **Unconditional claims** still go through swallow ([`on_hook`]) → attribute
-//!     ([`on_rawinput`]) → fail-open replay ([`expire`]). Since the swallowed key's Raw-Input twin
-//!     never arrives, they currently resolve by the fail-open replay: late, and as the original
-//!     key. Firmware-assigned private keys avoid this by naming their device themselves.
+//! arrives after the hook, and NOT AT ALL for a key the hook swallowed (measured with `hookorder`
+//! and live 2026-09-29; re-observed 2026-11-08). So the hook decides alone
+//! ([`Interceptor::on_edge`]):
+//!   * a conditional claim ([`KeyOut::SwallowWhileHeld`]) whose hold key is down takes the key as
+//!     its own device's;
+//!   * otherwise the key is attributed: among the devices Raw Input has seen in its namespace that
+//!     can send it (a definition's `[[buttons]]` limits a device to those keys), the one active
+//!     most recently. A key only one device can send is exact; a key two keyboards share follows
+//!     the one typed on last, so the first press after switching keyboards can be misattributed;
+//!   * a key no known device claims passes untouched.
 //!
-//! This module is the PURE decision core (no Win32) so it is fully unit-tested; the live hook +
-//! Raw-Input wiring drives it one event at a time. Injected replays are filtered OUT by the live
-//! layer (via a `dwExtraInfo` signature) before they ever reach [`on_hook`], so the shim never
-//! re-processes its own output.
+//! A taken key is delivered as its device's edge so its bind fires, or replaced by its target.
+//! Firmware-assigned private keys skip attribution: they name their device themselves.
+//!
+//! [`Interceptor`] is the PURE decision core (no Win32), fully unit-tested; the live hook and the
+//! Raw-Input feed drive it one event at a time. Our own output carries a `dwExtraInfo` signature
+//! the hook passes through, so the shim never re-processes it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 
 /// What a matched keystroke should turn into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,16 +45,15 @@ pub enum KeyOut {
     Scancode(u16),
     /// Emit NOTHING — the key is claimed by a host feature (the cast/weave trigger) and its
     /// keystroke must not reach the desktop at all. The same key on any OTHER device still
-    /// replays unchanged, exactly like a remap.
+    /// passes unchanged, exactly like a remap.
     Swallow,
-    /// Taken while this control (a layer's hold key) is down, and otherwise left alone. A hook
-    /// swallow hides the key from Raw Input, so the hook decides and attributes the key to the
-    /// claim's device itself (see [`Interceptor::on_shift`]); the device is not checked.
+    /// Taken while this control (a layer's hold key) is down, and otherwise left alone. Taken as
+    /// the claim's device without attribution: holding that device's key is the evidence.
     SwallowWhileHeld(crate::controls::ControlRef),
 }
 
 /// One device-scoped remap: pressing physical `from` scancode on device `pid` emits `to`. The same
-/// scancode on any other device is replayed unchanged.
+/// scancode on any other device passes unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Remap {
     /// Canonical source device — the same identity the rule spine and the held registry speak, so
@@ -82,37 +83,32 @@ pub struct Inject {
     pub down: bool,
 }
 
-/// One swallowed keystroke awaiting device attribution from Raw-Input.
-#[derive(Clone, Debug)]
-struct Pending {
-    scancode: u16,
-    down: bool,
-    at_us: u64,
-    remaps: Arc<[Remap]>,
+/// A key the hook took: the device it was attributed to and what it becomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Taken {
+    pub pid: crate::registry::CanonicalPid,
+    /// [`KeyOut::Scancode`] (inject the target) or [`KeyOut::Swallow`] (deliver it as `pid`'s).
+    pub to: KeyOut,
+    /// `false` for an auto-repeat of a press already acted on.
+    pub first: bool,
 }
 
-/// The pure correlation core. Not `Send`-shared directly — the live layer wraps it in a mutex and
-/// drives `on_hook` (hook thread) + `on_rawinput`/`expire` (reader thread).
+/// The pure decision core. Not `Send`-shared directly — the live layer wraps it in a mutex and
+/// drives [`Interceptor::on_edge`] from the hooks and [`Interceptor::observe`] from Raw Input.
 #[derive(Default)]
 pub struct Interceptor {
     /// scancode -> remaps that involve it (O(1) lookup for the hot hook path).
-    by_scancode: HashMap<u16, Arc<[Remap]>>,
-    /// swallowed-but-not-yet-attributed keystrokes, oldest first.
-    pending: VecDeque<Pending>,
-    /// An UP already replayed fail-open, but still awaiting its device identity so the matching
-    /// mapped target can be released without touching another device's held target.
-    late_ups: VecDeque<Pending>,
-    /// Claimed DOWNs accepted from Raw Input. A replacement's target UP must be sent even if
-    /// interception stops before the physical UP is attributed; a swallowed claim must suppress
-    /// its matching UP under the same lifetime rule.
-    held_targets: HashMap<(u16, crate::registry::CanonicalPid), KeyOut>,
-    /// A source whose device identity never arrived stands down until its next physical UP.
-    fail_open_sources: HashSet<u16>,
+    by_scancode: HashMap<u16, Vec<Remap>>,
     /// Answers whether a [`KeyOut::SwallowWhileHeld`] control is down. `None` = never held.
     held: Option<fn(crate::controls::ControlRef) -> bool>,
-    /// Shifted keys taken at the hook, by source, with the device they were delivered as. The
-    /// release is taken too, whether or not the hold key is still down.
-    shifted: HashMap<u16, crate::registry::CanonicalPid>,
+    /// Keys taken at the hook and not yet released: the release follows the press's decision,
+    /// whatever changed in between.
+    taken: HashMap<u16, (crate::registry::CanonicalPid, KeyOut)>,
+    /// Last Raw-Input press per (mouse namespace?, device), in microseconds.
+    activity: HashMap<(bool, crate::registry::CanonicalPid), u64>,
+    /// Devices that can only send some keys (a definition's `[[buttons]]`), as physkeys. A
+    /// device not listed can send any key.
+    keysets: HashMap<crate::registry::CanonicalPid, HashSet<u16>>,
 }
 
 impl Interceptor {
@@ -134,6 +130,38 @@ impl Interceptor {
         self.held = Some(held);
     }
 
+    /// Rebuild the active remap table. Keys already taken keep the decision they were taken with.
+    pub fn set_remaps(&mut self, remaps: impl IntoIterator<Item = Remap>) {
+        let mut by_scancode: HashMap<u16, Vec<Remap>> = HashMap::new();
+        for r in remaps {
+            by_scancode.entry(r.from).or_default().push(r);
+        }
+        self.by_scancode = by_scancode;
+    }
+
+    /// Declare which keys each limited device can send.
+    pub fn set_keysets(&mut self, keysets: HashMap<crate::registry::CanonicalPid, HashSet<u16>>) {
+        self.keysets = keysets;
+    }
+
+    /// A Raw-Input press from `pid`: the key reached the desktop, so `pid` is active.
+    pub fn observe(&mut self, physkey: u16, pid: crate::registry::CanonicalPid, now_us: u64) {
+        self.activity.insert((physkey & MOUSE_PHYSKEY_BASE != 0, pid), now_us);
+    }
+
+    /// The device most likely to have sent `physkey`: among the devices seen in its namespace
+    /// that can send it, the one active most recently.
+    fn attribute(&self, physkey: u16) -> Option<crate::registry::CanonicalPid> {
+        let mouse = physkey & MOUSE_PHYSKEY_BASE != 0;
+        self.activity
+            .iter()
+            .filter(|((ns, pid), _)| {
+                *ns == mouse && (mouse || self.keysets.get(pid).is_none_or(|ks| ks.contains(&physkey)))
+            })
+            .max_by_key(|(_, at)| **at)
+            .map(|((_, pid), _)| *pid)
+    }
+
     /// The claim `pid` makes on a key among `remaps`: a conditional swallow whose control is held
     /// wins, else the first unconditional claim.
     fn resolve_claim(&self, remaps: &[Remap], pid: crate::registry::CanonicalPid) -> Option<KeyOut> {
@@ -153,201 +181,45 @@ impl Interceptor {
         fallback
     }
 
-    /// HOOK edge for shifted keys, checked before [`on_hook`]. `Some(pid)`: take the edge and
-    /// deliver it as a key of `pid` (`None` from the second element = an auto-repeat, already
-    /// delivered). `None`: not shifted.
-    pub fn on_shift(&mut self, scancode: u16, down: bool) -> Option<(crate::registry::CanonicalPid, bool)> {
+    /// HOOK edge (device unknown): take it or leave it. A conditional claim whose hold key is
+    /// down takes the key as its own device's. Otherwise the key is attributed to a device
+    /// ([`Interceptor::observe`] feeds that) and taken when that device claims it. `None`: the key
+    /// is not ours and passes untouched.
+    pub fn on_edge(&mut self, physkey: u16, down: bool) -> Option<Taken> {
         if !down {
-            return self.shifted.remove(&scancode).map(|pid| (pid, true));
+            return self.taken.remove(&physkey).map(|(pid, to)| Taken { pid, to, first: true });
         }
-        if let Some(&pid) = self.shifted.get(&scancode) {
-            return Some((pid, false));
+        if let Some(&(pid, to)) = self.taken.get(&physkey) {
+            return Some(Taken { pid, to, first: false });
         }
-        let held = self.held?;
-        let pid = self.by_scancode.get(&scancode)?.iter().find_map(|r| match r.to {
-            KeyOut::SwallowWhileHeld(c) if held(c) => Some(r.pid),
-            _ => None,
-        })?;
-        self.shifted.insert(scancode, pid);
-        Some((pid, true))
-    }
-
-    /// Rebuild the active remap table. Swallowed edges keep the rules they captured at hook time,
-    /// so a config swap cannot reroute or discard input already withheld from the desktop.
-    pub fn set_remaps(&mut self, remaps: impl IntoIterator<Item = Remap>) {
-        let mut by_scancode: HashMap<u16, Vec<Remap>> = HashMap::new();
-        for r in remaps {
-            by_scancode.entry(r.from).or_default().push(r);
-        }
-        self.by_scancode = by_scancode
-            .into_iter()
-            .map(|(key, remaps)| (key, Arc::from(remaps)))
-            .collect();
-        self.fail_open_sources.clear();
-    }
-
-    /// True if a device remap that the hook swallows involves this scancode (device unknown yet).
-    #[must_use]
-    pub fn is_remapped_scancode(&self, scancode: u16) -> bool {
-        !self.fail_open_sources.contains(&scancode)
-            && self.by_scancode.get(&scancode).is_some_and(|v| v.iter().any(|r| !matches!(r.to, KeyOut::SwallowWhileHeld(_))))
-    }
-
-    /// HOOK edge: record a swallowed keystroke as pending. Returns whether the hook should swallow
-    /// (true iff the scancode is remapped for some device). Only call for NON-injected events.
-    pub fn on_hook(&mut self, scancode: u16, down: bool, now_us: u64) -> bool {
-        if self.fail_open_sources.contains(&scancode) {
-            if !down { self.fail_open_sources.remove(&scancode); }
-            return false;
-        }
-        let Some(remaps) = self.by_scancode.get(&scancode).cloned() else { return false };
-        // A conditional claim is decided by `on_shift`; unshifted, the key is not ours.
-        if remaps.iter().all(|r| matches!(r.to, KeyOut::SwallowWhileHeld(_))) {
-            return false;
-        }
-        self.pending.push_back(Pending {
-            scancode,
-            down,
-            at_us: now_us,
-            remaps,
+        let remaps = self.by_scancode.get(&physkey)?;
+        let shifted = self.held.and_then(|held| {
+            remaps.iter().find_map(|r| match r.to {
+                KeyOut::SwallowWhileHeld(c) if held(c) => Some(r.pid),
+                _ => None,
+            })
         });
-        true
-    }
-
-    /// RAW-INPUT edge (device known): resolve the matching pending keystroke. Returns what to
-    /// inject — the target key if `pid` matches a remap for this scancode, else the original
-    /// (another device sent it). `None` if there's no pending match (e.g. an injected replay's own
-    /// Raw-Input echo, or a scancode we don't remap).
-    pub fn on_rawinput(
-        &mut self,
-        scancode: u16,
-        down: bool,
-        pid: crate::registry::CanonicalPid,
-    ) -> Option<Inject> {
-        let (pending, already_replayed) = if !down {
-            if let Some(pos) = self.late_ups.iter().position(|p| p.scancode == scancode) {
-                (self.late_ups.remove(pos)?, true)
-            } else {
-                let pos = self.pending.iter().position(|p| p.scancode == scancode && !p.down)?;
-                (self.pending.remove(pos)?, false)
+        let (pid, to) = match shifted {
+            Some(pid) => (pid, KeyOut::Swallow),
+            None => {
+                let pid = self.attribute(physkey)?;
+                let to = remaps
+                    .iter()
+                    .find(|r| r.pid == pid && !matches!(r.to, KeyOut::SwallowWhileHeld(_)))?
+                    .to;
+                (pid, to)
             }
-        } else {
-            let pos = self.pending.iter().position(|p| p.scancode == scancode && p.down)?;
-            (self.pending.remove(pos)?, false)
         };
-        let held_key = (scancode, pid);
-        if let Some(&target) = self.held_targets.get(&held_key) {
-            if !down {
-                self.held_targets.remove(&held_key);
-                self.clear_late_ups_without_held_source(scancode);
-            }
-            return match target {
-                KeyOut::Scancode(scancode) => Some(Inject { scancode, down }),
-                KeyOut::Swallow | KeyOut::SwallowWhileHeld(_) => None,
-            };
-        }
-        if !down {
-            return (!already_replayed).then_some(Inject { scancode, down: false });
-        }
-        match self.resolve_claim(&pending.remaps, pid) {
-            Some(to) => {
-                self.held_targets.insert(held_key, to);
-                match to {
-                    KeyOut::Scancode(sc) => Some(Inject { scancode: sc, down }),
-                    // Claimed by a host feature: the swallow IS the resolution — inject nothing.
-                    KeyOut::Swallow | KeyOut::SwallowWhileHeld(_) => None,
-                }
-            }
-            // Some OTHER device sent this scancode — replay it unchanged so the real key still works.
-            None => Some(Inject { scancode, down }),
-        }
+        self.taken.insert(physkey, (pid, to));
+        Some(Taken { pid, to, first: true })
     }
 
-    /// FAIL-OPEN sweep: any pending keystroke with no Raw-Input attribution within `window_us` is
-    /// replayed as-is (a keystroke is never swallowed forever). Call periodically (the dispatch
-    /// tick). Returns the replays to inject, oldest first.
-    pub fn expire(&mut self, now_us: u64, window_us: u64) -> Vec<Inject> {
-        let mut out = Vec::new();
-        while let Some(front) = self.pending.front() {
-            if now_us.saturating_sub(front.at_us) < window_us {
-                break;
-            }
-            let p = self.pending.pop_front().expect("front just peeked");
-            out.push(Inject {
-                scancode: p.scancode,
-                down: p.down,
-            });
-            if !p.down {
-                let held = self.held_targets.keys().filter(|(source, _)| *source == p.scancode).count();
-                if held > 0 {
-                    // The hook has no device ID, even when just one mapped device is held: an
-                    // unrelated device could have sent this UP. Keep it for a late Raw Input
-                    // match rather than releasing a target that may still be physically held.
-                    let queued = self.late_ups.iter().filter(|edge| edge.scancode == p.scancode).count();
-                    if queued < held {
-                        self.late_ups.push_back(p);
-                    }
-                }
-            }
-        }
-        const RESET_US: u64 = 100_000;
-        let mut reset = HashSet::new();
-        for edge in &self.late_ups {
-            if now_us.saturating_sub(edge.at_us) >= RESET_US {
-                reset.insert(edge.scancode);
-            }
-        }
-        for source in reset {
-            self.late_ups.retain(|edge| edge.scancode != source);
-            self.fail_open_sources.insert(source);
-            self.held_targets.retain(|(scancode, _), target| {
-                if *scancode == source {
-                    if let KeyOut::Scancode(scancode) = *target {
-                        out.push(Inject { scancode, down: false });
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            let mut kept = VecDeque::new();
-            while let Some(edge) = self.pending.pop_front() {
-                if edge.scancode == source {
-                    out.push(Inject { scancode: source, down: edge.down });
-                } else {
-                    kept.push_back(edge);
-                }
-            }
-            self.pending = kept;
-        }
-        out
-    }
-
-    fn clear_late_ups_without_held_source(&mut self, source: u16) {
-        if !self.held_targets.keys().any(|(scancode, _)| *scancode == source) {
-            self.late_ups.retain(|edge| edge.scancode != source);
-        }
-    }
-
-    /// Fail open unresolved originals and release every target whose mapped DOWN already landed.
-    /// Both halves matter when a physical UP is pending at the state transition.
-    fn drain_transition(&mut self) -> Vec<Inject> {
-        self.late_ups.clear();
-        self.fail_open_sources.clear();
-        let mut out: Vec<Inject> = self.pending.drain(..)
-            .map(|p| Inject { scancode: p.scancode, down: p.down })
-            .collect();
-        out.extend(self.held_targets.drain().filter_map(|(_, target)| match target {
-            KeyOut::Scancode(scancode) => Some(Inject { scancode, down: false }),
-            KeyOut::Swallow | KeyOut::SwallowWhileHeld(_) => None,
-        }));
-        out
-    }
-
-    /// Pending count — for diagnostics/tests.
-    #[must_use]
-    pub fn pending_len(&self) -> usize {
-        self.pending.len()
+    /// Stand down: release every taken key, as `(physkey, taken)`.
+    fn drain_transition(&mut self) -> Vec<(u16, Taken)> {
+        self.taken
+            .drain()
+            .map(|(physkey, (pid, to))| (physkey, Taken { pid, to, first: true }))
+            .collect()
     }
 
     /// True if no remaps are configured (the whole shim is a no-op).
@@ -356,21 +228,10 @@ impl Interceptor {
         self.by_scancode.is_empty()
     }
 
-    /// Is there a remap for this (physkey, device pid)? Lets the live dispatcher SKIP its own
-    /// host-side handling of a trigger the shim already owns (avoids the double-send).
-    #[must_use]
-    pub fn has_remap(&self, physkey: u16, pid: crate::registry::CanonicalPid) -> bool {
-        if self.fail_open_sources.contains(&physkey) { return false; }
-        self.by_scancode
-            .get(&physkey)
-            .is_some_and(|v| v.iter().any(|r| r.pid == pid))
-    }
-
-    /// Like [`has_remap`], but ONLY for replacement remaps ([`KeyOut::Scancode`]). Swallow claims
+    /// Is there a replacement remap ([`KeyOut::Scancode`]) for this (physkey, pid)? Swallow claims
     /// don't count — the dispatcher must still fire their actions (see the module-level `owns`).
     #[must_use]
     pub fn has_key_remap(&self, physkey: u16, pid: crate::registry::CanonicalPid) -> bool {
-        if self.fail_open_sources.contains(&physkey) { return false; }
         self.by_scancode.get(&physkey).is_some_and(|v| {
             v.iter()
                 .any(|r| r.pid == pid && matches!(r.to, KeyOut::Scancode(_)))
@@ -378,11 +239,9 @@ impl Interceptor {
     }
 
     /// GRAB-MODEL resolve (e.g. Linux evdev `EVIOCGRAB`): the device is known at read time, so
-    /// there is no separate swallow/hook and no `pending` to match — look the remap up directly.
-    /// Returns the target key if this (physkey, pid) is remapped, else the original (pass-through).
-    /// Unlike [`on_rawinput`], this never touches `pending` (the Windows correlation path). The
-    /// Windows/macOS backends use `on_hook`+`on_rawinput`; a grab backend uses this instead.
-    /// `None` = the key is claimed with [`KeyOut::Swallow`] — emit nothing.
+    /// there is no hook decision to make — look the claim up directly. Returns the target key if
+    /// this (physkey, pid) is remapped, else the original (pass-through). `None` = the key is
+    /// swallowed — emit nothing.
     #[must_use]
     pub fn resolve_direct(
         &self,
@@ -409,18 +268,13 @@ impl Interceptor {
 
 // ─────────────────────────────── LIVE LAYER (process-global + Win32) ───────────────────────────
 //
-// The pure [`Interceptor`] above is driven by two threads: the LL keyboard hook (writes `pending`
-// via [`hook_edge`]) and the Raw-Input reader in `controls::listen` (resolves via [`on_raw_keyboard`]
-// and injects). They share ONE process-global behind a mutex — the same single-owner model as
-// `hook.rs`'s gaming hook. Everything is a zero-cost no-op until [`configure`] arms it.
+// The pure [`Interceptor`] above is driven by the LL hooks (decide via [`hook_edge`]) and the
+// Raw-Input reader in `controls::listen` (feeds device activity via [`on_raw_keyboard`]). They share
+// ONE process-global behind a mutex — the same single-owner model as `hook.rs`'s gaming hook.
+// Everything is a zero-cost no-op until [`configure`] arms it.
 //
-// KEY WIN32 FACTS this relies on (measured / documented):
-// * A WH_KEYBOARD_LL hook returning 1 suppresses the LEGACY message path (WM_KEYDOWN/WM_CHAR) but
-//   NOT Raw-Input (WM_INPUT) — so we still SEE the swallowed key (to attribute + resolve it), and
-//   press-to-bind capture (which reads Raw-Input) keeps working.
-// * Our own `SendInput` replays carry a `dwExtraInfo` signature so the hook passes them through
-//   instead of re-swallowing (no loop); their Raw-Input echo has no `pending` match so the reader
-//   ignores it.
+// Our own `SendInput` output carries a `dwExtraInfo` signature so the hook passes it through
+// instead of taking it again, and its Raw-Input echo carries no device, so it is not activity.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -430,9 +284,6 @@ use std::time::Instant;
 /// replays and passes them through. "nrn\0" — arbitrary but distinctive.
 #[cfg(windows)]
 const INJECT_SIG: usize = 0x006e_726e;
-/// Fail-open window: a swallowed keystroke with no Raw-Input attribution within this long is
-/// replayed as-is. The measured hook→Raw-Input gap is ~0.3–2ms, so 8ms is a comfortable ceiling.
-const EXPIRE_US: u64 = 8_000;
 
 static CORE: Mutex<Option<Interceptor>> = Mutex::new(None);
 struct EdgeState {
@@ -466,8 +317,8 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 
 /// Suspend/resume the shim for the duration of a press-to-bind capture. While paused, keys pass
-/// through untouched so a captured control is read cleanly. Already-swallowed originals are
-/// replayed before the pause takes effect. Call `true` at capture start and `false` at its end.
+/// through untouched so a captured control is read cleanly. Keys already taken are released
+/// before the pause takes effect. Call `true` at capture start and `false` at its end.
 pub fn set_paused(on: bool) {
     let _standdown = STANDDOWN_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (pending, _emission) = {
@@ -482,18 +333,18 @@ pub fn set_paused(on: bool) {
         }
         (pending, emission)
     };
-    for edge in pending { emit(edge); }
+    for (physkey, taken) in pending { release(physkey, taken); }
 }
 
-fn take_transition_edges() -> Vec<Inject> {
+fn take_transition_edges() -> Vec<(u16, Taken)> {
     CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_mut()
         .map(Interceptor::drain_transition)
         .unwrap_or_default()
 }
 
-/// Finish fail-open replay while the input gate is still armed, then close it before a new hook
-/// edge can enter. Called only by the process-wide safety setter.
+/// Release taken keys while the input gate is still armed, then close it before a new hook edge
+/// can enter. Called only by the process-wide safety setter.
 pub(crate) fn disarm_input_with(close_gate: impl FnOnce()) {
     let _standdown = STANDDOWN_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let pending = {
@@ -505,7 +356,7 @@ pub(crate) fn disarm_input_with(close_gate: impl FnOnce()) {
         }
         pending
     };
-    for edge in pending { emit(edge); }
+    for (physkey, taken) in pending { release(physkey, taken); }
     let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     close_gate();
     state.disarming = false;
@@ -519,11 +370,8 @@ pub fn paused() -> bool {
 }
 
 /// Is the shim standing down for this edge — either not armed at all, or [`set_paused`] for a
-/// press-to-bind capture? The three per-edge entry points (`hook_edge`, `on_raw_keyboard`, `owns`)
+/// press-to-bind capture? The per-edge entry points (`hook_edge`, `owns`)
 /// all route through this so "paused" cannot come to mean different things in different places.
-///
-/// [`expire_tick`] deliberately does NOT consult it: a keystroke swallowed in the instant BEFORE the
-/// pause must still fail open and replay, or pausing would eat the key it was meant to protect.
 fn standing_down() -> bool {
     standing_down_for(ACTIVE.load(Ordering::Relaxed), PAUSED.load(Ordering::Relaxed))
 }
@@ -565,6 +413,7 @@ pub fn configure(remaps: Vec<Remap>) {
     let any = !remaps.is_empty();
     let want_mouse = remaps.iter().any(|r| r.from & MOUSE_PHYSKEY_BASE != 0);
     let want_kbd = remaps.iter().any(|r| r.from & MOUSE_PHYSKEY_BASE == 0);
+    let keysets = device_keysets(&crate::registry::shared());
     // A config swap stands down the old remaps and releases their held outputs before the new
     // rules can own an edge. No key already withheld from the desktop is discarded.
     let (pending, _emission) = {
@@ -578,10 +427,12 @@ pub fn configure(remaps: Vec<Remap>) {
             }
         }
         let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.get_or_insert_with(Interceptor::live).set_remaps(remaps);
+        let core = g.get_or_insert_with(Interceptor::live);
+        core.set_remaps(remaps);
+        core.set_keysets(keysets);
         (pending, emission)
     };
-    for edge in pending { emit(edge); }
+    for (physkey, taken) in pending { release(physkey, taken); }
     drop(_emission);
     if any {
         let kbd_installed = if want_kbd {
@@ -612,8 +463,8 @@ pub fn configure(remaps: Vec<Remap>) {
 ///   * keyboard key + plain `Key` action → a REPLACEMENT remap ([`KeyOut::Scancode`]); the shim
 ///     emits the target and the dispatcher SKIPS the rule ([`owns`]) — no double-send;
 ///   * anything else the shim can hook (keyboard key with a non-Key action, any claimable mouse
-///     button) → a SWALLOW claim: the original emission is suppressed, and the dispatcher still
-///     fires the action off Raw Input (see the module note on what a swallow hides from it).
+///     button) → a SWALLOW claim: the original emission is suppressed, and the hook delivers the
+///     edge as the device's so the dispatcher still fires the action.
 ///
 /// Hold-layer rules and device-any binds are never claimed here (shifted binds get conditional
 /// claims from `layer_claims`) (a device-any swallow would eat the
@@ -654,7 +505,7 @@ pub fn claim_for_rule(rule: &crate::engine::Rule) -> Option<Remap> {
     // THE OWNERSHIP PRINCIPLE, device-agnostic: a pid-scoped BOUND control owns its input.
     //   * a plain `Key` remap on a keyboard key REPLACES the keystroke (Scancode target);
     //   * every other action — and every mouse-button bind — SWALLOWS the original emission and
-    //     lets host dispatch fire the action off Raw Input.
+    //     delivers it as the device's edge, so host dispatch fires the action.
     // Without the swallow arm, a side-plate key bound to a macro typed its digit AND ran the
     // macro, and a bound mouse side button still clicked into the app underneath — the exact
     // "additive, not a rebind" feel this shim exists to kill.
@@ -678,7 +529,7 @@ pub fn configure_from_engine(engine: &crate::engine::Engine) {
 /// trigger (the cast/weave trigger), pass it here and — if it is a pid-scoped keyboard key the
 /// shim can express — its keystroke is swallowed device-scoped, so holding the Naga side-plate
 /// key to weave stops typing `1111…` into the focused app. The feature reads the hold from the
-/// Raw-Input held registry (see the module note on what a swallow hides from it). Device-any or
+/// held registry, which the hook's delivery feeds. Device-any or
 /// mouse-button binds contribute nothing (mouse swallowing stays with the click-guard).
 pub fn configure_from_engine_with(
     engine: &crate::engine::Engine,
@@ -744,6 +595,19 @@ fn layer_claims(engine: &crate::engine::Engine) -> impl Iterator<Item = Remap> +
                 })
                 .collect::<Vec<_>>()
         })
+}
+
+/// The keys each device with a declared button table can send, as physkeys: its buttons' stock
+/// keys. A device without one may send any key.
+fn device_keysets(reg: &crate::registry::Registry) -> HashMap<crate::registry::CanonicalPid, HashSet<u16>> {
+    let mut out: HashMap<crate::registry::CanonicalPid, HashSet<u16>> = HashMap::new();
+    for def in reg.devices.iter().filter(|d| !d.buttons.is_empty()) {
+        let keys: HashSet<u16> = def.buttons.iter().filter_map(|b| sys::physkey_for_usage(u16::from(b.stock_usage))).collect();
+        for pid in def.owned_event_pids() {
+            out.entry(crate::registry::CanonicalPid::of(pid)).or_default().extend(keys.iter().copied());
+        }
+    }
+    out
 }
 
 fn firmware_managed(rule: &crate::engine::Rule) -> bool {
@@ -818,15 +682,15 @@ pub fn deactivate() {
         }
         (pending, emission)
     };
-    for edge in pending { emit(edge); }
+    for (physkey, taken) in pending { release(physkey, taken); }
     drop(_emission);
     sys::uninstall();
     sys::uninstall_mouse();
 }
 
 /// The HOOK's per-edge decision: should this keystroke be swallowed? Called from the LL hook proc
-/// with the physkey (`scancode | 0x100 if extended`). Records it as pending when swallowed. Gated
-/// on the input-arm kill-switch — in safe mode we swallow nothing (pure pass-through, no remap).
+/// with the physkey (`scancode | 0x100 if extended`). A taken key is delivered or replaced here.
+/// Gated on the input-arm kill-switch — in safe mode we swallow nothing (pure pass-through).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn hook_edge(physkey: u16, down: bool, injected: bool) -> bool {
     let state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -849,31 +713,74 @@ fn hook_edge(physkey: u16, down: bool, injected: bool) -> bool {
     if !injected && sys::usage_for_physkey(physkey).is_some_and(|u| crate::buttons::deliver_private(u, down)) {
         return true;
     }
-    let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(c) = g.as_mut() else { return false };
-    if !injected {
-        if let Some((pid, deliver)) = c.on_shift(physkey, down) {
-            drop(g);
-            if deliver {
-                deliver_shifted(pid, physkey, down);
+    // Another program's synthetic key has no device to attribute; it is never ours to take.
+    if injected {
+        return false;
+    }
+    let mut state = state;
+    let taken = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut().and_then(|c| c.on_edge(physkey, down));
+    let Some(taken) = taken else { return false };
+    let emission = reserve_emission(&mut state);
+    drop(state);
+    match taken.to {
+        KeyOut::Scancode(scancode) => emit_later(Inject { scancode, down }, emission),
+        KeyOut::Swallow | KeyOut::SwallowWhileHeld(_) => {
+            if taken.first {
+                deliver_taken(taken.pid, physkey, down);
             }
-            return true;
         }
     }
-    c.on_hook(physkey, down, now_us())
+    true
 }
 
-/// One device's keys the hook took as shifted, as `(page, usage)`.
-type ShiftedSet = (crate::registry::CanonicalPid, Vec<(u16, u16)>);
-/// Keys the hook took as shifted, per device: the held set each delivery reports.
-static SHIFTED_HELD: Mutex<Vec<ShiftedSet>> = Mutex::new(Vec::new());
+/// Release a key taken at the hook when the shim stands down.
+fn release(physkey: u16, taken: Taken) {
+    match taken.to {
+        KeyOut::Scancode(scancode) => emit(Inject { scancode, down: false }),
+        KeyOut::Swallow | KeyOut::SwallowWhileHeld(_) => deliver_taken(taken.pid, physkey, false),
+    }
+}
 
-/// Deliver a key the hook took as shifted as an edge of `pid`'s keyboard.
-fn deliver_shifted(pid: crate::registry::CanonicalPid, physkey: u16, down: bool) {
-    let Some(usage) = sys::usage_for_physkey(physkey) else { return };
-    let key = (0x07, usage);
+/// Injects from the hook go out on their own thread: `SendInput` runs the hooks again, and the hook
+/// thread must not wait on itself.
+fn emit_later(inject: Inject, emission: Emission) {
+    static TX: OnceLock<Mutex<std::sync::mpsc::Sender<(Inject, Emission)>>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(Inject, Emission)>();
+        crate::worker::spawn_detached("neuron-remap-emit", move || {
+            for (inject, emission) in rx {
+                emit(inject);
+                drop(emission);
+            }
+        });
+        Mutex::new(tx)
+    });
+    // No emitter (it failed to start or died): emit here rather than lose the key.
+    if let Err(std::sync::mpsc::SendError((inject, emission))) =
+        tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send((inject, emission))
+    {
+        emit(inject);
+        drop(emission);
+    }
+}
+
+/// One device's keys the hook took, as `(page, usage)`.
+type TakenSet = (crate::registry::CanonicalPid, Vec<(u16, u16)>);
+/// Keys the hook took, per device: the held set each delivery reports.
+static TAKEN_HELD: Mutex<Vec<TakenSet>> = Mutex::new(Vec::new());
+
+/// Deliver a key the hook took as an edge of `pid`, so its bind fires: the hook's swallow hid it
+/// from Raw Input.
+fn deliver_taken(pid: crate::registry::CanonicalPid, physkey: u16, down: bool) {
+    let key = if physkey & MOUSE_PHYSKEY_BASE != 0 {
+        (0x09, physkey & !MOUSE_PHYSKEY_BASE)
+    } else if let Some(usage) = sys::usage_for_physkey(physkey) {
+        (0x07, usage)
+    } else {
+        (0xFF07, physkey)
+    };
     let hits = {
-        let mut held = SHIFTED_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = TAKEN_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let at = held.iter().position(|(p, _)| *p == pid).unwrap_or_else(|| {
             held.push((pid, Vec::new()));
             held.len() - 1
@@ -890,56 +797,29 @@ fn deliver_shifted(pid: crate::registry::CanonicalPid, physkey: u16, down: bool)
     };
     crate::controls::inject_event(crate::controls::ControlEvent {
         pid: Some(pid),
-        stream: crate::controls::Stream::Shifted,
+        stream: crate::controls::Stream::Hooked,
         hits,
         raw: Vec::new(),
     });
 }
 
-/// The RAW-INPUT reader's per-edge call (from `controls::listen`): attribute a swallowed keystroke
-/// to its device and inject the resolved key. No-op unless armed. `pid` is the RAW pid straight off
-/// the wire — this is one of the two doors where it becomes a canonical identity, so callers never
-/// have to know the rule.
+/// The RAW-INPUT reader's per-edge call (from `controls::listen`): a key that reached the desktop
+/// marks its device active, which is what [`hook_edge`] attributes the next claimed key by. `pid`
+/// is the RAW pid off the wire; 0 is a synthetic event with no device.
 pub fn on_raw_keyboard(physkey: u16, down: bool, pid: u16) {
+    if !down || pid == 0 {
+        return;
+    }
     let pid = crate::registry::CanonicalPid::of(pid);
-    let (inject, _emission) = {
-        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A transition drains pending originals; do not race it by consuming an attributed edge.
-        if state.disarming || standing_down() { return; }
-        let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let inject = g.as_mut().and_then(|c| c.on_rawinput(physkey, down, pid));
-        let emission = inject.map(|_| reserve_emission(&mut state));
-        (inject, emission)
-    };
-    if let Some(i) = inject {
-        emit(i);
+    if let Some(c) = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+        c.observe(physkey, pid, now_us());
     }
 }
 
 /// The RAW-INPUT reader's per-edge call for MOUSE buttons (3=middle, 4=X1, 5=X2): the mouse-hook
-/// twin of [`on_raw_keyboard`], sharing the same correlation core via the mouse physkey
-/// namespace. Attributes a hook-swallowed click and replays it when it came from an unclaimed
-/// device.
+/// twin of [`on_raw_keyboard`], in the mouse physkey namespace.
 pub fn on_raw_mouse(button: u16, down: bool, pid: u16) {
     on_raw_keyboard(mouse_physkey(button), down, pid);
-}
-
-/// Fail-open sweep — call on the dispatch tick. Replays any keystroke that was swallowed but never
-/// attributed (so a key is never lost if Raw-Input is delayed/dropped).
-pub fn expire_tick() {
-    let (replays, _emission) = {
-        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.disarming { return; }
-        let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let replays = g.as_mut()
-            .map(|c| c.expire(now_us(), EXPIRE_US))
-            .unwrap_or_default();
-        let emission = (!replays.is_empty()).then(|| reserve_emission(&mut state));
-        (replays, emission)
-    };
-    for i in replays {
-        emit(i);
-    }
 }
 
 // ── the platform boundary: everything OS-specific lives in ONE place, `mod sys` ────────────────
@@ -1090,8 +970,7 @@ mod sys {
 
     /// One hook pump's shared body — both hooks (keyboard, mouse) run this with their own slot
     /// statics and proc. This callback sits in the OS input path, so being scheduled late delays
-    /// every event on the machine — and here it would also widen the swallow→replay window this
-    /// shim's whole design is built around.
+    /// every event on the machine.
     #[allow(clippy::type_complexity)]
     fn pump_main_for(
         hook_id: i32,
@@ -1195,8 +1074,7 @@ mod sys {
     }
 
     /// `SendInput` one mouse-button event (3=middle, 4=X1, 5=X2), stamped with our signature so the
-    /// mouse hook passes it — the replay path for a swallowed click that turned out to belong to
-    /// an unclaimed device. Gated on the arm kill-switch like every injection.
+    /// mouse hook passes it. Gated on the arm kill-switch like every injection.
     pub fn inject_mouse(button: u16, down: bool) {
         if !crate::action::input_armed() {
             return;
@@ -1236,16 +1114,14 @@ mod sys {
     //! ## Filling this in
     //! **Linux (evdev + uinput) — the simplest of the three.** `EVIOCGRAB` a specific `/dev/input`
     //! node: that yields device-identified events AND suppresses them from the rest of the system
-    //! in ONE step, so the swallow-and-replay correlation is NOT needed. `install` spawns a reader
-    //! thread that, per grabbed event, calls [`super::Interceptor::resolve_direct`] (device known,
-    //! no `pending`) and injects the result via `uinput`. `physkey_for_usage`: HID usage → evdev
-    //! keycode.
+    //! in ONE step, so no attribution is needed. `install` spawns a reader thread that, per grabbed
+    //! event, calls [`super::Interceptor::resolve_direct`] (device known) and injects the result
+    //! via `uinput`. `physkey_for_usage`: HID usage → evdev keycode.
     //!
     //! **macOS (CGEventTap + IOHIDManager).** A keyboard `CGEventTapCreate` tap can suppress and
-    //! reinject in place; device attribution is the hard part (taps don't carry the device), so
-    //! correlate against `IOHIDManager` the way Windows correlates against Raw-Input — REUSE the
-    //! swallow/attribute core ([`super::Interceptor::on_hook`] + `on_rawinput`). `physkey_for_usage`:
-    //! HID usage → the platform virtual keycode.
+    //! reinject in place; taps don't carry the device, so feed `IOHIDManager` activity to
+    //! [`super::Interceptor::observe`] and decide in the tap with [`super::Interceptor::on_edge`],
+    //! as Windows does with Raw Input. `physkey_for_usage`: HID usage → the platform virtual keycode.
 
     /// No key-id map yet → [`super::claim_for_rule`] builds nothing, so the shim stays inert here.
     pub fn physkey_for_usage(_usage: u16) -> Option<u16> {
@@ -1302,82 +1178,119 @@ mod tests {
         i
     }
 
-    #[test]
-    fn a_shifted_key_is_taken_at_the_hook_only_while_its_hold_key_is_down() {
-        FN_DOWN.with(|f| f.set(false));
-        let mut i = fn_core(&[]);
-        assert_eq!(i.on_shift(0x3C, true), None, "plain F2 is not shifted");
-        assert!(!i.on_hook(0x3C, true, 0), "and the hook leaves it alone, so Raw Input sees it");
-        assert_eq!(i.on_shift(0x3C, false), None);
-        assert!(!i.on_hook(0x3C, false, 5));
-        assert_eq!(i.pending_len(), 0);
-
-        FN_DOWN.with(|f| f.set(true));
-        assert_eq!(i.on_shift(0x3C, true), Some((kbd(), true)), "Fn+F2 is taken as the keyboard's");
-        assert_eq!(i.on_shift(0x3C, true), Some((kbd(), false)), "auto-repeat is taken, not redelivered");
-        // Fn lets go first: the taken press still owns its release.
-        FN_DOWN.with(|f| f.set(false));
-        assert_eq!(i.on_shift(0x3C, false), Some((kbd(), true)));
-        assert_eq!(i.on_shift(0x3C, false), None, "one release per press");
+    fn naga_keys() -> HashMap<crate::registry::CanonicalPid, HashSet<u16>> {
+        HashMap::from([(naga(), HashSet::from([0x02, 0x0D]))])
     }
 
     #[test]
-    fn an_unconditional_claim_on_the_same_key_keeps_the_correlation_path() {
+    fn a_shifted_key_is_taken_only_while_its_hold_key_is_down() {
         FN_DOWN.with(|f| f.set(false));
-        let base = Remap { pid: kbd(), from: 0x3C, to: KeyOut::Scancode(0x22) };
-        let mut i = fn_core(&[base]);
-        assert_eq!(i.on_shift(0x3C, true), None);
-        assert!(i.on_hook(0x3C, true, 0));
-        assert_eq!(i.on_rawinput(0x3C, true, kbd()), Some(Inject { scancode: 0x22, down: true }));
-        assert_eq!(i.resolve_direct(0x3C, true, kbd()), Some(Inject { scancode: 0x22, down: true }));
+        let mut i = fn_core(&[]);
+        assert_eq!(i.on_edge(0x3C, true), None, "plain F2 passes untouched");
+        assert_eq!(i.on_edge(0x3C, false), None);
+
         FN_DOWN.with(|f| f.set(true));
-        assert_eq!(i.resolve_direct(0x3C, true, kbd()), None, "the grab model resolves the shift itself");
-        assert_eq!(i.resolve_direct(0x3C, true, naga()), Some(Inject { scancode: 0x3C, down: true }));
+        assert_eq!(i.on_edge(0x3C, true), Some(Taken { pid: kbd(), to: KeyOut::Swallow, first: true }));
+        assert_eq!(i.on_edge(0x3C, true), Some(Taken { pid: kbd(), to: KeyOut::Swallow, first: false }), "auto-repeat");
+        // Fn lets go first: the taken press still owns its release.
+        FN_DOWN.with(|f| f.set(false));
+        assert_eq!(i.on_edge(0x3C, false), Some(Taken { pid: kbd(), to: KeyOut::Swallow, first: true }));
+        assert_eq!(i.on_edge(0x3C, false), None, "one release per press");
     }
 
     #[test]
     fn a_core_with_no_held_query_never_shifts() {
         let mut i = Interceptor::new();
         i.set_remaps([Remap { pid: kbd(), from: 0x3C, to: KeyOut::SwallowWhileHeld(fn_ref()) }]);
-        assert_eq!(i.on_shift(0x3C, true), None);
-        assert!(!i.on_hook(0x3C, true, 0));
+        i.observe(0x1E, kbd(), 0);
+        assert_eq!(i.on_edge(0x3C, true), None);
     }
 
     #[test]
-    fn naga_key_is_remapped_other_device_is_replayed() {
+    fn a_key_only_one_device_can_send_is_that_devices() {
+        let mut i = Interceptor::new();
+        i.set_keysets(naga_keys());
+        i.set_remaps([Remap { pid: kbd(), from: 0x3F, to: KeyOut::Swallow }]);
+        i.observe(0x1E, kbd(), 10);
+        i.observe(0x02, naga(), 20);
+        // F5 last came... nowhere, but the Naga can only send its grid keys: the keyboard sent it.
+        assert_eq!(i.on_edge(0x3F, true), Some(Taken { pid: kbd(), to: KeyOut::Swallow, first: true }));
+        assert_eq!(i.on_edge(0x3F, false), Some(Taken { pid: kbd(), to: KeyOut::Swallow, first: true }));
+    }
+
+    #[test]
+    fn a_shared_key_goes_to_the_device_active_last() {
+        let mut i = Interceptor::new();
+        i.set_keysets(naga_keys());
+        i.set_remaps([eq_to_g()]);
+        i.observe(0x1E, kbd(), 10);
+        i.observe(0x02, naga(), 20);
+        assert_eq!(i.on_edge(0x0D, true), Some(Taken { pid: naga(), to: KeyOut::Scancode(0x22), first: true }));
+        assert_eq!(i.on_edge(0x0D, false), Some(Taken { pid: naga(), to: KeyOut::Scancode(0x22), first: true }));
+
+        i.observe(0x1E, kbd(), 30);
+        assert_eq!(i.on_edge(0x0D, true), None, "the keyboard's '=' is not claimed and passes untouched");
+        assert_eq!(i.on_edge(0x0D, false), None);
+    }
+
+    #[test]
+    fn nothing_is_taken_before_any_device_is_known() {
         let mut i = Interceptor::new();
         i.set_remaps([eq_to_g()]);
-        // The '=' scancode is remapped, so the hook swallows it (device unknown at hook time).
-        assert!(i.on_hook(0x0D, true, 1000));
-        // Raw-Input arrives ~0.5ms later attributing it to the naga() -> emit 'g'.
-        assert_eq!(
-            i.on_rawinput(0x0D, true, naga()),
-            Some(Inject { scancode: 0x22, down: true })
-        );
-        // The release edge, same path.
-        assert!(i.on_hook(0x0D, false, 1400));
-        assert_eq!(
-            i.on_rawinput(0x0D, false, naga()),
-            Some(Inject { scancode: 0x22, down: false })
-        );
-        assert_eq!(i.pending_len(), 0, "both edges resolved");
+        assert_eq!(i.on_edge(0x0D, true), None);
+        assert_eq!(i.on_edge(0x1E, true), None, "an unclaimed key is never taken");
+    }
 
-        // The SAME scancode from the real keyboard is swallowed too (device unknown at hook)...
-        assert!(i.on_hook(0x0D, true, 2000));
-        // ...but Raw-Input attributes it to the KEYBOARD -> replay the ORIGINAL '=' unchanged.
+    #[test]
+    fn mouse_buttons_attribute_among_mice() {
+        let mut i = Interceptor::new();
+        i.set_remaps([Remap { pid: naga(), from: mouse_physkey(4), to: KeyOut::Swallow }]);
+        i.observe(0x1E, kbd(), 50);
+        i.observe(mouse_physkey(1), naga(), 10);
         assert_eq!(
-            i.on_rawinput(0x0D, true, kbd()),
-            Some(Inject { scancode: 0x0D, down: true })
+            i.on_edge(mouse_physkey(4), true),
+            Some(Taken { pid: naga(), to: KeyOut::Swallow, first: true }),
+            "keyboard activity says nothing about which mouse clicked"
         );
     }
 
     #[test]
-    fn unremapped_scancode_is_never_swallowed() {
+    fn a_reconfigured_key_releases_with_the_decision_it_was_pressed_with() {
         let mut i = Interceptor::new();
         i.set_remaps([eq_to_g()]);
-        assert!(!i.is_remapped_scancode(0x1E)); // 'a', not remapped
-        assert!(!i.on_hook(0x1E, true, 1000), "hook must pass unremapped keys through");
-        assert_eq!(i.pending_len(), 0);
+        i.observe(0x02, naga(), 0);
+        assert_eq!(i.on_edge(0x0D, true), Some(Taken { pid: naga(), to: KeyOut::Scancode(0x22), first: true }));
+        i.set_remaps([Remap { pid: naga(), from: 0x0D, to: KeyOut::Scancode(0x30) }]);
+        assert_eq!(i.on_edge(0x0D, false), Some(Taken { pid: naga(), to: KeyOut::Scancode(0x22), first: true }));
+        assert_eq!(i.on_edge(0x0D, true), Some(Taken { pid: naga(), to: KeyOut::Scancode(0x30), first: true }));
+    }
+
+    #[test]
+    fn standing_down_releases_every_taken_key_once() {
+        let mut i = Interceptor::new();
+        i.set_remaps([eq_to_g(), Remap { pid: naga(), from: 0x02, to: KeyOut::Swallow }]);
+        i.observe(0x02, naga(), 0);
+        i.on_edge(0x0D, true);
+        i.on_edge(0x02, true);
+        let mut released = i.drain_transition();
+        released.sort_by_key(|(physkey, _)| *physkey);
+        assert_eq!(released, vec![
+            (0x02, Taken { pid: naga(), to: KeyOut::Swallow, first: true }),
+            (0x0D, Taken { pid: naga(), to: KeyOut::Scancode(0x22), first: true }),
+        ]);
+        assert!(i.drain_transition().is_empty());
+        assert_eq!(i.on_edge(0x0D, false), None, "the physical release after a stand-down passes");
+    }
+
+    #[test]
+    fn resolve_direct_resolves_the_shift_itself() {
+        FN_DOWN.with(|f| f.set(false));
+        let base = Remap { pid: kbd(), from: 0x3C, to: KeyOut::Scancode(0x22) };
+        let i = fn_core(&[base]);
+        assert_eq!(i.resolve_direct(0x3C, true, kbd()), Some(Inject { scancode: 0x22, down: true }));
+        FN_DOWN.with(|f| f.set(true));
+        assert_eq!(i.resolve_direct(0x3C, true, kbd()), None);
+        assert_eq!(i.resolve_direct(0x3C, true, naga()), Some(Inject { scancode: 0x3C, down: true }));
     }
 
     /// `set_paused` must actually stand the shim down.
@@ -1414,138 +1327,6 @@ mod tests {
     }
 
     #[test]
-    fn fail_open_replays_unattributed_keystrokes() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        i.on_hook(0x0D, true, 1000);
-        // No Raw-Input arrived. Before the window, nothing expires.
-        assert!(i.expire(1003, 5000).is_empty());
-        // After the window, the swallowed key is replayed as-is (never lost).
-        assert_eq!(
-            i.expire(7000, 5000),
-            vec![Inject { scancode: 0x0D, down: true }]
-        );
-        assert_eq!(i.pending_len(), 0);
-    }
-
-    #[test]
-    fn stopping_interception_replays_pending_original_edges_in_order() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        assert!(i.on_hook(0x0D, true, 1000));
-        assert!(i.on_hook(0x0D, false, 1001));
-        i.set_remaps([]);
-        assert_eq!(i.drain_transition(), vec![
-            Inject { scancode: 0x0D, down: true },
-            Inject { scancode: 0x0D, down: false },
-        ]);
-        assert_eq!(i.pending_len(), 0);
-    }
-
-    #[test]
-    fn disarm_releases_a_mapped_target_even_when_its_physical_up_is_pending() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        assert!(i.on_hook(0x0D, true, 1000));
-        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
-        assert!(i.on_hook(0x0D, false, 1001));
-        assert_eq!(i.drain_transition(), vec![
-            Inject { scancode: 0x0D, down: false },
-            Inject { scancode: 0x22, down: false },
-        ]);
-        assert!(i.drain_transition().is_empty(), "a second disarm cannot release the key twice");
-    }
-
-    #[test]
-    fn unattributed_up_waits_for_device_identity_before_releasing_a_target() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        assert!(i.on_hook(0x0D, true, 1000));
-        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
-        assert!(i.on_hook(0x0D, false, 1001));
-        assert_eq!(i.expire(20_000, 8_000), vec![Inject { scancode: 0x0D, down: false }]);
-        assert_eq!(i.on_rawinput(0x0D, false, naga()), Some(Inject { scancode: 0x22, down: false }));
-        assert!(i.drain_transition().is_empty());
-    }
-
-    #[test]
-    fn missing_raw_up_releases_target_and_passes_through_until_next_up() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        assert!(i.on_hook(0x0D, true, 1000));
-        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
-        assert!(i.on_hook(0x0D, false, 1001));
-        assert_eq!(i.expire(20_000, 8_000), vec![Inject { scancode: 0x0D, down: false }]);
-        assert_eq!(i.expire(101_001, 8_000), vec![Inject { scancode: 0x22, down: false }]);
-        assert!(!i.is_remapped_scancode(0x0D));
-        assert!(!i.on_hook(0x0D, true, 102_000));
-        assert!(!i.on_hook(0x0D, false, 103_000));
-        assert!(i.is_remapped_scancode(0x0D));
-        assert!(i.on_hook(0x0D, true, 104_000));
-    }
-
-    #[test]
-    fn unrelated_up_timeout_cannot_release_the_only_held_target() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        assert!(i.on_hook(0x0D, true, 1000));
-        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
-        assert!(i.on_hook(0x0D, false, 1001));
-        assert_eq!(i.expire(20_000, 8_000), vec![Inject { scancode: 0x0D, down: false }]);
-        assert_eq!(i.on_rawinput(0x0D, false, kbd()), None, "the other device's UP was already replayed");
-        assert_eq!(i.drain_transition(), vec![Inject { scancode: 0x22, down: false }]);
-    }
-
-    #[test]
-    fn ambiguous_up_timeout_waits_for_device_attribution() {
-        let mut i = Interceptor::new();
-        i.set_remaps([
-            eq_to_g(),
-            Remap { pid: kbd(), from: 0x0D, to: KeyOut::Scancode(0x30) },
-        ]);
-        assert!(i.on_hook(0x0D, true, 1000));
-        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
-        assert!(i.on_hook(0x0D, true, 1001));
-        assert_eq!(i.on_rawinput(0x0D, true, kbd()), Some(Inject { scancode: 0x30, down: true }));
-        assert!(i.on_hook(0x0D, false, 1002));
-        assert_eq!(i.expire(20_000, 8_000), vec![Inject { scancode: 0x0D, down: false }]);
-        assert_eq!(i.on_rawinput(0x0D, false, naga()), Some(Inject { scancode: 0x22, down: false }));
-        assert!(i.on_hook(0x0D, false, 20_001));
-        assert_eq!(i.on_rawinput(0x0D, false, kbd()), Some(Inject { scancode: 0x30, down: false }));
-        assert!(i.drain_transition().is_empty());
-    }
-
-    #[test]
-    fn injected_echo_without_pending_is_ignored() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        // A Raw-Input event with no matching pending entry (e.g. our own replay's echo) -> None.
-        assert_eq!(i.on_rawinput(0x0D, true, kbd()), None);
-    }
-
-    #[test]
-    fn rapid_repeats_resolve_in_order() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        // Two quick down edges buffered before either Raw-Input arrives.
-        i.on_hook(0x0D, true, 1000);
-        i.on_hook(0x0D, true, 1100);
-        assert_eq!(i.pending_len(), 2);
-        // First Raw-Input (Naga) resolves the OLDEST -> 'g'.
-        assert_eq!(
-            i.on_rawinput(0x0D, true, naga()),
-            Some(Inject { scancode: 0x22, down: true })
-        );
-        assert_eq!(i.pending_len(), 1);
-        // Second resolves the remaining one.
-        assert_eq!(
-            i.on_rawinput(0x0D, true, naga()),
-            Some(Inject { scancode: 0x22, down: true })
-        );
-        assert_eq!(i.pending_len(), 0);
-    }
-
-    #[test]
     fn resolve_direct_is_the_grab_model_path() {
         // The Linux/evdev backend knows the device at read time — no swallow, no pending.
         let mut i = Interceptor::new();
@@ -1560,12 +1341,11 @@ mod tests {
             i.resolve_direct(0x0D, true, kbd()),
             Some(Inject { scancode: 0x0D, down: true })
         );
-        // An unremapped key -> unchanged, and no pending state was touched.
+        // An unremapped key -> unchanged.
         assert_eq!(
             i.resolve_direct(0x1E, false, naga()),
             Some(Inject { scancode: 0x1E, down: false })
         );
-        assert_eq!(i.pending_len(), 0);
     }
 
     #[cfg(windows)]
@@ -1694,109 +1474,6 @@ mod tests {
         ]);
         assert!(i.has_key_remap(0x0D, naga()), "a replacement remap is owned");
         assert!(!i.has_key_remap(0x02, naga()), "a swallow claim is NOT owned");
-        assert!(i.has_remap(0x02, naga()), "…but it IS a claim (the hook swallows it)");
-    }
-
-    /// A held-bind claim (the cast trigger on a specific device) swallows that device's
-    /// keystroke entirely — and ONLY that device's: the same key elsewhere replays unchanged.
-    #[test]
-    fn swallow_claim_eats_the_devices_key_and_only_that_devices() {
-        let mut i = Interceptor::new();
-        // '1' scancode 0x02 claimed as a held bind on the Naga.
-        i.set_remaps([Remap {
-            pid: naga(),
-            from: 0x02,
-            to: KeyOut::Swallow,
-        }]);
-        assert!(i.on_hook(0x02, true, 1000), "claimed scancode is swallowed at hook time");
-        // Naga attribution -> nothing injected: the '1' never reaches the desktop.
-        assert_eq!(i.on_rawinput(0x02, true, naga()), None);
-        assert!(i.on_hook(0x02, false, 1100), "claimed release is swallowed at hook time");
-        assert_eq!(
-            i.on_rawinput(0x02, false, naga()),
-            None,
-            "the release paired with a swallowed press must stay swallowed"
-        );
-        // The real keyboard's '1' is swallowed then replayed unchanged.
-        assert!(i.on_hook(0x02, true, 2000));
-        assert_eq!(
-            i.on_rawinput(0x02, true, kbd()),
-            Some(Inject { scancode: 0x02, down: true })
-        );
-        assert!(i.on_hook(0x02, false, 2100));
-        assert_eq!(
-            i.on_rawinput(0x02, false, kbd()),
-            Some(Inject { scancode: 0x02, down: false })
-        );
-        // Grab-model path agrees.
-        assert_eq!(i.resolve_direct(0x02, true, naga()), None);
-        assert_eq!(i.resolve_direct(0x02, false, naga()), None);
-        assert_eq!(
-            i.resolve_direct(0x02, true, kbd()),
-            Some(Inject { scancode: 0x02, down: true })
-        );
-        assert_eq!(
-            i.resolve_direct(0x02, false, kbd()),
-            Some(Inject { scancode: 0x02, down: false })
-        );
-    }
-
-    #[test]
-    fn swallow_and_replacement_holds_release_independently() {
-        let mut i = Interceptor::new();
-        i.set_remaps([
-            Remap { pid: naga(), from: 0x02, to: KeyOut::Swallow },
-            Remap { pid: kbd(), from: 0x02, to: KeyOut::Scancode(0x22) },
-        ]);
-        assert!(i.on_hook(0x02, true, 1000));
-        assert_eq!(i.on_rawinput(0x02, true, naga()), None);
-        assert!(i.on_hook(0x02, true, 1100));
-        assert_eq!(
-            i.on_rawinput(0x02, true, kbd()),
-            Some(Inject { scancode: 0x22, down: true })
-        );
-        assert!(i.on_hook(0x02, false, 1200));
-        assert_eq!(i.on_rawinput(0x02, false, naga()), None);
-        assert!(i.on_hook(0x02, false, 1300));
-        assert_eq!(
-            i.on_rawinput(0x02, false, kbd()),
-            Some(Inject { scancode: 0x22, down: false })
-        );
-    }
-
-    #[test]
-    fn state_transition_never_invents_a_release_for_swallowed_claim() {
-        let mut i = Interceptor::new();
-        i.set_remaps([Remap { pid: naga(), from: 0x02, to: KeyOut::Swallow }]);
-        assert!(i.on_hook(0x02, true, 1000));
-        assert_eq!(i.on_rawinput(0x02, true, naga()), None);
-        assert!(i.drain_transition().is_empty());
-    }
-
-    #[test]
-    fn set_remaps_preserves_pending_edges_with_their_original_claims() {
-        let mut i = Interceptor::new();
-        i.set_remaps([eq_to_g()]);
-        i.on_hook(0x0D, true, 1000);
-        assert_eq!(i.pending_len(), 1);
-        // The config changes before Raw-Input attributes the swallowed edge. It must retain the
-        // old rule snapshot, not be discarded or resolved using the replacement rule.
-        i.set_remaps([Remap { pid: naga(), from: 0x0D, to: KeyOut::Scancode(0x30) }]);
-        assert_eq!(i.pending_len(), 1);
-        assert_eq!(
-            i.on_rawinput(0x0D, true, naga()),
-            Some(Inject { scancode: 0x22, down: true }),
-            "an already-swallowed edge must resolve using its hook-time mapping"
-        );
-        assert_eq!(i.pending_len(), 0);
-        i.on_hook(0x0D, false, 1500);
-        assert_eq!(i.on_rawinput(0x0D, false, naga()), Some(Inject { scancode: 0x22, down: false }));
-        i.on_hook(0x0D, true, 2000);
-        assert_eq!(
-            i.on_rawinput(0x0D, true, naga()),
-            Some(Inject { scancode: 0x30, down: true }),
-            "the new mapping applies to edges swallowed after reconfiguration"
-        );
     }
 
     #[test]

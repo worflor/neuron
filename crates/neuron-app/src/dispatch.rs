@@ -938,8 +938,6 @@ fn live_cadence(ctx: &LiveCtx) -> Duration {
 /// the next tick.
 fn live_tick(ctx: &mut LiveCtx) -> Duration {
     ctx.tick = ctx.tick.wrapping_add(1);
-    // Remap shim fail-open: replay any keystroke swallowed but never attributed by Raw-Input.
-    neuron::intercept::expire_tick();
     for cmd in ctx.live_rx.try_iter() {
         match cmd {
             LiveCommand::Reload => ctx.reload_pending = true,

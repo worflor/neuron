@@ -41,8 +41,8 @@ pub enum Stream {
     Pad,
     /// Firmware-assigned private keys, delivered by the keyboard hook ([`crate::buttons`]).
     Private,
-    /// Keys a held layer shifts, taken and delivered by the keyboard hook ([`crate::intercept`]).
-    Shifted,
+    /// Keys the keyboard or mouse hook took and delivered as their device ([`crate::intercept`]).
+    Hooked,
 }
 
 /// A stable id for one HID collection's device path (FNV-1a over the lowercased path).
