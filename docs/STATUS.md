@@ -8,7 +8,7 @@
 - **Linux:** the app and CLI build from source, but no Linux package or native Razer HID test yet. **macOS:** no backend yet.
 - **Got different hardware?** [share what works](https://github.com/worflor/neuron/issues/new?template=device_report.yml), or [collect evidence yourself](reference/COMPATIBILITY-LAB.md#try-it-yourself).
 
-This page tracks [v0.1.5](https://github.com/worflor/neuron/releases/tag/v0.1.5), published 2026-10-13. Windows and Linux CI passed, and the Windows release's checksums and provenance attestations were verified. These are build checks, not proof that a new device works.
+This page tracks [v0.1.7](https://github.com/worflor/neuron/releases/tag/v0.1.7), published 2026-11-08. Windows and Linux CI passed, the release's checksums and provenance attestations were verified, and it scanned clean with Microsoft Defender. These are build checks, not proof that a new device works.
 
 The Compatibility Lab was checked against 30 HID collections across six Windows device groups and an unrelated ITE device (`0b05:1866`). This verifies descriptor inventory and reviewable export, not device command support. Passive input capture and Linux hardware collection still need physical testing. [How the Lab works](reference/COMPATIBILITY-LAB.md).
 
@@ -16,11 +16,10 @@ Lighting scene changes now dissolve through the persistent base renderer. Softwa
 
 The table below grades what actually works. [The README](../README.md#honesty-proven-gated-absent) has the device-write ledger.
 
-The v0.1.7 candidate (unreleased) includes the unpublished v0.1.6 and the changes in the
-[changelog](../CHANGELOG.md). v0.1.6 stayed a draft after Microsoft Defender flagged its Chroma
-broker during installation testing; the v0.1.7 broker is scanned before publishing. Broker
-replacement and rollback were checked through real UAC on 2026-11-07. Setup, update and uninstall in
-a clean Windows VM remain unchecked.
+v0.1.7 includes the unpublished v0.1.6. v0.1.6 stayed a draft after Microsoft Defender flagged
+its Chroma broker during installation testing. v0.1.7 was installed over v0.1.5 on the owner's
+Windows 11 machine on 2026-11-08 through real UAC: the broker was replaced and Defender raised
+nothing. Setup, update and uninstall in a clean Windows VM remain unchecked.
 
 | grade | meaning |
 |---|---|

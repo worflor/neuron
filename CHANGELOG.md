@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.7
+
 ### Security
 - BOUND macros run behind a runtime wall that refuses file, process, network, native-library and new-module access by any route, closing an escape through string-based reflection. BOUND ignores `PYTHONPATH`, `PYTHONHOME` and user site packages.
 - `neuron apply` and `profile import` list and refuse RAW macros, command-running binds, path screenshots and onboard-memory profiles a file adds, unless `--allow-code` is passed.
