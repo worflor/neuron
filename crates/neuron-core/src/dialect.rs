@@ -24,6 +24,28 @@ pub const RAZER_VID: u16 = 0x1532;
 /// [`RAZER_VID`] — duplicated in `synth.rs` until wave 2.)
 pub const RAZER_FEATURE_LEN: u16 = 91;
 
+/// The device never answered a command: asleep, out of range, or gone. A caller walking many
+/// commands to one device can stop at the first one, since the rest will not be answered either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoReply {
+    pub class: u8,
+    pub id: u8,
+}
+
+impl std::fmt::Display for NoReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timed out waiting for reply to {:#04x}/{:#04x}", self.class, self.id)
+    }
+}
+
+impl std::error::Error for NoReply {}
+
+/// Did this error come from a device that never answered?
+#[must_use]
+pub fn is_no_reply(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<NoReply>())
+}
+
 /// A wire-protocol FAMILY: how to recognize its pipes, frame its commands, and read its replies.
 /// One impl per family; devices reference their family by id in `DeviceDef.dialect` (registry
 /// DATA, serde-default "razer"). Object-safe so a `&'static [&'static dyn Dialect]` registry can
@@ -272,7 +294,7 @@ impl Dialect for RazerDialect {
                 t.set_feature(&out)?;
             }
         }
-        bail!("timed out waiting for reply to {cmd_class:#04x}/{cmd_id:#04x}")
+        Err(NoReply { class: cmd_class, id: cmd_id }.into())
     }
 
     fn exec_fast(
@@ -489,7 +511,7 @@ impl Dialect for RazerAudioDialect {
                 t.set_feature(&out)?;
             }
         }
-        bail!("timed out waiting for reply to {cmd_class:#04x}/{cmd_id:#04x}")
+        Err(NoReply { class: cmd_class, id: cmd_id }.into())
     }
 
     fn exec_fast(

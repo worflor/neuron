@@ -399,6 +399,7 @@ fn apply_impl(d: &Device, plan: &[ButtonPlan], live_guard: bool, safety_stock: b
         let want = p.record();
         let ok = match read(d, p.id) {
             Ok(have) if have == want || (p.role == Role::Stock && have.as_keyboard() == Some((0, p.stock_usage))) => Ok(()),
+            Err(e) if crate::dialect::is_no_reply(&e) => Err(e),
             _ => write_impl(d, p.id, want, safety_stock),
         };
         match ok {
@@ -407,7 +408,13 @@ fn apply_impl(d: &Device, plan: &[ButtonPlan], live_guard: bool, safety_stock: b
                 succeeded.insert(p.id);
             }
             Err(e) => {
+                let silent = crate::dialect::is_no_reply(&e);
                 first_err.get_or_insert(e);
+                // A device that did not answer will not answer the next button either; asking
+                // anyway costs a full reply timeout per button (a sleeping wireless mouse).
+                if silent {
+                    break;
+                }
             }
         }
     }
@@ -562,6 +569,26 @@ mod tests {
 
     fn key(k: &str) -> Action {
         Action::Key { key: k.into() }
+    }
+
+    #[test]
+    fn a_device_that_never_answers_is_asked_once_not_once_per_button() {
+        use crate::transport::mock::{Fault, MockDevice};
+        let pid = 0xFDB1;
+        let mut phantom = MockDevice::razer(pid, "sleeping naga");
+        // One silent conversation: the first send plus the dialect's five re-arms.
+        for _ in 0..6 {
+            phantom = phantom.faulting(Fault::Silence);
+        }
+        let phantom = std::sync::Arc::new(phantom);
+        let d = Device::with_transport(naga(), pid, Box::new(phantom.handle()));
+        assert!(d.def.buttons.len() > 2, "the Naga declares many buttons");
+
+        let err = restore_stock_safety(&d).expect_err("an unanswered restore fails");
+        assert!(crate::dialect::is_no_reply(&err), "{err:#}");
+        let asked = phantom.asked();
+        let first = asked[0];
+        assert!(asked.iter().all(|c| *c == first), "only the first command was tried: {asked:02x?}");
     }
 
     #[test]
