@@ -476,7 +476,7 @@ Instrument requests, such as teleport, whiteboard, dial, control center, and kno
 
 ### 5.5 Device And Profile Flow
 
-`neuron-app/src/runtime.rs` is the GUI-facing runtime. It owns registry/config snapshots and performs short, typed device operations on demand.
+`neuron-app/src/runtime.rs` is the GUI-facing runtime. It owns config snapshots, holds the process-wide device registry (`neuron::registry::shared`, one snapshot that reloads when definition files change or a writer calls `registry::invalidate`), and performs short, typed device operations on demand.
 
 `neuron-core/src/device.rs` exposes two device lifetimes:
 
