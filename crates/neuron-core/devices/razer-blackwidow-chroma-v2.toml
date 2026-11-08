@@ -129,3 +129,16 @@ class = 0x03
 id = 0x03
 size = 0x03
 args = [0x01, 0x05]
+
+# The printed Fn layer. Driver mode hands Fn to the host, so neuron re-creates it; table from
+# openrazer's chroma_keys. F10 toggles the firmware game mode through 03/00 with read-back. F9
+# (macro record) and F11/F12 (brightness) have no neuron action yet and keep their plain key.
+[fn_binds]
+"0x3a" = "media:mute"
+"0x3b" = "media:vol-down"
+"0x3c" = "media:vol-up"
+"0x3e" = "media:prev"
+"0x3f" = "media:play"
+"0x40" = "media:next"
+"0x43" = "game-mode"
+"0x48" = "system:sleep"

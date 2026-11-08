@@ -3,6 +3,9 @@
 ## Unreleased
 
 - The device registry is one shared snapshot that reloads itself when definition files change. Device discovery, event arming, macro-key handling, macro device verbs and the background workers all read it, so a device adopted or edited mid-session reaches every part of the app without a restart. Previously each subsystem kept its own copy (macro device verbs kept the one from first use), and the vitals and scan ticks re-parsed every file each time.
+- Keyboards held in driver mode for their macro keys keep their Fn layer and media keys. Driver mode hands Fn to the host, so Fn combos had stopped working while Neuron ran. The BlackWidow Chroma V2's Fn row comes from its definition: volume, media, sleep, and Fn+F10 toggles the keyboard's own game mode with read-back. Any keyboard's media-key reports (BlackWidow V3 and V4 class) now act as media keys. Your own binds on those keys still win; binding Fn itself turns the default layer off. New `game-mode` action.
+- A HyperShift layer with a hold key is held only by that key. Pressing a shifted key alone used to hold its layer and fire the shifted action; it now types normally. While the hold key is down, the keyboard hook takes the shifted key, so it no longer also types.
+- Device files in the run root may only carry the side-plate and Fn binds a built-in definition ships, so a shared file cannot attach a command to a key.
 - Macro sidecars are no longer killed when a busy machine delays their arming acknowledgement. Arming no longer waits, a fresh sidecar (which starts disarmed) only waits when it must confirm being armed, and only a disarm still waits briefly and kills a sidecar that does not confirm it.
 
 ## v0.1.7

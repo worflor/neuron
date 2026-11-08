@@ -443,6 +443,7 @@ impl Dialect for HidppDialect {
             lighting: None,
             side_plates: None,
             side_plate_binds: std::collections::BTreeMap::new(),
+            fn_binds: std::collections::BTreeMap::new(),
             // No push-report vocabulary probed this wave — an auto HID++ def carries none.
             events: None,
             buttons: Vec::new(),

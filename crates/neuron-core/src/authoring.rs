@@ -208,6 +208,7 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
         false,
         4,
     ),
+    ("game-mode", "game mode", "", "device", false, 4),
     (
         "profile",
         "profile",
@@ -257,6 +258,7 @@ pub fn action_blurb(id: &str) -> &'static str {
         "output-flip" => "Switch the default audio output",
         "dpi" => "Set or cycle mouse DPI",
         "scroll-stage" => "Cycle the wheel's scroll stage",
+        "game-mode" => "Toggle the keyboard's game mode",
         "profile" => "Switch or cycle profiles",
         "noop" => "Do nothing (unbind)",
         _ => "",
@@ -302,6 +304,7 @@ pub fn build_action(id: &str, param: &str) -> Action {
             Err(_) => Action::DpiCycle { dir: parse_dir(p) },
         },
         "scroll-stage" => Action::ScrollStageCycle { dir: parse_dir(p) },
+        "game-mode" => Action::GameMode,
         // CONSOLIDATED profile: a NAME switches to it; "up"/"down"/blank CYCLES (blank = next).
         "profile" => {
             let l = p.to_lowercase();
@@ -1117,6 +1120,7 @@ pub fn action_to_palette(a: &Action) -> (&'static str, String) {
             _ => ("noop", String::new()),
         },
         Action::ScrollStageCycle { dir } => ("scroll-stage", dir.label().to_string()),
+        Action::GameMode => ("game-mode", String::new()),
         Action::ProfileCycle { dir } => ("profile", dir.label().to_string()),
         Action::Teleport => ("teleport", String::new()),
         Action::Whiteboard => ("whiteboard", String::new()),
@@ -1602,6 +1606,7 @@ pub fn variant_name(a: &Action) -> &'static str {
         Action::DpiCycle { .. } => "dpi-cycle",
         Action::DpiSet { .. } => "dpi-set",
         Action::ScrollStageCycle { .. } => "scroll-stage-cycle",
+        Action::GameMode => "game-mode",
         Action::ProfileSwitch { .. } => "profile-switch",
         Action::ProfileCycle { .. } => "profile-cycle",
         Action::Turbo { .. } => "turbo",

@@ -75,7 +75,7 @@ pub fn run_shared_intent_observe(
     cause: crate::dpi_origin::Cause,
     mut on_profile_applied: impl FnMut(&crate::profile::ApplyReport),
 ) -> Option<String> {
-    use Intent::{Teleport, Whiteboard, Knockback, Glance, Summon, Banish, Pin, Kill, Tether, Dial, Control, Echo, DpiSet, DpiCycle, ScrollStageCycle, ProfileSwitch, ProfileCycle, LightingLayer, Undo};
+    use Intent::{Teleport, Whiteboard, Knockback, Glance, Summon, Banish, Pin, Kill, Tether, Dial, Control, Echo, DpiSet, DpiCycle, ScrollStageCycle, GameMode, ProfileSwitch, ProfileCycle, LightingLayer, Undo};
 
     match intent {
         Teleport | Whiteboard | Knockback | Glance(_) | Summon(..) | Banish(_) | Pin(_)
@@ -155,6 +155,15 @@ pub fn run_shared_intent_observe(
                 Err(e) => format!("scroll stage skipped ({e})"),
             }
         }
+        GameMode => match devices.with_writable("set_game_mode", |d| {
+            let on = !cap::game_mode(d)?;
+            cap::set_game_mode(d, on)?;
+            Ok(on)
+        }) {
+            Ok(true) => "game mode on · Win key off".into(),
+            Ok(false) => "game mode off".into(),
+            Err(e) => format!("game mode skipped ({e})"),
+        },
         ProfileSwitch(name) => match Profile::load(name) {
             Ok(p) => {
                 let prev = cursor.active_profile();

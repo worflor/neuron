@@ -96,6 +96,9 @@ pub enum Action {
     /// **Daemon intent** — cycle the `HyperScroll` scroll-wheel stage from the device's current
     /// stage over its enabled count (`writes::cycle_device_scroll_stage`).
     ScrollStageCycle { dir: Direction },
+    /// **Daemon intent** — toggle the keyboard's firmware game mode (its own Win-key kill and game
+    /// LED), read from and verified against the device.
+    GameMode,
     /// **Daemon intent** — switch to a named Neuron profile. Daemon-handled: the run-daemon loads
     /// the [`crate::profile::Profile`] and applies it. `run()` reports the intent.
     ProfileSwitch { name: String },
@@ -710,6 +713,8 @@ pub enum Intent {
     /// Cycle the `HyperScroll` stage **from the device's current stage** (read at `0x15/0x80`),
     /// wrapping over its enabled count (`0x15/0x81`).
     ScrollStageCycle(Direction),
+    /// Toggle the keyboard's firmware game mode from the state the device reports.
+    GameMode,
     /// Switch to the named profile (absolute — the target name is carried).
     ProfileSwitch(String),
     /// Cycle to the next/previous profile **from the currently-active one** (per the [`Intent`]
@@ -851,6 +856,7 @@ impl Action {
             Action::DpiCycle { dir } => format!("DPI cycle {}", dir.label()),
             Action::DpiSet { dpi } => format!("DPI -> {dpi}"),
             Action::ScrollStageCycle { dir } => format!("scroll-stage cycle {}", dir.label()),
+            Action::GameMode => "game mode toggle".into(),
             Action::ProfileSwitch { name } => format!("profile -> {name}"),
             Action::ProfileCycle { dir } => format!("profile cycle {}", dir.label()),
             Action::Turbo { action, cps } => format!("turbo {cps}cps: {}", action.describe()),
@@ -928,6 +934,7 @@ impl Action {
             Action::DpiCycle { dir } => Some(Intent::DpiCycle(*dir)),
             Action::DpiSet { dpi } => Some(Intent::DpiSet(*dpi)),
             Action::ScrollStageCycle { dir } => Some(Intent::ScrollStageCycle(*dir)),
+            Action::GameMode => Some(Intent::GameMode),
             Action::ProfileSwitch { name } => Some(Intent::ProfileSwitch(name.clone())),
             Action::ProfileCycle { dir } => Some(Intent::ProfileCycle(*dir)),
             Action::Teleport => Some(Intent::Teleport),
@@ -1042,6 +1049,7 @@ impl Action {
             Action::ScrollStageCycle { dir } => {
                 format!("intent: scroll-stage cycle {} (daemon)", dir.label())
             }
+            Action::GameMode => "intent: game mode toggle (daemon)".into(),
             Action::ProfileSwitch { name } => format!("intent: profile -> {name} (daemon)"),
             Action::ProfileCycle { dir } => {
                 format!("intent: profile cycle {} (daemon)", dir.label())

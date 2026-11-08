@@ -1705,6 +1705,7 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
         Action::ScrollStageCycle { .. } => {
             mk(WedgeGlyph::Scroll, "scroll", None, Tone::Plain, None)
         }
+        Action::GameMode => mk(WedgeGlyph::Key, "game mode", None, Tone::Plain, None),
         Action::Sequence { .. } => mk(WedgeGlyph::Key, "sequence", None, Tone::Plain, None),
         Action::Turbo { .. } => mk(WedgeGlyph::Key, "turbo", None, Tone::Plain, None),
         Action::Key { .. } | Action::MouseButton { .. } => {

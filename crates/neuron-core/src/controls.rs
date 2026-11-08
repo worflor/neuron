@@ -41,6 +41,8 @@ pub enum Stream {
     Pad,
     /// Firmware-assigned private keys, delivered by the keyboard hook ([`crate::buttons`]).
     Private,
+    /// Keys a held layer shifts, taken and delivered by the keyboard hook ([`crate::intercept`]).
+    Shifted,
 }
 
 /// A stable id for one HID collection's device path (FNV-1a over the lowercased path).
@@ -1459,6 +1461,9 @@ pub struct Runtime {
     /// layer(s) — instead of the old `release_all()`-on-any-release that dropped every layer the
     /// moment any unrelated button went up.
     held_by: std::collections::HashMap<Trigger, Vec<String>>,
+    /// Layers that are momentary whatever the stance ([`crate::engine::FN_LAYER`]), keyed by the
+    /// input holding them.
+    momentary_by: std::collections::HashMap<Trigger, Vec<String>>,
     /// The layer STANCE (see [`crate::feel::LayerMode`]) — hold / latch / smart / one-shot.
     /// Razer ships hold-only; the stance is Neuron's fix. Set from `feel.toml` by [`build_runtime`].
     layer_mode: crate::feel::LayerMode,
@@ -1570,7 +1575,17 @@ impl Runtime {
         // Scan ALL layers (held or not) for one whose rule matches this input — `resolve` would
         // only see a layer's rules once it's ALREADY held, so it can't discover the activating
         // input. `layers_activated_by` answers "pressing this input holds which layers?".
-        let layers = self.engine.layers_activated_by(trigger);
+        let (momentary, layers): (Vec<String>, Vec<String>) = self
+            .engine
+            .layers_activated_by(trigger)
+            .into_iter()
+            .partition(|l| l == crate::engine::FN_LAYER);
+        if !momentary.is_empty() {
+            for l in &momentary {
+                self.engine.hold(l.clone());
+            }
+            self.momentary_by.insert(trigger.clone(), momentary);
+        }
         if layers.is_empty() {
             return;
         }
@@ -1625,6 +1640,13 @@ impl Runtime {
     /// momentary end); the latch/one-shot stances ignore up edges entirely.
     pub fn release_for_input(&mut self, trigger: &Trigger) {
         use crate::feel::LayerMode;
+        if let Some(layers) = self.momentary_by.remove(trigger) {
+            for l in &layers {
+                if !self.momentary_by.values().any(|v| v.contains(l)) {
+                    self.engine.release(l);
+                }
+            }
+        }
         match self.layer_mode {
             LayerMode::Hold => {
                 if let Some(layers) = self.held_by.remove(trigger) {
@@ -1708,6 +1730,7 @@ impl Runtime {
     pub fn release_all_layers(&mut self) {
         self.engine.release_all();
         self.held_by.clear();
+        self.momentary_by.clear();
         self.latched.clear();
         self.oneshot.clear();
         self.down_at.clear();
@@ -1746,7 +1769,8 @@ pub fn build_runtime() -> Runtime {
     {
         let reg = crate::registry::shared();
         let mut rules = rt.engine.to_rules();
-        let defaults = plate_default_rules(&reg.devices, &rules);
+        let mut defaults = plate_default_rules(&reg.devices, &rules);
+        defaults.extend(driver_mode_key_rules(&reg, &rules));
         if !defaults.is_empty() {
             rules.extend(defaults);
             rt.engine = Engine::from_rules(rules);
@@ -1780,6 +1804,72 @@ pub fn plate_default_rules(defs: &[crate::registry::DeviceDef], user: &[Rule]) -
                 });
                 if !taken {
                     out.push(Rule::on_layer(layer.clone(), trigger, action));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The Fn code a keyboard's report 04 carries while Fn is held.
+pub const RAZER_FN_CODE: u16 = 0x01;
+
+/// The media key a keyboard's report 04 code stands for. Mice reuse these codes for their DPI and
+/// profile buttons, so this applies to keyboards only.
+#[must_use]
+pub fn razer_keyboard_media(code: u16) -> Option<crate::action::MediaKind> {
+    use crate::action::MediaKind;
+    Some(match code {
+        0x50 => MediaKind::VolumeDown,
+        0x51 => MediaKind::VolumeUp,
+        0x52 => MediaKind::VolumeMute,
+        0x53 => MediaKind::Next,
+        0x54 => MediaKind::Prev,
+        0x55 => MediaKind::PlayPause,
+        _ => return None,
+    })
+}
+
+/// What a keyboard in driver mode loses to the host, given back as rules: its media codes as media
+/// actions, and its `[fn_binds]` as the [`crate::engine::FN_LAYER`] held by Fn. A trigger the user
+/// binds is left to the user; binding Fn itself drops that keyboard's Fn layer.
+#[must_use]
+pub fn driver_mode_key_rules(reg: &crate::registry::Registry, user: &[Rule]) -> Vec<Rule> {
+    use crate::engine::FN_LAYER;
+    use crate::registry::CanonicalPid;
+    let keyboards = reg.razer_macro_key_pids();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for def in &reg.devices {
+        for raw in def.owned_event_pids().filter(|p| keyboards.contains(p)) {
+            let canonical = CanonicalPid::of(raw);
+            if !seen.insert(canonical) {
+                continue;
+            }
+            let pid = Some(canonical);
+            let bound = |t: &Trigger| user.iter().any(|r| &r.trigger == t);
+            for code in 0x50..=0x55 {
+                let trigger = Trigger::Input { page: RAZER_MACRO_PAGE, usage: code, pid };
+                if let (Some(key), false) = (razer_keyboard_media(code), bound(&trigger)) {
+                    out.push(Rule::new(trigger, Action::Media { key }));
+                }
+            }
+            let fn_key = Trigger::Input { page: RAZER_MACRO_PAGE, usage: RAZER_FN_CODE, pid };
+            if def.fn_binds.is_empty() || bound(&fn_key) {
+                continue;
+            }
+            out.push(Rule::on_layer(FN_LAYER, fn_key, Action::Noop));
+            for (usage, spec) in &def.fn_binds {
+                let (Some(usage), Ok(action)) = (
+                    u16::from_str_radix(usage.trim_start_matches("0x"), 16).ok(),
+                    crate::authoring::parse_action(spec),
+                ) else {
+                    continue;
+                };
+                let trigger = Trigger::Input { page: 0x07, usage, pid };
+                let taken = user.iter().any(|r| r.trigger == trigger && r.layer.as_deref() == Some(FN_LAYER));
+                if !taken && action != Action::Noop {
+                    out.push(Rule::on_layer(FN_LAYER, trigger, action));
                 }
             }
         }
@@ -1885,6 +1975,7 @@ pub fn build_runtime_from(
         cast_sectors: cast.sectors,
         cast_menu: CAST_MENU.into(),
         held_by: std::collections::HashMap::new(),
+        momentary_by: std::collections::HashMap::new(),
         layer_mode: crate::feel::LayerMode::default(),
         hold_ms: crate::feel::FeelConfig::default().hold_ms,
         latched: std::collections::HashSet::new(),
@@ -2361,6 +2452,67 @@ mod spine_tests {
             ..Default::default()
         });
         (rt, x)
+    }
+
+    fn blackwidow() -> crate::registry::Registry {
+        crate::registry::Registry {
+            devices: vec![toml::from_str(crate::registry::BUILTINS[1]).unwrap()],
+        }
+    }
+
+    #[test]
+    fn a_driver_mode_keyboard_gets_its_media_codes_and_fn_layer_back() {
+        use crate::action::MediaKind;
+        use crate::engine::FN_LAYER;
+        let reg = blackwidow();
+        let pid = Some(crate::registry::CanonicalPid::of(0x0221));
+        let rules = driver_mode_key_rules(&reg, &[]);
+        let find = |page, usage, layer: Option<&str>| {
+            rules.iter().find(|r| r.trigger == Trigger::Input { page, usage, pid } && r.layer.as_deref() == layer).map(|r| r.action.clone())
+        };
+        assert_eq!(find(RAZER_MACRO_PAGE, 0x52, None), Some(Action::Media { key: MediaKind::VolumeMute }));
+        assert_eq!(find(RAZER_MACRO_PAGE, RAZER_FN_CODE, Some(FN_LAYER)), Some(Action::Noop), "Fn is the hold key");
+        assert_eq!(find(0x07, 0x3B, Some(FN_LAYER)), Some(Action::Media { key: MediaKind::VolumeDown }));
+        assert_eq!(find(0x07, 0x48, Some(FN_LAYER)), Some(Action::Sleep));
+        assert_eq!(find(0x07, 0x43, Some(FN_LAYER)), Some(Action::GameMode), "F10 is the firmware's own game mode");
+        assert_eq!(find(0x07, 0x42, Some(FN_LAYER)), None, "F9 has no neuron action and keeps its key");
+
+        // The user's own binds win: a shifted F2 replaces the default, binding Fn drops the layer.
+        let f2 = Rule::on_layer(FN_LAYER, Trigger::Input { page: 0x07, usage: 0x3B, pid }, Action::Echo);
+        assert!(!driver_mode_key_rules(&reg, &[f2]).iter().any(|r| r.trigger == Trigger::Input { page: 0x07, usage: 0x3B, pid }));
+        let fn_bind = Rule::new(Trigger::Input { page: RAZER_MACRO_PAGE, usage: RAZER_FN_CODE, pid }, Action::Echo);
+        let without = driver_mode_key_rules(&reg, &[fn_bind]);
+        assert!(without.iter().all(|r| r.layer.is_none()), "{without:?}");
+        assert!(without.iter().any(|r| r.trigger == Trigger::Input { page: RAZER_MACRO_PAGE, usage: 0x55, pid }));
+    }
+
+    #[test]
+    fn mice_and_firmware_custody_keep_their_codes() {
+        let naga = crate::registry::Registry {
+            devices: vec![toml::from_str(crate::registry::BUILTINS[0]).unwrap()],
+        };
+        assert!(driver_mode_key_rules(&naga, &[]).is_empty(), "on a mouse 0x5x are DPI and profile buttons");
+    }
+
+    #[test]
+    fn the_fn_layer_stays_momentary_under_a_latching_stance() {
+        let reg = blackwidow();
+        let pid = Some(crate::registry::CanonicalPid::of(0x0221));
+        let fn_key = Trigger::Input { page: RAZER_MACRO_PAGE, usage: RAZER_FN_CODE, pid };
+        let f2 = Trigger::Input { page: 0x07, usage: 0x3B, pid };
+        let mut rt = build_runtime_from(&Bindings::default(), &CastConfig::default(), &AppRules::default(), &driver_mode_key_rules(&reg, &[]));
+        rt.set_feel(&crate::feel::FeelConfig { hypershift: crate::feel::LayerMode::Latch, ..Default::default() });
+
+        rt.hold_for_input(&f2);
+        assert!(!rt.engine.is_held(crate::engine::FN_LAYER), "a shifted key alone does not shift");
+        rt.release_for_input(&f2);
+
+        rt.hold_for_input(&fn_key);
+        assert!(rt.engine.is_held(crate::engine::FN_LAYER));
+        assert_eq!(rt.engine.resolve_top(&f2).map(|r| r.action.clone()), Some(Action::Media { key: crate::action::MediaKind::VolumeDown }));
+        rt.release_for_input(&fn_key);
+        assert!(!rt.engine.is_held(crate::engine::FN_LAYER), "Fn up ends the layer even when HyperShift latches");
+        assert!(rt.engine.resolve_top(&f2).is_none());
     }
 
     #[test]

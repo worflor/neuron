@@ -221,6 +221,17 @@ pub fn is_plate_layer(layer: &str) -> bool {
     layer.starts_with(PLATE_LAYER_PREFIX)
 }
 
+/// The keyboard Fn layer neuron re-creates from a definition's `[fn_binds]`. Always momentary:
+/// the `HyperShift` stance never latches it.
+pub const FN_LAYER: &str = "fn";
+
+/// Whether a rule on a layer is that layer's hold key: a `Noop`, which holds the layer and does
+/// nothing else.
+#[must_use]
+pub fn is_hold_key(rule: &Rule) -> bool {
+    rule.action == crate::action::Action::Noop
+}
+
 impl Engine {
     /// Build an engine from a base rule set (no layers).
     #[must_use]
@@ -475,7 +486,9 @@ impl Engine {
     /// whose trigger matches `fired`. Unlike [`resolve`](Engine::resolve), this scans every layer
     /// UNCONDITIONALLY (held or not), because it answers "if this input is pressed, which layers
     /// should become held?" — the daemon's `HyperShift` hold-edge question. A plate's layer is
-    /// never one: it follows the seated plate, so a bind on it is an ordinary bind. Returns sorted,
+    /// never one: it follows the seated plate, so a bind on it is an ordinary bind. A layer that
+    /// names a hold key (a `Noop` rule on it) is activated only by that key; its other rules are
+    /// what the key shifts. A layer without one keeps every rule as an activator. Returns sorted,
     /// de-duped layer names.
     #[must_use]
     pub fn layers_activated_by(&self, fired: &Trigger) -> Vec<String> {
@@ -483,7 +496,10 @@ impl Engine {
             .layers
             .iter()
             .filter(|(name, _)| !is_plate_layer(name))
-            .filter(|(_, rules)| rules.iter().any(|r| Self::matches(&r.trigger, fired)))
+            .filter(|(_, rules)| {
+                let has_hold_key = rules.iter().any(is_hold_key);
+                rules.iter().any(|r| (!has_hold_key || is_hold_key(r)) && Self::matches(&r.trigger, fired))
+            })
             .map(|(name, _)| name.clone())
             .collect();
         out.sort_unstable();
@@ -1038,6 +1054,22 @@ mod tests {
                 pid: None
             })
             .is_empty());
+    }
+
+    #[test]
+    fn a_layer_with_a_hold_key_is_held_only_by_that_key() {
+        let hold = Trigger::Input { page: 0xFF1A, usage: 0x01, pid: None };
+        let shifted = input();
+        let engine = Engine::new(vec![])
+            .with_layer_rule("fn", Rule::new(hold.clone(), Action::Noop))
+            .with_layer_rule("fn", Rule::new(shifted.clone(), Action::Echo))
+            .with_layer_rule("sniper", Rule::new(shifted.clone(), Action::DpiSet { dpi: 400 }));
+        assert_eq!(engine.layers_activated_by(&hold), vec!["fn".to_string()]);
+        assert_eq!(
+            engine.layers_activated_by(&shifted),
+            vec!["sniper".to_string()],
+            "a shifted key does not shift itself; a layer without a hold key keeps its activators"
+        );
     }
 
     #[test]

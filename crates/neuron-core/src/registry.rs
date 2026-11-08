@@ -140,6 +140,10 @@ pub struct DeviceDef {
     /// spec (`"mouse:back"`). A plate reuses thumb-grid ids, so its factory keys are grid keys.
     #[serde(default)]
     pub side_plate_binds: BTreeMap<String, BTreeMap<String, String>>,
+    /// The keyboard's printed Fn layer, re-created by the host while driver mode hands Fn to it:
+    /// `[fn_binds]` maps a key's keyboard usage (`"0x3b"`) to an action spec (`"media:vol-down"`).
+    #[serde(default)]
+    pub fn_binds: BTreeMap<String, String>,
     /// Optional device-PUSHED event vocabulary (an `[events]` table). Devices that push no such
     /// reports simply omit the table (`None`) — no every-device tax for a Naga-only or Seiren-only
     /// behaviour.

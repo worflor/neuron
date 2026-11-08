@@ -691,11 +691,12 @@ grade = "live"
 evidence = [
   { kind = "live", date = "2026-07-07", what = "game-mode incident on BW 0221 (memory razer-protocol-deep-tea)" },
   { kind = "source", src = "openrazer-issues", at = "https://github.com/openrazer/openrazer/issues/1174", what = "FN keys don't work while the daemon runs" },
+  { kind = "live", date = "2026-11-08", what = "BW 0221 in driver mode: Fn arrives as report-04 code 0x01 and the firmware sends plain F2/F3; neuron's re-created layer turned Fn+F2/F3 into volume, plain F2 unchanged" },
   { kind = "source", src = "openrazer-issues", at = "https://github.com/openrazer/openrazer/issues/2417", what = "BlackWidow V4 X: Fn media combos stop and send the base key while the daemon holds driver mode; the volume wheel keeps working" },
   { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4789-L4895", what = "the host re-creates the Fn layer from the 04-report FN flag: chroma_keys (F1-F3 volume, F5-F7 media, F9-F12, Pause) by default, chroma_keys_5 (F9-F12, Pause) for BlackWidow V3/V4/V4 X" },
 ]
 conflicts = [
-  "neuron holds driver mode on keyboards for their macro keys but does not re-create the Fn layer, so Fn combos are lost while it runs.",
+  "neuron re-creates the Fn layer from a definition's [fn_binds] (the BlackWidow Chroma V2 ships openrazer's chroma_keys) and maps keyboard media codes 0x50-0x55; a synthesized definition has no Fn table, so other boards keep only the media codes.",
 ]
 
 [[fact]]

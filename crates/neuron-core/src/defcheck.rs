@@ -8,7 +8,8 @@
 //! an opcode synthesis or a built-in definition gives that name, any other command must be a read
 //! the protocol ledger records, and lighting may only write opcodes synthesis emits. The bound is
 //! derived from the same knowledge synthesis uses, so everything synthesized passes and the bound
-//! grows with the catalog and ledger.
+//! grows with the catalog and ledger. Default binds (`side_plate_binds`, `fn_binds`) are actions,
+//! not discovery: a file may only repeat the ones a built-in definition ships.
 
 use crate::registry::DeviceDef;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,6 +26,17 @@ struct Knowledge {
     reads: BTreeMap<String, BTreeSet<(u8, u8)>>,
     /// Razer lighting write opcodes.
     lighting: BTreeSet<(u8, u8)>,
+    /// (table, usage, action spec) default binds the built-in definitions ship.
+    binds: BTreeSet<(String, String, String)>,
+}
+
+/// Every default bind a definition carries, as (table, usage, action spec).
+fn binds_of(def: &DeviceDef) -> impl Iterator<Item = (String, String, String)> + '_ {
+    let plates = def.side_plate_binds.iter().flat_map(|(label, binds)| {
+        binds.iter().map(move |(u, a)| (format!("side_plate_binds.{label}"), u.to_ascii_lowercase(), a.clone()))
+    });
+    let fns = def.fn_binds.iter().map(|(u, a)| ("fn_binds".to_string(), u.to_ascii_lowercase(), a.clone()));
+    plates.chain(fns)
 }
 
 fn knowledge() -> &'static Knowledge {
@@ -32,11 +44,13 @@ fn knowledge() -> &'static Knowledge {
     K.get_or_init(|| {
         let mut named: BTreeMap<(String, String), BTreeSet<(u8, u8)>> = BTreeMap::new();
         let mut lighting: BTreeSet<(u8, u8)> = crate::synth::lighting_opcodes().into_iter().collect();
+        let mut binds = BTreeSet::new();
         for (name, class, id) in crate::synth::known_commands() {
             named.entry(("razer".into(), name.into())).or_default().insert((class, id));
         }
         for src in crate::registry::BUILTINS {
             if let Ok(def) = toml::from_str::<DeviceDef>(src) {
+                binds.extend(binds_of(&def));
                 for (name, c) in &def.commands {
                     named.entry((def.dialect.clone(), name.clone())).or_default().insert((c.class, c.id));
                 }
@@ -58,7 +72,7 @@ fn knowledge() -> &'static Knowledge {
                 }
             }
         }
-        Knowledge { named, reads, lighting }
+        Knowledge { named, reads, lighting, binds }
     })
 }
 
@@ -78,6 +92,9 @@ pub fn check(def: &DeviceDef) -> Result<(), String> {
     }
     if def.stream_wait_us > MAX_STREAM_WAIT_US {
         return Err(format!("stream_wait_us {} is above {MAX_STREAM_WAIT_US}", def.stream_wait_us));
+    }
+    if let Some((table, usage, action)) = binds_of(def).find(|b| !knowledge().binds.contains(b)) {
+        return Err(format!("{table} binds {usage} to `{action}`, which no built-in definition ships"));
     }
     // HID++ commands address feature indices the device reports at runtime, which no static
     // table can describe; that dialect is bounded by its vendor and its own read-only adoption.
@@ -184,6 +201,21 @@ mod tests {
         let vid = crate::dialect::RAZER_VID;
         assert!(reg.find_by_pid(vid, 0x7AA7).is_some(), "an honest file must still load");
         assert!(reg.find_by_pid(vid, 0x7AA8).is_none(), "a crafted file must not load");
+    }
+
+    #[test]
+    fn a_file_may_only_repeat_the_default_binds_neuron_ships() {
+        let mut d = builtin(0);
+        d.fn_binds.insert("0x3b".into(), "run:calc.exe".into());
+        assert!(check(&d).unwrap_err().contains("fn_binds"));
+
+        let mut d = builtin(0);
+        d.side_plate_binds.entry("2-button".into()).or_default().insert("0x2d".into(), "run:calc.exe".into());
+        assert!(check(&d).unwrap_err().contains("side_plate_binds"));
+
+        let mut d = builtin(0);
+        d.fn_binds.insert("0x3B".into(), "media:vol-down".into());
+        assert_eq!(check(&d), Ok(()), "a bind a built-in ships passes, whatever the usage's case");
     }
 
     #[test]
