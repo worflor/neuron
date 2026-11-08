@@ -310,7 +310,12 @@ impl Shared {
 // the transport able to carry that whole semantic budget so its smaller per-macro limits, rather
 // than an unrelated pipe race, decide which fires survive a storm.
 const PIPE_QUEUE: usize = 1024;
-const ARM_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+/// A live sidecar told to disarm gets this long to acknowledge before it is killed: RAW code can act
+/// without the helpers, so an unacknowledged disarm is not trusted.
+const DISARM_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a fresh sidecar may take to confirm it is armed. It has already reported ready, but a
+/// loaded machine can still take a while to schedule it; until it confirms it acts disarmed.
+const SPAWN_ARM_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FireSend {
@@ -562,6 +567,28 @@ fn send_frame(w: &mut impl Write, v: &Value) -> bool {
     };
     let len = (body.len() as u32).to_le_bytes();
     w.write_all(&len).is_ok() && w.write_all(&body).is_ok() && w.flush().is_ok()
+}
+
+/// Carry an arm transition to one live sidecar. Disarming waits for the acknowledgement and kills a
+/// sidecar that does not give it; arming only queues the state, which the writer delivers before any
+/// later fire, so a slow interpreter delays its macros instead of losing its process. Arming never
+/// blocks this thread, so a disarm queued behind it is not held up.
+fn sync_arm_link(
+    writer: &PipeWriter,
+    shared: &Shared,
+    on: bool,
+    generation: u64,
+    retire: impl FnOnce(),
+) -> bool {
+    if !on {
+        return synchronize_arm(writer, shared, on, generation, DISARM_ACK_TIMEOUT, retire);
+    }
+    if writer.send_arm(on, generation) {
+        return true;
+    }
+    retire();
+    shared.mark_dead();
+    false
 }
 
 fn synchronize_arm(
@@ -877,11 +904,7 @@ impl MacroHost {
             let (Some(writer), Some(shared), Some(process)) = (
                 link.writer.upgrade(), link.shared.upgrade(), link.process.upgrade(),
             ) else { continue };
-            if synchronize_arm(&writer, &shared, on, generation, ARM_ACK_TIMEOUT, || {
-                process.terminate()
-            }) {
-                continue;
-            }
+            sync_arm_link(&writer, &shared, on, generation, || process.terminate());
         }
     }
 
@@ -2135,14 +2158,21 @@ impl MacroHost {
             });
         }
         let (armed, generation) = self.arm_snapshot(false);
-        if !synchronize_arm(
-            sess.writer.as_ref().expect("live writer"),
-            &sess.shared,
-            armed,
-            generation,
-            ARM_ACK_TIMEOUT,
-            || sess.process.terminate(),
-        ) {
+        // A fresh sidecar starts disarmed, so a disarmed state needs only to be queued; an armed
+        // one is confirmed before the sidecar takes fires.
+        let synced = if armed {
+            synchronize_arm(
+                sess.writer.as_ref().expect("live writer"),
+                &sess.shared,
+                armed,
+                generation,
+                SPAWN_ARM_ACK_TIMEOUT,
+                || sess.process.terminate(),
+            )
+        } else {
+            sess.writer.as_ref().expect("live writer").send_arm(armed, generation)
+        };
+        if !synced {
             return Err(format!("{} macro sidecar arm sync failed", mode.label()));
         }
         let registrations: Vec<_> = g.manifest
@@ -2369,12 +2399,10 @@ fn beacon_deliver(beacon: &BeaconSlot, ev: BeaconEvent) -> bool {
     }
 }
 
-/// The device registry, loaded ONCE for macro device-verbs (`neuron.dpi/profile/…`) and cached, so a
-/// macro spamming acts never re-reads the registry TOMLs.
-fn act_registry() -> Option<&'static crate::registry::Registry> {
-    static R: std::sync::OnceLock<Option<crate::registry::Registry>> = std::sync::OnceLock::new();
-    R.get_or_init(|| crate::registry::Registry::load().ok())
-        .as_ref()
+/// The registry for macro device verbs (`neuron.dpi/profile/…`): the shared snapshot, so a device
+/// adopted after the first macro ran is reachable without a restart.
+fn act_registry() -> Option<std::sync::Arc<crate::registry::Registry>> {
+    Some(crate::registry::shared())
 }
 
 /// Open the first connected device that satisfies `cap` (for a macro's read-back / brightness verb).
@@ -2887,7 +2915,7 @@ fn run_act(
     let Some(reg) = act_registry() else {
         return (false, "device registry failed to load".into());
     };
-    let mut devices = crate::device::DeviceSession::new(reg);
+    let mut devices = crate::device::DeviceSession::new(&reg);
     let mut cursor = crate::intent::ProcessProfileCursor;
     match crate::intent::run_shared_intent(
         &mut devices,
@@ -3794,6 +3822,15 @@ mod tests {
         assert!(writer.send(&json!({"t": "register", "source": "x"}))); // occupy write_all
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
+        // Arming against a sidecar that cannot acknowledge yet queues the state and keeps it.
+        let killed = Arc::new(AtomicBool::new(false));
+        let killed_by_arm = Arc::clone(&killed);
+        let started = Instant::now();
+        assert!(sync_arm_link(&writer, &shared, true, 2, move || killed_by_arm.store(true, Ordering::SeqCst)));
+        assert!(started.elapsed() < Duration::from_millis(100), "arming must not wait for an acknowledgement");
+        assert!(!killed.load(Ordering::SeqCst), "a slow arming acknowledgement must not kill the sidecar");
+        assert!(!shared.state.lock().unwrap().dead);
+
         let retired = Arc::new(AtomicBool::new(false));
         let retired_for_timeout = Arc::clone(&retired);
         let started = Instant::now();
@@ -3801,7 +3838,7 @@ mod tests {
             &writer,
             &shared,
             false,
-            2,
+            3,
             Duration::from_millis(20),
             move || retired_for_timeout.store(true, Ordering::SeqCst),
         ));

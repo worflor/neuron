@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The device registry is one shared snapshot that reloads itself when definition files change. Device discovery, event arming, macro-key handling, macro device verbs and the background workers all read it, so a device adopted or edited mid-session reaches every part of the app without a restart. Previously each subsystem kept its own copy (macro device verbs kept the one from first use), and the vitals and scan ticks re-parsed every file each time.
+- Macro sidecars are no longer killed when a busy machine delays their arming acknowledgement. Arming no longer waits, a fresh sidecar (which starts disarmed) only waits when it must confirm being armed, and only a disarm still waits briefly and kills a sidecar that does not confirm it.
+
 ## v0.1.7
 
 ### Security

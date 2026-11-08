@@ -21,10 +21,16 @@
 //!
 //! Skips cleanly (not a failure) when no python runtime is resolvable.
 
-use neuron::macros::{macro_host, Context};
+use neuron::macros::{macro_host, Context, MacroHost};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Run a macro and wait for it to finish. Correctness checks use a completion budget, not the
+/// interactive 2.5 s one, so a loaded machine slows them down instead of failing them.
+fn invoke_done(host: &MacroHost, id: &str, ctx: &Context) -> String {
+    host.invoke_with_budget(id, ctx, Duration::from_secs(30))
+}
 
 /// Path to a macro's on-disk KV store under the test's `NEURON_MACRO_STATE` dir. The macro ids used
 /// here are all plain `[a-z0-9_]`, so the sidecar's filename sanitizer is an identity map on them.
@@ -113,7 +119,7 @@ fn invoke_store_stress_e2e() {
     // lvl18 EXISTS (so the stop is the depth guard, not a missing target) and would mark itself if run.
     host.register("lvl18", "def macro(ctx):\n    neuron.store('i_ran', 1)\n    return 'leaf18'\n")
         .expect("register lvl18");
-    let r = host.invoke("lvl1", &ctx);
+    let r = invoke_done(host, "lvl1", &ctx);
     assert!(
         r.contains("stopped@17"),
         "the cycle guard must refuse the 17th nested invoke (got: {r})"
@@ -134,7 +140,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    return 'A-saw:' + str(neuron.invoke('inv_b', wait=True))\n",
     )
     .unwrap();
-    let r = host.invoke("inv_a", &ctx);
+    let r = invoke_done(host, "inv_a", &ctx);
     assert!(r.contains("A-saw:value-from-B"), "invoke(wait=True) returns the callee's value: {r}");
 
     // ── invoke_async_fire_and_forget ───────────────────────────────────────────────────────────
@@ -150,7 +156,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    rv = neuron.invoke('inv_b2', wait=False)\n    neuron.store('rv_is_none', rv is None)\n    return 'A-done'\n",
     )
     .unwrap();
-    assert!(host.invoke("inv_a2", &ctx).contains("A-done"), "the caller returns without blocking on the child");
+    assert!(invoke_done(host, "inv_a2", &ctx).contains("A-done"), "the caller returns without blocking on the child");
     let a2 = read_store(&state, "inv_a2").expect("inv_a2 store");
     assert_eq!(a2.get("rv_is_none").and_then(Value::as_bool), Some(true), "wait=False returns None immediately");
     // the child ran on its own worker — its store marker appears shortly after, concurrently.
@@ -171,7 +177,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    return 'r=%r' % neuron.invoke('does_not_exist_xyz', wait=True)\n",
     )
     .unwrap();
-    let r = host.invoke("inv_missing", &ctx);
+    let r = invoke_done(host, "inv_missing", &ctx);
     assert!(r.contains("r=None"), "invoking a non-existent macro returns None without raising: {r}");
     assert!(!r.contains("error"), "missing-target must NOT surface as a macro error: {r}");
 
@@ -186,7 +192,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    return neuron.invoke('inv_b3', wait=True, speed='fast', verbose=True)\n",
     )
     .unwrap();
-    let r = host.invoke("inv_a3", &ctx);
+    let r = invoke_done(host, "inv_a3", &ctx);
     assert!(
         r.contains("speed=fast verbose=True"),
         "invoke kwargs become the callee's options: {r}"
@@ -211,7 +217,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    return neuron.invoke('inv_b4', wait=True, bopt='bee')\n",
     )
     .unwrap();
-    let r = host.invoke("inv_a4", &ctx);
+    let r = invoke_done(host, "inv_a4", &ctx);
     assert!(r.contains("same=True"), "B's options are restored after the nested call: {r}");
     assert!(r.contains("before='bee' after='bee'"), "B sees its OWN option both sides of the call: {r}");
     assert!(r.contains("app=invstore.exe"), "ctx is shared down the chain (C saw the original app): {r}");
@@ -233,16 +239,16 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    n = neuron.load('count', 0)\n    neuron.store('count', n + 1)\n    return 'count=%d' % neuron.load('count')\n",
     )
     .unwrap();
-    assert!(host.invoke("store_basic", &ctx).contains("count=1"), "first fire stores 1");
-    assert!(host.invoke("store_basic", &ctx).contains("count=2"), "second fire loads + increments -> persisted");
-    assert!(host.invoke("store_basic", &ctx).contains("count=3"), "value survives across fires");
+    assert!(invoke_done(host, "store_basic", &ctx).contains("count=1"), "first fire stores 1");
+    assert!(invoke_done(host, "store_basic", &ctx).contains("count=2"), "second fire loads + increments -> persisted");
+    assert!(invoke_done(host, "store_basic", &ctx).contains("count=3"), "value survives across fires");
 
     // ── store_per_macro_isolation ──────────────────────────────────────────────────────────────
     host.register("store_iso_a", "def macro(ctx):\n    neuron.store('x', 'A')\n    return 'x=%r' % neuron.load('x')\n").unwrap();
     host.register("store_iso_b", "def macro(ctx):\n    neuron.store('x', 'B')\n    return 'x=%r' % neuron.load('x')\n").unwrap();
-    assert!(host.invoke("store_iso_a", &ctx).contains("x='A'"));
-    assert!(host.invoke("store_iso_b", &ctx).contains("x='B'"));
-    assert!(host.invoke("store_iso_a", &ctx).contains("x='A'"), "each macro has an isolated namespace (A unaffected by B)");
+    assert!(invoke_done(host, "store_iso_a", &ctx).contains("x='A'"));
+    assert!(invoke_done(host, "store_iso_b", &ctx).contains("x='B'"));
+    assert!(invoke_done(host, "store_iso_a", &ctx).contains("x='A'"), "each macro has an isolated namespace (A unaffected by B)");
 
     // ── store_atomic_write_safety ──────────────────────────────────────────────────────────────
     // Hammer 500 writes (cycling 26 keys) while a concurrent reader repeatedly opens + parses the
@@ -291,7 +297,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    neuron.store('a', 1)\n    neuron.store('b', 2)\n    neuron.store('c', 3)\n    neuron.forget('b')\n    return 'a=%r b=%r c=%r' % (neuron.load('a'), neuron.load('b'), neuron.load('c'))\n",
     )
     .unwrap();
-    let r = host.invoke("store_forget1", &ctx);
+    let r = invoke_done(host, "store_forget1", &ctx);
     assert!(r.contains("a=1 b=None c=3"), "forget(key) drops only that key: {r}");
 
     // ── store_forget_all_keys ──────────────────────────────────────────────────────────────────
@@ -300,7 +306,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    neuron.store('a', 1)\n    neuron.store('b', 2)\n    neuron.forget()\n    return 'stored=%r' % neuron.stored()\n",
     )
     .unwrap();
-    assert!(host.invoke("store_forgetall", &ctx).contains("stored={}"), "forget() wipes the whole store");
+    assert!(invoke_done(host, "store_forgetall", &ctx).contains("stored={}"), "forget() wipes the whole store");
     assert!(
         !store_path(&state, "store_forgetall").exists(),
         "forget() with no key removes the store file entirely"
@@ -312,7 +318,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    neuron.store('a', 1)\n    d = neuron.stored()\n    d['a'] = 999\n    d['b'] = 'injected'\n    return 'after=%r' % neuron.stored()\n",
     )
     .unwrap();
-    let r = host.invoke("store_copy", &ctx);
+    let r = invoke_done(host, "store_copy", &ctx);
     assert!(r.contains("'a': 1"), "stored() is a copy — mutating it doesn't touch the store: {r}");
     assert!(!r.contains("999") && !r.contains("injected"), "mutations to the returned dict never persist: {r}");
 
@@ -322,7 +328,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    big = 'x' * (1024 * 1024)\n    neuron.store('big', big)\n    v = neuron.load('big')\n    return 'len=%d match=%s' % (len(v), v == big)\n",
     )
     .unwrap();
-    let r = host.invoke("store_large", &ctx);
+    let r = invoke_done(host, "store_large", &ctx);
     assert!(r.contains("len=1048576 match=True"), "a 1MB value round-trips without truncation: {r}");
     let large = read_store(&state, "store_large").expect("large store parses");
     assert_eq!(large.get("big").and_then(Value::as_str).map(str::len), Some(1024 * 1024), "the file holds the full 1MB value");
@@ -333,7 +339,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    k = '\u{1f511}\u{952e}'\n    v = 'na\u{ef}ve caf\u{e9} \u{65e5}\u{672c}\u{8a9e} \u{1f600}'\n    neuron.store(k, v)\n    return 'match=%s back=%s' % (neuron.load(k) == v, neuron.load(k))\n",
     )
     .unwrap();
-    let r = host.invoke("store_unicode", &ctx);
+    let r = invoke_done(host, "store_unicode", &ctx);
     assert!(r.contains("match=True"), "unicode keys + values round-trip (no mojibake): {r}");
     assert!(r.contains("caf\u{e9}") && r.contains("\u{1f600}"), "the unicode value survives verbatim: {r}");
 
@@ -345,14 +351,14 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    longk = 'L' * 300\n    neuron.store('', 'empty')\n    neuron.store('a/b\\\\c:d*?', 'special')\n    neuron.store(longk, 'long')\n    return 'e=%r s=%r l=%r' % (neuron.load(''), neuron.load('a/b\\\\c:d*?'), neuron.load(longk))\n",
     )
     .unwrap();
-    let r = host.invoke("store_special", &ctx);
+    let r = invoke_done(host, "store_special", &ctx);
     assert!(r.contains("e='empty' s='special' l='long'"), "empty/special/long keys all round-trip: {r}");
 
     // ── store_neuron_macro_state_override ───────────────────────────────────────────────────────
     // The whole test runs under our NEURON_MACRO_STATE override; prove it's honored by finding the
     // macro's file PHYSICALLY in the override dir (never the default user data path).
     host.register("store_override", "def macro(ctx):\n    neuron.store('marker', 'here')\n    return 'ok'\n").unwrap();
-    assert!(host.invoke("store_override", &ctx).contains("ok"));
+    assert!(invoke_done(host, "store_override", &ctx).contains("ok"));
     let ov = read_store(&state, "store_override").expect("override store file is in the NEURON_MACRO_STATE dir");
     assert_eq!(ov.get("marker").and_then(Value::as_str), Some("here"), "the override dir holds the data");
 
@@ -398,7 +404,7 @@ fn invoke_store_stress_e2e() {
 
     // ── load_missing_key_returns_default ───────────────────────────────────────────────────────
     host.register("store_missing", "def macro(ctx):\n    return 'v=%r' % neuron.load('never_set_key', 'DEFAULT')\n").unwrap();
-    assert!(host.invoke("store_missing", &ctx).contains("v='DEFAULT'"), "load(missing) returns the default");
+    assert!(invoke_done(host, "store_missing", &ctx).contains("v='DEFAULT'"), "load(missing) returns the default");
 
     // ── load_from_corrupted_json_gracefully_fails ──────────────────────────────────────────────
     // Hand a macro a corrupt store file. load()/stored() must degrade to default/{} (never crash),
@@ -409,7 +415,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    a = neuron.load('x', 'DEF')\n    b = neuron.stored()\n    neuron.store('healed', 1)\n    return 'x=%r stored_was=%r' % (a, b)\n",
     )
     .unwrap();
-    let r = host.invoke("store_corrupt", &ctx);
+    let r = invoke_done(host, "store_corrupt", &ctx);
     assert!(r.contains("x='DEF'"), "load from corrupt JSON degrades to the default: {r}");
     assert!(r.contains("stored_was={}"), "stored() from corrupt JSON degrades to {{}}: {r}");
     let healed = read_store(&state, "store_corrupt").expect("the corrupt file was healed to valid JSON");
@@ -424,7 +430,7 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    cur = neuron.load('survivor', None)\n    if cur is None:\n        neuron.store('survivor', 42)\n        return 'stored'\n    return 'loaded=%r' % cur\n",
     )
     .unwrap();
-    assert!(host.invoke("store_persist", &ctx).contains("stored"), "first fire stores the survivor");
+    assert!(invoke_done(host, "store_persist", &ctx).contains("stored"), "first fire stores the survivor");
     // crash the sidecar (its whole reason to exist is to contain this).
     host.register("store_kill", "# neuron: raw\nimport os\ndef macro(ctx):\n    os._exit(1)\n").unwrap();
     let _ = host.fire_async("store_kill", &ctx);
@@ -432,7 +438,7 @@ fn invoke_store_stress_e2e() {
     let mut loaded = String::new();
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        let r = host.invoke("store_persist", &ctx);
+        let r = invoke_done(host, "store_persist", &ctx);
         if r.contains("loaded=42") {
             loaded = r;
             break;
@@ -514,7 +520,7 @@ fn bug_invoke_wait_false_child_output_is_dropped() {
     )
     .unwrap();
     host.drain_log();
-    let _ = host.invoke("bug_parent", &ctx);
+    let _ = invoke_done(host, "bug_parent", &ctx);
     let log = wait_log("boom-from-async-child", Duration::from_secs(5));
 
     host.unregister("bug_child");

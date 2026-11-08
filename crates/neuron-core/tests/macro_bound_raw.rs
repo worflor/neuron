@@ -6,8 +6,14 @@
 //! process so its process-global MacroHost, run-root override and macro-state override cannot race a
 //! sibling test. No hardware is touched and input stays disarmed for the entire run.
 
-use neuron::macros::{macro_host, Context};
+use neuron::macros::{macro_host, Context, MacroHost};
 use std::time::Duration;
+
+/// Run a macro and wait for it to finish. Correctness checks use a completion budget, not the
+/// interactive 2.5 s one, so a loaded machine slows them down instead of failing them.
+fn invoke_done(host: &MacroHost, id: &str, ctx: &Context) -> String {
+    host.invoke_with_budget(id, ctx, Duration::from_secs(30))
+}
 
 #[test]
 fn bound_and_raw_are_distinct_authority_domains() {
@@ -84,7 +90,7 @@ def macro(ctx):
 "#,
     )
     .expect("register RAW surface probe");
-    let raw = host.invoke("raw_surface", &ctx);
+    let raw = invoke_done(host, "raw_surface", &ctx);
     assert!(raw.contains("raw-ok"), "RAW lost ordinary Python power: {raw}");
     assert!(tmp.join("raw_touch.txt").exists(), "RAW file write did not land");
 
@@ -100,7 +106,7 @@ def macro(ctx):
     )
     .expect("register BOUND same-domain caller");
     assert!(
-        host.invoke("bound_same_domain", &ctx).contains("8"),
+        invoke_done(host, "bound_same_domain", &ctx).contains("8"),
         "same-domain BOUND invoke lost native Python return semantics"
     );
 
@@ -114,7 +120,7 @@ def macro(ctx):
         "# neuron: raw\ndef macro(ctx):\n    return neuron.invoke('bound_target', x='X')\n",
     )
     .expect("register RAW caller");
-    let down = host.invoke("raw_calls_bound", &ctx);
+    let down = invoke_done(host, "raw_calls_bound", &ctx);
     assert!(
         down.contains("bound:X:authority.exe"),
         "RAW -> BOUND did not execute in the target domain: {down}"
@@ -130,7 +136,7 @@ def macro(ctx):
         "def macro(ctx):\n    return repr(neuron.invoke('raw_target'))\n",
     )
     .expect("register BOUND caller");
-    let up = host.invoke("bound_calls_raw", &ctx);
+    let up = invoke_done(host, "bound_calls_raw", &ctx);
     assert!(
         up.contains("None"),
         "BOUND -> RAW crossed the authority boundary: {up}"
@@ -143,15 +149,15 @@ def macro(ctx):
         "def macro(ctx):\n    n = neuron.load('n', 0) + 1\n    neuron.store('n', n)\n    return n\n",
     )
     .expect("register BOUND state macro");
-    assert!(host.invoke("state_bridge", &ctx).contains("1"));
-    assert!(host.invoke("state_bridge", &ctx).contains("2"));
+    assert!(invoke_done(host, "state_bridge", &ctx).contains("1"));
+    assert!(invoke_done(host, "state_bridge", &ctx).contains("2"));
     host.register(
         "state_bridge",
         "# neuron: raw\ndef macro(ctx):\n    return neuron.load('n', 0)\n",
     )
     .expect("switch state macro to RAW");
     assert!(
-        host.invoke("state_bridge", &ctx).contains("2"),
+        invoke_done(host, "state_bridge", &ctx).contains("2"),
         "mode switch lost the macro's persistent state"
     );
 
@@ -166,7 +172,7 @@ def macro(ctx):
         "# neuron: raw\ndef macro(ctx):\n    neuron.invoke('bound_async_target', wait=False)\n    return 'queued'\n",
     )
     .expect("register RAW async caller");
-    assert!(host.invoke("raw_async_caller", &ctx).contains("queued"));
+    assert!(invoke_done(host, "raw_async_caller", &ctx).contains("queued"));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let state_path = tmp.join("state").join("bound_async_target.json");
@@ -190,7 +196,7 @@ def macro(ctx):
         "COUNT = [0]\ndef macro(ctx):\n    COUNT[0] += 1\n    return COUNT[0]\n",
     )
     .expect("register BOUND survivor");
-    assert!(host.invoke("bound_survivor", &ctx).contains("1"));
+    assert!(invoke_done(host, "bound_survivor", &ctx).contains("1"));
     host.register(
         "raw_crash",
         "# neuron: raw\nimport os\ndef macro(ctx):\n    os._exit(23)\n",
@@ -199,7 +205,7 @@ def macro(ctx):
     let _ = host.fire_async("raw_crash", &ctx);
     std::thread::sleep(Duration::from_millis(250));
     assert!(
-        host.invoke("bound_survivor", &ctx).contains("2"),
+        invoke_done(host, "bound_survivor", &ctx).contains("2"),
         "RAW process death reset or disturbed the BOUND interpreter"
     );
 
@@ -223,11 +229,11 @@ def macro(ctx):
     for (mode, header) in [("bound", ""), ("raw", "# neuron: raw\n")] {
         host.register(&format!("{mode}_helper_surface"), &format!("{header}{surface}"))
             .expect("register helper surface probe");
-        let got = host.invoke(&format!("{mode}_helper_surface"), &ctx);
+        let got = invoke_done(host, &format!("{mode}_helper_surface"), &ctx);
         assert!(got.contains("surface:True:True:True"), "{mode} lost exported helpers: {got}");
         host.register(&format!("{mode}_result_contract"), &format!("{header}{contract}"))
             .expect("register result contract probe");
-        let got = host.invoke(&format!("{mode}_result_contract"), &ctx);
+        let got = invoke_done(host, &format!("{mode}_result_contract"), &ctx);
         assert!(
             got.contains("contract:False/True,False/True,False/True,True/False"),
             "{mode} effect results broke the contract: {got}"
@@ -241,7 +247,7 @@ def macro(ctx):
     assert!(refused.contains("requires RAW"), "{refused}");
     host.register("raw_obs_request", &format!("# neuron: raw\n{obs_request}"))
         .expect("register RAW obs_request probe");
-    let got = host.invoke("raw_obs_request", &ctx);
+    let got = invoke_done(host, "raw_obs_request", &ctx);
     assert!(got.contains("obs_request=False/[disarmed]"), "RAW obs_request ignored the arm gate: {got}");
 
     // String-driven reflection gets past the static policy and reaches the real builtins, so the
@@ -287,12 +293,12 @@ def macro(ctx):
     let finish = "    return 'wall:' + ','.join(out)\n";
     host.register("bound_wall", &format!("{escape}{process_steps}{finish}"))
         .expect("register BOUND escape probe");
-    let got = host.invoke("bound_wall", &ctx);
+    let got = invoke_done(host, "bound_wall", &ctx);
     for label in ["open", "listdir", "system", "popen", "ctypes", "import"] {
         assert!(got.contains(&format!("{label}=refused")), "BOUND wall let {label} through: {got}");
     }
     host.register("raw_wall", &format!("# neuron: raw\n{escape}{finish}")).expect("register RAW escape probe");
-    let got = host.invoke("raw_wall", &ctx);
+    let got = invoke_done(host, "raw_wall", &ctx);
     for label in ["open", "listdir", "import"] {
         assert!(got.contains(&format!("{label}=ran")), "RAW lost {label}: {got}");
     }
@@ -307,7 +313,7 @@ def macro(ctx):
                     mid = statistics.median([1, 2, 3])\n    \
                     return 'everyday:%s:%s:%s:%s:%s' % (year, bom, pick in 'ab', data, mid)\n";
     host.register("bound_everyday", everyday).expect("register BOUND everyday probe");
-    let got = host.invoke("bound_everyday", &ctx);
+    let got = invoke_done(host, "bound_everyday", &ctx);
     assert!(got.contains("everyday:2026:efbbbf78:True:bb:2"), "the wall broke ordinary BOUND code: {got}");
 
     assert!(site.join("loaded-raw").exists(), "the probe never ran, so it proves nothing");
