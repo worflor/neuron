@@ -754,12 +754,19 @@ function script:Get-BrokerProcessImagePaths {
     param()
     Add-FixtureEvent 'ProcessQuery'
     if ($Script:ProcessQueryFailure) { throw 'injected process image query failure' }
+    return @($Script:ProcessImagePaths)
+}
+
+# The stop wait asks the executable whether it is still mapped. A process that outlives the task
+# stop is modelled here; process enumeration is never consulted for it.
+function script:Test-BrokerImageInUse($executable) {
+    Add-FixtureEvent 'ImageProbe'
     if ($Script:LingerAfterStop -gt 0 -and ($Script:Events -contains 'StopTask')) {
         $Script:LingerAfterStop--
         Add-FixtureEvent 'ProcessLingers'
-        return @($Script:Executable)
+        return $true
     }
-    return @($Script:ProcessImagePaths)
+    return $false
 }
 
 $productionCommands = @(
@@ -770,7 +777,7 @@ $productionCommands = @(
     'Get-CimInstance', 'Get-Content', 'Get-FileHash', 'Get-Item', 'Get-Process',
     'Get-NormalizedBrokerTaskXml', 'Get-OptionalScheduledTask', 'Get-ScheduledTask',
     'Install-BrokerTask', 'Install-PendingBrokerRepair', 'Install-ProtectedBrokerReplacement',
-    'New-StagedBrokerPayload', 'Test-BrokerProcessAtPath', 'Assert-NoBrokerProcessAtPath',
+    'New-StagedBrokerPayload', 'Test-BrokerProcessAtPath', 'Test-BrokerImageInUse', 'Assert-NoBrokerProcessAtPath',
     'Join-Path',
     'New-Item', 'New-Object', 'New-ScheduledTaskAction', 'New-ScheduledTaskPrincipal',
     'New-ScheduledTaskSettingsSet', 'New-ScheduledTaskTrigger', 'New-TimeSpan', 'Out-Null',
@@ -861,6 +868,16 @@ try {
     }
     Assert ($lastLinger -ge 0 -and $firstPublish -gt $lastLinger) 'executable was replaced while the old broker process still held it'
     Assert-ByteFile $Script:Executable $Script:NewBinary 'lingering broker process replacement executable'
+
+    # On Windows a broker process that is tearing down reports no image path while it still holds
+    # the file, so enumeration fails; the stop wait must not depend on it.
+    Initialize-Fixture 'process-unreadable-while-exiting'
+    $Script:LingerAfterStop = 2
+    $Script:ProcessQueryFailure = $true
+    $result = Invoke-Replacement ''
+    Assert (-not $result.Failed) ('an unreadable exiting broker process failed replacement: ' + $result.Message)
+    Assert-ByteFile $Script:Executable $Script:NewBinary 'unreadable exiting process replacement executable'
+    $Script:ProcessQueryFailure = $false
 
     Initialize-Fixture 'process-never-exits'
     $Script:LingerAfterStop = 1000

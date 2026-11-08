@@ -564,10 +564,23 @@ function Stop-BrokerTask($context, [bool]$verifyPrior = $true) {
     # makes File.Replace park the old executable as a ~RF*.TMP beside it.
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if ((Get-ScheduledTask -TaskName $context.TaskName -ErrorAction Stop).State -ne 'Running' -and
-            -not (Test-BrokerProcessAtPath $context.Executable)) { return }
+            -not (Test-BrokerImageInUse $context.Executable)) { return }
         Start-Sleep -Milliseconds 200
     }
     throw 'previous broker did not stop; task remains disabled'
+}
+
+# Whether a process still maps the executable. Asked of the file itself: a process that is
+# tearing down can report no image path while still holding it, so enumeration cannot tell.
+function Test-BrokerImageInUse($executable) {
+    if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { return $false }
+    try {
+        $stream = [IO.File]::Open($executable, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $stream.Dispose()
+        return $false
+    } catch [IO.IOException] {
+        return $true
+    }
 }
 
 function Restore-BrokerTaskRuntimeState($context) {
