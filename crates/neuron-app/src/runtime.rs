@@ -130,7 +130,7 @@ const SYNTH_RETRY: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// The resident runtime state. UI-thread owned (held in an `Rc<RefCell<_>>` by the glue).
 pub struct AppRuntime {
-    pub registry: Registry,
+    pub registry: std::sync::Arc<Registry>,
     pub bindings: Bindings,
     pub cast: CastConfig,
     pub vault: Vault,
@@ -190,14 +190,16 @@ pub struct AppRuntime {
     /// Distinct from `synth_inflight`, which only drives the transient "learning…" row for a key's
     /// FIRST attempt: this set spans every attempt (first and retry) and gates spawning, not UI.
     synth_running: Arc<std::sync::Mutex<std::collections::HashSet<AdoptKey>>>,
-    /// Set by a finished adoption thread; the next scan tick reloads the registry so the newly
-    /// synthesized device appears without a restart.
+    /// Set by a finished adoption thread so the device page rescans; the registry itself reloads
+    /// on its own when the definition files change (see `neuron::registry::shared`).
     synth_dirty: Arc<AtomicBool>,
     /// Monotonic count of registry swaps — the def-identity half of the panel-seeding key
     /// (`seeded_key`). A reload means ANY def behind an unchanged unit id may have changed (the
     /// learning→real adoption flip, a user-edited devices/auto file), so a same-unit selection
     /// after a bump must re-seed. Bumped at every site that reassigns `self.registry`.
     pub registry_gen: u64,
+    /// The shared registry generation `registry` was taken at.
+    registry_seen: u64,
     /// The (unit, dialect, `registry_gen`) the inspector panel was last seeded for — the select
     /// path's reseed decision. The seed identity is the control PLANE (unit + family), not the bare
     /// unit: a selection reseeds iff this differs from the newly selected plane's key, which catches
@@ -247,9 +249,7 @@ const UNRESPONSIVE_STRIKES: u32 = 3;
 
 impl AppRuntime {
     pub fn load() -> Self {
-        let registry = Registry::load().unwrap_or(Registry {
-            devices: Vec::new(),
-        });
+        let (registry, registry_seen) = neuron::registry::shared_with_generation();
         let mut profiles = Vec::new();
         let mut broken_profiles = Vec::new();
         for e in neuron::profile::load_all() {
@@ -315,6 +315,7 @@ impl AppRuntime {
             synth_running: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             synth_dirty: Arc::new(AtomicBool::new(false)),
             registry_gen: 0,
+            registry_seen,
             seeded_key: None,
             healed_units: std::collections::HashSet::new(),
             unclaimed: Vec::new(),
@@ -322,9 +323,8 @@ impl AppRuntime {
     }
 
     /// A clone of the shared `synth_dirty` flag — the SAME `Arc<AtomicBool>` the adoption worker
-    /// sets. The first-light heal worker (in glue) sets it after rewriting an auto file, so the
-    /// next `scan_devices` reloads the registry, bumps `registry_gen`, and the seeded-key machinery
-    /// re-seeds every downstream panel — the exact reload chain a successful adoption already rides.
+    /// sets. The first-light heal worker (in glue) sets it after rewriting an auto file so the
+    /// device page rescans; the rewrite itself is what reloads the registry.
     pub fn synth_dirty_handle(&self) -> Arc<AtomicBool> {
         self.synth_dirty.clone()
     }
@@ -363,17 +363,17 @@ impl AppRuntime {
     /// Returns whether a reload actually happened, so the BACKGROUND completion path can tell
     /// that rows computed before this point were resolved against a now-stale registry.
     fn reload_registry_if_dirty(&mut self) -> bool {
-        if self.synth_dirty.swap(false, Ordering::SeqCst) {
-            if let Ok(reg) = Registry::load() {
-                crate::hidwatch::reload_registry(reg.clone());
-                self.registry = reg;
-                // A def behind an existing unit id may have changed (learning→real, edited auto
-                // file) — bump the generation so a same-unit selection re-seeds the panel.
-                self.registry_gen = self.registry_gen.wrapping_add(1);
-            }
+        let adopted = self.synth_dirty.swap(false, Ordering::SeqCst);
+        let (registry, generation) = neuron::registry::shared_with_generation();
+        if generation != self.registry_seen {
+            self.registry = registry;
+            self.registry_seen = generation;
+            // A def behind an existing unit id may have changed (learning→real, edited auto
+            // file) — bump the generation so a same-unit selection re-seeds the panel.
+            self.registry_gen = self.registry_gen.wrapping_add(1);
             return true;
         }
-        false
+        adopted
     }
 
     /// Fold a finished BACKGROUND scan (see [`scan_hardware`]) into `self` — the exact same
@@ -621,7 +621,8 @@ impl AppRuntime {
             // for a DIFFERENT key must not also probe — and double-write the auto file of — a key
             // this worker already owns. Keying on (dialect, pid) is what makes that scope precise
             // when two families share a pid: this worker's key never selects the other's pipe.
-            if let Ok(reg) = Registry::load() {
+            {
+                let reg = neuron::registry::shared();
                 if let Ok(a) = neuron::synth::adopt_keys(&reg, &unknown) {
                     for b in &a.retired {
                         eprintln!("[adopt] set aside an outdated generated file: {}", b.display());
@@ -1175,7 +1176,7 @@ impl AppRuntime {
                 await_lighting_stop(&prior)?;
                 if stop.load(Ordering::SeqCst) || neuron::writes::writes_paused() { return Ok(()); }
                 if crate::host::owns_surface(pid, &unit) { return Err("surface ownership changed before local start".into()); }
-                let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
+                let reg = neuron::registry::shared();
                 let infos = transport::enumerate().map_err(|e| format!("enumerate: {e}"))?;
                 for i in &infos {
                     // find_for_pipe: the family-aware control-pipe def, so a two-family unit streams
@@ -1893,7 +1894,7 @@ pub fn pending_diagnostic_stations() -> Vec<DiagProbe> {
 /// first paint on activation. Each sub-read is best-effort — an asleep mouse falls back to stage 0 /
 /// last-known charge rather than aborting.
 fn publish_source_vitals(forced: bool) {
-    let Ok(reg) = Registry::load() else { return };
+    let reg = neuron::registry::shared();
     let Ok(infos) = transport::enumerate() else { return };
     // Candidate control interfaces, then the LOWEST instance wins — enumeration order is not
     // stable, and with two identical battery mice an order-dependent pick would alternate which
@@ -2022,9 +2023,7 @@ pub struct PerfSnapshot {
 /// (`io_gate`), same as every other getter path.
 pub fn read_perf_snapshot(pid: u16, unit: &str, dialect: &str) -> PerfSnapshot {
     let mut snap = PerfSnapshot::default();
-    let Ok(reg) = Registry::load() else {
-        return snap;
-    };
+    let reg = neuron::registry::shared();
     let Ok(infos) = transport::enumerate() else {
         return snap;
     };
@@ -2299,9 +2298,7 @@ fn scan_units(registry: &Registry, infos: &[transport::HidDeviceInfo]) -> Vec<De
 /// that calls this, then folds the result in via `AppRuntime::finish_background_scan` once it
 /// hops back to the UI thread (`slint::invoke_from_event_loop`).
 pub fn scan_hardware() -> Option<(Vec<transport::HidDeviceInfo>, Vec<DeviceState>)> {
-    let registry = Registry::load().unwrap_or(Registry {
-        devices: Vec::new(),
-    });
+    let registry = neuron::registry::shared();
     let infos = transport::enumerate().ok()?;
     let out = scan_units(&registry, &infos);
     Some((infos, out))

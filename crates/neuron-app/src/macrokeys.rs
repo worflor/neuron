@@ -29,9 +29,6 @@ fn verbose() -> bool {
     *V.get_or_init(|| std::env::var("NEURON_HIDWATCH").ok().as_deref() == Some("1"))
 }
 
-fn registry() -> Option<&'static neuron::registry::Registry> {
-    crate::hidwatch::registry()
-}
 
 #[derive(Default)]
 struct MacroInput {
@@ -97,7 +94,7 @@ pub fn start() {
 }
 
 fn refresh(input: &Arc<Mutex<MacroInput>>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
-    let Some(reg) = registry() else { return };
+    let reg = neuron::registry::shared();
     let pids = reg.razer_macro_key_pids();
     let identities = pids.iter().map(|&pid| (pid, CanonicalPid::of(pid))).collect();
     {
@@ -105,7 +102,7 @@ fn refresh(input: &Arc<Mutex<MacroInput>>, armed: &Arc<Mutex<HashSet<DevicePath>
         // Publish revocations under the same lock as reports, so no old reader can re-hold a key.
         for update in state.set_allowed(identities) { publish(update); }
     }
-    ensure_driver_mode(reg, &pids);
+    ensure_driver_mode(&reg, &pids);
     arm_new(&pids, armed, input);
 }
 
@@ -385,9 +382,8 @@ mod tests {
             return;
         }
         let _guard = crate::testsupport::cwd_guard("macro-adoption");
-        crate::hidwatch::reload_registry(neuron::registry::Registry::load().unwrap());
         let adopted_pid = 0x4567;
-        assert!(registry().unwrap().find_by_pid(neuron::synth::RAZER_VID, adopted_pid).is_none());
+        assert!(neuron::registry::shared().find_by_pid(neuron::synth::RAZER_VID, adopted_pid).is_none());
 
         let definition = include_str!("../../neuron-core/devices/razer-blackwidow-chroma-v2.toml")
             .replace("product_id = 0x0221", "product_id = 0x4567")
@@ -395,11 +391,10 @@ mod tests {
         let auto_dir = neuron::runroot::run_root().join("devices/auto");
         std::fs::create_dir_all(&auto_dir).unwrap();
         std::fs::write(auto_dir.join("razer-4567.toml"), definition).unwrap();
-        crate::hidwatch::reload_registry(neuron::registry::Registry::load().unwrap());
 
-        assert!(registry().unwrap().find_by_pid(neuron::synth::RAZER_VID, adopted_pid).is_some(),
+        assert!(neuron::registry::shared().find_by_pid(neuron::synth::RAZER_VID, adopted_pid).is_some(),
             "macro-key discovery must see a completed background adoption");
-        assert!(registry().unwrap().razer_macro_key_pids().contains(&adopted_pid));
+        assert!(neuron::registry::shared().razer_macro_key_pids().contains(&adopted_pid));
         assert_eq!(CanonicalPid::of(0x4569), CanonicalPid::of(adopted_pid));
     }
 }

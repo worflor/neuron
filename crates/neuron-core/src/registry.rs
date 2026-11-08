@@ -441,6 +441,99 @@ pub struct Registry {
     pub devices: Vec<DeviceDef>,
 }
 
+// ── THE SHARED REGISTRY ─────────────────────────────────────────────────────────────────────────
+//
+// One snapshot for the whole process. It reloads when the definition folders change on disk
+// (adoption, the CLI, a hand edit) or a writer calls `invalidate`. Each call returns the current
+// snapshot; a holder keeps the one it took (the dispatch worker and host bring-up hold theirs for
+// their lifetime).
+
+/// What the definition folders looked like when the snapshot was loaded: each file's name, size
+/// and modification time, plus the run root and discovery override that change what loads.
+#[derive(Clone, PartialEq, Eq)]
+struct DefsFingerprint(Vec<(std::path::PathBuf, u64, Option<std::time::SystemTime>)>);
+
+/// Bumped by [`invalidate`]. Part of the fingerprint because a same-size rewrite inside one
+/// filesystem timestamp tick changes neither size nor modification time.
+static DEFS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Make the next [`shared`] call reload. Code that writes a definition file calls this after the
+/// write, so a rewrite that keeps the file's size is never missed.
+pub fn invalidate() {
+    DEFS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn defs_fingerprint() -> DefsFingerprint {
+    let root = crate::runroot::run_root().join("devices");
+    let mut entries = vec![(
+        root.clone(),
+        u64::from(std::env::var("NEURON_PURE_DISCOVERY").is_ok_and(|v| v == "1"))
+            | (DEFS_EPOCH.load(std::sync::atomic::Ordering::SeqCst) << 1),
+        None,
+    )];
+    for dir in [root.clone(), root.join("auto")] {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|x| x == "toml") {
+                let meta = entry.metadata().ok();
+                entries.push((
+                    path,
+                    meta.as_ref().map_or(0, std::fs::Metadata::len),
+                    meta.and_then(|m| m.modified().ok()),
+                ));
+            }
+        }
+    }
+    entries.sort();
+    DefsFingerprint(entries)
+}
+
+struct SharedRegistry {
+    fingerprint: DefsFingerprint,
+    generation: u64,
+    registry: std::sync::Arc<Registry>,
+}
+
+static SHARED: std::sync::Mutex<Option<SharedRegistry>> = std::sync::Mutex::new(None);
+
+/// The process-wide registry snapshot, reloaded first if the definition folders changed since it
+/// was taken. Every holder of the returned `Arc` keeps a consistent snapshot for as long as it
+/// needs one; a later call may return a newer one. If a reload fails the previous snapshot stays.
+#[must_use]
+pub fn shared() -> std::sync::Arc<Registry> {
+    shared_with_generation().0
+}
+
+/// [`shared`] together with its generation, which increases by one at every reload. A consumer that
+/// derives state from the registry compares generations to know when to rebuild it.
+#[must_use]
+pub fn shared_with_generation() -> (std::sync::Arc<Registry>, u64) {
+    let fingerprint = defs_fingerprint();
+    let mut slot = SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(s) = slot.as_ref() {
+        if s.fingerprint == fingerprint {
+            return (std::sync::Arc::clone(&s.registry), s.generation);
+        }
+    }
+    let generation = slot.as_ref().map_or(1, |s| s.generation + 1);
+    match Registry::load() {
+        Ok(registry) => {
+            refresh_event_identities(&registry);
+            let registry = std::sync::Arc::new(registry);
+            *slot = Some(SharedRegistry { fingerprint, generation, registry: std::sync::Arc::clone(&registry) });
+            (registry, generation)
+        }
+        Err(e) => {
+            eprintln!("neuron: device definitions failed to load: {e}");
+            match slot.as_ref() {
+                Some(s) => (std::sync::Arc::clone(&s.registry), s.generation),
+                None => (std::sync::Arc::new(Registry { devices: Vec::new() }), 0),
+            }
+        }
+    }
+}
+
 // ── CANONICAL EVENT PID ─────────────────────────────────────────────────────────────────────────
 //
 // One physical device presents SEVERAL USB pids: one per link mode (wired / dongle / bluetooth)
@@ -482,13 +575,13 @@ fn event_identities(registry: &Registry) -> EventIdentities {
 
 /// Cache a successful load; failed loads retry. Runtime adoption refreshes the same tables.
 fn event_identity_tables() -> Option<EventIdentities> {
-    let mut g = EVENT_IDENTITIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if g.is_none() {
-        if let Ok(r) = Registry::load() {
-            *g = Some(event_identities(&r));
-        }
+    if let Some(tables) = EVENT_IDENTITIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+        return Some(tables);
     }
-    g.clone()
+    // Loading the shared snapshot refreshes the tables. Called without holding EVENT_IDENTITIES:
+    // `shared_with_generation` takes SHARED and then EVENT_IDENTITIES.
+    let _ = shared_with_generation();
+    EVENT_IDENTITIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 /// A device's EVENT identity, canonicalized — the type the whole input spine speaks.
@@ -867,6 +960,87 @@ impl Registry {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    fn write_def(dir: &std::path::Path, pid: u16) {
+        let auto = dir.join("devices").join("auto");
+        std::fs::create_dir_all(&auto).unwrap();
+        for literal in ["0x00A7", "0x00A8", "0x00A9"] {
+            assert!(BUILTINS[0].contains(literal), "the fixture rewrites {literal}, which the builtin no longer has");
+        }
+        let text = BUILTINS[0]
+            .replace("0x00A7", &format!("0x{pid:04X}"))
+            .replace("0x00A8", &format!("0x{:04X}", pid + 1))
+            .replace("0x00A9", &format!("0x{:04X}", pid + 2));
+        std::fs::write(auto.join(format!("razer-{pid:04x}.toml")), text).unwrap();
+    }
+
+    #[test]
+    fn the_shared_snapshot_is_reused_until_the_definitions_change() {
+        let root = crate::authoring::test_run_root();
+        let (first, generation) = shared_with_generation();
+        let (again, same) = shared_with_generation();
+        assert!(std::sync::Arc::ptr_eq(&first, &again) && generation == same, "an unchanged folder reuses the snapshot");
+
+        write_def(&root.dir, 0x7B10);
+        let (added, next) = shared_with_generation();
+        assert!(next > generation, "a new definition file reloads");
+        assert!(added.find_by_pid(crate::dialect::RAZER_VID, 0x7B10).is_some(), "and the new device is in the snapshot");
+        assert!(first.find_by_pid(crate::dialect::RAZER_VID, 0x7B10).is_none(), "a held snapshot does not change under its holder");
+
+        let path = root.dir.join("devices").join("auto").join("razer-7b10.toml");
+        let edited = std::fs::read_to_string(&path).unwrap().replacen("name = ", "name = \"Edited\" # ", 1);
+        std::fs::write(&path, edited).unwrap();
+        assert!(shared_with_generation().1 > next, "an edited definition file reloads");
+    }
+
+    #[test]
+    fn a_same_size_rewrite_in_one_timestamp_tick_reloads_after_invalidate() {
+        let root = crate::authoring::test_run_root();
+        write_def(&root.dir, 0x7B30);
+        let path = root.dir.join("devices").join("auto").join("razer-7b30.toml");
+        let before = shared();
+        let tx_line = |d: &DeviceDef| d.transaction_id;
+        let original = before.find_by_pid(crate::dialect::RAZER_VID, 0x7B30).map(tx_line).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // A heal-style rewrite: same length, same timestamp.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let from = format!("transaction_id = 0x{original:02X}");
+        assert!(text.contains(&from), "fixture names its transaction id as {from}");
+        let to = format!("transaction_id = 0x{:02X}", original ^ 0x20);
+        std::fs::write(&path, text.replacen(&from, &to, 1)).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+
+        let unseen = shared();
+        assert_eq!(unseen.find_by_pid(crate::dialect::RAZER_VID, 0x7B30).map(tx_line), Some(original),
+            "size and timestamp alone cannot see this rewrite");
+        invalidate();
+        let seen = shared();
+        assert_eq!(seen.find_by_pid(crate::dialect::RAZER_VID, 0x7B30).map(tx_line), Some(original ^ 0x20));
+    }
+
+    #[test]
+    fn concurrent_readers_never_see_the_generation_go_back() {
+        let root = crate::authoring::test_run_root();
+        let start = shared_with_generation().1;
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let mut last = 0;
+                    for _ in 0..40 {
+                        let (_, generation) = shared_with_generation();
+                        assert!(generation >= last, "generation went from {last} to {generation}");
+                        last = generation;
+                    }
+                    last
+                })
+            })
+            .collect();
+        write_def(&root.dir, 0x7B20);
+        let seen: Vec<u64> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(seen.iter().all(|&g| g >= start));
+        assert!(shared().find_by_pid(crate::dialect::RAZER_VID, 0x7B20).is_some());
+    }
 
     #[test]
     fn adoption_extends_event_identity_without_retargeting_existing_owners() {

@@ -1743,7 +1743,8 @@ pub fn build_runtime() -> Runtime {
     let _ = crate::profile::restore_active_once();
     let app_rules = AppRules::load();
     let mut rt = build_runtime_from(&bindings, &cast, &app_rules, &load_rule_sidecars());
-    if let Ok(reg) = crate::registry::Registry::load() {
+    {
+        let reg = crate::registry::shared();
         let mut rules = rt.engine.to_rules();
         let defaults = plate_default_rules(&reg.devices, &rules);
         if !defaults.is_empty() {

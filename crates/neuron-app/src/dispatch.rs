@@ -658,9 +658,7 @@ fn run_worker(
     let rt = controls::build_runtime();
     crate::chroma_lab::set_rules_listen(rt.binds_game_light());
     let exec = DispatchExecutor::new();
-    let reg = neuron::registry::Registry::load().unwrap_or(neuron::registry::Registry {
-        devices: Vec::new(),
-    });
+    let reg = neuron::registry::shared();
     let devices = neuron::device::DeviceSession::new(&reg);
     let pending_intents = Arc::new(AtomicUsize::new(0));
 

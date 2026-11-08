@@ -875,6 +875,7 @@ pub fn heal_auto_tx(dialect_id: &str, pid: u16, def: &DeviceDef, verified_tx: u8
     std::fs::create_dir_all(file.parent().expect("auto path has a parent"))
         .and_then(|()| std::fs::write(&file, text))
         .with_context(|| format!("healing {} failed", file.display()))?;
+    crate::registry::invalidate();
     Ok(())
 }
 
@@ -966,6 +967,7 @@ fn retire_stale_auto_def(path: &Path) -> std::io::Result<Option<PathBuf>> {
         f.write_all(text.as_bytes())?;
     }
     std::fs::remove_file(path)?;
+    crate::registry::invalidate();
     Ok(Some(backup))
 }
 
@@ -1081,6 +1083,7 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
         tried.push(key);
         let write = std::fs::create_dir_all(file.parent().expect("auto path has a parent"))
             .and_then(|()| std::fs::write(&file, emit_toml(&synth)));
+        crate::registry::invalidate();
         match write {
             Ok(()) => out.adopted.push(Adopted {
                 pid: i.pid,

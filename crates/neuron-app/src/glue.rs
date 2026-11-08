@@ -147,15 +147,6 @@ pub fn ui_installed() -> bool {
     UI.get().is_some()
 }
 
-/// The device registry — delegates to the ONE shared, RELOADABLE app-layer cache
-/// ([`crate::hidwatch::registry`]) rather than a second private `OnceLock` that would freeze a startup
-/// snapshot while hidwatch's/runtime's reloaded (the reload-mismatch a review caught). Used by
-/// [`endpoint_has_hardware_mute`] on device SELECT (not a hot path); one shared source keeps the
-/// def-based capability check consistent with hidwatch arming after an adoption reload.
-fn registry() -> Option<&'static neuron::registry::Registry> {
-    crate::hidwatch::registry()
-}
-
 /// Is this audio endpoint's mute HARDWARE-owned — driven by a device that pushes a firmware tap-mute
 /// event neuron bridges to the OS mute, rather than a plain software-only OS toggle? Two independent
 /// ways an endpoint can qualify, either sufficing:
@@ -174,7 +165,7 @@ fn registry() -> Option<&'static neuron::registry::Registry> {
 /// string policy: a mic with neither (BlackShark-class) is host-invisible for mute, so it must not
 /// claim to be hardware-owned. Thin shim over the pure [`hardware_mute_gate`], where tests live.
 fn endpoint_has_hardware_mute(endpoint_name: &str) -> bool {
-    hardware_mute_gate(endpoint_name, &crate::hidwatch::hardware_mute_products(), registry())
+    hardware_mute_gate(endpoint_name, &crate::hidwatch::hardware_mute_products(), Some(&neuron::registry::shared()))
 }
 
 /// The PURE core of [`endpoint_has_hardware_mute`]: same two-leg decision, with the emergent surface
@@ -6860,9 +6851,7 @@ fn maybe_first_light_heal(app: &AppWindow, sh: &SharedRt, pid: u16, unit: &str) 
         // lighting writer for our ACK'd probe writes. The anim stream may still write concurrently
         // on its own handle — the SAME accepted pre-existing second-handle race every getter worker
         // rides; the heal's read-backs tolerate an interleaved frame exactly as the vitals reads do.
-        let Ok(reg) = neuron::registry::Registry::load() else {
-            return;
-        };
+        let reg = neuron::registry::shared();
         let Ok(infos) = neuron::transport::enumerate() else {
             return;
         };

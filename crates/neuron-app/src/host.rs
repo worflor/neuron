@@ -1147,9 +1147,7 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
         );
         return false;
     };
-    let Ok(reg) = neuron::registry::Registry::load() else {
-        return false;
-    };
+    let reg = neuron::registry::shared();
     let host = match Host::spawn() {
         Ok(host) => host,
         Err(err) => {

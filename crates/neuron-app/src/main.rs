@@ -888,9 +888,7 @@ fn main() {
 /// (physical UNIT, FAMILY); every step is `let _ =` — this runs during teardown and must never fail
 /// the exit.
 fn restore_devices_to_firmware() {
-    let Ok(reg) = neuron::registry::Registry::load() else {
-        return;
-    };
+    let reg = neuron::registry::shared();
     let Ok(infos) = neuron::transport::enumerate() else {
         return;
     };

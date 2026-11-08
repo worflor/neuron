@@ -2456,7 +2456,7 @@ pub(crate) struct TestRoot {
     // Restore the process-wide override before releasing its lock.
     _pin: crate::runroot::RunDirPin,
     _lock: std::sync::MutexGuard<'static, ()>,
-    dir: std::path::PathBuf,
+    pub(crate) dir: std::path::PathBuf,
 }
 
 #[cfg(test)]

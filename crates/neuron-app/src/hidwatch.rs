@@ -129,41 +129,6 @@ fn verbose() -> bool {
     *V.get_or_init(|| std::env::var("NEURON_HIDWATCH").ok().as_deref() == Some("1"))
 }
 
-/// The device registry, loaded ONCE and cached. Battery reads used to re-parse the device TOMLs from
-/// disk on every poke + throttled sample; the registry is immutable at runtime, so this kills all that
-/// hot-path I/O.
-/// The app-layer registry — the ONE shared, RELOADABLE cache both `hidwatch` (arming, battery) and
-/// `glue` (endpoint capability gating) read, so both track the runtime's normal reload path instead
-/// of freezing a startup snapshot until restart (the reload-mismatch a review caught). It returns
-/// `&'static` on purpose: `event_def` is threaded into background reader threads and held for the
-/// reader's life, so it must outlive any borrow. To stay `&'static` AND reloadable, [`reload_registry`]
-/// LEAKS a fresh `Registry` and swaps the pointer — old readers keep their still-valid leaked snapshot,
-/// new arms see the new one. The leak is bounded by adoption events (rare — a few per session at most),
-/// not a per-frame cost, which is the deliberate trade for keeping the zero-alloc `&'static` reader path.
-pub fn registry() -> Option<&'static neuron::registry::Registry> {
-    let mut cell = reg_cell().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if cell.is_none() {
-        *cell = neuron::registry::Registry::load()
-            .ok()
-            .map(|r| {
-                neuron::registry::refresh_event_identities(&r);
-                &*Box::leak(Box::new(r))
-            });
-    }
-    *cell
-}
-
-/// Install the runtime's loaded snapshot so event arming and capability gating agree after adoption.
-pub fn reload_registry(registry: neuron::registry::Registry) {
-    let mut cell = reg_cell().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    neuron::registry::refresh_event_identities(&registry);
-    *cell = Some(&*Box::leak(Box::new(registry)));
-}
-
-fn reg_cell() -> &'static Mutex<Option<&'static neuron::registry::Registry>> {
-    static R: OnceLock<Mutex<Option<&'static neuron::registry::Registry>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(None))
-}
 
 /// Arm the listener: a reader thread per readable, event-carrying collection of each connected Razer
 /// DPI-mouse, plus a hotplug monitor that re-arms after replug. Never fails the app.
@@ -172,7 +137,7 @@ pub fn start() {
         crate::glue::ui_installed(),
         "startup-order contract: glue::install_ui must run before hidwatch::start — early mute events would silently drop (main.rs wiring)"
     );
-    registry(); // pre-warm (surface a load error early; cache for the hot path)
+    let _ = neuron::registry::shared(); // load now, so a load error surfaces at startup
 
     // Armed collection paths — shared so the monitor and the reader threads (which remove their own
     // path on exit) agree on what's live, so a REPLUG re-arms instead of staying deaf.
@@ -275,12 +240,7 @@ fn hid_topology_snapshot() -> Option<HashSet<DevicePath>> {
 /// under the DONGLE's pid (`event_alias_pids`), and the mouse's driver-mode side-plate events ride
 /// there — those collections belong to THIS reader, not macrokeys.
 fn mouse_event_pids() -> HashSet<u16> {
-    let Some(r) = registry() else {
-        if verbose() {
-            eprintln!("[hidwatch] registry unavailable this pass — mouse pids empty, retrying");
-        }
-        return HashSet::new();
-    };
+    let r = neuron::registry::shared();
     r.devices
         .iter()
         .filter(|d| d.dialect == "razer" && d.supports(neuron::registry::Capability::Dpi))
@@ -469,13 +429,12 @@ fn arm_new(
         // Skip the OS-protected mouse collection + plain media keys (0-length feature report).
         let is_mouse_event = mouse_pids.contains(&info.pid)
             && ((info.usage_page == 0x0001 && info.usage == 0x0000) || info.usage_page >= 0xFF00);
-        let event_def = registry().and_then(|r| {
-            r.devices.iter().find(|d| {
-                d.vendor_id == info.vid
-                    && d.product_ids().any(|p| p == info.pid)
-                    && d.event_pipe_matches(info.usage_page, info.usage, info.feature_len)
-            })
-        });
+        // Readers outlive this pass, so each owns a clone of its definition.
+        let event_def = neuron::registry::shared().devices.iter().find(|d| {
+            d.vendor_id == info.vid
+                && d.product_ids().any(|p| p == info.pid)
+                && d.event_pipe_matches(info.usage_page, info.usage, info.feature_len)
+        }).cloned();
         let event_dialect = neuron::dialect::event_dialect_for(&info);
         if !(is_mouse_event || event_def.is_some() || event_dialect.is_some()) {
             continue;
@@ -523,7 +482,7 @@ fn spawn_reader(
     pid: u16,
     path: DevicePath,
     armed: Arc<Mutex<HashSet<DevicePath>>>,
-    def: Option<&'static neuron::registry::DeviceDef>,
+    def: Option<neuron::registry::DeviceDef>,
     dialect: Option<&'static dyn neuron::dialect::Dialect>,
     product: String,
     // `gate_seed`: this reader is one of the INITIAL pass's counted seeds — it must call `seed_done`
@@ -620,7 +579,7 @@ fn spawn_reader(
                             }
                             eprintln!();
                         }
-                        decode(&buf[..n], pid, &path, def, dialect, &product);
+                        decode(&buf[..n], pid, &path, def.as_ref(), dialect, &product);
                         // lazy battery freshness — piggyback on activity (the device is awake; it's
                         // sending reports), throttled, off-thread so a slow open never stalls reads.
                         if neuron::vitals::due(pid, false) {
@@ -858,7 +817,7 @@ fn decode(
     buf: &[u8],
     pid: u16,
     path: &DevicePath,
-    def: Option<&'static neuron::registry::DeviceDef>,
+    def: Option<&neuron::registry::DeviceDef>,
     dialect: Option<&'static dyn neuron::dialect::Dialect>,
     product: &str,
 ) {
@@ -1174,10 +1133,8 @@ fn fulfill_button(pid: u16, intent: neuron::action::Intent) {
         return;
     }
     drop(d); // the gate handle is done; run_shared_intent opens its own writable via the session.
-    let Some(reg) = registry() else {
-        return;
-    };
-    let mut devices = neuron::device::DeviceSession::new(reg);
+    let reg = neuron::registry::shared();
+    let mut devices = neuron::device::DeviceSession::new(&reg);
     let mut cursor = neuron::intent::ProcessProfileCursor;
     if let Some(msg) = neuron::intent::run_shared_intent(
         &mut devices,
@@ -1205,9 +1162,12 @@ fn plate_label(pid: u16, id: u8) -> String {
     if id == 0 {
         return "detached".into();
     }
-    registry()
-        .and_then(|r| r.devices.iter().find(|d| d.product_ids().any(|p| p == pid)))
-        .and_then(|d| d.side_plate_label(id)).map_or_else(|| format!("plate {id}"), std::string::ToString::to_string)
+    neuron::registry::shared()
+        .devices
+        .iter()
+        .find(|d| d.product_ids().any(|p| p == pid))
+        .and_then(|d| d.side_plate_label(id))
+        .map_or_else(|| format!("plate {id}"), ToString::to_string)
 }
 
 /// One device-pushed settings change, on its way into the batch.
@@ -1471,7 +1431,7 @@ fn settle_charge(pid: u16) -> Option<(u8, bool)> {
 /// without this pass the mouse would sit on foreign state until the next sleep/wake.
 pub fn startup_reassert() {
     crate::worker::spawn_detached("neuron-feel-reassert", || {
-        let Some(reg) = registry() else { return };
+        let reg = neuron::registry::shared();
         let Ok(infos) = neuron::transport::enumerate() else { return };
         let mut seen: HashSet<(u16, String)> = HashSet::new();
         for i in &infos {
@@ -1502,7 +1462,7 @@ pub fn startup_reassert() {
 }
 
 fn open_device(pid: u16) -> Option<neuron::device::Device> {
-    let reg = registry()?;
+    let reg = neuron::registry::shared();
     let def = reg.devices.iter().find(|d| d.product_ids().any(|p| p == pid))?;
     neuron::device::Device::open(def.clone(), pid).ok()
 }
@@ -1510,7 +1470,7 @@ fn open_device(pid: u16) -> Option<neuron::device::Device> {
 /// Open the control pipe belonging to one physical unit, even when another connected unit shares
 /// its VID/PID. Event-triggered reconciliation must act on the device that emitted the report.
 fn open_device_for_unit(pid: u16, unit: &str) -> Option<neuron::device::Device> {
-    let reg = registry()?;
+    let reg = neuron::registry::shared();
     let infos = neuron::transport::enumerate().ok()?;
     for info in infos {
         if info.pid != pid || info.instance() != unit {
@@ -1953,24 +1913,6 @@ mod tests {
         while PENDING_FLUSHES.load(Ordering::SeqCst) > 0 {
             thread::sleep(Duration::from_millis(5));
         }
-    }
-
-    #[test]
-    fn registry_cache_swaps_on_reload_instead_of_freezing_startup() {
-        let _guard = crate::testsupport::cwd_guard("registry-reload");
-        // The reload-mismatch pin: this cache is the ONE app-layer registry both hidwatch (arming)
-        // and glue (capability gating) read, and the runtime's `synth_dirty` reload path calls
-        // `reload_registry()` on it. A regression back to a frozen OnceLock snapshot would make an
-        // adopted def appear in the device list while event arming + mute gating kept the startup
-        // snapshot until restart — so pin that a reload actually SWAPS the snapshot. (Old readers
-        // keeping their previous leaked snapshot is by design; new reads must see the new one.)
-        let before = std::ptr::from_ref::<neuron::registry::Registry>(registry().expect("registry loads on a dev checkout"));
-        reload_registry(neuron::registry::Registry::load().expect("registry reloads"));
-        let after = std::ptr::from_ref::<neuron::registry::Registry>(registry().expect("registry reloads"));
-        assert!(
-            !std::ptr::eq(before, after),
-            "reload_registry must swap in a freshly loaded snapshot, not keep the startup one"
-        );
     }
 
     #[test]

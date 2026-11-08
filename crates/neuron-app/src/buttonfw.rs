@@ -249,7 +249,7 @@ fn fail_closed(reason: &str) {
 
 /// Every connected device that can take button functions, each through its live link.
 fn devices() -> Result<Vec<neuron::device::Device>, String> {
-    let reg = crate::hidwatch::registry().ok_or_else(|| "HID registry is not initialized".to_string())?;
+    let reg = neuron::registry::shared();
     let infos = neuron::transport::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
     let mut out: Vec<neuron::device::Device> = Vec::new();
     for i in &infos {
