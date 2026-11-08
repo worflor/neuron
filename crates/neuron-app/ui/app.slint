@@ -399,8 +399,8 @@ export component AppWindow inherits Window {
                             // lit in either loud state — live when ARMED, provisional when ARM?; SAFE is the
                             // unlit gutter (StatusLamp draws lamp-off + the text-dim ink, hover→text-mid).
                             StatusLamp {
-                                text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : "safe";
-                                lit: State.input-armed || root.arm-confirm;
+                                text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : State.arm-held != "" ? "arming" : "safe";
+                                lit: State.input-armed || root.arm-confirm || State.arm-held != "";
                                 signal: State.input-armed ? Signal.live : Signal.provisional;
                                 clickable: true;
                                 clicked => {

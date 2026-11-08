@@ -784,6 +784,13 @@ fn main() {
                 // ARMED pill: the arm gate is a process-global — re-read it so any writer (a future
                 // bound disarm action, a teardown path) can't leave the pill lying.
                 if slow_due {
+                    let held = crate::buttonfw::arm_hold().unwrap_or_default();
+                    if st.get_arm_held() != held.as_str() {
+                        if !held.is_empty() {
+                            st.set_status_line(format!("arming once devices answer · {held}").into());
+                        }
+                        st.set_arm_held(held.into());
+                    }
                     let armed_now = neuron::action::input_armed();
                     if st.get_input_armed() != armed_now {
                         st.set_input_armed(armed_now);

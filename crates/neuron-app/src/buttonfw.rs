@@ -25,6 +25,23 @@ static WANT: Mutex<Option<Want>> = Mutex::new(None);
 /// through each other.
 static OPERATIONS: Mutex<()> = Mutex::new(());
 
+/// Why an armed stance is waiting: a device's button functions could not be verified, so input
+/// stays disarmed until a retry restores every device to stock. `None` = not waiting.
+static HOLD: Mutex<Option<String>> = Mutex::new(None);
+/// When the held stance last tried to recover.
+static HOLD_TRIED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// How often a held stance retries; a sleeping wireless mouse answers again once it wakes.
+const HOLD_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The reason an armed stance is waiting on button custody, if it is.
+pub fn arm_hold() -> Option<String> {
+    HOLD.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+fn set_hold(reason: Option<String>) {
+    *HOLD.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = reason;
+}
+
 /// The seated side plate's layer (`plate:12-button`), as the mouse announced it.
 static PLATE: Mutex<Option<String>> = Mutex::new(None);
 
@@ -84,10 +101,17 @@ pub fn restore_all() {
 
 /// Move the app's input and write gates with firmware button custody ordered around them.
 pub fn set_stance(armed: bool, paused: bool) -> Result<(), String> {
+    set_hold(None);
     neuron::buttons::begin_private_pool_quarantine();
     neuron::action::arm_input(false);
     neuron::writes::set_writes_paused(paused);
-    restore_stock_now()?;
+    if let Err(e) = restore_stock_now() {
+        if armed {
+            set_hold(Some(e.clone()));
+            kick();
+        }
+        return Err(e);
+    }
     if armed {
         neuron::action::arm_input(true);
         reapply();
@@ -150,6 +174,14 @@ pub fn tick() {
     let armed = neuron::action::input_armed();
     if ARMED.swap(armed, Ordering::AcqRel) != armed {
         kick();
+    }
+    if arm_hold().is_some() {
+        let mut tried = HOLD_TRIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tried.is_none_or(|t| t.elapsed() >= HOLD_RETRY) {
+            *tried = Some(std::time::Instant::now());
+            drop(tried);
+            kick();
+        }
     }
 }
 
@@ -238,12 +270,24 @@ fn sync() {
     }
     if whole_stock_verified {
         neuron::buttons::clear_private_pool_quarantine();
+        // Every device verified stock: a stance that was waiting on custody arms now.
+        if arm_hold().is_some() && !neuron::action::input_armed() {
+            set_hold(None);
+            neuron::action::arm_input(true);
+            crate::flight::trace("buttons", "held stance armed after stock verified", 0);
+        }
     }
 }
 
+/// Disarm and quarantine private keys until custody is verified again. An armed stance is kept
+/// as a hold, so the next verified pass arms again.
 fn fail_closed(reason: &str) {
     neuron::buttons::begin_private_pool_quarantine();
+    if neuron::action::input_armed() || arm_hold().is_some() {
+        set_hold(Some(reason.to_string()));
+    }
     neuron::action::arm_input(false);
+    crate::flight::trace("buttons", "input held: button custody unverified", 0);
     eprintln!("[buttons] input disarmed and private keys quarantined: {reason}");
 }
 
