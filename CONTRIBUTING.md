@@ -42,7 +42,7 @@ so you know where things live:
 - `neuron-app` is the GUI and live driver on Windows; its Linux GUI has partial runtime backends.
 - `neuron-cli` is a thin front-end.
 - `neuron-host` is a separate protocol hub (an OpenRGB / Chroma-REST bridge, so neuron can drive a mixed-brand rig).
-- `engram` is the Woflo Labs gesture codec, included under its own terms.
+- [`engram`](https://github.com/worflor/engram) is the Woflo Labs gesture codec, included under its own terms.
 
 the rule everywhere: semantics live in `neuron-core` as typed, tested code; device wiring lives in data.
 
