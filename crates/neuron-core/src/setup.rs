@@ -260,7 +260,7 @@ pub struct ApplyOpts {
     /// Treat a macro, profile or route target that resolves to nothing as an error. By default it
     /// is a warning, so a setup that already had a dangling name round-trips through dump and apply.
     pub strict_refs: bool,
-    /// Accept what [`code_it_adds`] lists (RAW macros, command-running binds, onboard writes)
+    /// Accept what [`code_it_adds`] lists (new macros, command-running binds, onboard writes)
     /// as warnings instead of refusing the document.
     pub allow_code: bool,
 }
@@ -475,11 +475,16 @@ pub fn code_it_adds(doc: &Setup) -> Vec<String> {
     }
     found.extend(theirs.difference(&ours).cloned());
     for (id, src) in doc.macros.iter().flatten() {
+        if crate::macros::macro_host::load_macro(id).as_deref() == Some(src.as_str()) {
+            continue;
+        }
         let raw = crate::macros::policy::mode_from_source(src)
             .is_ok_and(|m| m == crate::macros::policy::MacroMode::Raw);
-        if raw && crate::macros::macro_host::load_macro(id).as_deref() != Some(src.as_str()) {
-            found.push(format!("macro `{id}` is RAW: unsandboxed Python with your account's access"));
-        }
+        found.push(if raw {
+            format!("macro `{id}` is RAW: unsandboxed Python with your account's access")
+        } else {
+            format!("macro `{id}` is BOUND: Python under a policy wall, which is containment for honest code and not an isolation boundary")
+        });
     }
     for b in doc.profiles.iter().flatten() {
         let already = crate::profile::Profile::load(&b.profile.name).is_ok_and(|p| p.persist);
@@ -785,7 +790,8 @@ mod tests {
         let _r = crate::authoring::test_run_root();
         let raw = "# neuron: raw\ndef macro(ctx):\n    return 1\n";
         let mut doc = Setup::default();
-        doc.macros = Some([("helper".to_string(), raw.to_string())].into());
+        let bound = "def macro(ctx):\n    return 2\n";
+        doc.macros = Some([("helper".to_string(), raw.to_string()), ("calm".to_string(), bound.to_string())].into());
         let hidden = Action::Sequence {
             steps: vec![crate::action::Step {
                 action: Box::new(Action::Run { cmd: "calc".into() }),
@@ -802,10 +808,11 @@ mod tests {
         let refused = apply(&doc, ApplyOpts::default()).unwrap();
         assert!(!refused.applied, "{refused:?}");
         let said = refused.issues.iter().map(|i| i.message.as_str()).collect::<Vec<_>>().join("\n");
-        for needle in ["macro `helper` is RAW", "runs the command `calc`", "profile `loud` writes"] {
+        for needle in ["macro `helper` is RAW", "macro `calm` is BOUND", "runs the command `calc`", "profile `loud` writes"] {
             assert!(said.contains(needle), "missing {needle:?} in:\n{said}");
         }
         assert!(crate::macros::macro_host::load_macro("helper").is_none(), "a refused RAW macro was written");
+        assert!(crate::macros::macro_host::load_macro("calm").is_none(), "a refused BOUND macro was written");
         assert!(RuleStore::Gui.load().unwrap().is_empty(), "a refused bind was written");
 
         let allowed = apply(&doc, ApplyOpts { allow_code: true, ..Default::default() }).unwrap();
@@ -857,8 +864,8 @@ mod tests {
             ),
             Rule::new(Trigger::Cast { taps: 3 }, Action::ProfileSwitch { name: "p".into() }),
         ]);
-        let rep = apply(&doc, ApplyOpts::default()).unwrap();
-        assert!(rep.applied && rep.issues.is_empty(), "{rep:?}");
+        let rep = apply(&doc, ApplyOpts { allow_code: true, ..Default::default() }).unwrap();
+        assert!(rep.applied && rep.issues.iter().all(|i| i.severity == authoring::Severity::Warning), "{rep:?}");
     }
 
     #[test]

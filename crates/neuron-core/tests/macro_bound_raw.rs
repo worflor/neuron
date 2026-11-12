@@ -252,56 +252,52 @@ def macro(ctx):
 
     // String-driven reflection gets past the static policy and reaches the real builtins, so the
     // runtime wall must refuse every machine-touching operation that follows; RAW keeps them.
-    let escape = r#"def macro(ctx):
+    // Each probe is a known way to turn a string into an attribute lookup, reach the sidecar's own
+    // globals, and empty the runtime wall's deny set before touching the machine. None may get a
+    // value back: the reflection primitive is withheld at import, and the wall's policy is not
+    // reachable from Python even where one is found.
+    let escapes = [
+        ("bound_escape_attrgetter", r#"def macro(ctx):
     import operator
     ag = operator.attrgetter
-    mc = operator.methodcaller
-    bi = None
-    for c in mc("__subclasses__")(ag("__class__.__base__")("")):
-        try:
-            g = ag("__init__.__globals__")(c).get("__builtins__")
-        except Exception:
-            continue
-        if hasattr(g, "get") and g.get("__import__"):
-            bi = g
-            break
-    if bi is None:
-        return "wall:no-vector"
-    imp = bi["__import__"]
-    os = imp("os")
-    sysm = imp("sys")
-    out = []
-    def attempt(label, fn):
-        try:
-            fn()
-            out.append(label + "=ran")
-        except PermissionError:
-            out.append(label + "=refused")
-        except Exception as e:
-            out.append(label + "=" + ag("__class__.__name__")(e))
-    attempt("open", lambda: bi["open"](sysm.executable, "rb").close())
-    attempt("listdir", lambda: os.listdir("."))
-    attempt("import", lambda: imp("socket"))
-"#;
-    let process_steps = r#"    attempt("system", lambda: os.system("exit 0"))
-    attempt("popen", lambda: imp("subprocess").Popen(["cmd", "/c", "exit", "0"]).wait())
-    def native():
-        c = sysm.modules.get("ctypes") or imp("ctypes")
-        return c.windll.kernel32.GetTickCount() if sysm.platform == "win32" else c.CDLL(None).getpid()
-    attempt("ctypes", native)
-"#;
-    let finish = "    return 'wall:' + ','.join(out)\n";
-    host.register("bound_wall", &format!("{escape}{process_steps}{finish}"))
-        .expect("register BOUND escape probe");
-    let got = invoke_done(host, "bound_wall", &ctx);
-    for label in ["open", "listdir", "system", "popen", "ctypes", "import"] {
-        assert!(got.contains(&format!("{label}=refused")), "BOUND wall let {label} through: {got}");
+    g = ag("__globals__")(neuron.key)
+    ag("_BOUND_DENIED_EVENTS")(g["sys"].modules["__main__"]).clear()
+    return "escaped"
+"#),
+        ("bound_escape_from_import", r#"from operator import attrgetter
+def macro(ctx):
+    return "escaped"
+"#),
+        ("bound_escape_formatter", r#"def macro(ctx):
+    import re, string
+    main = re.enum.sys.modules["__main__"]
+    string.Formatter().get_field("0._BOUND_DENIED_EVENTS", (main,), {})[0].clear()
+    return "escaped"
+"#),
+        ("bound_escape_submodule_import", r#"def macro(ctx):
+    import re
+    return "escaped:" + str(re.functools.sys)
+"#),
+    ];
+    for (id, src) in escapes {
+        match host.register(id, src) {
+            Err(_) => {}
+            Ok(_) => {
+                let got = invoke_done(host, id, &ctx);
+                assert!(!got.contains("escaped"), "{id} escaped the BOUND wall: {got}");
+            }
+        }
     }
-    host.register("raw_wall", &format!("# neuron: raw\n{escape}{finish}")).expect("register RAW escape probe");
-    let got = invoke_done(host, "raw_wall", &ctx);
-    for label in ["open", "listdir", "import"] {
-        assert!(got.contains(&format!("{label}=ran")), "RAW lost {label}: {got}");
-    }
+    let proxied = "import re, operator\n\
+                   def macro(ctx):\n    \
+                   return 'proxy:%s:%s:%s' % (hasattr(re, 'sub'), hasattr(re, 'enum'), hasattr(operator, 'itemgetter'))\n";
+    host.register("bound_proxy", proxied).expect("register BOUND proxy probe");
+    let got = invoke_done(host, "bound_proxy", &ctx);
+    assert!(got.contains("proxy:True:False:True"), "BOUND module surface is wrong: {got}");
+    host.register("raw_reflection", "# neuron: raw\nimport operator\ndef macro(ctx):\n    return 'raw:' + str(operator.attrgetter('__name__')(operator))\n")
+        .expect("register RAW reflection probe");
+    let got = invoke_done(host, "raw_reflection", &ctx);
+    assert!(got.contains("raw:operator"), "RAW lost reflection: {got}");
 
     // Ordinary computation the wall must leave alone: lazily loaded stdlib paths included.
     let everyday = "import datetime, random, json, re, statistics\n\
@@ -322,8 +318,12 @@ def macro(ctx):
 
     for id in [
         "bound_everyday",
-        "bound_wall",
-        "raw_wall",
+        "bound_escape_attrgetter",
+        "bound_escape_from_import",
+        "bound_escape_formatter",
+        "bound_escape_submodule_import",
+        "bound_proxy",
+        "raw_reflection",
         "raw_obs_request",
         "bound_helper_surface",
         "raw_helper_surface",

@@ -115,15 +115,43 @@ _BOUND_NEURON = _BoundNeuron()
 _REAL_IMPORT = _builtins.__import__
 
 
+# Stdlib modules expose their own imports (`re.enum.sys`) and a few string-driven attribute lookups
+# (`operator.attrgetter`, `string.Formatter`) that reach any loaded object, past the AST check.
+# A macro gets a copy of the module's public surface with those removed.
+_BOUND_HIDDEN = {"operator": {"attrgetter", "methodcaller"}, "string": {"Formatter"}}
+_bound_proxies = {}
+
+
+def _bound_proxy(mod):
+    name = mod.__name__
+    proxy = _bound_proxies.get(name)
+    if proxy is None:
+        proxy = _bound_proxies[name] = type(mod)(name)
+        hidden = _BOUND_HIDDEN.get(name, ())
+        members = vars(proxy)  # setattr on a module is audited, and sealed processes refuse it
+        for k, v in vars(mod).items():
+            if k.startswith("_") or k in hidden:
+                continue
+            if isinstance(v, type(mod)):
+                if not v.__name__.startswith(name + "."):
+                    continue
+                v = _bound_proxy(v)
+            members[k] = v
+    return proxy
+
+
 def _bound_import(name, globals=None, locals=None, fromlist=(), level=0):
     root = name.split(".", 1)[0]
     if level:
         raise ImportError("relative imports require RAW mode")
     if root == "neuron":
         return _BOUND_NEURON
-    if root not in _BOUND_IMPORTS and root not in _STDLIB_INTERNAL_IMPORTS:
+    if root in _STDLIB_INTERNAL_IMPORTS:
+        return _REAL_IMPORT(name, globals, locals, fromlist, level)
+    if root not in _BOUND_IMPORTS:
         raise ImportError("import %r requires RAW mode" % root)
-    return _REAL_IMPORT(name, globals, locals, fromlist, level)
+    _REAL_IMPORT(name)
+    return _bound_proxy(sys.modules[name if fromlist else root])
 
 
 # Allowed stdlib modules import these through the calling frame's `__import__`, which in a macro
@@ -140,6 +168,9 @@ _BOUND_DENIED_EVENTS = {
     "open", "import", "code.__new__", "object.__setattr__", "object.__delattr__",
     "pickle.find_class", "marshal.load", "marshal.loads", "builtins.breakpoint",
     "sys.addaudithook", "cpython.run_command", "cpython.run_file", "cpython.run_module",
+    # the ways to find the wall's own closure and rewrite it (cell contents are unaudited)
+    "gc.get_objects", "gc.get_referrers", "gc.get_referents", "sys._getframe",
+    "sys._current_frames", "sys._current_exceptions", "sys.settrace", "sys.setprofile",
 }
 _BOUND_DENIED_PREFIXES = (
     "os.", "subprocess.", "_winapi.", "ctypes.", "socket.", "winreg.", "msvcrt.", "shutil.",
@@ -165,11 +196,18 @@ def _seal_bound_process():
         except ImportError:
             pass
 
+    # The policy lives only in this closure: a module global (or a `sys.modules["__main__"]`
+    # attribute) is a mutable object any reflection can reach and edit, and the audit hook list
+    # itself is not visible from Python.
+    denied = frozenset(_BOUND_DENIED_EVENTS)
+    prefixes = tuple(_BOUND_DENIED_PREFIXES)
+
     def _wall(event, _args):
-        if event in _BOUND_DENIED_EVENTS or event.startswith(_BOUND_DENIED_PREFIXES):
+        if event in denied or event.startswith(prefixes):
             raise PermissionError("BOUND macros can't use %s; add `# neuron: raw` for full Python" % event)
 
     sys.addaudithook(_wall)
+    del globals()["_BOUND_DENIED_EVENTS"], globals()["_BOUND_DENIED_PREFIXES"]
 
 
 _BOUND_BUILTINS = dict(vars(_builtins))
