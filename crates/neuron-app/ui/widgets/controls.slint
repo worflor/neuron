@@ -481,7 +481,8 @@ export component Slider inherits Rectangle {
     // bottom edge, colliding with whatever sat beneath it (the SPEED fader landing on the BLEND label).
     // Size the box to its real content so a fader never overruns its neighbour.
     height: root.compact ? 24px : 64px;
-    property <float> frac: (root.value - root.minimum) / max(0.0001, root.maximum - root.minimum);
+    // clamped: a stored value outside the range pins the fill at the rail's end instead of overrunning it
+    property <float> frac: clamp((root.value - root.minimum) / max(0.0001, root.maximum - root.minimum), 0.0, 1.0);
     VerticalLayout {
         spacing: root.compact ? 0px : 9px;
         if !root.compact : HorizontalLayout {
