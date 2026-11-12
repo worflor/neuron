@@ -5,6 +5,7 @@
 import { Theme, Signal } from "../theme.slint";
 import { ChromaLab } from "chromalab.slint";
 import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Picker, DefaultChip } from "../widgets/controls.slint";
+import { SensePicker, SenseOffers } from "../widgets/colorsense.slint";
 import { ListView } from "std-widgets.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
@@ -519,6 +520,7 @@ component SpectrumEditor inherits VerticalLayout {
     // glue can select a stop after an insert: click/drag in the strip write it; `add-stop`'s glue points
     // it at the just-inserted stop. Clamped to the live count here so a delete never strands the picker.
     property <int> stop-idx: min(max(0, State.light-sel-stop), max(0, State.light-stops.length - 1));
+    changed stop-idx => { State.picker-sync(); }
     // the active frame (the scrubber position) the strip + motion + per-frame controls all edit. INVARIANT:
     // `frame-idx` is a valid index ONLY when the sequence has a frame — an empty seq yields 0, and EVERY
     // reader/writer that indexes `light-seq[frame-idx]` (the strip Image, `ease-idx`, and the per-frame
@@ -565,6 +567,15 @@ component SpectrumEditor inherits VerticalLayout {
             Rectangle {}
             // no stop-count here: "stop N of M" under the strip already carries the total —
             // the same number twice in 75px, in two grammars, read as unconsidered.
+            // which colour picker (and, with the second, its suggestions) this editor uses
+            VerticalLayout {
+                alignment: center;
+                SplitToggle {
+                    options: ["v1", "v2"];
+                    index: State.picker-v2 ? 1 : 0;
+                    picked(i) => { State.set-picker-v2(i == 1); }
+                }
+            }
         }
         // the strip: the Rust-rendered gradient of the ACTIVE frame's palette, with stop handles
         // overlaid. ONE touch surface owns every gesture — press grabs the nearest handle (or adds
@@ -647,7 +658,7 @@ component SpectrumEditor inherits VerticalLayout {
         // the selected stop's colour — the SHARED prism picker (the SAME component the SYSTEM accents
         // use). `pick` commits the hex; `preview` recolours the stop live so the strip + the board
         // update in real time as the prism is dragged. Both route through set-stop-color(idx, hex).
-        if State.light-stops.length > 0 : ColorPicker {
+        if State.light-stops.length > 0 && !State.picker-v2 : ColorPicker {
             current: State.light-stops[root.stop-idx].col;
             value: State.light-stops[root.stop-idx].hex;
             swatches: Palette.accent;
@@ -657,6 +668,17 @@ component SpectrumEditor inherits VerticalLayout {
             pick(h) => { State.set-stop-color(root.stop-idx, h); }
             preview(h) => { State.set-stop-color(root.stop-idx, h); }
         }
+        if State.light-stops.length > 0 && State.picker-v2 : SensePicker {
+            current: State.light-stops[root.stop-idx].col;
+            value: State.light-stops[root.stop-idx].hex;
+            swatches: Palette.accent;
+            lead: State.default-chip-key != "" && State.default-chip-solid;
+            lead-col: State.default-chip-col;
+            lead-pick => { State.apply-default-chip(); }
+            pick(h) => { State.set-stop-color(root.stop-idx, h); }
+            preview(h) => { State.set-stop-color(root.stop-idx, h); }
+        }
+        if State.picker-v2 : SenseOffers {}
         // GRADIENT PRESETS — whole-ramp bases ("fire on everything"), the same 26px chips as the colour
         // swatch row above so the two read as one palette. A click swaps the stops; motion/blend stay.
         HorizontalLayout {

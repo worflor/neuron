@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A second colour picker, switched on from the spectrum header (`v1` / `v2`). It sets lightness and vividness on a plane and hue on a rail, in a perceptually even colour space, so changing hue keeps the colour as light as it was. With it comes a suggestion row: while you recolour a stop it offers alternatives for the palette, such as carrying the change through the neighbouring stops. Resting on one previews it, leaving restores your palette, a click keeps it, and the row then offers the way back. Nothing is applied without that click.
 - An effect tile's pairing pill is sized for its longest name ("with sunset on light painting" was cut off) and opens from a pinned corner: the first row stays put and the rest is uncovered. A typed-into readout draws its edit box inside its own space instead of past the panel edge.
 - A slider whose stored value is past its range no longer draws its fill over the readout (the timeline's `stay` on a 13-second frame). `stay` now runs to 30 s and `fade in` to 10 s.
 - The device registry is one shared snapshot that reloads itself when definition files change. Device discovery, event arming, macro-key handling, macro device verbs and the background workers all read it, so a device adopted or edited mid-session reaches every part of the app without a restart. Previously each subsystem kept its own copy (macro device verbs kept the one from first use), and the vitals and scan ticks re-parsed every file each time.

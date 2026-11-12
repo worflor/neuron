@@ -91,6 +91,9 @@ pub struct Prefs {
     /// Default is the house look, Directed Intent.
     #[serde(default = "default_material")]
     pub weave_material: String,
+    /// Use the second colour picker and its suggestion row in the spectrum editor. Default off.
+    #[serde(default)]
+    pub picker_v2: bool,
     /// PHOENIX — let the OS relaunch Neuron after a crash/hang (`RegisterApplicationRestart`). Default
     /// ON: the always-on flight recorder + an automatic respawn is the whole reliability story. Takes
     /// effect at the next launch (the OS registration happens once, at startup).
@@ -374,6 +377,7 @@ impl Default for Prefs {
             ui_accent: default_accent(),
             weave_accent: default_accent(),
             weave_material: default_material(),
+            picker_v2: false,
             phoenix: true,
             notif_enabled: true,
             notif_placement: default_notif_placement(),
@@ -467,6 +471,7 @@ impl Prefs {
         salvage!("ui_accent", ui_accent);
         salvage!("weave_accent", weave_accent);
         salvage!("weave_material", weave_material);
+        salvage!("picker_v2", picker_v2);
         salvage!("phoenix", phoenix);
         salvage!("notif_enabled", notif_enabled);
         salvage!("notif_placement", notif_placement);
@@ -631,6 +636,21 @@ fn salvage_lighting(v: &toml::Value) -> BTreeMap<String, DeviceLight> {
 /// Convenience: read just the start-minimized flag (the one `main` consults at launch).
 pub fn start_minimized() -> bool {
     Prefs::load().start_minimized
+}
+
+/// Which colour picker the spectrum editor shows.
+pub fn picker_v2() -> bool {
+    Prefs::load().picker_v2
+}
+
+/// Persist the colour picker choice. A failed save keeps the choice for this session only.
+pub fn set_picker_v2(v: bool) {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut p = Prefs::load();
+    p.picker_v2 = v;
+    if let Err(e) = p.save() {
+        eprintln!("neuron: colour picker choice not saved: {e}");
+    }
 }
 
 /// Convenience: persist the start-minimized flag, returning a user-facing status line.
@@ -1503,6 +1523,7 @@ mod tests {
             ui_accent: "ff0000".into(),
             weave_accent: "00ff00".into(),
             weave_material: "test-mat".into(),
+            picker_v2: !d.picker_v2,
             phoenix: !d.phoenix,
             notif_enabled: !d.notif_enabled,
             notif_placement: "test-place".into(),

@@ -213,6 +213,14 @@ export struct EffectRow {
 // the MATERIAL-card pattern applied to lighting. `slug` is the stable id the picker passes back;
 // `kind` groups the tile ("effect" | "data" | "stub"); `swatch` is the rendered preview image (the
 // tile IS the effect, running). Selection is derived in the view (slug == State.light-effect).
+// One suggestion for the palette being edited: a whole-palette ramp, or (solid) one stop's colour.
+export struct AssistOffer {
+    title: string,       // a few plain words for what taking it does
+    swatch: image,       // the palette as it would be
+    solid: bool,         // the offer recolours only the selected stop: draw `col`, not the ramp
+    col: color,
+}
+
 export struct PairChip {
     name: string,        // the gradient's name ("aurora")
     swatch: image,       // the gradient ramp

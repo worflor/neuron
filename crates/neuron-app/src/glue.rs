@@ -2649,8 +2649,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         {
             let w = app.as_weak();
             let sh = sh.clone();
+            colorsense::install(app, &sh);
             app.global::<State>().on_set_stop_color(move |idx, hex| {
                 if let (Some(app), Some(c)) = (w.upgrade(), Rgb::parse(hex.as_str())) {
+                    colorsense::note_edit(&sh, idx.max(0) as usize);
                     edit_active_palette(&app, &sh, |pal| pal.set_stop_color(idx.max(0) as usize, c));
                 }
             });
@@ -9720,6 +9722,7 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     st.set_selected_layer(if n == 0 { -1 } else { sel.min(n - 1) as i32 });
     refresh_default_chip(app, sh);
+    colorsense::refresh(app, sh);
     update_value_model(st.get_lighting_layer_choices(), layers.iter().enumerate().map(|(index, _layer)| {
         LightingLayerChoice { index_text: index.to_string().into() }
     }).collect(), |model| st.set_lighting_layer_choices(model));
@@ -10759,6 +10762,8 @@ pub(crate) fn widest_pair(pairs: &ModelRc<PairChip>) -> slint::SharedString {
     use slint::Model;
     pairs.iter().map(|p| p.name).max_by_key(|name| name.chars().count()).unwrap_or_default()
 }
+
+mod colorsense;
 
 fn selected_layer_pattern(sh: &SharedRt) -> String {
     let s = sh.borrow();

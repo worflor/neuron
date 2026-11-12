@@ -16,7 +16,7 @@ import {
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTileMeta, EffectParam,
-    SpectrumStop, SpectrumFrame, GradientPreset, PairChip,
+    SpectrumStop, SpectrumFrame, GradientPreset, PairChip, AssistOffer,
     ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene,
     LightingLayerChoice, LightingPresetChoice
 } from "models.slint";
@@ -388,6 +388,21 @@ export global State {
     // directly on click/drag; the editor clamps it into 0..length-1 so a delete never strands the picker.
     in-out property <int> light-sel-stop: 0;
     callback set-stop-color(int, string);              // (stop idx, hex) — recolour a stop
+    // The second colour picker (lightness × vividness plane + hue rail) and its suggestion row.
+    in-out property <bool> picker-v2;                   // which picker the spectrum editor shows; persisted
+    callback set-picker-v2(bool);
+    in-out property <image> picker-plane;               // vividness → right, lightness → up, at the stop's hue
+    in-out property <image> picker-rail;                // every hue at the stop's lightness and vividness
+    in-out property <float> picker-hue;                 // 0..1, the cursor on the rail
+    in-out property <float> picker-vivid;               // 0..1 of the most chroma the display shows there
+    in-out property <float> picker-light;               // 0..1
+    in-out property <[float]> picker-marks;             // the other stops' hues, ticked on the rail
+    callback picker-plane-pick(float, float);           // (vivid, light) — recolour the selected stop
+    callback picker-hue-pick(float);
+    callback picker-sync();                             // the selected stop changed: re-point the picker
+    in-out property <[AssistOffer]> assist-offers;      // suggestions for the palette being edited
+    callback assist-preview(int);                       // show offer i on the live palette; -1 puts it back
+    callback assist-accept(int);                        // keep offer i
     callback add-stop(float);                          // (at 0..1) — insert a stop (colour sampled there), select it
     callback remove-stop(int);                         // (stop idx) — delete (a palette never drops below 1 stop)
     callback move-stop(int, float);                    // (stop idx, at 0..1) — reposition along the gradient

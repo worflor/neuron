@@ -1,0 +1,148 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+// The second colour picker and the suggestion row that travels with it. Rust renders both picker
+// surfaces and owns the colour maths (glue/colorsense.rs); this file is geometry and gestures.
+
+import { Theme } from "../theme.slint";
+import { State } from "../state.slint";
+import { Field, Mono, SwatchRow } from "controls.slint";
+
+// A colour as three independent moves: the plane sets lightness (up) and vividness (right) at the
+// current hue, the rail below sets hue at the current lightness and vividness. Each surface shows
+// the colours a click on it would give, and the rail carries a tick for every other stop's hue.
+export component SensePicker inherits VerticalLayout {
+    in property <color> current;       // the selected stop's colour
+    in property <string> value;        // its bare RRGGBB
+    in property <[{hex: string, col: color}]> swatches;
+    in property <bool> lead;
+    in property <color> lead-col;
+    callback lead-pick();
+    callback pick(string);             // a bare RRGGBB typed or chosen from a chip
+    callback preview(string);          // a bare RRGGBB while typing
+    spacing: 9px;
+    HorizontalLayout {
+        spacing: 10px;
+        Rectangle {
+            width: 26px; height: 26px; border-radius: Theme.radius-sm;
+            border-width: Theme.hair; border-color: Theme.line;
+            background: fld.has-focus && State.hex-preview-ok ? State.hex-preview-col : root.current;
+            animate background { duration: Theme.quick; }
+        }
+        fld := Field {
+            field-width: 110px;
+            placeholder: "4af2b0";
+            text: root.value;
+            invalid: self.has-focus && State.hex-preview-bad;
+            edited(t) => { State.preview-hex(t); root.preview(t); }
+            accepted(t) => { root.pick(t); }
+        }
+        Rectangle {}
+    }
+    plane := Rectangle {
+        height: 96px;
+        border-radius: Theme.radius-sm;
+        border-width: Theme.hair;
+        border-color: Theme.line;
+        clip: true;
+        Image { source: State.picker-plane; width: 100%; height: 100%; image-fit: fill; }
+        // the cursor: the chosen colour in a ring that stays readable on any ground
+        Rectangle {
+            width: 12px; height: 12px; border-radius: 6px;
+            x: clamp(State.picker-vivid * plane.width - 6px, 0px, plane.width - 12px);
+            y: clamp((1 - State.picker-light) * plane.height - 6px, 0px, plane.height - 12px);
+            background: root.current;
+            border-width: 1.5px;
+            border-color: State.picker-light > 0.62 ? #000000b0 : #ffffffe0;
+        }
+        TouchArea {
+            mouse-cursor: MouseCursor.crosshair;
+            function at() {
+                State.picker-plane-pick(clamp(self.mouse-x / self.width, 0.0, 1.0),
+                    1 - clamp(self.mouse-y / self.height, 0.0, 1.0));
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { self.at(); }
+            }
+            moved => { if (self.pressed) { self.at(); } }
+        }
+    }
+    rail := Rectangle {
+        height: 16px;
+        border-radius: Theme.radius-sm;
+        border-width: Theme.hair;
+        border-color: Theme.line;
+        clip: true;
+        Image { source: State.picker-rail; width: 100%; height: 100%; image-fit: fill; }
+        for mark in State.picker-marks : Rectangle {
+            x: clamp(mark * rail.width, 0px, rail.width - 1px);
+            width: 1px; height: 5px;
+            background: #ffffffc8;
+        }
+        Rectangle {
+            width: 5px; height: parent.height;
+            x: clamp(State.picker-hue * rail.width - 2.5px, 0px, rail.width - 5px);
+            background: root.current;
+            border-width: 1px;
+            border-color: State.picker-light > 0.62 ? #000000b0 : #ffffffe0;
+        }
+        TouchArea {
+            mouse-cursor: MouseCursor.ew-resize;
+            function at() { State.picker-hue-pick(clamp(self.mouse-x / self.width, 0.0, 1.0)); }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { self.at(); }
+            }
+            moved => { if (self.pressed) { self.at(); } }
+        }
+    }
+    SwatchRow {
+        swatches: root.swatches;
+        value: root.value;
+        lead: root.lead;
+        lead-col: root.lead-col;
+        lead-pick => { root.lead-pick(); }
+        pick(h) => { root.pick(h); State.preview-hex(h); }
+    }
+}
+
+// The suggestions for the palette being edited. Resting on a capsule shows it on the strip and the
+// board; leaving puts the palette back. Only a click keeps it. One touch area outside the `for`
+// owns the gesture, so a row update cannot drop the hover. The row opens and closes by height.
+export component SenseOffers inherits Rectangle {
+    property <int> n: State.assist-offers.length;
+    property <length> cw: 44px;
+    property <length> gap: 6px;
+    property <int> hov: ta.has-hover && root.n > 0
+        ? max(0, min(root.n - 1, Math.floor(ta.mouse-x / (root.cw + root.gap)))) : -1;
+    changed hov => { State.assist-preview(root.hov); }
+    height: root.n > 0 ? 26px : 0px;
+    animate height { duration: 200ms; easing: ease-out; }
+    clip: true;
+    for offer[i] in State.assist-offers : Rectangle {
+        x: i * (root.cw + root.gap);
+        width: root.cw; height: 26px;
+        border-radius: 13px;
+        border-width: Theme.hair;
+        border-color: i == root.hov ? Theme.accent : Theme.line;
+        animate border-color { duration: Theme.quick; }
+        clip: true;
+        if offer.solid : Rectangle { background: offer.col; }
+        if !offer.solid : Image { source: offer.swatch; width: 100%; height: 100%; image-fit: fill; }
+    }
+    Mono {
+        x: root.n * (root.cw + root.gap) + 2px;
+        y: (26px - self.height) / 2;
+        width: max(0px, parent.width - self.x);
+        overflow: elide;
+        text: root.hov >= 0 ? State.assist-offers[root.hov].title : "suggested";
+        color: root.hov >= 0 ? Theme.text-mid : Theme.text-faint;
+        font-size: Theme.fs-small;
+    }
+    ta := TouchArea {
+        width: root.n * (root.cw + root.gap);
+        height: 26px;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { if (root.hov >= 0) { State.assist-accept(root.hov); } }
+    }
+}

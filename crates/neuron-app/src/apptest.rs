@@ -1350,6 +1350,111 @@ fn layer_stack_controls_preserve_identity_and_draw_a_large_scrollable_stack() {
     }
 }
 
+/// The second picker and its suggestion row, end to end: an edit draws offers, resting on one shows
+/// it and leaving puts the palette back, only accepting keeps it, and the row then offers the way
+/// back. The picker's three axes move independently and a grey keeps the hue it was reached from.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn second_picker_offers_preview_accept_and_undo() {
+    use neuron::assist::Lch;
+    use neuron::lighting::Rgb;
+    use neuron::spectrum::{Motion, Palette, Spectrum, Stop};
+    use slint::Model;
+    let _cwd = crate::testsupport::cwd_guard("second_picker");
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    let mut layer = neuron::pattern::preset_layer("wave").unwrap();
+    layer.spectrum = Spectrum::from_palette(Palette::new(
+        [(20, 40, 90), (60, 110, 180), (120, 170, 220), (200, 225, 245)].into_iter().enumerate()
+            .map(|(i, (r, g, b))| Stop::new(Rgb::new(r, g, b), i as f32 / 3.0)).collect(),
+        Motion::Hold,
+    ));
+    shared.borrow_mut().light_layers = vec![layer];
+    glue::refresh_layers(&app, &shared);
+    let stops = || shared.borrow().light_layers[0].spectrum.seq[0].palette.stops.clone();
+    let titles = || st.get_assist_offers().iter().map(|o| o.title.to_string()).collect::<Vec<_>>();
+    let original = stops();
+
+    assert!(!st.get_picker_v2(), "the first picker is the default");
+    st.invoke_set_stop_color(1, "9650aa".into());
+    assert!(titles().is_empty(), "the first picker has no suggestions");
+    st.invoke_set_stop_color(1, "3c6eb4".into());
+    assert_eq!(stops(), original);
+
+    st.invoke_set_picker_v2(true);
+    assert!(st.get_picker_v2() && crate::prefs::picker_v2(), "the choice is saved");
+    assert!(titles().is_empty(), "a palette nobody is editing draws no offers");
+    st.set_light_sel_stop(1);
+    st.invoke_picker_sync();
+    st.invoke_set_stop_color(1, "9650aa".into());
+    assert_eq!(titles().first().map(String::as_str), Some("carry the change through"), "{:?}", titles());
+    let edited = stops();
+    let offered = titles();
+
+    st.invoke_assist_preview(0);
+    let shown = stops();
+    assert_ne!(shown, edited, "resting on an offer shows it on the live palette");
+    assert_eq!(shown[1], edited[1], "the stop being edited is kept");
+    assert_eq!(titles(), offered, "the row holds still under the pointer");
+    st.invoke_assist_preview(-1);
+    assert_eq!(stops(), edited, "leaving puts the palette back");
+
+    st.invoke_assist_preview(0);
+    st.invoke_assist_accept(0);
+    assert_eq!(stops(), shown, "accepting keeps what was shown");
+    assert_eq!(titles(), ["put it back"]);
+    st.invoke_assist_preview(-1);
+    assert_eq!(stops(), shown, "an accepted offer is not undone by the pointer leaving");
+    st.invoke_assist_accept(0);
+    assert_eq!(stops(), edited, "the way back restores the palette the offer replaced");
+    assert!(!titles().contains(&"put it back".to_string()));
+    st.invoke_assist_accept(7);
+    st.invoke_assist_preview(7);
+    assert_eq!(stops(), edited, "an index past the row does nothing");
+
+    // the picker: vividness and lightness on the plane, hue on the rail
+    let chosen = || Lch::of(stops()[1].col);
+    st.invoke_picker_plane_pick(1.0, 0.6);
+    let vivid = chosen();
+    assert!((vivid.l - 0.6).abs() < 0.02 && vivid.c > 0.1, "{vivid:?}");
+    assert!((st.get_picker_vivid() - 1.0).abs() < 1e-6 && (st.get_picker_light() - 0.6).abs() < 1e-6);
+    st.invoke_picker_hue_pick(0.4);
+    let turned = chosen();
+    assert!((turned.h - 0.4).abs() < 0.02 && (turned.l - 0.6).abs() < 0.02, "hue moves, lightness stays: {turned:?}");
+    assert!((st.get_picker_vivid() - 1.0).abs() < 1e-6, "vividness stays at the edge on a new hue");
+    st.invoke_picker_plane_pick(0.0, 0.5);
+    assert!(chosen().c < 0.01, "the left edge is grey");
+    assert!((st.get_picker_hue() - 0.4).abs() < 1e-6, "a grey keeps the hue it was reached from");
+    st.invoke_picker_plane_pick(0.7, 0.5);
+    assert!((chosen().h - 0.4).abs() < 0.02, "and comes back out on that hue");
+    assert_eq!(st.get_picker_marks().row_count(), 3, "the other stops' hues are ticked on the rail");
+
+    st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
+    st.set_sel_can_light(true); st.set_grid_rows(1); st.set_grid_cols(2);
+    st.set_page(1); st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(1000.0, 1300.0));
+    app.show().unwrap();
+    let capture = |name: &str| {
+        let frame = app.window().take_snapshot().expect("the second picker draws without binding loops");
+        if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            image::save_buffer(dir.join(format!("{name}.png")), frame.as_bytes(), frame.width(), frame.height(), image::ColorType::Rgba8).unwrap();
+        }
+    };
+    capture("picker-v2-offers");
+    st.invoke_assist_preview(0);
+    capture("picker-v2-previewing");
+    st.invoke_assist_preview(-1);
+    st.invoke_set_picker_v2(false);
+    assert!(titles().is_empty() && !crate::prefs::picker_v2());
+    capture("picker-v1");
+}
+
 #[test]
 #[ignore = "run by gui_tests_in_fresh_processes"]
 fn spectrum_controls_reverse_only_the_active_frame_and_draw_relevant_properties() {
