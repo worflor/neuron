@@ -1433,6 +1433,21 @@ fn second_picker_offers_preview_accept_and_undo() {
     assert!((chosen().h - 0.4).abs() < 0.02, "and comes back out on that hue");
     assert_eq!(st.get_picker_marks().row_count(), 3, "the other stops' hues are ticked on the rail");
 
+    // a colour offered for the stop is a dot in the picker, after the ramps in the list
+    let offers: Vec<_> = st.get_assist_offers().iter().collect();
+    let dot = offers.iter().position(|o| o.solid).expect("an inner stop being recoloured is offered a colour");
+    assert!(dot >= st.get_assist_ramps() as usize && offers[..dot].iter().all(|o| !o.solid), "ramps lead, dots follow");
+    let (w, h) = (240.0, 96.0);
+    let (x, y) = (offers[dot].vivid * w, (1.0 - offers[dot].light) * h);
+    assert_eq!(st.invoke_assist_at(x, y, w, h), dot as i32, "the dot is found where it is drawn");
+    assert_eq!(st.invoke_assist_at(x + 30.0, y, w, h).max(st.invoke_assist_at(x - 30.0, y, w, h)), -1, "and not far from it");
+    let picked = stops();
+    st.invoke_assist_preview(dot as i32);
+    let tried = stops();
+    assert!(tried[1] != picked[1] && tried[0] == picked[0] && tried[2..] == picked[2..], "resting on a dot shows that colour on the stop alone");
+    st.invoke_assist_preview(-1);
+    assert_eq!(stops(), picked, "and leaving puts it back");
+
     st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
     st.set_sel_can_light(true); st.set_grid_rows(1); st.set_grid_cols(2);
     st.set_page(1); st.set_window_shown(true);

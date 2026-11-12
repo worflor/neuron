@@ -13,8 +13,10 @@
 //! Nothing here applies anything. The caller previews an offer, and takes one only when the person
 //! picks it, through [`Slate::take`], which refuses a slate made for a different scene.
 //!
-//! [`Rules`] is the built-in engine: closed-form colour reasoning in OKLab. A learned engine plugs
-//! in behind the same trait and inherits the same checks.
+//! [`Rules`] is the built-in engine: closed-form colour reasoning in OKLab. [`learned::Learned`] is
+//! a trained one, behind the same trait and the same checks.
+
+pub mod learned;
 
 use crate::lighting::Rgb;
 use crate::spectrum::{oklab_in_gamut, oklab_to_rgb, rgb_to_oklab, Interp, Stop};
@@ -89,6 +91,15 @@ pub struct Offer {
 /// Something that proposes offers. It may return anything; [`propose`] keeps what is valid.
 pub trait Engine {
     fn offers(&self, scene: &Scene) -> Vec<Offer>;
+}
+
+/// Several engines asked in order. Earlier ones fill the slate first.
+pub struct Chain<'a>(pub &'a [&'a dyn Engine]);
+
+impl Engine for Chain<'_> {
+    fn offers(&self, scene: &Scene) -> Vec<Offer> {
+        self.0.iter().flat_map(|engine| engine.offers(scene)).collect()
+    }
 }
 
 /// The checked offers for one scene.

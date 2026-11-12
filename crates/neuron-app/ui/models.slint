@@ -219,6 +219,9 @@ export struct AssistOffer {
     swatch: image,       // the palette as it would be
     solid: bool,         // the offer recolours only the selected stop: draw `col`, not the ramp
     col: color,
+    vivid: float,        // where `col` sits in the picker (solid offers only)
+    light: float,
+    hue: float,
 }
 
 export struct PairChip {

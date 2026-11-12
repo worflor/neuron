@@ -12,6 +12,10 @@ import { Field, Mono, SwatchRow } from "controls.slint";
 // A colour as three independent moves: the plane sets lightness (up) and vividness (right) at the
 // current hue, the rail below sets hue at the current lightness and vividness. Each surface shows
 // the colours a click on it would give, and the rail carries a tick for every other stop's hue.
+//
+// A suggested colour for the stop sits on the plane as a dot of that colour, at its own lightness
+// and vividness, with a tick of the same colour at its hue on the rail. Resting on the dot shows
+// it on the stop; moving off puts the stop back; a click keeps it.
 export component SensePicker inherits VerticalLayout {
     in property <color> current;       // the selected stop's colour
     in property <string> value;        // its bare RRGGBB
@@ -56,16 +60,52 @@ export component SensePicker inherits VerticalLayout {
             border-width: 1.5px;
             border-color: State.picker-light > 0.62 ? #000000b0 : #ffffffe0;
         }
-        TouchArea {
-            mouse-cursor: MouseCursor.crosshair;
+        for offer[i] in State.assist-offers : Rectangle {
+            property <bool> hot: i == pta.dot;
+            property <bool> born;
+            property <length> d: self.hot ? 14px : 10px;
+            init => { self.born = true; }
+            visible: offer.solid;
+            width: self.d; height: self.d; border-radius: self.d / 2;
+            x: clamp(offer.vivid * plane.width - self.d / 2, 0px, plane.width - self.d);
+            y: clamp((1 - offer.light) * plane.height - self.d / 2, 0px, plane.height - self.d);
+            background: offer.col;
+            border-width: self.hot ? 1.5px : 1px;
+            border-color: self.hot ? Theme.accent : offer.light > 0.62 ? #00000090 : #ffffffb0;
+            opacity: self.born ? 1 : 0;
+            animate opacity { duration: 200ms; easing: ease-out; }
+            animate d, x, y { duration: Theme.quick; easing: ease-out; }
+        }
+        pta := TouchArea {
+            // The dot under the pointer. A drag never lands on one: the pointer has to arrive at
+            // a dot, so a colour being chosen is not swapped for a suggestion that appears under it.
+            property <int> under: self.has-hover && State.assist-offers.length > State.assist-ramps
+                ? State.assist-at(self.mouse-x / 1px, self.mouse-y / 1px, self.width / 1px, self.height / 1px) : -1;
+            property <bool> armed: true;
+            property <bool> dragging;
+            property <int> dot: self.armed && !self.dragging ? self.under : -1;
+            changed dot => { State.assist-preview(self.dot); }
+            changed under => { if (self.under < 0 && !self.dragging) { self.armed = true; } }
+            mouse-cursor: self.dot >= 0 ? MouseCursor.pointer : MouseCursor.crosshair;
             function at() {
                 State.picker-plane-pick(clamp(self.mouse-x / self.width, 0.0, 1.0),
                     1 - clamp(self.mouse-y / self.height, 0.0, 1.0));
             }
             pointer-event(e) => {
-                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { self.at(); }
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    if (self.dot >= 0) {
+                        State.assist-accept(self.dot);
+                    } else {
+                        self.dragging = true;
+                        self.at();
+                    }
+                    self.armed = false;
+                } else if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                    self.dragging = false;
+                    if (self.under < 0) { self.armed = true; }
+                }
             }
-            moved => { if (self.pressed) { self.at(); } }
+            moved => { if (self.dragging) { self.at(); } }
         }
     }
     rail := Rectangle {
@@ -79,6 +119,16 @@ export component SensePicker inherits VerticalLayout {
             x: clamp(mark * rail.width, 0px, rail.width - 1px);
             width: 1px; height: 5px;
             background: #ffffffc8;
+        }
+        for offer in State.assist-offers : Rectangle {
+            visible: offer.solid;
+            x: clamp(offer.hue * rail.width - 2.5px, 0px, rail.width - 5px);
+            y: parent.height - self.height;
+            width: 5px; height: 8px;
+            border-radius: 2px;
+            background: offer.col;
+            border-width: 1px;
+            border-color: #ffffffd0;
         }
         Rectangle {
             width: 5px; height: parent.height;
@@ -106,11 +156,12 @@ export component SensePicker inherits VerticalLayout {
     }
 }
 
-// The suggestions for the palette being edited. Resting on a capsule shows it on the strip and the
-// board; leaving puts the palette back. Only a click keeps it. One touch area outside the `for`
-// owns the gesture, so a row update cannot drop the hover. The row opens and closes by height.
+// The whole-palette suggestions for the palette being edited (single colours sit in the picker).
+// Resting on a capsule shows it on the strip and the board; leaving puts the palette back. Only a
+// click keeps it. One touch area outside the `for` owns the gesture, so a row update cannot drop
+// the hover. The row opens and closes by height.
 export component SenseOffers inherits Rectangle {
-    property <int> n: State.assist-offers.length;
+    property <int> n: min(State.assist-ramps, State.assist-offers.length);
     property <length> cw: 44px;
     property <length> gap: 6px;
     property <int> hov: ta.has-hover && root.n > 0
@@ -120,6 +171,7 @@ export component SenseOffers inherits Rectangle {
     animate height { duration: 200ms; easing: ease-out; }
     clip: true;
     for offer[i] in State.assist-offers : Rectangle {
+        visible: i < root.n;
         x: i * (root.cw + root.gap);
         width: root.cw; height: 26px;
         border-radius: 13px;
@@ -127,8 +179,7 @@ export component SenseOffers inherits Rectangle {
         border-color: i == root.hov ? Theme.accent : Theme.line;
         animate border-color { duration: Theme.quick; }
         clip: true;
-        if offer.solid : Rectangle { background: offer.col; }
-        if !offer.solid : Image { source: offer.swatch; width: 100%; height: 100%; image-fit: fill; }
+        Image { source: offer.swatch; width: 100%; height: 100%; image-fit: fill; }
     }
     Mono {
         x: root.n * (root.cw + root.gap) + 2px;

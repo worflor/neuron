@@ -400,7 +400,9 @@ export global State {
     callback picker-plane-pick(float, float);           // (vivid, light) — recolour the selected stop
     callback picker-hue-pick(float);
     callback picker-sync();                             // the selected stop changed: re-point the picker
-    in-out property <[AssistOffer]> assist-offers;      // suggestions for the palette being edited
+    in-out property <[AssistOffer]> assist-offers;      // suggestions for the palette being edited: ramps first, then single colours
+    in-out property <int> assist-ramps;                 // how many lead the list as ramps; the rest sit in the picker
+    pure callback assist-at(float, float, float, float) -> int; // the single-colour offer under plane point (x, y) of (w, h) px, or -1
     callback assist-preview(int);                       // show offer i on the live palette; -1 puts it back
     callback assist-accept(int);                        // keep offer i
     callback add-stop(float);                          // (at 0..1) — insert a stop (colour sampled there), select it
