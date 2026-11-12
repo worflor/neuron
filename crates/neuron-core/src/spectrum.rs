@@ -885,6 +885,21 @@ pub fn rgb_to_oklab(c: Rgb) -> (f32, f32, f32) {
     )
 }
 
+/// Whether an OKLab colour is one sRGB can show without changing it.
+#[must_use]
+pub fn oklab_in_gamut(l: f32, a: f32, b: f32) -> bool {
+    let l_ = (l + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m_ = (l - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s_ = (l - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+    let linear = [
+        4.076_741_7 * l_ - 3.307_711_6 * m_ + 0.230_969_93 * s_,
+        -1.268_438 * l_ + 2.609_757_4 * m_ - 0.341_319_4 * s_,
+        -0.004_196_086_3 * l_ - 0.703_418_6 * m_ + 1.707_614_7 * s_,
+    ];
+    // half an 8-bit step of slack, so a colour that came from sRGB counts as inside
+    linear.iter().all(|v| (-0.002..=1.002).contains(v))
+}
+
 /// Convert OKLab (L, a, b) to sRGB with hue-preserving chroma reduction for out-of-gamut colours.
 #[must_use]
 #[allow(clippy::manual_range_contains)] // Explicit comparisons preserve the existing NaN behavior.

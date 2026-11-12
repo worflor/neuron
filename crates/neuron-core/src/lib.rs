@@ -35,6 +35,7 @@ pub mod action;
 pub mod analog;
 pub mod app;
 pub mod app_focus;
+pub mod assist;
 pub mod badge;
 pub mod audio;
 pub mod audio_level;
