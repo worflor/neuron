@@ -277,21 +277,22 @@ fn dump_then_apply_reproduces_the_whole_setup_and_is_idempotent() {
     let file = write(&a.0, "setup.toml", &doc);
 
     let b = Root::new("dump_b");
-    let dry = b.json(&["apply", &file, "--dry-run"]);
+    assert!(b.fails(&["apply", &file, "--dry-run"]).contains("--allow-code"), "a macro the document adds needs consent");
+    let dry = b.json(&["apply", &file, "--dry-run", "--allow-code"]);
     assert_eq!(dry["applied"], false);
     assert!(b.json(&["profile", "list"])["profiles"].as_array().unwrap().is_empty(), "a dry run writes nothing");
 
-    let done = b.json(&["apply", &file]);
+    let done = b.json(&["apply", &file, "--allow-code"]);
     assert_eq!(done["applied"], true);
     assert_eq!(b.text(&["dump"]), doc, "the applied setup dumps back byte for byte");
-    let again = b.json(&["apply", &file]);
+    let again = b.json(&["apply", &file, "--allow-code"]);
     assert!(again["sections"].as_array().unwrap().iter().all(|s| s["status"] == "unchanged"), "a second apply changes nothing: {again}");
 
     // the JSON form of the same document applies too
     let json_doc = a.json(&["dump"]);
     let jfile = write(&a.0, "setup.json", &serde_json::to_string(&json_doc).unwrap());
     let c = Root::new("dump_c");
-    c.json(&["apply", &jfile]);
+    c.json(&["apply", &jfile, "--allow-code"]);
     assert_eq!(c.text(&["dump"]), doc);
 
     // a broken document is refused whole
