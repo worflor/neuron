@@ -2853,6 +2853,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
             app.global::<State>().set_gradient_presets(ModelRc::new(VecModel::from(presets)));
             let w = app.as_weak();
             let sh = sh.clone();
+            let (w_d, sh_d) = (w.clone(), sh.clone());
+            app.global::<State>().on_apply_default_chip(move || {
+                if let Some(app) = w_d.upgrade() {
+                    let slug = selected_layer_pattern(&sh_d);
+                    if let Some(p) = default_palette_for(&slug) {
+                        edit_active_palette(&app, &sh_d, |pal| pal.stops = p.stops);
+                        app.global::<State>().set_light_sel_stop(0);
+                    }
+                }
+            });
             app.global::<State>().on_apply_gradient(move |idx| {
                 if let (Some(app), Some(p)) = (w.upgrade(), neuron::spectrum::gradient_preset(idx.max(0) as usize)) {
                     let pattern = {
@@ -9709,6 +9719,7 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
     let n = layers.len();
     let st = app.global::<State>();
     st.set_selected_layer(if n == 0 { -1 } else { sel.min(n - 1) as i32 });
+    refresh_default_chip(app, sh);
     update_value_model(st.get_lighting_layer_choices(), layers.iter().enumerate().map(|(index, _layer)| {
         LightingLayerChoice { index_text: index.to_string().into() }
     }).collect(), |model| st.set_lighting_layer_choices(model));
@@ -10745,6 +10756,39 @@ fn pair_chips(slug: &'static str) -> ModelRc<PairChip> {
 
 /// Render a small horizontal strip of a palette (the timeline frame chip) — samples the gradient across
 /// the width so a frame reads as its colour program at a glance.
+fn selected_layer_pattern(sh: &SharedRt) -> String {
+    let s = sh.borrow();
+    s.light_layers.get(s.selected_layer).map(|l| l.pattern.clone()).unwrap_or_default()
+}
+
+/// The effect's shipped look: its preset's palette, else its pattern's default.
+fn default_palette_for(slug: &str) -> Option<neuron::spectrum::Palette> {
+    let spectrum = neuron::pattern::preset_by_slug(slug)
+        .map(|p| (p.spectrum)())
+        .or_else(|| neuron::pattern::default_spectrum(slug))?;
+    spectrum.seq.into_iter().next().map(|f| f.palette)
+}
+
+/// Reserve the selected effect's default look as the LAST chip of its row (a solid ends the colour
+/// row, a gradient the gradient row); the generic chips never move. Only rebuilds when the selected
+/// effect changes, so hover state on the chips survives edits.
+fn refresh_default_chip(app: &AppWindow, sh: &SharedRt) {
+    let st = app.global::<State>();
+    let slug = selected_layer_pattern(sh);
+    if st.get_default_chip_key() == slug.as_str() { return; }
+    let Some(pal) = default_palette_for(&slug) else {
+        st.set_default_chip_key("".into());
+        return;
+    };
+    let solid = pal.stops.windows(2).all(|w| w[0].col == w[1].col);
+    if let Some(first) = pal.stops.first() {
+        st.set_default_chip_col(slint::Color::from_rgb_u8(first.col.r, first.col.g, first.col.b));
+    }
+    st.set_default_chip_swatch(palette_strip_image(&pal));
+    st.set_default_chip_solid(solid);
+    st.set_default_chip_key(slug.as_str().into());
+}
+
 fn palette_strip_image(palette: &neuron::spectrum::Palette) -> Image {
     let (w, h) = (96usize, 14usize);
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);

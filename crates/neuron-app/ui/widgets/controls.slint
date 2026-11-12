@@ -2140,9 +2140,33 @@ export global Palette {
 // panel (which used to hand-copy it, letting the two drift). The chip whose bare-RRGGBB equals
 // `value` wears the accent frame; a click reports that hex via `pick`. Trailing spacer keeps the
 // chips hugging left in a stretchy column.
+// The effect's own default look, ringed so it reads as reserved rather than as one more preset.
+// It ends its row behind a hairline, so the chips before it keep their positions across effects.
+export component DefaultChip inherits HorizontalLayout {
+    in property <image> swatch;
+    in property <color> tint;
+    in property <bool> solid;
+    callback clicked();
+    spacing: 8px;
+    Rectangle { width: Theme.hair; background: Theme.line; }
+    Rectangle {
+        width: 26px; height: 26px; border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: dta.has-hover ? Theme.accent : Theme.accent-line;
+        clip: true;
+        animate border-color { duration: Theme.quick; }
+        if root.solid : Rectangle { background: root.tint; }
+        if !root.solid : Image { source: root.swatch; width: 100%; height: 100%; image-fit: fill; }
+        dta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+    }
+}
+
 export component SwatchRow inherits HorizontalLayout {
     in property <[{hex: string, col: color}]> swatches;
     in property <string> value;
+    in property <bool> lead;           // end the row with the default solid colour, set apart
+    in property <color> lead-col;
+    callback lead-pick();
     callback pick(string);
     spacing: 6px;
     for sw in root.swatches : Rectangle {
@@ -2153,6 +2177,7 @@ export component SwatchRow inherits HorizontalLayout {
         animate border-color { duration: Theme.quick; }
         swta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.pick(sw.hex); } }
     }
+    if root.lead : DefaultChip { solid: true; tint: root.lead-col; clicked => { root.lead-pick(); } }
     Rectangle {}
 }
 
@@ -2170,6 +2195,9 @@ export component ColorPicker inherits VerticalLayout {
     in property <color> current;       // the LIVE committed colour, for the preview swatch
     in property <string> value;        // the saved bare-RRGGBB, for the selected-swatch mark + field
     in property <[{hex: string, col: color}]> swatches;
+    in property <bool> lead;           // reserve the first chip for a default solid colour
+    in property <color> lead-col;
+    callback lead-pick();
     callback pick(string);             // COMMIT a bare RRGGBB (no '#')
     callback preview(string);          // LIVE, uncommitted bare RRGGBB while dragging the prism / typing
     // is THIS picker's field the one being typed into? gates the (shared) live preview swatch to the
@@ -2249,6 +2277,9 @@ export component ColorPicker inherits VerticalLayout {
     SwatchRow {
         swatches: root.swatches;
         value: root.value;
+        lead: root.lead;
+        lead-col: root.lead-col;
+        lead-pick => { root.lead-pick(); }
         pick(h) => { root.pick(h); State.preview-hex(h); }
     }
     // the hint wraps within the column (a Mono ran off the edge before)

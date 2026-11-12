@@ -413,6 +413,13 @@ export global State {
     in-out property <[string]> light-name-chars;           // the palette's name, one string per character
     in-out property <[color]> light-name-ramp;             // the palette sampled forward-then-back (a seamless loop) for the name's flow
     in-out property <[string]> light-effect-chars;         // the selected layer's display name, one string per character (the EFFECT header's painted name)
+    // The selected effect's OWN default look, reserved first in its row: a solid leads the colour row,
+    // a gradient leads the gradient row. Empty key = no layer.
+    in-out property <string> default-chip-key;
+    in-out property <bool> default-chip-solid;
+    in-out property <image> default-chip-swatch;
+    in-out property <color> default-chip-col;
+    callback apply-default-chip();                      // restore the effect's default stops, keep motion + blend
     callback apply-gradient(int);                      // preset idx — swap the active palette's stops, keep motion + blend
     callback set-interp(string);                        // rgb | hsv | oklab — the gradient colour space
     // TIMELINE / sequencer — the keyframe track. The model `light-seq` is the SINGLE source of truth for

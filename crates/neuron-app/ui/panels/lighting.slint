@@ -4,7 +4,7 @@
 
 import { Theme, Signal } from "../theme.slint";
 import { ChromaLab } from "chromalab.slint";
-import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Picker } from "../widgets/controls.slint";
+import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Picker, DefaultChip } from "../widgets/controls.slint";
 import { ListView } from "std-widgets.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
@@ -638,6 +638,9 @@ component SpectrumEditor inherits VerticalLayout {
             current: State.light-stops[root.stop-idx].col;
             value: State.light-stops[root.stop-idx].hex;
             swatches: Palette.accent;
+            lead: State.default-chip-key != "" && State.default-chip-solid;
+            lead-col: State.default-chip-col;
+            lead-pick => { State.apply-default-chip(); }
             pick(h) => { State.set-stop-color(root.stop-idx, h); }
             preview(h) => { State.set-stop-color(root.stop-idx, h); }
         }
@@ -653,6 +656,10 @@ component SpectrumEditor inherits VerticalLayout {
                 animate border-color { duration: Theme.quick; }
                 Image { source: g.swatch; width: 100%; height: 100%; image-fit: fill; }
                 gta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.apply-gradient(i); } }
+            }
+            if State.default-chip-key != "" && !State.default-chip-solid : DefaultChip {
+                swatch: State.default-chip-swatch;
+                clicked => { State.apply-default-chip(); }
             }
             Rectangle {}
         }
