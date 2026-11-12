@@ -48,6 +48,7 @@ macro_rules! preserve_legacy_config {
     };
 }
 
+mod caustic;
 mod input;
 mod life;
 mod session;
@@ -55,11 +56,14 @@ mod provider;
 mod transition;
 mod live;
 
+pub use caustic::Caustic;
 pub use input::*;
 pub use session::*;
 pub use provider::*;
 pub use transition::*;
 pub use live::*;
+use caustic::{caustic_params, caustic_spectrum};
+use input::render_input;
 use life::Life;
 
 // ─────────────────────────────────────── Field & Pattern ─────────────────────────────────
@@ -520,7 +524,7 @@ impl PatternDef {
     pub fn input_dependencies(&self) -> InputDependencies {
         match self.key {
             "uniform" | "axis" | "radial" | "heat" | "rain" | "sparkle" | "flow" | "custom" => InputDependencies::None,
-            "comet" | "ignite" | "ring" | "thermal" | "life" => InputDependencies::Keys,
+            "comet" | "ignite" | "ring" | "thermal" | "life" | "caustic" => InputDependencies::Keys,
             "meter" | "miclight" => InputDependencies::Audio,
             "screen" => InputDependencies::Desktop,
             "vitals" | "onair" | "modeheld" | "gamelight" | "signal" => InputDependencies::Shared,
@@ -820,6 +824,17 @@ static REGISTRY: &[PatternDef] = &[
         palette_addressing: PaletteAddressing::Field,
         readout: false,
     },
+    PatternDef {
+        key: "caustic",
+        label: "Caustic",
+        make: || Box::new(Caustic::default()),
+        params: caustic_params,
+        default_spectrum: caustic_spectrum,
+        tile: TileMeta { live_input: true },
+        has_spectrum: true,
+        palette_addressing: PaletteAddressing::Field,
+        readout: false,
+    },
 ];
 
 /// The house default accent (the weave teal) — the neutral colour solid-spectrum patterns start in.
@@ -920,7 +935,7 @@ pub fn render_elapsed() -> f32 { render_elapsed_time().as_secs_f32() }
 // shared param-schema constructors (reused across pattern defs so the ranges read consistently)
 
 /// A `speed` rate knob (the design default is 1.0).
-fn speed_param() -> Param {
+pub(super) fn speed_param() -> Param {
     Param {
         key: "speed",
         label: "speed",
@@ -1361,7 +1376,7 @@ impl Pattern for Radial {
 /// A lean deterministic xorshift32 step → 0.0..1.0 (no `rand` dependency — the project stays lean).
 /// The stateful patterns (Heat/Streak/Sparkle) carry their seed as a `u32` (so they `#[derive(Default)]`
 /// freely); the zero-guard means an unseeded `0` still produces a stable stream on first use.
-fn xorshift(state: &mut u32) -> f32 {
+pub(super) fn xorshift(state: &mut u32) -> f32 {
     let mut x = if *state == 0 { 0x9E37_79B9 } else { *state };
     x ^= x << 13;
     x ^= x >> 17;
@@ -4052,6 +4067,8 @@ pub fn presets() -> Vec<Preset> {
             blurb: "a light your macros drive: neuron.signal(n, v)", source: "macros" },
         Preset { slug: "wildlife", label: "Wildlife", pattern: "life", params: pp_none, spectrum: life_spectrum,
             blurb: "a seasonal cellular habitat shaped by your typing", source: "keys" },
+        Preset { slug: "tidepool", label: "Tidepool", pattern: "caustic", params: pp_none, spectrum: caustic_spectrum,
+            blurb: "shallow sunlit water refracting over seafoam and keystroke ripples", source: "keys" },
     ]
 }
 
@@ -4410,7 +4427,7 @@ mod tests {
                 Rgb::new(255, 0, 0), Rgb::new(128, 0, 128), Rgb::new(0, 0, 255),
             ]);
         }
-        for key in ["axis", "radial", "heat", "rain", "comet", "flow", "thermal", "meter", "life", "signal"] {
+        for key in ["axis", "radial", "heat", "rain", "comet", "flow", "thermal", "meter", "life", "signal", "caustic"] {
             assert_eq!(pattern_def(key).unwrap().palette_addressing, PaletteAddressing::Field);
         }
 
@@ -4916,12 +4933,14 @@ mod tests {
             assert!(keys.contains(&k), "registry is missing the '{k}' pattern");
         }
         // the thirteen procedural shapes + the `custom` static-frame layer + the DATA readouts
-        // (`vitals`, `onair`, `miclight`, `modeheld`, `gamelight`, `signal`).
+        // (`vitals`, `onair`, `miclight`, `modeheld`, `gamelight`, `signal`) + `life` + `caustic`.
         assert!(keys.contains(&"custom"), "registry is missing the 'custom' layer type");
+        assert!(keys.contains(&"life"), "registry is missing the 'life' pattern");
+        assert!(keys.contains(&"caustic"), "registry is missing the 'caustic' pattern");
         for k in ["vitals", "onair", "miclight", "modeheld", "gamelight", "signal"] {
             assert!(keys.contains(&k), "registry is missing the '{k}' readout");
         }
-        assert_eq!(keys.len(), 21, "the registered patterns including custom frame and readouts");
+        assert_eq!(keys.len(), 22, "the registered patterns including custom frame and readouts");
     }
 
     // ── presets are pure, valid data (the tile grid) ────────────────────────────────────────────
@@ -4991,6 +5010,7 @@ mod tests {
             ("gamelight", "data"),
             ("signal", "data"),
             ("wildlife", "input"),
+            ("tidepool", "input"),
         ];
         let ps = presets();
         assert_eq!(

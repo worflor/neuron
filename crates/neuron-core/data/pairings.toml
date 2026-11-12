@@ -5,7 +5,7 @@
 # fail the pairing tests.
 
 # effects whose list is exactly their pins
-closed = ["fire"]
+closed = ["fire", "tidepool"]
 
 [[pin]]
 effect = "comet"
@@ -64,3 +64,15 @@ on = "matrix"
 [[pin]]
 effect = "cascade"
 with = "aurora"
+
+[[pin]]
+effect = "tidepool"
+with = "thermal"
+
+[[pin]]
+effect = "tidepool"
+with = "sunset"
+
+[[pin]]
+effect = "tidepool"
+with = "meadow"

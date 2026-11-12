@@ -102,7 +102,7 @@ pub fn reading(slug: &str) -> Option<Reading> {
 #[must_use]
 pub fn pattern_reading(pattern: &str) -> Option<Reading> {
     match pattern {
-        "heat" | "thermal" => Some(Reading::Energy),
+        "heat" | "thermal" | "caustic" => Some(Reading::Energy),
         "flow" => Some(Reading::Position),
         "rain" | "comet" | "sparkle" | "ring" | "ignite" => Some(Reading::Streak),
         _ => None,
@@ -192,7 +192,7 @@ impl Pairing {
 }
 
 /// The gradient an effect already wears by default; it is never offered back to the same effect.
-const OWN: &[(&str, &str)] = &[("fire", "fire"), ("typingheat", "thermal"), ("aurora", "aurora")];
+const OWN: &[(&str, &str)] = &[("fire", "fire"), ("typingheat", "thermal"), ("aurora", "aurora"), ("tidepool", "tidepool")];
 
 fn is_own(slug: &str, gradient: usize) -> bool {
     OWN.iter().any(|(e, g)| e.eq_ignore_ascii_case(slug) && gradient_index(g) == Some(gradient))
@@ -349,6 +349,7 @@ mod tests {
         assert_eq!(names("cascade")[1], "aurora");
         assert_eq!(names("starlight")[..2], ["rainbow", "bubble"]);
         assert_eq!(names("aurora")[0], "fire");
+        assert_eq!(names("tidepool"), ["thermal", "sunset", "meadow"], "tidepool is a closed list");
     }
 
     #[test]
@@ -372,7 +373,7 @@ mod tests {
 
     #[test]
     fn derived_pairings_are_distinct_from_each_other_and_the_effect() {
-        for s in ["fire", "typingheat", "comet", "reactive", "ripple", "cascade", "starlight", "aurora"] {
+        for s in ["fire", "typingheat", "comet", "reactive", "ripple", "cascade", "starlight", "aurora", "tidepool"] {
             let ps = pairings_for(s);
             assert!(ps.len() <= MAX_PAIRS, "{s}");
             for (i, a) in ps.iter().enumerate().filter(|(_, p)| p.source == Source::Derived) {
@@ -386,7 +387,7 @@ mod tests {
 
     #[test]
     fn energy_foot_gives_bright_ramps_a_cold_end_and_leaves_dark_ones_alone() {
-        let ocean = gradient_preset(gradient_index("ice").unwrap()).unwrap();
+        let ocean = Palette::gradient(vec![Rgb::new(90, 130, 255), Rgb::new(130, 210, 255), Rgb::new(235, 250, 255)]);
         assert!(look(&ocean).floor > 0.2);
         let dressed = energy_foot(&ocean);
         assert!(look(&dressed).floor < 0.15 && look(&dressed).range > look(&ocean).range);

@@ -722,7 +722,7 @@ pub const GRADIENT_PRESETS: &[GradientPreset] = &[
     ("thermal", &[(72, 6, 2), (190, 22, 0), (255, 96, 0), (255, 200, 46), (255, 255, 255)]),
     ("sunset", &[(52, 22, 104), (150, 34, 120), (232, 66, 98), (255, 138, 62), (255, 214, 140)]),
     ("meadow", &[(12, 45, 34), (67, 190, 116), (206, 229, 128)]),
-    ("ice", &[(90, 130, 255), (130, 210, 255), (235, 250, 255)]),
+    ("tidepool", &[(6, 24, 50), (8, 74, 122), (18, 168, 204), (120, 244, 226), (240, 253, 255)]),
     ("bubble", &[(253, 249, 236), (244, 214, 143), (191, 109, 45), (77, 40, 178), (29, 173, 227), (192, 239, 191), (237, 220, 33)]),
 ];
 
@@ -770,7 +770,8 @@ pub fn palette_name(p: &Palette) -> std::borrow::Cow<'static, str> {
     static STOCK_RAMPS: std::sync::OnceLock<Vec<(&'static str, Palette)>> = std::sync::OnceLock::new();
     let stock_ramps = STOCK_RAMPS.get_or_init(|| {
         [("fire", "fire"), ("typingheat", "thermal"), ("cascade", "cascade"),
-            ("comet", "comet"), ("audiometer", "meter"), ("pulse", "pulse")].into_iter().filter_map(|(slug, name)| {
+            ("comet", "comet"), ("audiometer", "meter"), ("pulse", "pulse"),
+            ("tidepool", "tidepool")].into_iter().filter_map(|(slug, name)| {
             let def = crate::pattern::preset_by_slug(slug)?;
             (def.spectrum)().seq.into_iter().next().map(|frame| (name, frame.palette))
         }).collect()
