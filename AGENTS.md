@@ -228,6 +228,9 @@ place links to it.
   answers nothing is slop, and so is "juice" added for its own sake.
 - **Keep row identity stable.** Update live models in place; replacing a model on every tick
   rebuilds its rows, which drops hover state and half-typed text.
+- **Stay inside the box.** Slint compiles an element placed past its parent and text with nothing
+  bounding it; both only show when the right data arrives. `src/uilint.rs` fails the suite on those
+  two shapes. Bound the element or the text; a deliberate exception takes its allow marker and reason.
 
 ## Verifying your work honestly
 
