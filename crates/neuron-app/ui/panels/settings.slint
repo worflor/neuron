@@ -17,6 +17,7 @@ component ObsMenuItem inherits Rectangle {
     background: lit ? Theme.accent-glow : transparent;
     border-width: lit ? Theme.hair : 0px;
     border-color: Theme.accent-line;
+    // ui-lint: allow(loose-text) the chip takes its width from this text
     txt := Mono {
         x: 6px;
         text: root.label;
@@ -270,6 +271,7 @@ component RingPulse inherits Rectangle {
         property <float> rp: max(0.0, min(1.0, root.p * 1.34 - k * 0.17));
         property <float> ef: root.outward ? (1.0 - (1.0 - self.rp) * (1.0 - self.rp)) : (1.0 - self.rp);
         property <length> grow: (8px + 20px * root.amp * root.strength) * self.ef;
+        // ui-lint: allow(bleed) the rings are drawn around the card, outside it by design
         x: -self.grow;
         y: -self.grow;
         width: parent.width + 2 * self.grow;

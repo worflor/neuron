@@ -377,10 +377,13 @@ export component ValueReadout inherits Rectangle {
     property <bool> editing: false;
     property <float> scale: root.decimals <= 0 ? 1 : (root.decimals == 1 ? 10 : 100);
     property <string> shown: round(root.value * root.scale) / root.scale;
-    min-width: max(shown-txt.preferred-width, 3 * root.font-size * 0.6);
+    // the number sits inside a gutter the edit well is drawn in, so opening the well neither moves
+    // the number nor draws past this readout's own box
+    property <length> gutter: 4px;
+    min-width: max(shown-txt.preferred-width, 3 * root.font-size * 0.6) + 2 * root.gutter;
     preferred-height: shown-txt.preferred-height;
     shown-txt := Text {
-        width: 100%; height: 100%;
+        x: root.gutter; width: parent.width - 2 * root.gutter; height: 100%;
         text: root.shown;
         opacity: root.editing ? 0 : 1;
         color: root.ink;
@@ -393,13 +396,12 @@ export component ValueReadout inherits Rectangle {
         clicked => { root.editing = true; }
     }
     if root.editing : Rectangle {
-        x: -4px; width: parent.width + 8px;
         background: Theme.well;
         border-radius: Theme.radius-sm;
         border-width: Theme.hair;
         border-color: Theme.accent.with-alpha(0.6);
         TextInput {
-            x: 4px; width: parent.width - 8px; height: 100%;
+            x: root.gutter; width: parent.width - 2 * root.gutter; height: 100%;
             text: root.shown;
             single-line: true;
             color: Theme.text;
@@ -677,7 +679,7 @@ export component Slider inherits Rectangle {
 export component FaderRow inherits HorizontalLayout {
     in property <string> label;
     in property <length> label-w: 76px;
-    in property <length> readout-w: 48px;
+    in property <length> readout-w: 52px;
     in property <float> minimum: 0;
     in property <float> maximum: 100;
     in property <float> value;
@@ -971,6 +973,8 @@ export component CodeArea inherits Rectangle {
     }
     if root.text == "" : Text {
         x: 11px; y: 11px;
+        width: parent.width - 22px;
+        overflow: elide;
         text: root.placeholder;
         color: Theme.text-faint;
         font-size: Theme.fs-data;
@@ -1567,6 +1571,7 @@ export component ActionPicker inherits VerticalLayout {
                     if c.header && rta.has-hover : Rectangle {
                         width: 140px;
                         height: 20px;
+                        // ui-lint: allow(bleed) the name hangs over the list beside the rail
                         x: -(self.width + 6px);
                         y: (parent.height - self.height) / 2;
                         background: Theme.bg-2;
@@ -2509,6 +2514,7 @@ export component ConfirmButton inherits Rectangle {
         // to size the button, and binding that same text's width to its own container would be a
         // circular reference that collapses to 0 (the glyph vanishes). Centre by hand instead.
         Rectangle {
+            // ui-lint: allow(loose-text) both labels size the button through label-w
             rest := Text {
                 text: root.text;
                 opacity: root.armed ? 0 : 1;
@@ -2520,6 +2526,7 @@ export component ConfirmButton inherits Rectangle {
                 color: root.enabled ? Theme.danger : Theme.text-faint;
                 animate opacity { duration: Theme.quick; }
             }
+            // ui-lint: allow(loose-text) both labels size the button through label-w
             conf := Text {
                 text: root.confirm-text;
                 opacity: root.armed ? 1 : 0;

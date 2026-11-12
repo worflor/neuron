@@ -10097,7 +10097,7 @@ fn init_light_tile_metadata(app: &AppWindow, _sh: &SharedRt) {
             install_swatches(ModelRc::new(VecModel::from(vec![Image::default(); rows.len()])));
             install(ModelRc::new(VecModel::from(rows.iter().map(|t| EffectTileMeta {
                 name: t.name.into(), slug: t.slug.into(), kind: t.group.into(), blurb: t.blurb.into(),
-                source: t.source.into(), pairs: pair_chips(t.slug),
+                source: t.source.into(), pairs: pair_chips(t.slug), pair_widest: widest_pair(&pair_chips(t.slug)),
             }).collect::<Vec<_>>())));
         } else if swatches.row_count() != rows.len() {
             install_swatches(ModelRc::new(VecModel::from(vec![Image::default(); rows.len()])));
@@ -10240,7 +10240,7 @@ fn install_saved_catalog(app: &AppWindow, result: Result<crate::light_metadata::
                 let rows = saved.iter().map(|(slug, effect)| EffectTileMeta {
                     name: effect.name.clone().into(), slug: format!("{USER_TILE_PREFIX}{slug}").into(),
                     kind: "effect".into(), blurb: effect.blurb.clone().into(),
-                    source: "".into(), pairs: ModelRc::default(),
+                    source: "".into(), pairs: ModelRc::default(), pair_widest: "".into(),
                 }).collect::<Vec<_>>();
                 let old_meta = st.get_light_user_tiles();
                 let old_swatches = st.get_light_user_swatches();
@@ -10754,8 +10754,12 @@ fn pair_chips(slug: &'static str) -> ModelRc<PairChip> {
     })
 }
 
-/// Render a small horizontal strip of a palette (the timeline frame chip) — samples the gradient across
-/// the width so a frame reads as its colour program at a glance.
+/// The longest name among a tile's pairing chips: the pill is sized for it so no name is cut short.
+pub(crate) fn widest_pair(pairs: &ModelRc<PairChip>) -> slint::SharedString {
+    use slint::Model;
+    pairs.iter().map(|p| p.name).max_by_key(|name| name.chars().count()).unwrap_or_default()
+}
+
 fn selected_layer_pattern(sh: &SharedRt) -> String {
     let s = sh.borrow();
     s.light_layers.get(s.selected_layer).map(|l| l.pattern.clone()).unwrap_or_default()
@@ -10789,6 +10793,8 @@ fn refresh_default_chip(app: &AppWindow, sh: &SharedRt) {
     st.set_default_chip_key(slug.as_str().into());
 }
 
+/// Render a small horizontal strip of a palette (the timeline frame chip) — samples the gradient across
+/// the width so a frame reads as its colour program at a glance.
 fn palette_strip_image(palette: &neuron::spectrum::Palette) -> Image {
     let (w, h) = (96usize, 14usize);
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);

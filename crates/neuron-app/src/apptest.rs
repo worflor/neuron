@@ -973,18 +973,22 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
     std::env::set_var("SLINT_SCALE_FACTOR", "1");
     let Some(app) = try_window() else { return };
     let st = app.global::<State>();
-    let tile = |slug: &str, names: &[&str]| EffectTileMeta {
-        name: slug.into(),
-        slug: slug.into(),
-        kind: "effect".into(),
-        blurb: "a look".into(),
-        source: "".into(),
-        pairs: ModelRc::new(VecModel::from(
+    let tile = |slug: &str, names: &[&str]| {
+        let pairs = ModelRc::new(VecModel::from(
             names.iter().enumerate().map(|(i, n)| marked_chip(n, i as i32)).collect::<Vec<_>>(),
-        )),
+        ));
+        EffectTileMeta {
+            name: slug.into(),
+            slug: slug.into(),
+            kind: "effect".into(),
+            blurb: "a look".into(),
+            source: "".into(),
+            pair_widest: crate::glue::widest_pair(&pairs),
+            pairs,
+        }
     };
     st.set_light_tiles(ModelRc::new(VecModel::from(vec![
-        tile("fire", &["aurora", "sunset", "bubble", "meadow", "ice"]),
+        tile("fire", &["aurora", "sunset on light painting", "bubble", "meadow", "tidepool"]),
         tile("comet", &["rainbow"]),
     ])));
     // the catalog only draws once a lighting surface exists: a selected, lit-capable board with a grid
@@ -1020,9 +1024,26 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
     let at = |dx: f32| WindowEvent::PointerMoved { position: LogicalPosition::new(x as f32 + dx, y as f32 + 3.0) };
     // onto the first capsule, then across the drawer as it opens (the drawer animates, so a few
     // frames), then back out
-    for dx in [3.0, 3.0, 30.0, 56.0, 82.0, 3.0] {
+    for (step, dx) in [3.0, 3.0, 30.0, 56.0, 82.0, 3.0].into_iter().enumerate() {
         app.window().dispatch_event(at(dx));
-        app.window().take_snapshot().expect("a hovered frame is drawn");
+        let frame = app.window().take_snapshot().expect("a hovered frame is drawn");
+        // NEURON_INSPECTOR_SHOTS=<dir> keeps the opening frame and each settled one for a look
+        if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let save = |name: String, f: &slint::SharedPixelBuffer<slint::Rgba8Pixel>| {
+                image::save_buffer(dir.join(name), f.as_bytes(), f.width(), f.height(), image::ColorType::Rgba8).unwrap();
+            };
+            save(format!("pairs-{step}-first.png"), &frame);
+            for mid in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(70));
+                slint::platform::update_timers_and_animations();
+                save(format!("pairs-{step}-t{}.png", (mid + 1) * 70), &app.window().take_snapshot().unwrap());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            slint::platform::update_timers_and_animations();
+            save(format!("pairs-{step}-settled.png"), &app.window().take_snapshot().unwrap());
+        }
     }
     app.window().dispatch_event(WindowEvent::PointerExited);
     let after = app.window().take_snapshot().expect("a frame after the pointer leaves");

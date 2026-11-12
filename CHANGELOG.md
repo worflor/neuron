@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- An effect tile's pairing pill is sized for its longest name ("with sunset on light painting" was cut off) and opens from a pinned corner: the first row stays put and the rest is uncovered. A typed-into readout draws its edit box inside its own space instead of past the panel edge.
 - A slider whose stored value is past its range no longer draws its fill over the readout (the timeline's `stay` on a 13-second frame). `stay` now runs to 30 s and `fade in` to 10 s.
 - The device registry is one shared snapshot that reloads itself when definition files change. Device discovery, event arming, macro-key handling, macro device verbs and the background workers all read it, so a device adopted or edited mid-session reaches every part of the app without a restart. Previously each subsystem kept its own copy (macro device verbs kept the one from first use), and the vitals and scan ticks re-parsed every file each time.
 - Keyboards held in driver mode for their macro keys keep their Fn layer and media keys. Driver mode hands Fn to the host, so Fn combos had stopped working while Neuron ran. The BlackWidow Chroma V2's Fn row comes from its definition: volume, media, sleep, and Fn+F10 toggles the keyboard's own game mode with read-back. Any keyboard's media-key reports (BlackWidow V3 and V4 class) now act as media keys. Your own binds on those keys still win; binding Fn itself turns the default layer off. New `game-mode` action.

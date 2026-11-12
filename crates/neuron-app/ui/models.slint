@@ -226,6 +226,7 @@ export struct EffectTileMeta {
     blurb: string,       // one plain-words line: what this look IS / what feeds it
     source: string,      // the named real-world feed ("keys", "audio", "battery", …; "" = none)
     pairs: [PairChip],   // suggested gradients for this effect (pins first); empty = none
+    pair-widest: string, // the longest pairing name, which sizes the tile's pairing pill
 }
 
 // One auto-rendered PARAM control for the selected effect — the weave-knobs pattern applied to

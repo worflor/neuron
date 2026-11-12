@@ -87,6 +87,7 @@ component EffectTileCard inherits Rectangle {
         padding: 6px;
         spacing: 5px;
         alignment: start;
+        // ui-lint: allow(bleed) a one-pixel lift inside the card's own border
         y: -root.lift;
         animate y { duration: Theme.quick; }
         // the live preview — the tile IS the effect, running (or a looping demo for a fed look).
@@ -188,9 +189,11 @@ component EffectTileCard inherits Rectangle {
         }
     }
     // SUGGESTED GRADIENTS — a capsule on the art that opens in place into the rest of its pairings.
-    // The pill's left edge never moves; it only grows rightward, so hovering never shifts the first
-    // capsule under the pointer. Everything is arithmetic over ONE touch area (outside any `for`, so
-    // the tick's row rewrites can't kill it): the hovered capsule is derived from the mouse x.
+    // The pill's left and bottom edges are pinned and every capsule is laid out from that corner, so
+    // opening only uncovers: the first row never moves under the pointer, further rows and the name
+    // sit where they will be and the growing pill reveals them. Everything is arithmetic over ONE
+    // touch area (outside any `for`, so the tick's row rewrites can't kill it): the hovered capsule
+    // is derived from the pointer position.
     if root.tile.pairs.length > 0 && !root.dimmed : pairs := Rectangle {
         property <length> cw: 18px;
         property <length> gap: 3px;
@@ -200,23 +203,25 @@ component EffectTileCard inherits Rectangle {
         property <int> n: root.tile.pairs.length;
         // the widest the pill may grow: the art's width minus a margin each side
         property <length> avail: root.width - 12px - 20px;
-        // one row + the name inline when it all fits, else a row/grid of capsules under a name line
-        // sized by the longest possible name, NOT the hovered one, so the width can't depend on `hov`
+        // one row + the name inline when it all fits, else a grid of capsules under a name line.
+        // Sized by this tile's longest name, NOT the hovered one, so the width can't depend on `hov`;
+        // a name wider than the art elides.
+        property <length> label-w: min(measure.preferred-width, self.avail - self.pad * 2);
         property <length> inline-w: self.pad * 2 + self.n * (self.cw + self.gap) + measure.preferred-width;
         property <bool> stacked: self.inline-w > self.avail;
         property <int> cols: self.stacked ? max(1, Math.floor((self.avail - self.pad * 2 + self.gap) / (self.cw + self.gap))) : self.n;
         property <int> rows: Math.ceil(self.n / self.cols);
-        property <length> open-w: self.stacked ? max(self.pad * 2 + min(self.n, self.cols) * (self.cw + self.gap) - self.gap, min(self.avail, self.pad * 2 + measure.preferred-width)) : self.inline-w;
+        property <length> open-w: self.stacked ? max(self.pad * 2 + min(self.n, self.cols) * (self.cw + self.gap) - self.gap, self.pad * 2 + self.label-w) : self.inline-w;
         property <length> open-h: 18px + (self.stacked ? self.labh + (self.rows - 1) * self.rowh : 0px);
-        property <length> lab-off: self.stacked ? self.labh : 0px;
         property <bool> open: pta.has-hover;
         // closed: a slice of up to three capsules in one row (+ a plus when there are more); the grid
         // geometry above only applies while open, or a stacked pill would push them out of view
         property <int> shown: min(self.n, 3);
         property <length> plus-w: self.n > 3 ? 11px : 0px;
         property <length> closed-w: self.pad * 2 + self.shown * (self.cw + self.gap) - self.gap + self.plus-w;
-        property <int> hov: self.open ? max(0, min(self.n - 1,
-            Math.floor((pta.mouse-y - self.lab-off - 2px) / self.rowh) * self.cols
+        // rows count up from the pinned bottom edge: row 0 is the one the closed pill shows
+        property <int> hov-row: max(0, min(self.rows - 1, Math.floor((self.height - pta.mouse-y - 2.5px) / self.rowh)));
+        property <int> hov: self.open ? max(0, min(self.n - 1, self.hov-row * self.cols
             + max(0, min(self.cols - 1, Math.floor((pta.mouse-x - self.pad) / (self.cw + self.gap)))))) : 0;
         x: 10px;
         // bottom edge pinned: the pill grows upward over the art, the first capsule never moves
@@ -231,33 +236,41 @@ component EffectTileCard inherits Rectangle {
         animate border-color { duration: Theme.quick; }
         clip: true;
         for p[i] in root.tile.pairs : Rectangle {
-            x: pairs.pad + (pairs.open ? mod(i, pairs.cols) : i) * (pairs.cw + pairs.gap);
-            y: (pairs.open ? pairs.lab-off + floor(i / pairs.cols) * pairs.rowh + (pairs.rowh - self.height) / 2 + 2px : (18px - self.height) / 2);
+            x: pairs.pad + mod(i, pairs.cols) * (pairs.cw + pairs.gap);
+            y: pairs.height - 18px - floor(i / pairs.cols) * pairs.rowh + (18px - self.height) / 2;
             width: pairs.cw;
             height: (pta.has-hover && i == pairs.hov) ? 11px : 8px;
             opacity: (pairs.open || i < pairs.shown) ? 1.0 : 0.0;
-            animate x, y { duration: 200ms; easing: ease-out; }
-            animate height, opacity { duration: Theme.quick; }
+            animate height { duration: Theme.quick; }
+            // the capsules past the closed slice come up in order behind the growing edge; closing
+            // drops them together
+            animate opacity {
+                duration: pairs.open ? 160ms : Theme.quick;
+                delay: pairs.open && i >= pairs.shown ? 30ms + (i - pairs.shown) * 14ms : 0ms;
+            }
             border-radius: 2px;
             clip: true;
             Image { source: p.swatch; width: 100%; height: 100%; image-fit: fill; }
         }
         Mono {
             x: pairs.pad + pairs.shown * (pairs.cw + pairs.gap) - 1px;
-            y: (18px - self.height) / 2;
+            y: pairs.height - 18px + (18px - self.height) / 2;
+            width: 9px;
             text: "+";
             color: Theme.text-dim; font-size: Theme.fs-small;
             opacity: (!pairs.open && pairs.n > 3) ? 1.0 : 0.0;
             animate opacity { duration: Theme.quick; }
         }
-        measure := Mono { text: "with bubble on matrix"; font-size: Theme.fs-small; visible: false; }
+        measure := Mono { text: "with " + root.tile.pair-widest; font-size: Theme.fs-small; visible: false; }
         lbl := Mono {
             x: pairs.stacked ? pairs.pad : pairs.pad + pairs.n * (pairs.cw + pairs.gap);
-            y: pairs.stacked ? 2px : (18px - self.height) / 2;
+            y: pairs.stacked ? pairs.height - pairs.open-h + 2px : pairs.height - 18px + (18px - self.height) / 2;
+            width: pairs.label-w;
+            overflow: elide;
             text: "with " + root.tile.pairs[pairs.hov].name;
             color: Theme.text-dim; font-size: Theme.fs-small;
             opacity: pta.has-hover ? 1.0 : 0.0;
-            animate opacity { duration: 200ms; }
+            animate opacity { duration: pairs.open ? 160ms : Theme.quick; delay: pairs.open ? 60ms : 0ms; }
         }
         pta := TouchArea {
             mouse-cursor: MouseCursor.pointer;
@@ -404,7 +417,7 @@ component VisitorLane inherits VerticalLayout {
 // `label-w` sizes the label cell (wider for the longer TUNE param names); the change is live.
 component SpecSlider inherits FaderRow {
     label-w: 78px;
-    readout-w: 48px;
+    readout-w: 52px;
     step: 0.02;
     decimals: 2;
     spacing: 9px;

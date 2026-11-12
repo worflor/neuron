@@ -835,6 +835,8 @@ export component AppWindow inherits Window {
                                 width: dock.cell-w;
                                 Text {
                                     text: t.label;
+                                    width: min(self.preferred-width, parent.width);
+                                    overflow: elide;
                                     x: (parent.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
                                     color: cell.on ? Theme.accent

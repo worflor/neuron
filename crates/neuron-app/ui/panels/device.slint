@@ -528,6 +528,7 @@ component SnapTapStage inherits Rectangle {
         width: root.rail-w; height: 2px; border-radius: 1px;
         background: Theme.line;
         for ex in [0.0, 1.0] : Rectangle {
+            // ui-lint: allow(bleed) an end-stop tick drawn across its hairline rail
             x: ex * root.rail-w - 1px; y: -4px;
             width: 2px; height: 10px; border-radius: 1px;
             background: Theme.text-faint.with-alpha(0.6);
@@ -540,6 +541,7 @@ component SnapTapStage inherits Rectangle {
         background: root.snapping ? Theme.accent.with-alpha(0.55) : Theme.accent-line;
         animate background { duration: root.snapping ? 90ms : 420ms; easing: ease-out; }
         for ex in [0.0, 1.0] : Rectangle {
+            // ui-lint: allow(bleed) an end-stop tick drawn across its hairline rail
             x: ex * root.rail-w - 1px; y: -4px;
             width: 2px; height: 10px; border-radius: 1px;
             background: Theme.text-faint.with-alpha(0.6);

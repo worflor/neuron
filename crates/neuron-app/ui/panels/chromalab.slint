@@ -436,6 +436,8 @@ export component ChromaLab inherits VerticalLayout {
                 height: 14px;
                 Mono {
                     x: 0;
+                    width: parent.width;
+                    overflow: elide;
                     // with nothing hovered, say how the game drives the board when it isn't a custom grid
                     text: State.chroma-lab-readout != "" ? State.chroma-lab-readout
                         : State.chroma-lab-kb-effect != "custom" ? State.chroma-lab-kb-effect : "";
