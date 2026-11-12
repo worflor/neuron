@@ -2522,6 +2522,7 @@ mod tests {
     /// true; clean completion → stale false (no infinite re-kick loop).
     #[test]
     fn background_scan_reports_stale_rows_when_an_adoption_landed_mid_flight() {
+        let _cwd = crate::testsupport::cwd_guard("background_scan_stale_rows");
         let mut rt = AppRuntime::load();
         // adoption lands mid-flight: the worker has computed rows, then this flag flips.
         rt.synth_dirty.store(true, Ordering::SeqCst);
