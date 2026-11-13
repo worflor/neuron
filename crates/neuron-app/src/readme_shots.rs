@@ -73,6 +73,8 @@ fn shot() {
 
     mock_bus();
     let app = AppWindow::new().unwrap();
+    // as main does: the lighting worker publishes its frames through this handle
+    crate::glue::install_ui(app.as_weak());
     app.window().set_size(slint::LogicalSize::new(w, h));
     app.show().unwrap();
     let weak = app.as_weak();
@@ -162,6 +164,8 @@ fn select_and_open(app: &AppWindow, scene: &str) {
         let ticker = slint::Timer::default();
         ticker.start(slint::TimerMode::Repeated, Duration::from_millis(80), move || {
             if let Some(app) = weak.upgrade() {
+                // the panel reports which previews are on screen; only those are rendered
+                app.invoke_sample_light_demand();
                 app.global::<State>().invoke_preview_tick();
             }
         });
@@ -171,8 +175,79 @@ fn select_and_open(app: &AppWindow, scene: &str) {
 
 /// Demo state layered over whatever the real glue produced. Applied last so a background scan or
 /// seed cannot overwrite it before the snapshot.
+/// The second picker at one of its moments, with the Luma-T Neuron ships, on Tidepool's palette:
+/// `suggest` (an edit, its suggestions, the first on show as a draft), `roll` (the drawer open, a
+/// roll on show), `ask` (asked about a palette at rest: reaches) or `guide` (the Spectrum guide's
+/// Suggestions section).
+fn seed_picker(app: &AppWindow, moment: &str) {
+    use slint::platform::{PointerEventButton, WindowEvent};
+    let st = app.global::<State>();
+    crate::glue::colorsense::use_builtin_model();
+    st.invoke_set_picker_v2(true);
+    st.invoke_pick_tile("tidepool".into());
+    st.set_light_sel_stop(1);
+    st.invoke_picker_sync();
+    let click = |x: f32, y: f32| {
+        let at = slint::LogicalPosition::new(x, y);
+        app.window().dispatch_event(WindowEvent::PointerPressed { position: at, button: PointerEventButton::Left });
+        app.window().dispatch_event(WindowEvent::PointerReleased { position: at, button: PointerEventButton::Left });
+    };
+    match moment {
+        "suggest" => {
+            // Luma-T keeps quiet about many edits (that is its judgement, not a fault), so try a
+            // few real moves on the selected stop and keep the first it answers
+            let hex = st.get_light_stops().row_data(1).map(|s| s.hex.to_string()).unwrap_or_default();
+            let rgb = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0x3c6eb4);
+            let from = neuron::assist::Lch::of(neuron::lighting::Rgb::new((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
+            let moves: [(f32, f32, f32); 8] = [(0.07, 0.02, 1.0), (0.12, -0.04, 1.0), (-0.08, 0.05, 1.0), (0.05, 0.12, 1.1),
+                (0.15, 0.0, 0.7), (-0.12, -0.08, 1.2), (0.2, 0.25, 1.0), (0.1, 0.5, 1.0)];
+            for (dl, dh, dc) in moves {
+                st.invoke_set_stop_color(1, hex.clone().into());
+                let mut lch = from;
+                lch.l = (lch.l + dl).clamp(0.05, 0.95);
+                lch.h = (lch.h + dh).rem_euclid(1.0);
+                lch.c = (lch.c * dc).min(neuron::assist::Lch::max_chroma(lch.l, lch.h));
+                let moved = lch.rgb();
+                st.invoke_set_stop_color(1, format!("{:02x}{:02x}{:02x}", moved.r, moved.g, moved.b).into());
+                if st.get_assist_prime() >= 0 {
+                    break;
+                }
+            }
+            st.set_picker_focus(st.get_picker_focus() + 1);
+            let first = st.get_assist_prime();
+            if first >= 0 {
+                st.invoke_assist_preview(first);
+                st.set_assist_keyed(first);
+            }
+        }
+        "roll" => {
+            st.invoke_roll_choose(1, 1);
+            if let Some((x, y, w, h)) = crate::uifit::rect_of(app.window(), "RollButton") {
+                click(x + w - 8.0, y + h / 2.0);
+            }
+            st.invoke_roll();
+        }
+        "ask" => {
+            st.invoke_assist_ask();
+            st.invoke_assist_ask();
+        }
+        "guide" => {
+            st.invoke_guide_toggle("spectrum".into(), 40.0, 90.0);
+            st.invoke_guide_make_sticky();
+            let at = slint::LogicalPosition::new(240.0, 380.0);
+            app.window().dispatch_event(WindowEvent::PointerScrolled { position: at, delta_x: 0.0, delta_y: -4000.0 });
+        }
+        _ => {}
+    }
+}
+
 fn finish_seed(app: &AppWindow, scene: &str) {
     let st = app.global::<State>();
+    if scene == "lighting" {
+        if let Some(moment) = env("NEURON_SHOT_PICKER") {
+            seed_picker(app, &moment);
+        }
+    }
     if scene == "lighting" && env("NEURON_SHOT_GRADIENT").is_some() {
         // Device selection restores saved lighting asynchronously; edit only after its readouts settle.
         assert_ne!(st.get_idle_readout().as_str(), "…");

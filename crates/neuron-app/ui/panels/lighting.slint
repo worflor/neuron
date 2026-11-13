@@ -513,11 +513,12 @@ component RampName inherits Rectangle {
             }
         }
     }
+    // a long fade, solid before the edge: a cut name trails off instead of stopping mid-letter
     if root.cut : Rectangle {
         x: root.width - self.width;
-        width: 20px;
+        width: min(44px, root.width);
         height: root.height;
-        background: @linear-gradient(90deg, Theme.bg.with-alpha(0) 0%, Theme.bg 100%);
+        background: @linear-gradient(90deg, Theme.bg.with-alpha(0) 0%, Theme.bg 72%, Theme.bg 100%);
     }
     property <float> phase: rta.has-hover ? 0.5 : 0.0;
     animate phase { duration: 1400ms; easing: ease-in-out; }

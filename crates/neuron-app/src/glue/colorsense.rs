@@ -134,6 +134,12 @@ fn model() -> Option<Arc<Learned>> {
     })
 }
 
+/// Use Luma-T as Neuron ships it on this thread (the README shots show the real model).
+#[cfg(test)]
+pub(crate) fn use_builtin_model() {
+    MODEL.with(|slot| *slot.borrow_mut() = Some(Some(Arc::new(Learned::builtin()))));
+}
+
 /// Use `bundle` as the colour model on this thread, or none.
 #[cfg(test)]
 pub(crate) fn use_model(bundle: Option<&[u8]>) {
