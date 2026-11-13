@@ -218,6 +218,7 @@ export struct AssistOffer {
     title: string,       // a few plain words for what taking it does
     swatch: image,       // the palette as it would be
     solid: bool,         // the offer recolours only the selected stop: draw `col`, not the ramp
+    back: bool,          // the way back to the palette the last accepted offer replaced
     col: color,
     vivid: float,        // where `col` sits in the picker (solid offers only)
     light: float,

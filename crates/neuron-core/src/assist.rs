@@ -14,15 +14,17 @@
 //! picks it, through [`Slate::take`], which refuses a slate made for a different scene.
 //!
 //! [`Rules`] is the built-in engine: closed-form colour reasoning in OKLab. [`learned::Learned`] is
-//! a trained one, behind the same trait and the same checks.
+//! a trained one, behind the same trait and the same checks; [`Chain`] asks both.
 
+pub mod journal;
 pub mod learned;
 
 use crate::lighting::Rgb;
 use crate::spectrum::{oklab_in_gamut, oklab_to_rgb, rgb_to_oklab, Interp, Stop};
 
-/// The most offers a slate carries. A choice among a few is a suggestion; a long list is a menu.
-pub const MAX_OFFERS: usize = 4;
+/// The most offers of one scope a slate carries. A choice among a few is a suggestion; a long list
+/// is a menu.
+pub const MAX_OFFERS: usize = 3;
 /// OKLab distance below which two colours read as the same. Offers that move nothing further than
 /// this, or that differ from an earlier offer by less, are dropped.
 const SAME: f32 = 0.02;
@@ -39,6 +41,12 @@ pub struct Scene {
     pub selected: usize,
     /// Stops no offer may change. Shorter than `stops` means the rest are free.
     pub pins: Vec<bool>,
+    /// The selected stop was just added and nobody has chosen its colour: what it shows is a
+    /// placeholder, and a colour for it may be offered without an edit.
+    pub open: bool,
+    /// Other palettes by the same person, for an engine that reads taste from them. No offer
+    /// depends on their order.
+    pub library: Vec<Vec<Rgb>>,
 }
 
 impl Scene {
@@ -63,7 +71,10 @@ impl Scene {
                 (s.col.r, s.col.g, s.col.b, s.at.to_bits()).hash(&mut h);
             }
         }
-        (self.interp.as_str(), self.selected, &self.pins).hash(&mut h);
+        for c in self.library.iter().flatten() {
+            (c.r, c.g, c.b).hash(&mut h);
+        }
+        (self.interp.as_str(), self.selected, &self.pins, self.open, self.library.len()).hash(&mut h);
         h.finish()
     }
 }
@@ -93,12 +104,18 @@ pub trait Engine {
     fn offers(&self, scene: &Scene) -> Vec<Offer>;
 }
 
-/// Several engines asked in order. Earlier ones fill the slate first.
+/// Several engines asked in order. Earlier ones fill the slate first, and an offer whose `id` an
+/// earlier engine already used is dropped: two engines answering the same question are one choice.
 pub struct Chain<'a>(pub &'a [&'a dyn Engine]);
 
 impl Engine for Chain<'_> {
     fn offers(&self, scene: &Scene) -> Vec<Offer> {
-        self.0.iter().flat_map(|engine| engine.offers(scene)).collect()
+        let mut all: Vec<Offer> = Vec::new();
+        for engine in self.0 {
+            let answered: Vec<&'static str> = all.iter().map(|offer| offer.id).collect();
+            all.extend(engine.offers(scene).into_iter().filter(|offer| !answered.contains(&offer.id)));
+        }
+        all
     }
 }
 
@@ -128,11 +145,9 @@ pub fn propose(engine: &dyn Engine, scene: &Scene) -> Slate {
             });
         let moved = offer.interp != scene.interp || apart(&offer.stops, &scene.stops) >= SAME;
         let fresh = offers.iter().all(|kept| kept.interp != offer.interp || apart(&kept.stops, &offer.stops) >= SAME);
-        if shape_kept && moved && fresh {
+        let room = offers.iter().filter(|kept| kept.scope == offer.scope).count() < MAX_OFFERS;
+        if shape_kept && moved && fresh && room {
             offers.push(offer);
-        }
-        if offers.len() == MAX_OFFERS {
-            break;
         }
     }
     Slate { scene: scene.fingerprint(), offers }
@@ -354,6 +369,8 @@ mod tests {
             before: None,
             selected: 0,
             pins: Vec::new(),
+            open: false,
+            library: Vec::new(),
         }
     }
 

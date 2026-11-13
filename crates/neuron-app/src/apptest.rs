@@ -1364,6 +1364,7 @@ fn second_picker_offers_preview_accept_and_undo() {
     std::env::set_var("SLINT_BACKEND", "winit-software");
     std::env::set_var("SLINT_SCALE_FACTOR", "1");
     let Some(app) = try_window() else { return };
+    glue::colorsense::use_model(None);
     let shared = glue::install(&app);
     let st = app.global::<State>();
     st.set_writes_paused(true);
@@ -1407,6 +1408,7 @@ fn second_picker_offers_preview_accept_and_undo() {
     st.invoke_assist_accept(0);
     assert_eq!(stops(), shown, "accepting keeps what was shown");
     assert_eq!(titles(), ["put it back"]);
+    assert!(st.get_assist_offers().row_data(0).unwrap().back, "the way back is drawn as one");
     st.invoke_assist_preview(-1);
     assert_eq!(stops(), shown, "an accepted offer is not undone by the pointer leaving");
     st.invoke_assist_accept(0);
@@ -1447,6 +1449,68 @@ fn second_picker_offers_preview_accept_and_undo() {
     assert!(tried[1] != picked[1] && tried[0] == picked[0] && tried[2..] == picked[2..], "resting on a dot shows that colour on the stop alone");
     st.invoke_assist_preview(-1);
     assert_eq!(stops(), picked, "and leaving puts it back");
+
+    // an edit is made to the palette as it is, not to an offer that is only on show
+    st.invoke_assist_preview(0);
+    st.invoke_picker_nudge(0.0, 0.05, 0.0);
+    let nudged = stops();
+    assert!((Lch::of(nudged[1].col).l - Lch::of(picked[1].col).l - 0.05).abs() < 0.02, "the keyboard steps lightness");
+    assert!(nudged[0] == picked[0] && nudged[2..] == picked[2..], "from the palette, not from the offer shown");
+
+    // a held stop is left alone by every offer
+    st.set_light_sel_stop(2);
+    st.invoke_picker_sync();
+    st.invoke_toggle_pin();
+    assert!(st.get_light_sel_pinned() && st.get_light_pins().iter().eq([false, false, true, false]));
+    st.set_light_sel_stop(1);
+    st.invoke_picker_sync();
+    st.invoke_set_stop_color(1, "d07030".into());
+    let held = stops();
+    assert!(!titles().is_empty());
+    for i in 0..titles().len() as i32 {
+        st.invoke_assist_preview(i);
+        assert_eq!(stops()[2], held[2], "offer {i} moved the held stop");
+    }
+    st.invoke_assist_preview(-1);
+    st.set_light_sel_stop(2);
+    st.invoke_picker_sync();
+    st.invoke_toggle_pin();
+    assert!(!st.get_light_sel_pinned());
+
+    // with a model in the run root: a stop just added is offered colours before anyone picks one
+    glue::colorsense::use_model(Some(include_bytes!("../../neuron-core/data/colour-model.golden.lumacore")));
+    // the small model has nothing to say about some palettes, so a few stops are tried
+    let before_adding = stops();
+    let mut offered = false;
+    for _ in 0..3 {
+        st.invoke_add_stop(0.5);
+        let added = stops();
+        let new = st.get_light_sel_stop() as usize;
+        let offers: Vec<_> = st.get_assist_offers().iter().collect();
+        assert!(offers.iter().all(|o| o.solid && o.title == "a colour for this stop"), "{:?}", titles());
+        if offers.is_empty() || offered {
+            continue;
+        }
+        offered = true;
+        st.invoke_assist_preview(0);
+        let tried = stops();
+        assert!(tried[new] != added[new] && (0..added.len()).all(|i| i == new || tried[i] == added[i]), "only the new stop is coloured");
+        st.invoke_assist_accept(0);
+        assert_eq!(stops(), tried);
+        assert_eq!(titles(), ["put it back"], "a coloured stop is no longer open");
+        st.invoke_assist_accept(0);
+        assert_eq!(stops(), added);
+        // and the model's answer to an edit arrives with the rules'
+        st.invoke_set_stop_color(new as i32, "30c060".into());
+        assert!(!titles().is_empty());
+    }
+    assert!(offered, "no new stop was offered a colour");
+    shared.borrow_mut().light_layers[0].spectrum.seq[0].palette.stops = before_adding;
+    glue::refresh_layers(&app, &shared);
+    glue::colorsense::use_model(None);
+    st.set_light_sel_stop(1);
+    st.invoke_picker_sync();
+    st.invoke_set_stop_color(1, "8c5aa0".into());
 
     st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
     st.set_sel_can_light(true); st.set_grid_rows(1); st.set_grid_cols(2);

@@ -5,16 +5,16 @@
 
     python colour-model.py <luma checkout>
 
-Builds a small random-weight palette core, then uses Luma's own bridge tools to write it as a
-bundle and to record what the Python runtime answers for its refine requests. The results land
-beside this script:
+Builds a small random-weight core (layout 5, revision 2 runtime), then uses Luma's own bridge tools
+to write it as a bundle and to record what the Python runtime answers for requests on a gradient.
+The results land beside this script:
 
     colour-model.golden.lumacore   the small core, in the bundle format Neuron loads
     colour-model.golden.jsonl      the requests and the runtime's answers
 
 The Rust port is tested against these, so its arithmetic is checked without trained weights in
 this repository. A trained bundle is checked the same way against Luma's own vectors; see the
-`matches_luma_vectors` test.
+`matches_luma_vectors` test. Use a clean checkout of a pushed Luma commit.
 """
 
 import hashlib
@@ -27,31 +27,35 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
+ASKS = ("lighter", "darker", "warmer", "cooler", "more chroma", "less chroma")
 
 
 def tiny(folder):
-    """A layout 3 core small enough to commit, with margins loose enough that both answers occur."""
-    rng = np.random.default_rng(20261112)
-    margins = {"spoil": -8.0, "keep": -5.0}
+    """A core small enough to commit, with margins loose enough that every task offers and keeps."""
+    rng = np.random.default_rng(20261113)
+    margins = {"spoil": -8.0, "keep": -3.0}
+    joint = {"spoil": -60.0, "keep": -25.0}
     config = {"width": 16, "heads": 2, "blocks": 2, "components": 3, "sigma": [.008, .25], "merge": .02,
-              "order": "weight", "layout": 3,
+              "order": "weight", "layout": 5, "cone": .5, "style": 4, "revision": 2, "favour": .5,
               "policy": {"measure": "density", "joint": "pseudo", "duplicate": .02,
-                         "masked": margins, "refine": margins, "follow": margins}}
-    width, k = config["width"], config["components"]
-    shapes = {"embed.0.weight": (width, 40), "embed.0.bias": (width,), "embed.2.weight": (width, width),
-              "embed.2.bias": (width,)}
+                         "masked": margins, "refine": margins, "intent": margins, "follow": joint, "repair": joint}}
+    width, k, style, lanes = config["width"], config["components"], config["style"], 8
+    shapes = {"embed.0": (width, 87 + 5 + style + 1), "embed.2": (width, width),
+              "bias.0": (lanes, 14), "bias.2": (config["blocks"] * config["heads"], lanes),
+              "head.0": (width, width), "head.2": (7 * k + 4, width),
+              "style.token.0": (lanes, 4), "style.token.2": (lanes, lanes), "style.query": (1, lanes),
+              "style.palette": (lanes, 2 * lanes), "style.pick": (1, lanes), "style.out": (style, 2 * lanes)}
     for i in range(config["blocks"]):
-        p = f"blocks.{i}."
-        shapes.update({p + "norm1.weight": (width,), p + "norm1.bias": (width,), p + "qkv.weight": (3 * width, width),
-                       p + "qkv.bias": (3 * width,), p + "proj.weight": (width, width), p + "proj.bias": (width,),
-                       p + "norm2.weight": (width,), p + "norm2.bias": (width,), p + "wide.weight": (2 * width, width),
-                       p + "wide.bias": (2 * width,), p + "narrow.weight": (width, 2 * width), p + "narrow.bias": (width,)})
-    shapes.update({"norm.weight": (width,), "norm.bias": (width,), "head.0.weight": (width, width), "head.0.bias": (width,),
-                   "head.2.weight": (7 * k + 4, width), "head.2.bias": (7 * k + 4,)})
-    weights = {key: (rng.normal(size=shape) * (.5 if len(shape) == 2 else .2)
-                     + (1. if "norm" in key and key.endswith("weight") else 0.)).astype(np.float32)
-               for key, shape in shapes.items()}
-    np.savez(folder / "tiny.npz", **weights)
+        shapes.update({f"blocks.{i}.qkv": (3 * width, width), f"blocks.{i}.proj": (width, width),
+                       f"blocks.{i}.wide": (2 * width, width), f"blocks.{i}.narrow": (width, 2 * width)})
+    weights = {}
+    for name, shape in shapes.items():
+        weights[name + ".weight"] = rng.normal(size=shape) * .5
+        weights[name + ".bias"] = rng.normal(size=shape[:1]) * .2
+    for name in ["norm"] + [f"blocks.{i}.norm{j}" for i in range(config["blocks"]) for j in (1, 2)]:
+        weights[name + ".weight"] = 1. + rng.normal(size=width) * .2
+        weights[name + ".bias"] = rng.normal(size=width) * .2
+    np.savez(folder / "tiny.npz", **{key: value.astype(np.float32) for key, value in weights.items()})
     digest = hashlib.sha256((folder / "tiny.npz").read_bytes()).hexdigest()
     manifest = folder / "tiny.json"
     manifest.write_text(json.dumps({"schema": "luma.palette-core.v1", "name": "tiny", "weights": "tiny.npz",
@@ -61,28 +65,50 @@ def tiny(folder):
 
 def main(luma):
     luma = Path(luma).resolve()
+    sys.path[:0] = [str(luma), str(luma / "tools")]
+    import verify_core_bridge as v2
+    import verify_core_bridge_v4 as v4
+    from luma.color import oklab
+    from luma.palette_core import PaletteCore, intent_vector
+
     with tempfile.TemporaryDirectory() as folder:
         folder = Path(folder)
         manifest = tiny(folder)
-        run = lambda *args: subprocess.run([sys.executable, *map(str, args)], cwd=luma, check=True)
-        run(luma / "tools" / "export_core_bridge.py", manifest, "--output", folder / "bridge")
-        run(luma / "tools" / "verify_core_bridge.py", "--manifest", manifest, "--golden", folder / "all.jsonl", "--write")
+        subprocess.run([sys.executable, str(luma / "tools" / "export_core_bridge.py"), str(manifest),
+                        "--output", str(folder / "bridge")], cwd=luma, check=True)
         bundle, = (folder / "bridge").glob("*.lumacore")
         (HERE / "colour-model.golden.lumacore").write_bytes(bundle.read_bytes())
-        kept, keeps = [], 0
-        for line in (folder / "all.jsonl").read_text(encoding="utf-8").splitlines():
-            row = json.loads(line)
-            if row["task"] != "refine":
+        core = PaletteCore(str(manifest))
+        rows, tally = [], {}
+        for number, case in enumerate(v2.cases()[::2]):
+            rng = np.random.default_rng([20261113, number])
+            inp = dict(case["input"])
+            # Neuron's stops all carry weight; a request that hides one is not a request it makes.
+            if inp.get("weights") is not None and min(inp["weights"]) <= 0:
                 continue
-            active = row["input"]["active"]
-            answer = row["output"]
-            keeps += answer["keep"]
-            kept.append({"id": row["id"], "input": row["input"], "offerable": answer["offerable"], "keep": answer["keep"],
-                         "options": [{"rgb": option["rgb"][active], "score": option["score"]} for option in answer["options"]]})
+            intent = None
+            if inp["task"] in ("refine", "repair") and rng.random() < .5:
+                about = oklab(np.asarray(inp["rgb"][inp["active"] if inp["active"] is not None else 0]))
+                intent = intent_vector(ASKS[int(rng.integers(len(ASKS)))], float(rng.uniform(.015, .09)), about).tolist()
+            support = None
+            if rng.random() < .25:
+                support = [oklab(v2.palette(rng, int(rng.integers(2, 13)), str(rng.choice(("ramp", "diverging", "random", "vivid"))))).tolist()
+                           for _ in range(int(rng.integers(1, 9)))]
+            inp.update(weights=None, geometry={"kind": "ordered_gradient"}, intent=intent, support_lab=support)
+            checkpoint, output = v4.evaluate(core, inp)
+            entry = tally.setdefault(inp["task"], [0, 0, 0])
+            entry[0] += 1
+            entry[1] += output["keep"]
+            entry[2] += len(output["options"])
+            rows.append({"id": case["id"], "input": inp, "style": checkpoint and checkpoint["style"],
+                         "output": {"offerable": output["offerable"], "keep": output["keep"],
+                                    "keep_probability": output.get("keep_probability"),
+                                    "options": [{"rgb": option["rgb"], "score": option["score"]} for option in output["options"]]}})
     with open(HERE / "colour-model.golden.jsonl", "w", encoding="utf-8", newline="\n") as out:
-        for row in kept:
-            out.write(json.dumps(row, separators=(",", ":")) + "\n")
-    print(f"{len(kept)} refine requests, {keeps} keep, {sum(len(row['options']) for row in kept)} options")
+        for row in rows:
+            out.write(json.dumps(row, separators=(",", ":"), allow_nan=False) + "\n")
+    for task, (count, keeps, options) in tally.items():
+        print(f"{task}: {count} requests, {keeps} keep, {options} options")
 
 
 if __name__ == "__main__":

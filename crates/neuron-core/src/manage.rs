@@ -357,6 +357,7 @@ pub const APP_PREF_KINDS: &[(&str, &str)] = &[
     ("weave_accent", "string"),
     ("weave_material", "string"),
     ("picker_v2", "bool"),
+    ("picker_journal", "bool"),
     ("phoenix", "bool"),
     ("notif_enabled", "bool"),
     ("notif_placement", "string"),

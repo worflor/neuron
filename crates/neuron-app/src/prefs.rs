@@ -94,6 +94,10 @@ pub struct Prefs {
     /// Use the second colour picker and its suggestion row in the spectrum editor. Default off.
     #[serde(default)]
     pub picker_v2: bool,
+    /// Keep a local record of colour picks and the suggestions shown for them, in the run root's
+    /// `models/picker-sessions.jsonl`, for training a colour model on. Default off; nothing sends it.
+    #[serde(default)]
+    pub picker_journal: bool,
     /// PHOENIX — let the OS relaunch Neuron after a crash/hang (`RegisterApplicationRestart`). Default
     /// ON: the always-on flight recorder + an automatic respawn is the whole reliability story. Takes
     /// effect at the next launch (the OS registration happens once, at startup).
@@ -378,6 +382,7 @@ impl Default for Prefs {
             weave_accent: default_accent(),
             weave_material: default_material(),
             picker_v2: false,
+            picker_journal: false,
             phoenix: true,
             notif_enabled: true,
             notif_placement: default_notif_placement(),
@@ -472,6 +477,7 @@ impl Prefs {
         salvage!("weave_accent", weave_accent);
         salvage!("weave_material", weave_material);
         salvage!("picker_v2", picker_v2);
+        salvage!("picker_journal", picker_journal);
         salvage!("phoenix", phoenix);
         salvage!("notif_enabled", notif_enabled);
         salvage!("notif_placement", notif_placement);
@@ -641,6 +647,11 @@ pub fn start_minimized() -> bool {
 /// Which colour picker the spectrum editor shows.
 pub fn picker_v2() -> bool {
     Prefs::load().picker_v2
+}
+
+/// Whether colour picks are recorded to the run root for training a colour model.
+pub fn picker_journal() -> bool {
+    Prefs::load().picker_journal
 }
 
 /// Persist the colour picker choice. A failed save keeps the choice for this session only.
@@ -1524,6 +1535,7 @@ mod tests {
             weave_accent: "00ff00".into(),
             weave_material: "test-mat".into(),
             picker_v2: !d.picker_v2,
+            picker_journal: !d.picker_journal,
             phoenix: !d.phoenix,
             notif_enabled: !d.notif_enabled,
             notif_placement: "test-place".into(),

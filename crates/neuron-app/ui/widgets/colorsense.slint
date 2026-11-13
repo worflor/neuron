@@ -14,8 +14,12 @@ import { Field, Mono, SwatchRow } from "controls.slint";
 // the colours a click on it would give, and the rail carries a tick for every other stop's hue.
 //
 // A suggested colour for the stop sits on the plane as a dot of that colour, at its own lightness
-// and vividness, with a tick of the same colour at its hue on the rail. Resting on the dot shows
-// it on the stop; moving off puts the stop back; a click keeps it.
+// and vividness, with a tick at its hue under the rail. Resting on the dot shows it on the stop and
+// says why it is offered; moving off puts the stop back; a click keeps it.
+//
+// Once clicked, the picker takes the keyboard: arrows step lightness and vividness, Shift with
+// left or right steps hue, Tab walks the offers (showing each), Enter keeps the one on show and
+// Escape puts the palette back.
 export component SensePicker inherits VerticalLayout {
     in property <color> current;       // the selected stop's colour
     in property <string> value;        // its bare RRGGBB
@@ -25,6 +29,10 @@ export component SensePicker inherits VerticalLayout {
     callback lead-pick();
     callback pick(string);             // a bare RRGGBB typed or chosen from a chip
     callback preview(string);          // a bare RRGGBB while typing
+    // the offer on show: under the pointer, else stepped to from the keyboard
+    property <int> lit: pta.dot >= 0 ? pta.dot : State.assist-keyed;
+    property <bool> lit-dot: root.lit >= State.assist-ramps && root.lit < State.assist-offers.length;
+    property <float> step: 0.02;
     spacing: 9px;
     HorizontalLayout {
         spacing: 10px;
@@ -48,9 +56,40 @@ export component SensePicker inherits VerticalLayout {
         height: 96px;
         border-radius: Theme.radius-sm;
         border-width: Theme.hair;
-        border-color: Theme.line;
+        border-color: keys.has-focus ? Theme.accent-line : Theme.line;
+        animate border-color { duration: Theme.quick; }
         clip: true;
         Image { source: State.picker-plane; width: 100%; height: 100%; image-fit: fill; }
+        keys := FocusScope {
+            width: 0px; height: 0px;
+            key-pressed(e) => {
+                if (e.text == Key.Tab && State.assist-offers.length > 0) {
+                    State.assist-keyed = State.assist-keyed + 1 >= State.assist-offers.length ? -1 : State.assist-keyed + 1;
+                    State.assist-preview(State.assist-keyed);
+                    return accept;
+                }
+                if (e.text == Key.Return && State.assist-keyed >= 0) {
+                    State.assist-accept(State.assist-keyed);
+                    return accept;
+                }
+                if (e.text == Key.Escape && State.assist-keyed >= 0) {
+                    State.assist-keyed = -1;
+                    State.assist-preview(-1);
+                    return accept;
+                }
+                if (e.text == Key.UpArrow) { State.picker-nudge(0, root.step, 0); return accept; }
+                if (e.text == Key.DownArrow) { State.picker-nudge(0, -root.step, 0); return accept; }
+                if (e.text == Key.RightArrow) {
+                    State.picker-nudge(e.modifiers.shift ? 0 : root.step, 0, e.modifiers.shift ? 0.01 : 0);
+                    return accept;
+                }
+                if (e.text == Key.LeftArrow) {
+                    State.picker-nudge(e.modifiers.shift ? 0 : -root.step, 0, e.modifiers.shift ? -0.01 : 0);
+                    return accept;
+                }
+                reject
+            }
+        }
         // the cursor: the chosen colour in a ring that stays readable on any ground
         Rectangle {
             width: 12px; height: 12px; border-radius: 6px;
@@ -61,9 +100,9 @@ export component SensePicker inherits VerticalLayout {
             border-color: State.picker-light > 0.62 ? #000000b0 : #ffffffe0;
         }
         for offer[i] in State.assist-offers : Rectangle {
-            property <bool> hot: i == pta.dot;
+            property <bool> hot: i == root.lit;
             property <bool> born;
-            property <length> d: self.hot ? 14px : 10px;
+            property <length> d: self.hot ? 14px : 9px;
             init => { self.born = true; }
             visible: offer.solid;
             width: self.d; height: self.d; border-radius: self.d / 2;
@@ -76,6 +115,28 @@ export component SensePicker inherits VerticalLayout {
             animate opacity { duration: 200ms; easing: ease-out; }
             animate d, x, y { duration: Theme.quick; easing: ease-out; }
         }
+        // why the dot on show is offered, in the half of the plane the dot is not in
+        Rectangle {
+            property <bool> low: root.lit-dot && State.assist-offers[root.lit].light < 0.5;
+            x: 4px;
+            y: self.low ? 4px : plane.height - self.height - 4px;
+            width: min(why.preferred-width + 12px, plane.width - 8px);
+            height: 16px;
+            border-radius: 8px;
+            background: #000000b0;
+            opacity: root.lit-dot ? 1 : 0;
+            animate opacity { duration: Theme.quick; }
+            why := Mono {
+                x: 6px;
+                width: parent.width - 12px;
+                height: parent.height;
+                vertical-alignment: center;
+                overflow: elide;
+                text: root.lit-dot ? State.assist-offers[root.lit].title : "";
+                color: #ffffffe6;
+                font-size: Theme.fs-small;
+            }
+        }
         pta := TouchArea {
             // The dot under the pointer. A drag never lands on one: the pointer has to arrive at
             // a dot, so a colour being chosen is not swapped for a suggestion that appears under it.
@@ -84,7 +145,10 @@ export component SensePicker inherits VerticalLayout {
             property <bool> armed: true;
             property <bool> dragging;
             property <int> dot: self.armed && !self.dragging ? self.under : -1;
-            changed dot => { State.assist-preview(self.dot); }
+            changed dot => {
+                State.assist-keyed = -1;
+                State.assist-preview(self.dot);
+            }
             changed under => { if (self.under < 0 && !self.dragging) { self.armed = true; } }
             mouse-cursor: self.dot >= 0 ? MouseCursor.pointer : MouseCursor.crosshair;
             function at() {
@@ -93,6 +157,7 @@ export component SensePicker inherits VerticalLayout {
             }
             pointer-event(e) => {
                 if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    keys.focus();
                     if (self.dot >= 0) {
                         State.assist-accept(self.dot);
                     } else {
@@ -115,20 +180,21 @@ export component SensePicker inherits VerticalLayout {
         border-color: Theme.line;
         clip: true;
         Image { source: State.picker-rail; width: 100%; height: 100%; image-fit: fill; }
+        // the other stops' hues hang from the top edge; suggested hues stand on the bottom one
         for mark in State.picker-marks : Rectangle {
             x: clamp(mark * rail.width, 0px, rail.width - 1px);
             width: 1px; height: 5px;
             background: #ffffffc8;
         }
-        for offer in State.assist-offers : Rectangle {
+        for offer[i] in State.assist-offers : Rectangle {
+            property <bool> hot: i == root.lit;
             visible: offer.solid;
-            x: clamp(offer.hue * rail.width - 2.5px, 0px, rail.width - 5px);
+            x: clamp(offer.hue * rail.width - 1px, 0px, rail.width - 2px);
             y: parent.height - self.height;
-            width: 5px; height: 8px;
-            border-radius: 2px;
-            background: offer.col;
-            border-width: 1px;
-            border-color: #ffffffd0;
+            width: 2px;
+            height: self.hot ? 9px : 6px;
+            background: self.hot ? Theme.accent : #ffffffe6;
+            animate height, background { duration: Theme.quick; }
         }
         Rectangle {
             width: 5px; height: parent.height;
@@ -141,7 +207,10 @@ export component SensePicker inherits VerticalLayout {
             mouse-cursor: MouseCursor.ew-resize;
             function at() { State.picker-hue-pick(clamp(self.mouse-x / self.width, 0.0, 1.0)); }
             pointer-event(e) => {
-                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { self.at(); }
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    keys.focus();
+                    self.at();
+                }
             }
             moved => { if (self.pressed) { self.at(); } }
         }
@@ -158,15 +227,20 @@ export component SensePicker inherits VerticalLayout {
 
 // The whole-palette suggestions for the palette being edited (single colours sit in the picker).
 // Resting on a capsule shows it on the strip and the board; leaving puts the palette back. Only a
-// click keeps it. One touch area outside the `for` owns the gesture, so a row update cannot drop
-// the hover. The row opens and closes by height.
+// click keeps it, and the capsule that then says "undo" is the way back. One touch area outside
+// the `for` owns the gesture, so a row update cannot drop the hover. The row opens and closes by
+// height.
 export component SenseOffers inherits Rectangle {
     property <int> n: min(State.assist-ramps, State.assist-offers.length);
     property <length> cw: 44px;
     property <length> gap: 6px;
     property <int> hov: ta.has-hover && root.n > 0
         ? max(0, min(root.n - 1, Math.floor(ta.mouse-x / (root.cw + root.gap)))) : -1;
-    changed hov => { State.assist-preview(root.hov); }
+    property <int> lit: root.hov >= 0 ? root.hov : State.assist-keyed < root.n ? State.assist-keyed : -1;
+    changed hov => {
+        State.assist-keyed = -1;
+        State.assist-preview(root.hov);
+    }
     height: root.n > 0 ? 26px : 0px;
     animate height { duration: 200ms; easing: ease-out; }
     clip: true;
@@ -176,18 +250,30 @@ export component SenseOffers inherits Rectangle {
         width: root.cw; height: 26px;
         border-radius: 13px;
         border-width: Theme.hair;
-        border-color: i == root.hov ? Theme.accent : Theme.line;
+        border-color: i == root.lit ? Theme.accent : Theme.line;
         animate border-color { duration: Theme.quick; }
         clip: true;
         Image { source: offer.swatch; width: 100%; height: 100%; image-fit: fill; }
+        if offer.back : Rectangle {
+            background: #000000a8;
+            Mono {
+                width: parent.width;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: "undo";
+                color: #ffffffe6;
+                font-size: Theme.fs-small;
+            }
+        }
     }
     Mono {
         x: root.n * (root.cw + root.gap) + 2px;
         y: (26px - self.height) / 2;
         width: max(0px, parent.width - self.x);
         overflow: elide;
-        text: root.hov >= 0 ? State.assist-offers[root.hov].title : "suggested";
-        color: root.hov >= 0 ? Theme.text-mid : Theme.text-faint;
+        text: root.lit >= 0 ? State.assist-offers[root.lit].title
+            : root.n == 1 && State.assist-offers[0].back ? "" : "suggested";
+        color: root.lit >= 0 ? Theme.text-mid : Theme.text-faint;
         font-size: Theme.fs-small;
     }
     ta := TouchArea {

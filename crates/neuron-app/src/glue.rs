@@ -2652,7 +2652,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
             colorsense::install(app, &sh);
             app.global::<State>().on_set_stop_color(move |idx, hex| {
                 if let (Some(app), Some(c)) = (w.upgrade(), Rgb::parse(hex.as_str())) {
-                    colorsense::note_edit(&sh, idx.max(0) as usize);
+                    colorsense::note_edit(&app, &sh, idx.max(0) as usize);
                     edit_active_palette(&app, &sh, |pal| pal.set_stop_color(idx.max(0) as usize, c));
                 }
             });
@@ -2716,6 +2716,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     // documented "add a stop, select it" contract: the prism now edits the NEW stop,
                     // not whatever was selected before the insert sorted into the gradient.
                     app.global::<State>().set_light_sel_stop(inserted as i32);
+                    colorsense::note_added(&app, &sh, inserted);
                 }
             });
         }
@@ -10763,7 +10764,7 @@ pub(crate) fn widest_pair(pairs: &ModelRc<PairChip>) -> slint::SharedString {
     pairs.iter().map(|p| p.name).max_by_key(|name| name.chars().count()).unwrap_or_default()
 }
 
-mod colorsense;
+pub(crate) mod colorsense;
 
 fn selected_layer_pattern(sh: &SharedRt) -> String {
     let s = sh.borrow();

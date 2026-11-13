@@ -2,45 +2,59 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! A learned [`Engine`]: a small attention network that reads a palette and says which colours
-//! the stop being worked on could be instead, and whether any of them beats leaving it alone.
+//! A learned [`Engine`]: a small attention network that reads a palette and answers four
+//! questions about it. What colour could a stop nobody has coloured yet take (`masked`)? What could
+//! the stop being worked on be instead (`refine`)? How should the other stops answer an edit
+//! (`follow`)? Which stops look out of place (`repair`)? Every answer is weighed against leaving
+//! the palette alone, and the bundle's margins decide what is worth offering.
 //!
-//! This is a port of Luma's palette core (layout 3, the `refine` request) from its bridge
-//! specification. The network is data: [`Learned::load`] reads a `.lumacore` bundle from a folder,
-//! and no trained weights are compiled in. Each stop becomes one token (its colour, position,
-//! flags, the colour its neighbours imply, and what it was before the edit). The answer for a stop
-//! is a mixture of Gaussians in OKLab whose last component sits on the stop's current colour, so
-//! "keep" is always one of the answers. Candidates are the mixture's modes, held within an edit
-//! budget of the current colour; each is scored against the current palette by the density the
-//! network gives every free stop, and the bundle's margins decide what is worth offering.
+//! This is a port of Luma's core v4 (layout 5, the revision 2 runtime) from its bridge
+//! specification, for stops on a line. The network is data: [`Learned::load`] reads a `.lumacore`
+//! bundle from a folder, and no trained weights are compiled in. Each stop becomes one token (its
+//! colour, position, flags, the colour its neighbours imply and what it was before the edit) and
+//! each pair of stops a few numbers about how far apart they sit, which bias attention. A request
+//! may carry an intent (a wanted change in OKLab, placed on the free stops) and a style vector
+//! made from other palettes by the same person. The answer for a stop is a mixture of Gaussians in
+//! OKLab whose last component sits on the stop's current colour, so "keep" is always one answer.
 //!
-//! Colour conversion and the budget arithmetic are `f64` and follow the reference step for step:
-//! their thresholds sit below `f32` resolution, and a colour on the gamut edge must land on the
-//! same side in both.
+//! Everything is `f64` and follows the reference step for step: the thresholds sit below `f32`
+//! resolution, and a colour on the gamut edge must land on the same side in both.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use super::{Engine, Offer, Scene, Scope, MAX_OFFERS};
+use super::{Engine, Offer, Scene, Scope};
 use crate::lighting::Rgb;
 
 /// The bundle [`Learned::load`] looks for in its folder.
 pub const BUNDLE: &str = "colour-model.lumacore";
 const MAGIC: &[u8; 8] = b"LUMACORE";
 const FORMAT: &str = "luma.core-bridge.v1";
-/// Token width of the one layout this reads.
-const FEATURES: usize = 40;
+/// Token values before the intent and the style vector, the intent's own, and a pair's.
+const SPACE: usize = 87;
+const INTENT: usize = 5;
+const PAIR: usize = 14;
 const SCALE: [f64; 3] = [2.0, 4.0, 4.0];
 const SHIFT: [f64; 3] = [0.5, 0.0, 0.0];
-/// Modes read from the active stop's mixture before scoring, whatever the caller asks to see.
+const GREY: Lab = [0.5, 0.0, 0.0];
+/// Scale of an OKLab change as a model input.
+const MOVE: f64 = 20.0;
+const RANGES: [f64; 5] = [0.1, 0.2, 0.4, 0.8, 1.6];
+/// The most palettes, and colours of each, a style vector reads.
+const SUPPORT: usize = 8;
+const SUPPORT_COLOURS: usize = 12;
+/// Modes read from a stop's mixture before scoring, whatever the caller asks to see.
 const MODES: usize = 5;
 /// How far, in OKLab, a suggestion may sit from the colour it would replace. The policy margins
 /// were fitted on requests with this budget.
 const BUDGET: f64 = 0.18;
+/// The longest change the model was trained to take as an intent.
+const NUDGE: f64 = 0.10;
 
 type Lab = [f64; 3];
+type Srgb = [f64; 3];
 
 /// `y = W x + b`, `W` row-major. For a normalisation, the per-channel gain and offset.
 struct Linear {
@@ -64,43 +78,96 @@ struct Block {
 }
 
 /// One stop's answer: mixture logits, and each component's mean and spread in OKLab. The last
-/// component is the stop's current colour.
+/// component is "no change": the stop's colour, or what its neighbours imply when it has none.
 struct Mixture {
     logits: Vec<f64>,
     means: Vec<Lab>,
     sigmas: Vec<Lab>,
 }
 
-/// A refine request: a palette in display sRGB (`0..1`), in position order.
-struct Request<'a> {
-    rgb: &'a [[f64; 3]],
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Task {
+    Masked,
+    Refine,
+    Follow,
+    Repair,
+}
+
+#[derive(Clone, Copy)]
+struct Margins {
+    /// An option must beat keeping by more than this to be listed at all.
+    spoil: f64,
+    /// The best option must beat keeping by more than this for the answer to be "change".
+    keep: f64,
+}
+
+/// A request: a palette in display sRGB (`0..1`), in position order.
+struct Ask<'a> {
+    task: Task,
+    rgb: &'a [Srgb],
     /// The palette before the last edit; `None` when there was none.
-    before: Option<&'a [[f64; 3]]>,
+    before: Option<&'a [Srgb]>,
     /// Stop positions on `-1..=1`.
     positions: &'a [f64],
     pins: &'a [bool],
-    /// The stops the request may change. Their colours count toward a candidate's score.
-    free: &'a [bool],
-    active: usize,
+    /// The stops the request may change, pins aside.
+    scope: &'a [bool],
+    active: Option<usize>,
     /// Stops whose colour their owner has settled on.
-    recent: &'a [bool],
+    recent: &'a [usize],
     /// The edit budget; `None` for no limit.
     radius: Option<f64>,
+    count: usize,
+    /// A wanted change in OKLab, aimed at the free stops.
+    intent: Option<Lab>,
+    /// From [`Learned::style_vector`].
+    style: &'a [f64],
 }
 
-/// A colour the active stop could take, and how the network rates it against keeping the current
-/// one (log-density difference in nats; positive prefers the candidate).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A palette the request could become, and how the network rates it against the palette as it
+/// stands (log-density difference in nats; positive prefers the candidate).
 struct Candidate {
-    rgb: [f64; 3],
+    rgb: Vec<Srgb>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "options arrive best first; the number is for the reference check"))]
     score: f64,
 }
 
-struct Decision {
+struct Answer {
+    /// False when the request leaves nothing to suggest for (no free stop, a palette of one).
+    offerable: bool,
     /// True when nothing clears the margin over leaving the palette alone. Options may still be
     /// listed: they are what the model would show if asked anyway.
     keep: bool,
     options: Vec<Candidate>,
+    /// Per free stop of the candidate pass: the mixture mass on "no change".
+    keep_probability: Vec<f64>,
+}
+
+/// One pass over the palette.
+#[derive(Clone)]
+struct Inputs {
+    lab: Vec<Lab>,
+    pinned: Vec<bool>,
+    free: Vec<bool>,
+    /// Whether the stop shows a colour.
+    shown: Vec<bool>,
+    /// Whether `previous` is known for the stop.
+    known: Vec<bool>,
+    active: Option<usize>,
+    previous: Vec<Lab>,
+    recent: Vec<bool>,
+}
+
+struct Condition<'a> {
+    intent: Option<Lab>,
+    style: &'a [f64],
+}
+
+/// Which stops are each other's neighbours on the line, with their distances and offsets.
+struct Near {
+    near: Vec<Vec<bool>>,
+    distance: Vec<Vec<f64>>,
+    delta: Vec<Vec<f64>>,
 }
 
 /// A loaded colour model.
@@ -108,15 +175,32 @@ pub struct Learned {
     name: String,
     heads: usize,
     components: usize,
+    /// Width of the style vector without its presence flag.
+    style: usize,
+    features: usize,
+    /// Trailing heads of each block that take no geometry bias.
+    open_heads: usize,
+    cone: f64,
     sigma: [f64; 2],
     merge: f64,
+    /// Nats by which a move must outweigh "leave it" on a stop that shows a colour.
+    favour: f64,
     duplicate: f64,
-    spoil: f64,
-    keep: f64,
+    masked: Option<Margins>,
+    refine: Option<Margins>,
+    follow: Option<Margins>,
+    repair: Option<Margins>,
+    intent: Option<Margins>,
     embed: [Linear; 2],
+    bias: [Linear; 2],
     blocks: Vec<Block>,
     norm: Linear,
     head: [Linear; 2],
+    style_token: [Linear; 2],
+    style_query: Linear,
+    style_palette: Linear,
+    style_pick: Linear,
+    style_out: Linear,
 }
 
 impl Learned {
@@ -132,8 +216,8 @@ impl Learned {
 
     /// Build a model from a `.lumacore` bundle: magic, container version and header length
     /// (little-endian `u32`s), a JSON header, zero padding to a multiple of 64, then the arrays as
-    /// little-endian `f32`. Refuses an unknown container, format or layout, a payload whose length
-    /// or hash the header does not name, and arrays of the wrong shape.
+    /// little-endian `f32`. Refuses an unknown container, format, layout or runtime revision, a
+    /// payload whose length or hash the header does not name, and arrays of the wrong shape.
     pub fn parse(bundle: &[u8]) -> Result<Learned, String> {
         let word = |at: usize| bundle.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
         if bundle.get(..8) != Some(MAGIC.as_slice()) || word(8) != Some(1) {
@@ -152,10 +236,13 @@ impl Learned {
         let config = &doc["config"];
         let number = |v: &serde_json::Value, what: &str| v.as_f64().ok_or_else(|| format!("bundle config: {what}"));
         let size = |what: &str| config[what].as_u64().map(|v| v as usize).filter(|v| (1..=4096).contains(v)).ok_or_else(|| format!("bundle config: {what}"));
-        let (width, heads, blocks, components) = (size("width")?, size("heads")?, size("blocks")?, size("components")?);
+        let (width, heads, blocks, components, style) = (size("width")?, size("heads")?, size("blocks")?, size("components")?, size("style")?);
         let policy = &config["policy"];
-        if config["layout"] != 3 || width % heads != 0 || policy["measure"] != "density" || policy["joint"] != "pseudo" {
-            return Err("unsupported colour model layout or policy".into());
+        let stated = |v: &serde_json::Value, word: &str| v.is_null() || v == word;
+        if config["layout"] != 5 || config["revision"] != 2 || config["order"] != "weight" || width % heads != 0
+            || !stated(&policy["measure"], "density") || !stated(&policy["joint"], "pseudo")
+        {
+            return Err("unsupported colour model layout, revision or policy".into());
         }
         let mut arrays: HashMap<&str, (Vec<usize>, usize)> = HashMap::new();
         for a in doc["arrays"].as_array().ok_or("bundle header: arrays")? {
@@ -167,40 +254,73 @@ impl Learned {
         }
         let take = |name: &str, shape: &[usize]| -> Result<Vec<f64>, String> {
             let (found, offset) = arrays.get(name).ok_or_else(|| format!("bundle has no array {name}"))?;
-            let bytes = 4 * shape.iter().product::<usize>();
-            let raw = offset.checked_add(bytes).and_then(|end| payload.get(*offset..end)).filter(|_| found == shape);
+            let bytes = shape.iter().try_fold(4usize, |total, side| total.checked_mul(*side));
+            let raw = bytes.and_then(|bytes| offset.checked_add(bytes)).and_then(|end| payload.get(*offset..end)).filter(|_| found == shape);
             let raw = raw.ok_or_else(|| format!("bundle array {name} has the wrong shape"))?;
             Ok(raw.chunks_exact(4).map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))).collect())
         };
-        let linear = |name: &str, out: usize, inp: usize| -> Result<Linear, String> {
+        // `out` of `None` takes the row count the bundle states; the next layer's input checks it.
+        let linear = |name: &str, out: Option<usize>, inp: usize| -> Result<Linear, String> {
+            let stated = arrays.get(format!("{name}.weight").as_str()).and_then(|(shape, _)| shape.first().copied());
+            let out = out.or(stated).filter(|rows| (1..=4096).contains(rows)).ok_or_else(|| format!("bundle has no array {name}.weight"))?;
             Ok(Linear { weight: take(&format!("{name}.weight"), &[out, inp])?, bias: take(&format!("{name}.bias"), &[out])? })
         };
         let scale = |name: &str| -> Result<Linear, String> {
             Ok(Linear { weight: take(&format!("{name}.weight"), &[width])?, bias: take(&format!("{name}.bias"), &[width])? })
         };
+        let margins = |task: &str| -> Result<Option<Margins>, String> {
+            let entry = &policy[task];
+            if entry.is_null() {
+                return Ok(None);
+            }
+            Ok(Some(Margins { spoil: number(&entry["spoil"], "policy margin")?, keep: number(&entry["keep"], "policy margin")? }))
+        };
+        let optional = |v: &serde_json::Value, what: &str, otherwise: f64| if v.is_null() { Ok(otherwise) } else { number(v, what) };
+        let features = SPACE + INTENT + style + 1;
+        let merge = number(&config["merge"], "merge")?;
+        let bias = linear("bias.0", None, PAIR)?;
+        let lanes = bias.bias.len();
+        let token = linear("style.token.0", None, 4)?;
+        let lane = token.bias.len();
+        let palette = linear("style.palette", None, 2 * lane)?;
+        let pooled = palette.bias.len();
         Ok(Learned {
             name: doc["name"].as_str().unwrap_or("colour model").to_string(),
             heads,
             components,
+            style,
+            features,
+            open_heads: config["open_heads"].as_u64().unwrap_or(0).min(heads as u64) as usize,
+            cone: optional(&config["cone"], "cone", 0.5)?,
             sigma: [number(&config["sigma"][0], "sigma")?, number(&config["sigma"][1], "sigma")?],
-            merge: number(&config["merge"], "merge")?,
-            duplicate: number(&policy["duplicate"], "policy.duplicate")?,
-            spoil: number(&policy["refine"]["spoil"], "policy.refine.spoil")?,
-            keep: number(&policy["refine"]["keep"], "policy.refine.keep")?,
-            embed: [linear("embed.0", width, FEATURES)?, linear("embed.2", width, width)?],
+            merge,
+            favour: optional(&config["favour"], "favour", 0.0)?,
+            duplicate: optional(&policy["duplicate"], "policy.duplicate", merge)?,
+            masked: margins("masked")?,
+            refine: margins("refine")?,
+            follow: margins("follow")?,
+            repair: margins("repair")?,
+            intent: margins("intent")?,
+            embed: [linear("embed.0", Some(width), features)?, linear("embed.2", Some(width), width)?],
+            bias: [bias, linear("bias.2", Some(blocks * heads), lanes)?],
             blocks: (0..blocks).map(|i| {
                 let p = format!("blocks.{i}");
                 Ok(Block {
                     norm1: scale(&format!("{p}.norm1"))?,
-                    qkv: linear(&format!("{p}.qkv"), 3 * width, width)?,
-                    proj: linear(&format!("{p}.proj"), width, width)?,
+                    qkv: linear(&format!("{p}.qkv"), Some(3 * width), width)?,
+                    proj: linear(&format!("{p}.proj"), Some(width), width)?,
                     norm2: scale(&format!("{p}.norm2"))?,
-                    wide: linear(&format!("{p}.wide"), 2 * width, width)?,
-                    narrow: linear(&format!("{p}.narrow"), width, 2 * width)?,
+                    wide: linear(&format!("{p}.wide"), Some(2 * width), width)?,
+                    narrow: linear(&format!("{p}.narrow"), Some(width), 2 * width)?,
                 })
             }).collect::<Result<_, String>>()?,
             norm: scale("norm")?,
-            head: [linear("head.0", width, width)?, linear("head.2", 7 * components + 4, width)?],
+            head: [linear("head.0", Some(width), width)?, linear("head.2", Some(7 * components + 4), width)?],
+            style_token: [token, linear("style.token.2", Some(lane), lane)?],
+            style_query: linear("style.query", Some(1), lane)?,
+            style_pick: linear("style.pick", Some(1), pooled)?,
+            style_out: linear("style.out", Some(style), 2 * pooled)?,
+            style_palette: palette,
         })
     }
 
@@ -210,49 +330,132 @@ impl Learned {
         &self.name
     }
 
-    /// One token per stop. Every stop shows a colour and has a previous one.
-    fn tokens(&self, lab: &[Lab], previous: &[Lab], positions: &[f64], pinned: &[bool], free: &[bool], active: usize, recent: &[bool]) -> Vec<[f64; FEATURES]> {
-        let between = neighbours(lab, positions);
-        let flag = |on: bool| f64::from(u8::from(on));
-        (0..lab.len()).map(|i| {
-            let mut t = [0.0; FEATURES];
-            let relative = positions[i] - positions[active];
-            for d in 0..3 {
-                t[d] = (lab[i][d] - SHIFT[d]) * SCALE[d];
-                t[32 + d] = (previous[i][d] - SHIFT[d]) * SCALE[d];
-                t[37 + d] = (lab[i][d] - previous[i][d]) * SCALE[d];
-            }
-            (t[3], t[4], t[5], t[6], t[7], t[8]) = (positions[i], flag(pinned[i]), flag(free[i]), 1.0, flag(i == active), relative);
-            for (w, octave) in [1.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
-                let (at, from) = (positions[i] * std::f64::consts::PI * octave, relative * std::f64::consts::PI * octave / 2.0);
-                (t[9 + w], t[13 + w], t[17 + w], t[21 + w]) = (at.sin(), at.cos(), from.sin(), from.cos());
-            }
-            if let Some(mid) = between[i] {
-                for d in 0..3 {
-                    t[25 + d] = (mid[d] - SHIFT[d]) * SCALE[d];
-                    t[29 + d] = (lab[i][d] - mid[d]) * SCALE[d];
+    /// What a set of palettes by one person says about their taste, as the model reads it: the
+    /// style values and a presence flag, all zero for an empty set. The order of palettes and of
+    /// colours does not matter; palettes and colours past the limits are not read.
+    fn style_vector(&self, support: &[Vec<Lab>]) -> Vec<f64> {
+        let mut out = vec![0.0; self.style + 1];
+        let palettes: Vec<&[Lab]> = support.iter().map(|p| &p[..p.len().min(SUPPORT_COLOURS)]).filter(|p| !p.is_empty()).take(SUPPORT).collect();
+        if palettes.is_empty() {
+            return out;
+        }
+        // a set of rows as their attention-weighted sum followed by their mean
+        let pooled = |rows: &[Vec<f64>], query: &Linear| -> Vec<f64> {
+            let share = softmax(&rows.iter().map(|row| query.apply(row)[0]).collect::<Vec<f64>>());
+            let width = rows[0].len();
+            let mut both = vec![0.0; 2 * width];
+            for (row, s) in rows.iter().zip(&share) {
+                for d in 0..width {
+                    both[d] += s * row[d];
+                    both[width + d] += row[d] / rows.len() as f64;
                 }
-                t[28] = 1.0;
             }
-            (t[35], t[36]) = (1.0, flag(recent[i]));
-            t
-        }).collect()
+            both
+        };
+        let each: Vec<Vec<f64>> = palettes.iter().map(|palette| {
+            let hidden: Vec<Vec<f64>> = palette.iter().map(|lab| {
+                let token = [(lab[0] - SHIFT[0]) * SCALE[0], (lab[1] - SHIFT[1]) * SCALE[1], (lab[2] - SHIFT[2]) * SCALE[2], 4.0 * lab[1].hypot(lab[2])];
+                self.style_token[1].apply(&gelu(self.style_token[0].apply(&token)))
+            }).collect();
+            gelu(self.style_palette.apply(&pooled(&hidden, &self.style_query)))
+        }).collect();
+        for (o, z) in out.iter_mut().zip(self.style_out.apply(&pooled(&each, &self.style_pick))) {
+            *o = z.tanh();
+        }
+        out[self.style] = 1.0;
+        out
     }
 
-    /// The network: tokens in, one mixture per stop out.
-    fn forward(&self, tokens: &[[f64; FEATURES]]) -> Vec<Mixture> {
+    /// One token per stop, and the pairwise geometry attention is biased by.
+    fn tokens(&self, inp: &Inputs, positions: &[f64], condition: &Condition) -> (Vec<Vec<f64>>, Vec<Vec<[f64; PAIR]>>) {
+        let n = inp.lab.len();
+        let seen = neighbours(positions, &inp.shown, self.cone);
+        let everyone = neighbours(positions, &vec![true; n], self.cone);
+        let (between, found) = interpolate(&inp.lab, &seen);
+        let flag = |on: bool| f64::from(u8::from(on));
+        let nearest: Vec<f64> = (0..n).map(|i| if n > 1 { (0..n).filter(|j| *j != i).map(|j| seen.distance[i][j]).fold(f64::INFINITY, f64::min) } else { 0.0 }).collect();
+        let pi = std::f64::consts::PI;
+        let tokens = (0..n).map(|i| {
+            let mut t = vec![0.0; self.features];
+            let lab = inp.lab[i];
+            // a stop sits on a line: its second and third coordinates are zero
+            let coords = [positions[i], 0.0, 0.0];
+            let relative = inp.active.map_or([0.0; 3], |a| [positions[i] - positions[a], 0.0, 0.0]);
+            for c in 0..3 {
+                if inp.shown[i] {
+                    t[c] = (lab[c] - SHIFT[c]) * SCALE[c];
+                }
+                t[3 + c] = coords[c];
+                if found[i] {
+                    t[10 + c] = (between[i][c] - SHIFT[c]) * SCALE[c];
+                }
+                if inp.shown[i] && found[i] {
+                    t[14 + c] = (lab[c] - between[i][c]) * SCALE[c];
+                }
+                if inp.known[i] {
+                    t[17 + c] = (inp.previous[i][c] - SHIFT[c]) * SCALE[c];
+                }
+                if inp.known[i] && inp.shown[i] {
+                    t[22 + c] = (lab[c] - inp.previous[i][c]) * SCALE[c];
+                }
+                t[25 + c] = relative[c];
+                for (w, wave) in [1.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
+                    t[39 + 4 * c + w] = (coords[c] * (pi * wave)).sin();
+                    t[51 + 4 * c + w] = (coords[c] * (pi * wave)).cos();
+                }
+                if inp.active.is_some() {
+                    for (w, wave) in [0.5, 1.0, 2.0, 4.0].into_iter().enumerate() {
+                        t[63 + 4 * c + w] = (relative[c] * (pi * wave)).sin();
+                        t[75 + 4 * c + w] = (relative[c] * (pi * wave)).cos();
+                    }
+                }
+            }
+            (t[6], t[7], t[8], t[9]) = (flag(inp.pinned[i]), flag(inp.free[i]), flag(inp.shown[i]), flag(inp.active == Some(i)));
+            (t[13], t[20], t[21]) = (flag(found[i]), flag(inp.known[i]), flag(inp.recent[i]));
+            t[28] = relative[0].abs();
+            // surface 0 of five: a gradient. Its stops have no size and no weight (34 to 37).
+            t[29] = 1.0;
+            t[38] = nearest[i];
+            if let (Some(intent), true) = (condition.intent, inp.free[i]) {
+                let push = intent.map(|v| v * MOVE);
+                t[SPACE] = 1.0;
+                t[SPACE + 1..SPACE + 4].copy_from_slice(&push);
+                t[SPACE + 4] = (push[0] * push[0] + push[1] * push[1] + push[2] * push[2]).sqrt();
+            }
+            t[SPACE + INTENT..].copy_from_slice(condition.style);
+            t
+        }).collect();
+        let pair = (0..n).map(|i| (0..n).map(|j| {
+            let d = seen.distance[i][j];
+            let mut p = [0.0; PAIR];
+            (p[0], p[1]) = (d, d * d);
+            for (r, range) in RANGES.into_iter().enumerate() {
+                p[2 + r] = (-(d / range) * (d / range)).exp();
+            }
+            p[7] = seen.delta[i][j];
+            p[10] = (d.max(1e-6) / nearest[i].max(1e-6)).log2().clamp(-1.0, 5.0) / 4.0;
+            (p[11], p[12], p[13]) = (flag(everyone.near[i][j]), flag(seen.near[i][j]), flag(i == j));
+            p
+        }).collect()).collect();
+        (tokens, pair)
+    }
+
+    /// The network: tokens and pair geometry in, one mixture per stop out.
+    fn forward(&self, tokens: &[Vec<f64>], pair: &[Vec<[f64; PAIR]>]) -> Vec<Mixture> {
         let k = self.components;
+        let bias: Vec<Vec<Vec<f64>>> = pair.iter().map(|row| row.iter().map(|p| self.bias[1].apply(&gelu(self.bias[0].apply(p)))).collect()).collect();
         let mut x: Vec<Vec<f64>> = tokens.iter().map(|t| self.embed[1].apply(&gelu(self.embed[0].apply(t)))).collect();
         let width = x.first().map_or(0, Vec::len);
         let part = width / self.heads;
-        for block in &self.blocks {
+        for (b, block) in self.blocks.iter().enumerate() {
             // queries, keys and values, each a third of the row; a head owns `part` of each third
             let qkv: Vec<Vec<f64>> = x.iter().map(|row| block.qkv.apply(&norm(row, &block.norm1))).collect();
             for (i, row) in x.iter_mut().enumerate() {
                 let mut mixed = vec![0.0; width];
                 for head in 0..self.heads {
                     let of = |third: usize| third * width + head * part..third * width + (head + 1) * part;
-                    let score: Vec<f64> = qkv.iter().map(|other| dot(&qkv[i][of(0)], &other[of(1)]) / (part as f64).sqrt()).collect();
+                    let lean = |j: usize| if head < self.heads - self.open_heads { bias[i][j][b * self.heads + head] } else { 0.0 };
+                    let score: Vec<f64> = qkv.iter().enumerate().map(|(j, other)| dot(&qkv[i][of(0)], &other[of(1)]) / (part as f64).sqrt() + lean(j)).collect();
                     for (other, w) in qkv.iter().zip(softmax(&score)) {
                         for (m, v) in mixed[head * part..(head + 1) * part].iter_mut().zip(&other[of(2)]) {
                             *m += w * v;
@@ -260,8 +463,6 @@ impl Learned {
                     }
                 }
                 add(row, &block.proj.apply(&mixed));
-            }
-            for row in &mut x {
                 let hidden = block.narrow.apply(&gelu(block.wide.apply(&norm(row, &block.norm2))));
                 add(row, &hidden);
             }
@@ -269,7 +470,9 @@ impl Learned {
         let (low, high) = (self.sigma[0].ln(), self.sigma[1].ln());
         x.iter().zip(tokens).map(|(row, token)| {
             let out = self.head[1].apply(&gelu(self.head[0].apply(&norm(row, &self.norm))));
-            let base: Lab = std::array::from_fn(|d| token[d] / SCALE[d] + SHIFT[d]);
+            // a stop without a colour starts from what its neighbours imply
+            let from = if token[8] > 0.0 { 0 } else { 10 };
+            let base: Lab = std::array::from_fn(|d| token[from + d] / SCALE[d] + SHIFT[d]);
             Mixture {
                 logits: out[..=k].to_vec(),
                 means: (0..=k).map(|c| if c < k { std::array::from_fn(|d| base[d] + out[k + 1 + 3 * c + d] / SCALE[d]) } else { base }).collect(),
@@ -278,10 +481,16 @@ impl Learned {
         }).collect()
     }
 
-    /// The mixture's components as distinct colours, heaviest first: components closer than the
-    /// merge distance to a group's representative join it, and a group the keep component joins is
-    /// represented by it. Returns each group's representative component.
-    fn modes(&self, mix: &Mixture) -> Vec<usize> {
+    fn run(&self, inp: &Inputs, positions: &[f64], condition: &Condition) -> Vec<Mixture> {
+        let (tokens, pair) = self.tokens(inp, positions, condition);
+        self.forward(&tokens, &pair)
+    }
+
+    /// The mixture's components as distinct colours, heaviest first, each with its weight:
+    /// components closer than the merge distance to a group's representative join it, and a group
+    /// the "no change" component joins is represented by it. `favour` lifts that group in the
+    /// order without changing its weight.
+    fn modes(&self, mix: &Mixture, favour: f64) -> Vec<(usize, f64)> {
         let weight = softmax(&mix.logits);
         let mut order: Vec<usize> = (0..weight.len()).collect();
         order.sort_by(|&a, &b| weight[b].total_cmp(&weight[a]));
@@ -297,98 +506,379 @@ impl Learned {
                 None => kept.push((i, weight[i])),
             }
         }
-        kept.sort_by(|a, b| b.1.total_cmp(&a.1));
-        kept.into_iter().map(|row| row.0).collect()
+        let rank = |row: &(usize, f64)| if row.0 == self.components && favour != 0.0 { row.1 * favour.exp() } else { row.1 };
+        kept.sort_by(|a, b| rank(b).total_cmp(&rank(a)));
+        kept
     }
 
-    /// Candidates for the active stop, scored against leaving the palette as it is.
-    fn refine(&self, request: &Request, count: usize) -> Decision {
-        let n = request.rgb.len();
-        let active = request.active;
-        if n < 2 || active >= n || !request.free[active] {
-            return Decision { keep: true, options: Vec::new() };
+    /// For each palette in `candidates`, the summed log-density of its free stops' colours. With
+    /// several free stops, each is rated with the other free stops already at the candidate's colours.
+    fn score(&self, inp: &Inputs, positions: &[f64], condition: &Condition, candidates: &[Vec<Lab>]) -> Vec<f64> {
+        let stops: Vec<usize> = (0..inp.free.len()).filter(|k| inp.free[*k]).collect();
+        if let [only] = stops[..] {
+            let mix = self.run(inp, positions, condition);
+            return candidates.iter().map(|c| log_density(&mix[only], c[only])).collect();
         }
-        let lab: Vec<Lab> = request.rgb.iter().map(|c| oklab(*c)).collect();
-        let previous: Vec<Lab> = request.before.map_or_else(|| lab.clone(), |b| b.iter().map(|c| oklab(*c)).collect());
-        let here: Vec<bool> = (0..n).map(|i| i == active).collect();
+        candidates.iter().map(|candidate| {
+            stops.iter().map(|&s| {
+                let mut scene = inp.clone();
+                for k in stops.iter().copied().filter(|k| *k != s) {
+                    scene.lab[k] = candidate[k];
+                    scene.shown[k] = true;
+                }
+                log_density(&self.run(&scene, positions, condition)[s], candidate[s])
+            }).sum()
+        }).collect()
+    }
 
-        // the pass the candidates come from: only the active stop is asked about
-        let pinned: Vec<bool> = (0..n).map(|i| request.pins[i] && i != active).collect();
-        let settled: Vec<bool> = (0..n).map(|i| i == active && request.recent[active]).collect();
-        let asked = self.forward(&self.tokens(&lab, &previous, request.positions, &pinned, &here, active, &settled));
-        let current = request.rgb[active];
-        let candidates: Vec<[f64; 3]> = self.modes(&asked[active]).into_iter().take(MODES).map(|component| {
-            // "leave it" is the stop's colour itself, not its round trip through the display
-            let mean = asked[active].means[component];
-            let legal = if component == self.components { mean } else { oklab(display(mean)) };
-            within(current, display(legal), request.radius)
+    /// Candidates for the request, scored against the palette as it stands.
+    fn answer(&self, ask: &Ask) -> Answer {
+        let n = ask.rgb.len();
+        let mut out = Answer { offerable: false, keep: true, options: Vec::new(), keep_probability: Vec::new() };
+        let free: Vec<bool> = (0..n).map(|i| ask.scope[i] && !ask.pins[i]).collect();
+        let one = matches!(ask.task, Task::Masked | Task::Refine);
+        let able = match ask.task {
+            Task::Masked | Task::Refine => n >= 2 && ask.active.is_some_and(|a| free[a]),
+            Task::Follow => ask.active.is_some(),
+            Task::Repair => n >= 2,
+        };
+        if !able {
+            return out;
+        }
+        let inputs = inputs(ask, &free, one);
+        let stops: Vec<usize> = (0..n).filter(|k| inputs.free[*k]).collect();
+        if stops.is_empty() {
+            return out;
+        }
+        out.offerable = true;
+        let condition = Condition { intent: ask.intent, style: ask.style };
+        let mix = self.run(&inputs, ask.positions, &condition);
+        out.keep_probability = stops.iter().map(|&k| {
+            let anchor = mix[k].means[self.components];
+            softmax(&mix[k].logits).iter().zip(&mix[k].means).filter(|(_, mean)| distance(**mean, anchor) < self.merge).map(|(w, _)| w).sum()
         }).collect();
-
-        // The pass they are scored under asks about every free stop. A candidate is rated by the
-        // density of each free stop's colour in a palette where the other free stops already hold
-        // the candidate's colours; it differs from the request only at the active stop, so that
-        // stop's term comes from the request as it stands and the others from the candidate palette.
-        let pinned: Vec<bool> = (0..n).map(|i| request.pins[i] && !request.free[i]).collect();
-        let judge = |palette: &[Lab]| self.forward(&self.tokens(palette, &previous, request.positions, &pinned, request.free, active, request.recent));
-        let alone = request.free == here.as_slice() && request.recent == settled.as_slice();
-        let standing = if alone { asked } else { judge(&lab) };
-        let free = || (0..n).filter(|&j| request.free[j]);
-        let keep_score: f64 = free().map(|j| log_density(&standing[j], lab[j])).sum();
-        let mut scored: Vec<(Candidate, Lab)> = candidates.into_iter().map(|rgb| {
-            let colour = oklab(rgb);
-            let mut palette = lab.clone();
-            palette[active] = colour;
-            let around = if free().count() == 1 { Vec::new() } else { judge(&palette) };
-            let score: f64 = free().map(|j| if j == active { log_density(&standing[j], colour) } else { log_density(&around[j], lab[j]) }).sum();
-            (Candidate { rgb, score: score - keep_score }, colour)
-        }).collect();
-        scored.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
-        let mut kept: Vec<(Candidate, Lab)> = Vec::new();
-        for (option, colour) in scored {
-            let repeats = distance(colour, lab[active]) < self.duplicate || kept.iter().any(|other| distance(colour, other.1) < self.duplicate);
-            if option.score > self.spoil && !repeats {
-                kept.push((option, colour));
+        let margins = match ask.task {
+            Task::Masked => self.masked,
+            Task::Refine => ask.intent.and(self.intent).or(self.refine),
+            Task::Follow => self.follow,
+            Task::Repair => self.repair,
+        };
+        let Some(margins) = margins else { return out };
+        let anchor = self.components;
+        let current = &inputs.lab;
+        let asked = ask.intent.is_some();
+        let far = |a: &[Lab], b: &[Lab]| a.iter().zip(b).map(|(x, y)| distance(*x, *y)).fold(0.0, f64::max);
+        // every stop outside `changing` comes back exactly as it was sent
+        let settle = |mut rgb: Vec<Srgb>, changing: &dyn Fn(usize) -> bool| {
+            for j in (0..n).filter(|j| !changing(*j)) {
+                rgb[j] = ask.rgb[j];
+            }
+            rgb
+        };
+        let mut candidates: Vec<Vec<Srgb>> = Vec::new();
+        match ask.task {
+            Task::Masked | Task::Refine => {
+                let active = stops[0];
+                let refine = ask.task == Task::Refine;
+                for (component, _) in self.modes(&mix[active], if refine && !asked { self.favour } else { 0.0 }).into_iter().take(MODES) {
+                    let centre = mix[active].means[component];
+                    let mut sample = current.clone();
+                    // "leave it" is the stop's colour itself, not its round trip through the display
+                    sample[active] = if refine && component == anchor { centre } else { oklab(display(centre)) };
+                    let rgb = legal(ask, &free, &sample, (!refine).then_some(active));
+                    candidates.push(settle(rgb, &|j| j == active));
+                }
+            }
+            Task::Follow => {
+                // each stop's own leading mode, each stop's leading move, and that move at half strength
+                let (mut mixed, mut carry) = (current.clone(), current.clone());
+                for &stop in &stops {
+                    let ranked = self.modes(&mix[stop], if asked { 0.0 } else { self.favour });
+                    if let Some((component, _)) = ranked.iter().find(|row| row.0 != anchor) {
+                        carry[stop] = oklab(display(mix[stop].means[*component]));
+                        if ranked[0].0 != anchor {
+                            mixed[stop] = carry[stop];
+                        }
+                    }
+                }
+                let half: Vec<Lab> = (0..n).map(|k| {
+                    if distance(carry[k], current[k]) > 0.0 { oklab(display(std::array::from_fn(|c| current[k][c] + 0.5 * (carry[k][c] - current[k][c])))) } else { current[k] }
+                }).collect();
+                let mut chosen: Vec<Vec<Lab>> = Vec::new();
+                for reading in [mixed, carry, half] {
+                    if far(&reading, current) > 1e-6 && chosen.iter().all(|other| far(&reading, other) > 0.005) {
+                        chosen.push(reading);
+                    }
+                }
+                for reading in chosen {
+                    candidates.push(settle(legal(ask, &free, &reading, None), &|j| free[j]));
+                }
+            }
+            Task::Repair => {
+                // every free stop's leading mode, that at half strength, and every stop's likeliest move
+                let reading = |every: bool| -> Vec<Lab> {
+                    let mut lab = current.clone();
+                    for &stop in &stops {
+                        let stay = inputs.shown[stop];
+                        let ranked = self.modes(&mix[stop], if stay && !asked { self.favour } else { 0.0 });
+                        let first = ranked.iter().map(|row| row.0).find(|c| !(stay && *c == anchor));
+                        if let Some(first) = first.filter(|first| every || ranked[0].0 == *first) {
+                            lab[stop] = oklab(display(mix[stop].means[first]));
+                        }
+                    }
+                    lab
+                };
+                let top = reading(false);
+                let half: Vec<Lab> = (0..n).map(|k| std::array::from_fn(|c| current[k][c] + 0.5 * (top[k][c] - current[k][c]))).collect();
+                for reading in [top, half, reading(true)] {
+                    candidates.push(settle(legal(ask, &free, &reading, None), &|j| free[j]));
+                }
             }
         }
-        Decision {
-            keep: kept.first().is_none_or(|best| best.0.score <= self.keep),
-            options: kept.into_iter().take(count).map(|row| row.0).collect(),
+        if candidates.is_empty() {
+            return out;
         }
+        let in_lab = |rgb: &[Srgb]| -> Vec<Lab> { rgb.iter().map(|c| oklab(*c)).collect() };
+        let palettes: Vec<Vec<Lab>> = std::iter::once(ask.rgb).chain(candidates.iter().map(Vec::as_slice)).map(in_lab).collect();
+        let mut scores = self.score(&inputs, ask.positions, &condition, &palettes);
+        if !one {
+            scores.iter_mut().for_each(|s| *s /= stops.len() as f64);
+        }
+        let duplicate = match ask.radius {
+            Some(radius) if radius > 0.0 && radius < 2.0 => self.duplicate.min(0.5 * radius),
+            _ => self.duplicate,
+        };
+        let mut order: Vec<usize> = (1..palettes.len()).collect();
+        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+        let mut chosen: Vec<usize> = Vec::new();
+        for i in order {
+            let repeats = far(&palettes[i], &palettes[0]) < duplicate || chosen.iter().any(|&j| far(&palettes[i], &palettes[j]) < duplicate);
+            if scores[i] - scores[0] > margins.spoil && !repeats {
+                chosen.push(i);
+            }
+        }
+        out.keep = chosen.first().is_none_or(|&best| scores[best] - scores[0] <= margins.keep);
+        chosen.truncate(ask.count);
+        let mut candidates: Vec<Option<Vec<Srgb>>> = candidates.into_iter().map(Some).collect();
+        out.options = chosen.into_iter().filter_map(|i| Some(Candidate { rgb: candidates[i - 1].take()?, score: scores[i] - scores[0] })).collect();
+        out
     }
 }
 
+/// The flags of the pass a request's candidates come from. `single` frees only the active stop,
+/// which is how a one-stop request is asked whatever its scope.
+fn inputs(ask: &Ask, free: &[bool], single: bool) -> Inputs {
+    let n = ask.rgb.len();
+    let mut free = free.to_vec();
+    let mut pinned = ask.pins.to_vec();
+    let mut recent: Vec<bool> = (0..n).map(|i| ask.recent.contains(&i)).collect();
+    let mut shown = vec![true; n];
+    if let Some(k) = ask.active {
+        match ask.task {
+            // the stop just committed is the context the others answer
+            Task::Follow => (free[k], pinned[k], recent[k]) = (false, true, true),
+            Task::Masked => shown[k] = false,
+            Task::Refine | Task::Repair => {}
+        }
+        if single {
+            for j in 0..n {
+                (free[j], pinned[j], recent[j]) = (free[j] && j == k, pinned[j] && j != k, recent[j] && j == k);
+            }
+        }
+    }
+    for k in 0..n {
+        pinned[k] = pinned[k] && !free[k];
+    }
+    let lab: Vec<Lab> = ask.rgb.iter().map(|c| oklab(*c)).collect();
+    Inputs {
+        previous: ask.before.map_or_else(|| lab.clone(), |before| before.iter().map(|c| oklab(*c)).collect()),
+        lab,
+        pinned,
+        free,
+        known: shown.clone(),
+        shown,
+        active: ask.active,
+        recent,
+    }
+}
+
+/// Visible stop `j` is a neighbour of `i` unless a nearer visible stop lies the same way.
+fn neighbours(positions: &[f64], visible: &[bool], cone: f64) -> Near {
+    let n = positions.len();
+    let delta: Vec<Vec<f64>> = (0..n).map(|i| (0..n).map(|j| positions[j] - positions[i]).collect()).collect();
+    let distance: Vec<Vec<f64>> = delta.iter().map(|row| row.iter().map(|d| d.abs()).collect()).collect();
+    let unit = |i: usize, j: usize| delta[i][j] / distance[i][j].max(1e-12);
+    let near = (0..n).map(|i| (0..n).map(|j| {
+        visible[j] && j != i && !(0..n).any(|k| visible[k] && k != i && distance[i][k] < distance[i][j] && unit(i, j) * unit(i, k) > cone)
+    }).collect()).collect();
+    Near { near, distance, delta }
+}
+
+/// For each stop, the inverse-distance mean of its neighbours' colours and whether it has any;
+/// mid grey without one.
+fn interpolate(lab: &[Lab], found: &Near) -> (Vec<Lab>, Vec<bool>) {
+    let n = lab.len();
+    let mut between = vec![GREY; n];
+    let mut has = vec![false; n];
+    for i in 0..n {
+        let (mut total, mut sum) = (0.0, [0.0; 3]);
+        for j in (0..n).filter(|j| found.near[i][*j]) {
+            let pull = 1.0 / found.distance[i][j].max(1e-9);
+            total += pull;
+            for c in 0..3 {
+                sum[c] += pull * lab[j][c];
+            }
+            has[i] = true;
+        }
+        if has[i] {
+            between[i] = sum.map(|v| v / total.max(1e-300));
+        }
+    }
+    (between, has)
+}
+
+/// `sample` (OKLab) as display colours: stops that are not free stay as they are, and free ones
+/// are pulled to within `radius` of where they are now. If any stop cannot be brought inside the
+/// budget the whole palette comes back unchanged.
+fn project(current: &[Srgb], free: &[bool], radius: Option<f64>, sample: &[Lab]) -> Vec<Srgb> {
+    let targets: Vec<Srgb> = (0..current.len()).map(|k| if free[k] { display(sample[k]) } else { current[k] }).collect();
+    let Some(radius) = radius.filter(|r| *r < 2.0) else { return targets };
+    if radius == 0.0 {
+        return current.to_vec();
+    }
+    let bound = radius * (radius / (radius + 2e-7));
+    let mut rgb = current.to_vec();
+    for k in (0..current.len()).filter(|k| free[*k]) {
+        let base = oklab(current[k]);
+        let target = oklab(targets[k]);
+        let shrink = (bound / (distance(target, base) + 1e-30)).min(1.0);
+        let (to, from) = (display(std::array::from_fn(|d| base[d] + (target[d] - base[d]) * shrink)), display(base));
+        rgb[k] = std::array::from_fn(|d| (current[k][d] + to[d] - from[d]).clamp(0.0, 1.0));
+        for _ in 0..16 {
+            let far = distance(oklab(rgb[k]), base);
+            if far <= radius + 1e-10 {
+                break;
+            }
+            let ratio = (bound / (far + 1e-30)).min(1.0);
+            rgb[k] = std::array::from_fn(|d| current[k][d] + ratio * (rgb[k][d] - current[k][d]));
+        }
+        if distance(oklab(rgb[k]), base) > radius + 1e-9 {
+            return current.to_vec();
+        }
+    }
+    rgb
+}
+
+/// [`project`] for a request. A stop with no colour of its own (`masked`) has its budget measured
+/// from what its neighbours imply; when one stop voids the palette, each stop meant to move is
+/// clipped on its own along the line to its target; a stop that was not asked to move comes back
+/// exactly.
+fn legal(ask: &Ask, free: &[bool], sample: &[Lab], masked: Option<usize>) -> Vec<Srgb> {
+    let n = ask.rgb.len();
+    let mut origin = ask.rgb.to_vec();
+    if let Some(active) = masked.filter(|a| free[*a]) {
+        let lab: Vec<Lab> = ask.rgb.iter().map(|c| oklab(*c)).collect();
+        let others: Vec<bool> = (0..n).map(|i| i != active).collect();
+        let (between, found) = interpolate(&lab, &neighbours(ask.positions, &others, 0.5));
+        if found[active] {
+            origin[active] = display(between[active]);
+        }
+    }
+    let mut rgb = project(&origin, free, ask.radius, sample);
+    if let Some(radius) = ask.radius.filter(|r| *r > 0.0 && *r < 2.0) {
+        let targets: Vec<Srgb> = sample.iter().map(|c| display(*c)).collect();
+        let wanted: Vec<bool> = (0..n).map(|i| free[i] && (0..3).any(|c| (targets[i][c] - origin[i][c]).abs() > 1e-6)).collect();
+        if wanted.contains(&true) && rgb == origin {
+            for i in (0..n).filter(|i| wanted[*i]) {
+                let base = oklab(origin[i]);
+                let at = |part: f64| -> Srgb { std::array::from_fn(|c| origin[i][c] + part * (targets[i][c] - origin[i][c])) };
+                let (mut low, mut high) = (0.0f64, 1.0f64);
+                for _ in 0..30 {
+                    let mid = (low + high) / 2.0;
+                    if distance(oklab(at(mid)), base) <= radius { low = mid } else { high = mid }
+                }
+                rgb[i] = at(low);
+            }
+        }
+    }
+    for i in 0..n {
+        if distance(sample[i], oklab(ask.rgb[i])) < 1e-9 {
+            rgb[i] = ask.rgb[i];
+        }
+    }
+    rgb
+}
+
 impl Engine for Learned {
-    /// Speaks only about a free stop the edit in progress has recoloured, and only when the model
-    /// rates an alternative above keeping it. The colour is put to the model as one being tried:
-    /// told a colour is settled it never argues, and a colour still under the pointer is not. The
-    /// ends are marked pinned when they are not the stop asked about, as in the requests the
-    /// model's margins were fitted on.
+    /// What the model has to say about `scene`, as up to four kinds of offer:
+    ///
+    /// - A stop nobody has coloured yet (`scene.open`): colours it could take.
+    /// - The stop the edit in progress has recoloured: colours it could be instead. A short move is
+    ///   put to the model as a request made from the colour the stop had (roughly this way, about
+    ///   this far), which it answers readily; a long one as the colour now tried, which it argues
+    ///   with only when sure. The colour is never called settled: told that, the model never argues.
+    /// - How the other stops could answer that edit.
+    /// - Stops that look out of place beside it. The edited stop is held.
+    ///
+    /// One-stop requests mark the palette's ends as pinned unless one is the stop asked about, as
+    /// in the requests the margins were fitted on. Other palettes in `scene.library` set the style.
     fn offers(&self, scene: &Scene) -> Vec<Offer> {
         let n = scene.stops.len();
-        let Some(before) = scene.before.as_ref().filter(|b| b.len() == n && b.iter().zip(&scene.stops).all(|(x, y)| x.at == y.at)) else {
-            return Vec::new();
-        };
         let active = scene.selected;
-        if n < 2 || active >= n || scene.pinned(active) || !scene.selected_is_edited() || scene.stops.windows(2).any(|pair| pair[1].at <= pair[0].at) {
+        if n < 2 || active >= n || scene.stops.windows(2).any(|pair| pair[1].at <= pair[0].at) {
             return Vec::new();
         }
         let unit = |c: Rgb| [f64::from(c.r) / 255.0, f64::from(c.g) / 255.0, f64::from(c.b) / 255.0];
-        let rgb: Vec<[f64; 3]> = scene.stops.iter().map(|s| unit(s.col)).collect();
-        let was: Vec<[f64; 3]> = before.iter().map(|s| unit(s.col)).collect();
+        let rgb: Vec<Srgb> = scene.stops.iter().map(|s| unit(s.col)).collect();
         let positions: Vec<f64> = scene.stops.iter().map(|s| 2.0 * f64::from(s.at) - 1.0).collect();
-        let pins: Vec<bool> = (0..n).map(|i| i != active && (scene.pinned(i) || i == 0 || i == n - 1)).collect();
+        let support: Vec<Vec<Lab>> = scene.library.iter().map(|palette| palette.iter().map(|c| oklab(unit(*c))).collect()).collect();
+        let style = self.style_vector(&support);
+        let pins: Vec<bool> = (0..n).map(|i| scene.pinned(i)).collect();
+        let ends: Vec<bool> = (0..n).map(|i| i != active && (pins[i] || i == 0 || i == n - 1)).collect();
         let here: Vec<bool> = (0..n).map(|i| i == active).collect();
-        let request = Request { rgb: &rgb, before: Some(&was), positions: &positions, pins: &pins, free: &here, active, recent: &vec![false; n], radius: Some(BUDGET) };
-        let decision = self.refine(&request, MAX_OFFERS);
-        if decision.keep {
-            return Vec::new();
+        let everywhere = vec![true; n];
+        let ask = Ask { task: Task::Refine, rgb: &rgb, before: None, positions: &positions, pins: &pins, scope: &everywhere, active: Some(active), recent: &[], radius: Some(BUDGET), count: 1, intent: None, style: &style };
+        let mut out = Vec::new();
+        let mut offer = |answer: Answer, id: &'static str, title: &'static str, scope: Scope| {
+            for option in answer.options.iter().filter(|_| !answer.keep) {
+                let byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+                let stops = scene.stops.iter().zip(&option.rgb).zip(&rgb).map(|((stop, new), old)| {
+                    let mut stop = *stop;
+                    if scope == Scope::Stop || new != old {
+                        stop.col = Rgb::new(byte(new[0]), byte(new[1]), byte(new[2]));
+                    }
+                    stop
+                }).collect();
+                out.push(Offer { id, title, scope, stops, interp: scene.interp });
+            }
+        };
+        if scene.open {
+            if !pins[active] {
+                offer(self.answer(&Ask { task: Task::Masked, pins: &ends, scope: &here, count: 3, ..ask }), "fits", "a colour for this stop", Scope::Stop);
+            }
+            return out;
         }
-        decision.options.iter().map(|option| {
-            let mut stops = scene.stops.clone();
-            let byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
-            stops[active].col = Rgb::new(byte(option.rgb[0]), byte(option.rgb[1]), byte(option.rgb[2]));
-            Offer { id: "learned", title: "fits this palette", scope: Scope::Stop, stops, interp: scene.interp }
-        }).collect()
+        let Some(before) = scene.before.as_ref().filter(|_| scene.selected_is_edited()) else { return out };
+        if before.iter().zip(&scene.stops).any(|(was, now)| was.at != now.at) {
+            return out;
+        }
+        let was: Vec<Srgb> = before.iter().map(|s| unit(s.col)).collect();
+        if !pins[active] {
+            let (from, to) = (oklab(was[active]), oklab(rgb[active]));
+            let answer = if distance(from, to) <= NUDGE {
+                let mut origin = rgb.clone();
+                origin[active] = was[active];
+                let wanted: Lab = std::array::from_fn(|d| to[d] - from[d]);
+                self.answer(&Ask { rgb: &origin, pins: &ends, scope: &here, count: 2, intent: Some(wanted), ..ask })
+            } else {
+                self.answer(&Ask { before: Some(&was), pins: &ends, scope: &here, count: 2, ..ask })
+            };
+            offer(answer, "fits", "fits this palette", Scope::Stop);
+        }
+        let held: Vec<bool> = (0..n).map(|i| pins[i] || i == active).collect();
+        offer(self.answer(&Ask { task: Task::Follow, before: Some(&was), ..ask }), "follow", "carry the change through", Scope::Palette);
+        offer(self.answer(&Ask { task: Task::Repair, before: Some(&was), pins: &held, active: None, recent: &[active], ..ask }), "tidy", "tidy the rest", Scope::Palette);
+        out
     }
 }
 
@@ -426,35 +916,6 @@ fn softmax(logits: &[f64]) -> Vec<f64> {
 
 fn distance(a: Lab, b: Lab) -> f64 {
     (0..3).map(|d| (a[d] - b[d]).powi(2)).sum::<f64>().sqrt()
-}
-
-/// Natural-log density of an OKLab colour under a mixture.
-fn log_density(mix: &Mixture, colour: Lab) -> f64 {
-    let weight = softmax(&mix.logits);
-    let parts: Vec<f64> = (0..weight.len()).map(|c| {
-        let z: f64 = (0..3).map(|d| ((colour[d] - mix.means[c][d]) / mix.sigmas[c][d]).powi(2)).sum();
-        let volume: f64 = mix.sigmas[c].iter().map(|s| s.ln()).sum();
-        weight[c].ln() - 0.5 * z - volume - 1.5 * std::f64::consts::TAU.ln()
-    }).collect();
-    let peak = parts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    peak + parts.iter().map(|p| (p - peak).exp()).sum::<f64>().ln()
-}
-
-/// For each stop, the colour its nearest neighbours on either side imply at its position
-/// (one-sided at the ends), or `None` for a palette of one. This is the part of a token that
-/// assumes stops lie on a line.
-fn neighbours(lab: &[Lab], positions: &[f64]) -> Vec<Option<Lab>> {
-    let last = lab.len().saturating_sub(1);
-    (0..lab.len()).map(|i| match (i > 0, i < last) {
-        (true, true) => {
-            let (start, end) = (positions[i - 1], positions[i + 1]);
-            let part = ((positions[i] - start) / if end > start { end - start } else { 1.0 }).clamp(0.0, 1.0);
-            Some(std::array::from_fn(|d| lab[i - 1][d] * (1.0 - part) + lab[i + 1][d] * part))
-        }
-        (true, false) => Some(lab[i - 1]),
-        (false, true) => Some(lab[i + 1]),
-        (false, false) => None,
-    }).collect()
 }
 
 fn oklab(rgb: [f64; 3]) -> Lab {
@@ -509,30 +970,20 @@ fn display(lab: Lab) -> [f64; 3] {
     })
 }
 
-/// `target` pulled to within `radius` (OKLab) of `current`, both display sRGB. A colour that
-/// cannot be brought inside the budget comes back as `current`.
-fn within(current: [f64; 3], target: [f64; 3], radius: Option<f64>) -> [f64; 3] {
-    let Some(radius) = radius.filter(|r| *r < 2.0) else { return target };
-    if radius == 0.0 {
-        return current;
-    }
-    let base = oklab(current);
-    let bound = radius * (radius / (radius + 2e-7));
-    let from_base = |rgb: [f64; 3]| distance(oklab(rgb), base);
-    let aim = oklab(target);
-    let shrink = (bound / (distance(aim, base) + 1e-30)).min(1.0);
-    let moved = display(std::array::from_fn(|d| base[d] + (aim[d] - base[d]) * shrink));
-    let home = display(base);
-    let mut rgb: [f64; 3] = std::array::from_fn(|d| (current[d] + moved[d] - home[d]).clamp(0.0, 1.0));
-    for _ in 0..16 {
-        let far = from_base(rgb);
-        if far <= radius + 1e-10 {
-            break;
+/// Natural-log density of an OKLab colour under a mixture.
+fn log_density(mix: &Mixture, colour: Lab) -> f64 {
+    let top = mix.logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let total = mix.logits.iter().map(|l| (l - top).exp()).sum::<f64>().ln();
+    let parts: Vec<f64> = (0..mix.logits.len()).map(|c| {
+        let mut part = mix.logits[c] - top - total - 1.5 * std::f64::consts::TAU.ln();
+        for d in 0..3 {
+            let z = (colour[d] - mix.means[c][d]) / mix.sigmas[c][d];
+            part -= 0.5 * z * z;
         }
-        let ratio = (bound / (far + 1e-30)).min(1.0);
-        rgb = std::array::from_fn(|d| current[d] + ratio * (rgb[d] - current[d]));
-    }
-    if from_base(rgb) > radius + 1e-9 { current } else { rgb }
+        part - (mix.sigmas[c][0].ln() + mix.sigmas[c][1].ln() + mix.sigmas[c][2].ln())
+    }).collect();
+    let peak = parts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    peak + parts.iter().map(|p| (p - peak).exp()).sum::<f64>().ln()
 }
 
 #[cfg(test)]
@@ -543,73 +994,95 @@ mod tests {
     const SMALL: &[u8] = include_bytes!("../../data/colour-model.golden.lumacore");
     const SMALL_CASES: &str = include_str!("../../data/colour-model.golden.jsonl");
 
-    /// Run every refine request in `cases` through `model` and compare with the recorded answers.
-    /// Returns (requests, keeps, options).
-    fn check(model: &Learned, cases: &str) -> (usize, usize, usize) {
-        let (mut requests, mut keeps, mut options) = (0, 0, 0);
+    /// Run every gradient request in `cases` through `model` and compare with the recorded
+    /// answers. Returns, per task, (requests, answers that change something, options).
+    fn check(model: &Learned, cases: &str) -> HashMap<String, [usize; 3]> {
+        let mut seen: HashMap<String, [usize; 3]> = HashMap::new();
+        let triple = |v: &serde_json::Value| -> [f64; 3] { std::array::from_fn(|d| v[d].as_f64().unwrap()) };
+        let triples = |v: &serde_json::Value| -> Vec<[f64; 3]> { v.as_array().unwrap().iter().map(triple).collect() };
+        let numbers = |v: &serde_json::Value| -> Vec<f64> { v.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect() };
+        let flags = |v: &serde_json::Value| -> Vec<bool> { v.as_array().unwrap().iter().map(|v| v.as_bool().unwrap()).collect() };
         for line in cases.lines() {
             let case: serde_json::Value = serde_json::from_str(line).unwrap();
             let input = &case["input"];
-            if input["task"] != "refine" {
+            // stops on a line that all count: the only requests Neuron makes
+            if input["geometry"]["kind"] != "ordered_gradient" || !input["weights"].is_null() {
                 continue;
             }
-            // Luma's own vectors nest the answer; the small set keeps it beside the input.
-            let (answer, whole) = if case["output"].is_null() { (&case, false) } else { (&case["output"], true) };
             let id = case["id"].as_str().unwrap();
-            let palette = |v: &serde_json::Value| -> Vec<[f64; 3]> {
-                v.as_array().unwrap().iter().map(|c| std::array::from_fn(|d| c[d].as_f64().unwrap())).collect()
+            let task = match input["task"].as_str().unwrap() {
+                "masked" => Task::Masked,
+                "refine" => Task::Refine,
+                "follow" => Task::Follow,
+                _ => Task::Repair,
             };
-            let flags = |v: &serde_json::Value| -> Vec<bool> { v.as_array().unwrap().iter().map(|v| v.as_bool().unwrap()).collect() };
-            let rgb = palette(&input["rgb"]);
-            let before = (!input["before_rgb"].is_null()).then(|| palette(&input["before_rgb"]));
-            let positions: Vec<f64> = input["positions"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
-            let (scope, pins) = (flags(&input["scope"]), flags(&input["pins"]));
-            let free: Vec<bool> = scope.iter().zip(&pins).map(|(s, p)| *s && !p).collect();
-            let active = input["active"].as_u64().unwrap() as usize;
-            let recent: Vec<bool> = (0..rgb.len()).map(|i| input["recent"].as_array().unwrap().iter().any(|r| r.as_u64() == Some(i as u64))).collect();
-            assert!(input["weights"].is_null(), "{id}: refine requests carry no stop weights");
-            let decision = model.refine(&Request {
+            let rgb = triples(&input["rgb"]);
+            let before = (!input["before_rgb"].is_null()).then(|| triples(&input["before_rgb"]));
+            let support: Vec<Vec<Lab>> = input["support_lab"].as_array().map(|set| set.iter().map(triples).collect()).unwrap_or_default();
+            let style = model.style_vector(&support);
+            // Luma's own vectors keep the style with the other checkpoints; the small set beside the input
+            let recorded = if case["checkpoint"].is_null() { &case["style"] } else { &case["checkpoint"]["style"] };
+            if let Some(recorded) = recorded.as_array() {
+                assert!(recorded.iter().zip(&style).all(|(want, got)| (want.as_f64().unwrap() - got).abs() < 1e-9), "{id}: style");
+            }
+            let recent: Vec<usize> = input["recent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+            let answer = model.answer(&Ask {
+                task,
                 rgb: &rgb,
                 before: before.as_deref(),
-                positions: &positions,
-                pins: &pins,
-                free: &free,
-                active,
+                positions: &numbers(&input["positions"]),
+                pins: &flags(&input["pins"]),
+                scope: &flags(&input["scope"]),
+                active: input["active"].as_u64().map(|v| v as usize),
                 recent: &recent,
                 radius: input["radius"].as_f64(),
-            }, input["count"].as_u64().unwrap() as usize);
-            let expected = answer["options"].as_array().unwrap();
-            assert_eq!(decision.keep, answer["keep"].as_bool().unwrap(), "{id}: keep");
-            assert_eq!(decision.options.len(), expected.len(), "{id}: option count");
-            for (got, want) in decision.options.iter().zip(expected) {
-                assert!((got.score - want["score"].as_f64().unwrap()).abs() < 1e-6, "{id}: score {} vs {}", got.score, want["score"]);
-                let colour: [f64; 3] = std::array::from_fn(|d| if whole { want["rgb"][active][d].as_f64().unwrap() } else { want["rgb"][d].as_f64().unwrap() });
-                assert!((0..3).all(|d| (got.rgb[d] - colour[d]).abs() < 1e-9), "{id}: {:?} vs {colour:?}", got.rgb);
+                count: input["count"].as_u64().unwrap_or(3) as usize,
+                intent: (!input["intent"].is_null()).then(|| triple(&input["intent"])),
+                style: &style,
+            });
+            let output = &case["output"];
+            let expected = output["options"].as_array().unwrap();
+            assert_eq!(answer.offerable, output["offerable"].as_bool().unwrap(), "{id}: offerable");
+            assert_eq!(answer.keep, output["keep"].as_bool().unwrap(), "{id}: keep");
+            assert_eq!(answer.options.len(), expected.len(), "{id}: option count");
+            for (got, want) in answer.options.iter().zip(expected) {
+                assert!((got.score - want["score"].as_f64().unwrap()).abs() < 1e-7, "{id}: score {} vs {}", got.score, want["score"]);
+                let palette = triples(&want["rgb"]);
+                assert!(got.rgb.iter().zip(&palette).all(|(a, b)| (0..3).all(|d| (a[d] - b[d]).abs() < 1e-9)), "{id}: {:?} vs {palette:?}", got.rgb);
             }
-            requests += 1;
-            keeps += usize::from(decision.keep);
-            options += decision.options.len();
+            if let Some(recorded) = output["keep_probability"].as_array() {
+                assert_eq!(recorded.len(), answer.keep_probability.len(), "{id}: free stops");
+                assert!(recorded.iter().zip(&answer.keep_probability).all(|(want, got)| (want.as_f64().unwrap() - got).abs() < 1e-9), "{id}: keep probability");
+            }
+            let tally = seen.entry(input["task"].as_str().unwrap().to_string()).or_default();
+            tally[0] += 1;
+            tally[1] += usize::from(!answer.keep);
+            tally[2] += answer.options.len();
         }
-        (requests, keeps, options)
+        seen
     }
 
     #[test]
     fn matches_the_reference_implementation() {
         let model = Learned::parse(SMALL).expect("the small bundle loads");
-        let (requests, keeps, options) = check(&model, SMALL_CASES);
-        assert!(requests >= 150 && options >= 25 && keeps < requests, "the cases cover both answers: {requests} requests, {keeps} keeps, {options} options");
+        let seen = check(&model, SMALL_CASES);
+        for task in ["masked", "refine", "follow", "repair"] {
+            let [requests, changes, options] = seen[task];
+            assert!(requests >= 40 && changes >= 5 && changes < requests && options >= 10, "{task} covers both answers: {requests} requests, {changes} changes, {options} options");
+        }
     }
 
     /// The same check for a trained bundle against the vectors Luma publishes with it. Point
-    /// `NEURON_LUMA_BRIDGE` at the folder holding `palette-core-v2.lumacore` and `golden-v2.jsonl`.
+    /// `NEURON_LUMA_BRIDGE` at the folder holding `core-v4.lumacore` and `golden-v4.jsonl`.
     #[test]
     #[ignore = "needs a Luma bridge folder in NEURON_LUMA_BRIDGE"]
     fn matches_luma_vectors() {
         let folder = std::path::PathBuf::from(std::env::var_os("NEURON_LUMA_BRIDGE").expect("NEURON_LUMA_BRIDGE"));
-        let model = Learned::parse(&std::fs::read(folder.join("palette-core-v2.lumacore")).unwrap()).unwrap();
-        let (requests, keeps, options) = check(&model, &std::fs::read_to_string(folder.join("golden-v2.jsonl")).unwrap());
-        println!("{}: {requests} refine requests, {keeps} keeps, {options} options", model.name());
-        assert!(requests >= 100);
+        let model = Learned::parse(&std::fs::read(folder.join("core-v4.lumacore")).unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let seen = check(&model, &std::fs::read_to_string(folder.join("golden-v4.jsonl")).unwrap());
+        println!("{}: {seen:?} in {:?}", model.name(), started.elapsed());
+        assert!(seen.values().map(|tally| tally[0]).sum::<usize>() >= 30);
     }
 
     #[test]
@@ -630,40 +1103,74 @@ mod tests {
         assert!(Learned::load(Path::new("no-such-folder")).unwrap().is_none(), "no model is not an error");
     }
 
+    fn scene(colours: &[(u8, u8, u8)]) -> Scene {
+        let last = (colours.len() - 1).max(1) as f32;
+        let stops = colours.iter().enumerate().map(|(i, c)| Stop::new(Rgb::new(c.0, c.1, c.2), i as f32 / last)).collect();
+        Scene { stops, interp: Interp::Oklab, before: None, selected: 1, pins: Vec::new(), open: false, library: Vec::new() }
+    }
+
     #[test]
-    fn the_engine_only_speaks_about_a_free_stop_being_edited() {
+    fn the_engine_speaks_only_about_an_edit_or_a_new_stop() {
         let model = Learned::parse(SMALL).unwrap();
-        let stops: Vec<Stop> = [(12, 45, 34), (200, 40, 190), (67, 190, 116), (206, 229, 128)]
-            .iter().enumerate().map(|(i, c)| Stop::new(Rgb::new(c.0, c.1, c.2), i as f32 / 3.0)).collect();
-        let mut scene = Scene { stops: stops.clone(), interp: Interp::Oklab, before: None, selected: 1, pins: Vec::new() };
-        assert!(model.offers(&scene).is_empty(), "a resting palette");
-        scene.before = Some(stops.clone());
-        assert!(model.offers(&scene).is_empty(), "an edit that has not touched the selected stop");
-        scene.before.as_mut().unwrap()[1].col = Rgb::new(40, 120, 80);
-        for offer in model.offers(&scene) {
-            assert!(offer.scope == Scope::Stop && offer.stops.len() == 4);
-            assert!((0..4).all(|i| i == 1 || offer.stops[i] == scene.stops[i]), "only the selected stop changes");
+        let mut s = scene(&[(12, 45, 34), (200, 40, 190), (67, 190, 116), (206, 229, 128)]);
+        assert!(model.offers(&s).is_empty(), "a resting palette");
+        s.before = Some(s.stops.clone());
+        assert!(model.offers(&s).is_empty(), "an edit that has not touched the selected stop");
+        s.stops.truncate(1);
+        s.before.as_mut().unwrap().truncate(1);
+        s.selected = 0;
+        s.open = true;
+        assert!(model.offers(&s).is_empty(), "a palette of one");
+    }
+
+    /// Every offer the engine makes over a spread of edits keeps to what its kind may touch.
+    #[test]
+    fn each_kind_of_offer_changes_only_what_it_may() {
+        let model = Learned::parse(SMALL).unwrap();
+        let base = [(12, 45, 34), (60, 120, 80), (67, 190, 116), (150, 210, 120), (206, 229, 128)];
+        let mut kinds: HashMap<&str, usize> = HashMap::new();
+        for (edited, colour) in [(1, (200, 40, 190)), (2, (70, 180, 120)), (3, (20, 20, 160)), (0, (240, 240, 240)), (2, (255, 0, 0)), (4, (90, 60, 30))] {
+            for pin in [None, Some(2usize)] {
+                let mut s = scene(&base);
+                s.before = Some(s.stops.clone());
+                s.selected = edited;
+                s.stops[edited].col = Rgb::new(colour.0, colour.1, colour.2);
+                s.pins = (0..5).map(|i| Some(i) == pin).collect();
+                s.library = vec![vec![Rgb::new(250, 120, 20), Rgb::new(20, 60, 200)]];
+                for offer in model.offers(&s) {
+                    *kinds.entry(offer.id).or_default() += 1;
+                    assert_eq!(offer.stops.len(), 5);
+                    let changed: Vec<usize> = (0..5).filter(|&i| offer.stops[i].col != s.stops[i].col).collect();
+                    assert!(changed.iter().all(|i| Some(*i) != pin), "{}: a pinned stop moved", offer.id);
+                    match offer.scope {
+                        Scope::Stop => assert!(changed.iter().all(|i| *i == edited), "{}: {changed:?}", offer.id),
+                        Scope::Palette => assert!(!changed.contains(&edited), "{}: the edited stop moved", offer.id),
+                    }
+                }
+                s.before = None;
+                s.open = true;
+                for offer in model.offers(&s) {
+                    *kinds.entry("new").or_default() += 1;
+                    assert!(offer.scope == Scope::Stop && (0..5).all(|i| i == edited || offer.stops[i] == s.stops[i]), "only the new stop changes");
+                }
+            }
         }
-        scene.pins = vec![false, true];
-        assert!(model.offers(&scene).is_empty(), "a pinned stop");
-        scene.pins.clear();
-        scene.stops.truncate(1);
-        scene.before.as_mut().unwrap().truncate(1);
-        scene.selected = 0;
-        assert!(model.offers(&scene).is_empty(), "a palette of one");
+        let seen = |kind: &str| kinds.get(kind).copied().unwrap_or(0);
+        assert!(seen("fits") > 0 && seen("new") > 0 && seen("follow") + seen("tidy") > 0, "the spread reaches every scope: {kinds:?}");
     }
 
     #[test]
     fn a_suggestion_stays_inside_the_edit_budget() {
-        let current = [0.2, 0.5, 0.3];
+        let current = [[0.2, 0.5, 0.3], [0.9, 0.9, 0.2]];
+        let free = [true, false];
         for target in [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.21, 0.5, 0.3]] {
-            let got = within(current, target, Some(BUDGET));
-            assert!(distance(oklab(got), oklab(current)) <= BUDGET + 1e-9, "{target:?} -> {got:?}");
-            assert!(got.iter().all(|v| (0.0..=1.0).contains(v)));
+            let got = project(&current, &free, Some(BUDGET), &[oklab(target), oklab([0.0, 0.0, 0.0])]);
+            assert!(distance(oklab(got[0]), oklab(current[0])) <= BUDGET + 1e-9, "{target:?} -> {got:?}");
+            assert!(got[0].iter().all(|v| (0.0..=1.0).contains(v)));
+            assert_eq!(got[1], current[1], "a stop that is not free stays");
         }
-        let near = within(current, [0.21, 0.5, 0.3], Some(BUDGET));
-        assert!((0..3).all(|d| (near[d] - [0.21, 0.5, 0.3][d]).abs() < 1e-6), "a near colour is not moved: {near:?}");
-        assert_eq!(within(current, [1.0, 0.0, 0.0], None), [1.0, 0.0, 0.0]);
-        assert_eq!(within(current, [1.0, 0.0, 0.0], Some(0.0)), current);
+        let near = project(&current, &free, Some(BUDGET), &[oklab([0.21, 0.5, 0.3]), oklab(current[1])]);
+        assert!((0..3).all(|d| (near[0][d] - [0.21, 0.5, 0.3][d]).abs() < 1e-6), "a near colour is not moved: {near:?}");
+        assert_eq!(project(&current, &free, Some(0.0), &[oklab([1.0, 0.0, 0.0]), oklab(current[1])]), current.to_vec());
     }
 }

@@ -629,6 +629,12 @@ component SpectrumEditor inherits VerticalLayout {
                     border-width: handle.on ? Theme.hair-2 : Theme.hair;
                     border-color: handle.on ? Theme.text : Theme.text-faint;
                 }
+                // a held stop wears a bar across its foot: suggestions leave it where it is
+                if State.picker-v2 && State.light-pins.length > i && State.light-pins[i] : Rectangle {
+                    width: 8px; height: 2px;
+                    y: parent.height - 4px; x: (parent.width - self.width) / 2;
+                    background: Theme.text;
+                }
                 // the stem — ONLY the SELECTED stop drops a cursor line down the strip, marking the column
                 // it controls. Unselected stops are just their chip, so the gradient stays clean instead of
                 // a forest of thin tendrils (the part that read as "spooky").
@@ -651,6 +657,12 @@ component SpectrumEditor inherits VerticalLayout {
                 right-text: "+ add";
                 left-clicked => { State.remove-stop(root.stop-idx); }
                 right-clicked => { State.add-stop(0.5); }
+            }
+            if State.picker-v2 : Button {
+                height: Theme.row-h-sm;
+                text: State.light-sel-pinned ? "held" : "hold";
+                primary: State.light-sel-pinned;
+                clicked => { State.toggle-pin(); }
             }
             Rectangle { horizontal-stretch: 1; }
             Mono { text: "stop " + (root.stop-idx + 1) + " of " + State.light-stops.length; color: Theme.text-faint; }

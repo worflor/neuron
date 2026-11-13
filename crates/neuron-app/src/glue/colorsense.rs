@@ -9,14 +9,22 @@
 //! Offers for the palette being edited come from the built-in rules and, when the run root holds
 //! a bundle under `models/`, a learned colour model. A whole-palette offer is a capsule in the row; a
 //! colour for the selected stop is a dot in the picker, where that colour would be picked by hand.
-//! Hovering either shows it on the strip and the board and leaving puts the palette back; only a
-//! click keeps it, and the row then offers the way back.
+//! Hovering either (or stepping to it with Tab) shows it on the strip and the board and leaving
+//! puts the palette back; only a click or Enter keeps it, and the row then offers the way back.
+//!
+//! The rules answer at once. The model is asked on its own thread, once a drag has settled, and
+//! its answer joins the row when it arrives if the palette is still the one it was asked about.
+//! A stop just added is offered colours before anyone has picked one; a pinned stop is left alone
+//! by every offer. With `picker_journal` set in the preferences, picks and what was offered are
+//! appended to `models/picker-sessions.jsonl` in the run root ([`neuron::assist::journal`]).
 
 use super::*;
 use crate::ui::AssistOffer;
+use neuron::assist::journal::{Control, Journal};
 use neuron::assist::learned::Learned;
 use neuron::assist::{self, Lch, Offer, Scope};
 use neuron::spectrum::{Interp, Motion, Palette, Stop};
+use std::sync::{Arc, Condvar, Mutex, Once, PoisonError};
 
 /// (layer, frame): which palette a remembered state belongs to.
 type Home = (usize, usize);
@@ -38,37 +46,101 @@ struct Sense {
     /// What is on offer (capsules first, then dots), and the scene and slate it came from.
     rows: Vec<Row>,
     slate: Option<(assist::Scene, assist::Slate)>,
+    /// The model's slate for a scene, held until nothing is on show.
+    pending: Option<(assist::Scene, assist::Slate)>,
     /// The palette to return to while an offer is shown on hover.
     stash: Option<(Vec<Stop>, Interp)>,
     /// After an offer is taken: the palette it replaced and the stops it left, until either changes.
     undo: Option<(Home, Vec<Stop>, Interp, Vec<Stop>)>,
+    /// A stop just added whose colour nobody has chosen, and the palette it was added to.
+    open: Option<(Home, usize, Vec<Stop>)>,
+    /// Stops no offer may change.
+    pins: Option<(Home, Vec<bool>)>,
     /// The picker's own coordinates and the colour they made. Kept while the stop still has that
     /// colour, so the cursor neither drifts through 8-bit rounding nor loses its hue at grey.
     pick: Option<(Lch, f32, Rgb)>,
     plane_hue: Option<u32>,
     rail_at: Option<(u32, u32)>,
+    journal: Option<(Home, Journal)>,
+    /// What moved the colour last, the last colour the journal has, and whether the journal's
+    /// last slate is still unanswered.
+    control: Option<Control>,
+    logged: Option<(usize, Rgb)>,
+    offered: bool,
 }
+
+/// The most palettes, and colours of each, handed to an engine as the person's other work.
+const LIBRARY: (usize, usize) = (8, 12);
+/// How long a palette must hold still before the model is asked about it.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(90);
 
 thread_local! {
     static SENSE: RefCell<Sense> = RefCell::default();
     /// The learned model in the run root, read on first use.
-    static MODEL: std::cell::OnceCell<Option<Learned>> = const { std::cell::OnceCell::new() };
+    static MODEL: RefCell<Option<Option<Arc<Learned>>>> = const { RefCell::new(None) };
+    /// The window and state a model answer is delivered to.
+    static HOME: RefCell<Option<(slint::Weak<AppWindow>, SharedRt)>> = const { RefCell::new(None) };
+    static JOURNALING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Ask every engine about `scene`: the learned model first, when there is one, then the rules.
-fn propose(scene: &assist::Scene) -> assist::Slate {
+fn model() -> Option<Arc<Learned>> {
     MODEL.with(|model| {
-        let model = model.get_or_init(|| {
-            Learned::load(&neuron::runroot::run_root().join("models")).unwrap_or_else(|e| {
+        model.borrow_mut().get_or_insert_with(|| {
+            Learned::load(&neuron::runroot::run_root().join("models")).map(|model| model.map(Arc::new)).unwrap_or_else(|e| {
                 eprintln!("neuron: colour model not loaded ({e})");
                 None
             })
-        });
-        match model {
-            Some(model) => assist::propose(&assist::Chain(&[model, &assist::Rules]), scene),
-            None => assist::propose(&assist::Rules, scene),
-        }
+        }).clone()
     })
+}
+
+/// Use `bundle` as the colour model on this thread, or none.
+#[cfg(test)]
+pub(crate) fn use_model(bundle: Option<&[u8]>) {
+    let model = bundle.map(|bytes| Arc::new(Learned::parse(bytes).expect("a readable bundle")));
+    MODEL.with(|slot| *slot.borrow_mut() = Some(model));
+}
+
+/// The newest scene waiting for the model. A scene still waiting when another arrives is never
+/// worked on: during a drag only the palette it ends on is worth an answer.
+static DESK: (Mutex<Option<(Arc<Learned>, assist::Scene)>>, Condvar) = (Mutex::new(None), Condvar::new());
+
+fn both(model: &Learned, scene: &assist::Scene) -> assist::Slate {
+    assist::propose(&assist::Chain(&[model, &assist::Rules]), scene)
+}
+
+/// Ask the model about `scene` on its own thread. The answer comes back through [`deliver`].
+fn ask(model: Arc<Learned>, scene: assist::Scene) {
+    static WORKER: Once = Once::new();
+    WORKER.call_once(|| {
+        let work = || loop {
+            let mut next = DESK.0.lock().unwrap_or_else(PoisonError::into_inner);
+            while next.is_none() {
+                next = DESK.1.wait(next).unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(next);
+            std::thread::sleep(SETTLE);
+            let Some((model, scene)) = DESK.0.lock().unwrap_or_else(PoisonError::into_inner).take() else { continue };
+            let slate = both(&model, &scene);
+            if DESK.0.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
+                let _ = slint::invoke_from_event_loop(move || deliver(scene, slate));
+            }
+        };
+        if !crate::worker::spawn_detached("neuron-colour-model", work) {
+            eprintln!("neuron: colour model thread not started");
+        }
+    });
+    *DESK.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((model, scene));
+    DESK.1.notify_one();
+}
+
+/// The model's slate for `scene` has arrived. It is used if the palette is still that scene.
+fn deliver(scene: assist::Scene, slate: assist::Slate) {
+    SENSE.with(|sense| sense.borrow_mut().pending = Some((scene, slate)));
+    let home = HOME.with(|home| home.borrow().as_ref().and_then(|(app, sh)| Some((app.upgrade()?, sh.clone()))));
+    if let Some((app, sh)) = home {
+        refresh(&app, &sh);
+    }
 }
 
 /// How much of the chroma the display shows at a colour's lightness and hue it uses.
@@ -84,13 +156,37 @@ fn active(sh: &SharedRt) -> Option<(Home, Palette)> {
     Some(((s.selected_layer, frame), layer.spectrum.seq.get(frame)?.palette.clone()))
 }
 
+/// The other palettes in the lighting stack: the nearest thing to the person's own library.
+fn library(sh: &SharedRt, home: Home) -> Vec<Vec<Rgb>> {
+    let s = sh.borrow();
+    let mut all: Vec<Vec<Rgb>> = Vec::new();
+    for (l, layer) in s.light_layers.iter().enumerate() {
+        for (f, frame) in layer.spectrum.seq.iter().enumerate() {
+            let colours: Vec<Rgb> = frame.palette.stops.iter().take(LIBRARY.1).map(|stop| stop.col).collect();
+            if (l, f) != home && !colours.is_empty() && !all.contains(&colours) && all.len() < LIBRARY.0 {
+                all.push(colours);
+            }
+        }
+    }
+    all
+}
+
 fn same_shape(a: &[Stop], b: &[Stop]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.at == y.at)
 }
 
+/// Put the palette back if an offer is on show: an edit is made to the palette as it is, never
+/// to one that is only being looked at.
+fn settle(app: &AppWindow, sh: &SharedRt) {
+    if SENSE.with(|sense| sense.borrow().stash.is_some()) {
+        preview(app, sh, -1);
+    }
+}
+
 /// Call before stop `idx` is recoloured. Recolouring the same stop again continues one edit;
 /// anything else starts a new one from the palette as it is now.
-pub(super) fn note_edit(sh: &SharedRt, idx: usize) {
+pub(super) fn note_edit(app: &AppWindow, sh: &SharedRt, idx: usize) {
+    settle(app, sh);
     let Some((home, palette)) = active(sh) else { return };
     SENSE.with(|sense| {
         let mut sense = sense.borrow_mut();
@@ -105,8 +201,38 @@ pub(super) fn note_edit(sh: &SharedRt, idx: usize) {
     });
 }
 
+/// Call after stop `idx` was added and selected: until someone colours it, what it shows is a
+/// placeholder and colours for it may be offered.
+pub(super) fn note_added(app: &AppWindow, sh: &SharedRt, idx: usize) {
+    let Some((home, palette)) = active(sh) else { return };
+    SENSE.with(|sense| sense.borrow_mut().open = Some((home, idx, palette.stops)));
+    refresh(app, sh);
+}
+
 fn selected(app: &AppWindow, stops: usize) -> usize {
     (app.global::<State>().get_light_sel_stop().max(0) as usize).min(stops.saturating_sub(1))
+}
+
+/// Make sure a journal session for `home` is open, when the preferences ask for one. A journal
+/// that cannot be written is given up on for the rest of the run.
+fn journaling(sense: &mut Sense, home: Home, palette: &[Stop]) -> bool {
+    if !JOURNALING.get() {
+        return false;
+    }
+    if sense.journal.as_ref().is_none_or(|(at, _)| *at != home) {
+        let folder = neuron::runroot::run_root().join("models");
+        let begun = std::fs::create_dir_all(&folder).and_then(|()| Journal::start(&folder.join("picker-sessions.jsonl"), palette));
+        (sense.logged, sense.offered) = (None, false);
+        sense.journal = written(begun).map(|journal| (home, journal));
+    }
+    sense.journal.is_some()
+}
+
+fn written<T>(result: std::io::Result<T>) -> Option<T> {
+    result.map_err(|e| {
+        eprintln!("neuron: picker journal not written ({e})");
+        JOURNALING.set(false);
+    }).ok()
 }
 
 /// Re-read the active palette into the row and the picker. Runs after every palette change.
@@ -117,32 +243,54 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
     }
     let Some((home, palette)) = active(sh) else {
         SENSE.with(|sense| *sense.borrow_mut() = Sense::default());
-        show(app, &[], 0);
+        show(app, &[], 0, &[]);
         return;
     };
     let chosen = selected(app, palette.stops.len());
     // while an offer is on show the row must not change under the pointer
     let showing = SENSE.with(|sense| sense.borrow().stash.is_some());
     if !showing {
-        let rows = SENSE.with(|sense| {
+        let others = library(sh, home);
+        let (rows, pins) = SENSE.with(|sense| {
             let mut sense = sense.borrow_mut();
+            let sense = &mut *sense;
             if sense.base.as_ref().is_some_and(|(at, base)| *at != home || !same_shape(base, &palette.stops)) {
                 sense.base = None;
             }
             if sense.undo.as_ref().is_some_and(|(at, _, _, left)| *at != home || *left != palette.stops) {
                 sense.undo = None;
             }
+            if sense.open.as_ref().is_some_and(|(at, idx, then)| *at != home || *idx != chosen || *then != palette.stops) {
+                sense.open = None;
+            }
+            if sense.pins.as_ref().is_some_and(|(at, pins)| *at != home || pins.len() != palette.stops.len()) {
+                sense.pins = None;
+            }
+            let pins = sense.pins.as_ref().map(|(_, pins)| pins.clone()).unwrap_or_default();
+            let open = sense.open.is_some();
             let scene = assist::Scene {
                 stops: palette.stops.clone(),
                 interp: palette.interp,
-                before: sense.base.as_ref().map(|(_, base)| base.clone()),
+                before: sense.base.as_ref().filter(|_| !open).map(|(_, base)| base.clone()),
                 selected: chosen,
-                pins: Vec::new(),
+                pins: pins.clone(),
+                open,
+                library: others,
             };
-            // the engines are only asked again when something they read has changed
-            let slate = match sense.slate.take() {
-                Some((asked, slate)) if asked == scene => slate,
-                _ => propose(&scene),
+            // The engines are only asked again when something they read has changed. The rules
+            // answer here; the model's answer for the same scene replaces theirs when it arrives.
+            let arrived = sense.pending.take().filter(|(asked, _)| *asked == scene);
+            let held = sense.slate.take().filter(|(asked, _)| *asked == scene);
+            let slate = match arrived.or(held) {
+                Some((_, slate)) => slate,
+                None => match model() {
+                    Some(model) if cfg!(test) => both(&model, &scene),
+                    Some(model) => {
+                        ask(model, scene.clone());
+                        assist::propose(&assist::Rules, &scene)
+                    }
+                    None => assist::propose(&assist::Rules, &scene),
+                },
             };
             let offered = |scope: Scope| slate.offers.iter().enumerate().filter(move |(_, offer)| offer.scope == scope);
             let mut rows: Vec<Row> = offered(Scope::Palette).map(|(i, offer)| Row { offer: offer.clone(), slate: Some(i), dot: None }).collect();
@@ -154,25 +302,57 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
                 let lch = Lch::of(offer.stops.get(chosen)?.col);
                 Some(Row { offer: offer.clone(), slate: Some(i), dot: Some((vividness(lch), lch.l.clamp(0.0, 1.0))) })
             }));
+            record(sense, home, &palette, chosen, &rows);
             sense.slate = Some((scene, slate));
             sense.rows = rows.clone();
-            rows
+            (rows, pins)
         });
-        show(app, &rows, chosen);
+        show(app, &rows, chosen, &pins);
     }
     sync_picker(app, &palette, chosen);
 }
 
-fn show(app: &AppWindow, rows: &[Row], chosen: usize) {
+/// Write what just happened to the journal, when one is kept: the colour the edit in progress
+/// has reached, and the offers when they change.
+fn record(sense: &mut Sense, home: Home, palette: &Palette, chosen: usize, rows: &[Row]) {
+    if !journaling(sense, home, &palette.stops) {
+        return;
+    }
+    let moved = sense.base.as_ref().is_some_and(|(_, base)| base.get(chosen).map(|s| s.col) != palette.stops.get(chosen).map(|s| s.col));
+    let now = palette.stops.get(chosen).map(|stop| (chosen, stop.col));
+    let control = sense.control.take().unwrap_or(Control::Other);
+    let changed = rows.len() != sense.rows.len() || rows.iter().zip(&sense.rows).any(|(a, b)| a.offer != b.offer);
+    let Some((_, journal)) = sense.journal.as_mut() else { return };
+    let mut wrote = Ok(());
+    if let Some((idx, col)) = now.filter(|now| moved && Some(*now) != sense.logged) {
+        wrote = wrote.and(journal.drag(idx, col, control));
+        sense.logged = now;
+    }
+    if changed {
+        let slate: Vec<&[Stop]> = rows.iter().filter(|row| row.slate.is_some()).map(|row| row.offer.stops.as_slice()).collect();
+        if sense.offered {
+            wrote = wrote.and(journal.dismissed());
+        }
+        wrote = wrote.and(journal.shown(&slate));
+        sense.offered = !slate.is_empty();
+    }
+    written(wrote);
+}
+
+fn show(app: &AppWindow, rows: &[Row], chosen: usize, pins: &[bool]) {
     let st = app.global::<State>();
     st.set_assist_ramps(rows.iter().filter(|row| row.dot.is_none()).count() as i32);
-    let rows: Vec<AssistOffer> = rows.iter().map(|Row { offer, dot, .. }| match *dot {
+    st.set_assist_keyed(-1);
+    st.set_light_sel_pinned(pins.get(chosen).copied().unwrap_or(false));
+    update_value_model(st.get_light_pins(), pins.to_vec(), |model| st.set_light_pins(model));
+    let rows: Vec<AssistOffer> = rows.iter().map(|Row { offer, dot, slate }| match *dot {
         Some((vivid, light)) => {
             let col = offer.stops.get(chosen).map(|s| s.col).unwrap_or_default();
-            AssistOffer { title: offer.title.into(), solid: true, col: rgb_to_color(col), vivid, light, hue: Lch::of(col).h, swatch: Image::default() }
+            AssistOffer { title: offer.title.into(), solid: true, col: rgb_to_color(col), vivid, light, hue: Lch::of(col).h, ..AssistOffer::default() }
         }
         None => AssistOffer {
             title: offer.title.into(),
+            back: slate.is_none(),
             swatch: palette_strip_image(&Palette { stops: offer.stops.clone(), motion: Motion::Hold, interp: offer.interp }),
             ..AssistOffer::default()
         },
@@ -217,8 +397,10 @@ fn preview(app: &AppWindow, sh: &SharedRt, index: i32) {
             None => sense.stash.take(),
         }
     });
-    if let Some((stops, interp)) = step {
-        put(app, sh, stops, interp);
+    match step {
+        Some((stops, interp)) => put(app, sh, stops, interp),
+        // nothing was on show: an answer that arrived meanwhile may now be
+        None => refresh(app, sh),
     }
 }
 
@@ -227,6 +409,7 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
     let Some((home, palette)) = active(sh) else { return };
     let taken = SENSE.with(|sense| {
         let mut sense = sense.borrow_mut();
+        let sense = &mut *sense;
         let index = usize::try_from(index).ok()?;
         let Row { offer, slate: place, .. } = sense.rows.get(index).cloned()?;
         let (was_stops, was_interp) = sense.stash.take().unwrap_or((palette.stops.clone(), palette.interp));
@@ -240,6 +423,17 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
         if !current {
             return Some((was_stops, was_interp));
         }
+        let choice = sense.rows[..index].iter().filter(|row| row.slate.is_some()).count();
+        if journaling(sense, home, &was_stops) {
+            let offered = std::mem::take(&mut sense.offered);
+            if let Some((_, journal)) = sense.journal.as_mut() {
+                written(match place {
+                    Some(_) if offered => journal.accepted(choice),
+                    Some(_) => Ok(()),
+                    None => journal.undo(&offer.stops),
+                });
+            }
+        }
         sense.undo = place.is_some().then(|| (home, was_stops, was_interp, offer.stops.clone()));
         sense.base = None;
         Some((offer.stops, offer.interp))
@@ -247,6 +441,21 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
     if let Some((stops, interp)) = taken {
         put(app, sh, stops, interp);
     }
+}
+
+/// Hold the selected stop against every offer, or let it go.
+fn toggle_pin(app: &AppWindow, sh: &SharedRt) {
+    let Some((home, palette)) = active(sh) else { return };
+    let chosen = selected(app, palette.stops.len());
+    SENSE.with(|sense| {
+        let mut sense = sense.borrow_mut();
+        let mut pins = sense.pins.take().filter(|(at, pins)| *at == home && pins.len() == palette.stops.len()).map_or_else(|| vec![false; palette.stops.len()], |(_, pins)| pins);
+        if let Some(pin) = pins.get_mut(chosen) {
+            *pin = !*pin;
+        }
+        sense.pins = Some((home, pins));
+    });
+    refresh(app, sh);
 }
 
 const PLANE: (u32, u32) = (128, 64);
@@ -320,34 +529,47 @@ fn sync_picker(app: &AppWindow, palette: &Palette, chosen: usize) {
 }
 
 /// Recolour the selected stop from picker coordinates.
-fn pick(app: &AppWindow, sh: &SharedRt, lch_at: impl FnOnce(Lch, f32) -> (Lch, f32)) {
+fn pick(app: &AppWindow, sh: &SharedRt, control: Control, lch_at: impl FnOnce(Lch, f32) -> (Lch, f32)) {
+    settle(app, sh);
     let Some((_, palette)) = active(sh) else { return };
     let chosen = selected(app, palette.stops.len());
     let Some((from, vivid)) = SENSE.with(|sense| sense.borrow().pick.map(|(lch, vivid, _)| (lch, vivid))) else { return };
     let (mut lch, vivid) = lch_at(from, vivid);
     lch.c = Lch::max_chroma(lch.l, lch.h) * vivid;
     let made = lch.rgb();
-    SENSE.with(|sense| sense.borrow_mut().pick = Some((lch, vivid, made)));
-    note_edit(sh, chosen);
+    SENSE.with(|sense| {
+        let mut sense = sense.borrow_mut();
+        sense.pick = Some((lch, vivid, made));
+        sense.control = Some(control);
+    });
+    note_edit(app, sh, chosen);
     edit_active_palette(app, sh, |palette| palette.set_stop_color(chosen, made));
 }
 
 pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     st.set_picker_v2(crate::prefs::picker_v2());
-    let bind = |f: fn(&AppWindow, &SharedRt, f32, f32)| {
+    JOURNALING.set(crate::prefs::picker_journal());
+    HOME.with(|home| *home.borrow_mut() = Some((app.as_weak(), sh.clone())));
+    let bind = |f: fn(&AppWindow, &SharedRt, f32, f32, f32)| {
         let (w, sh) = (app.as_weak(), sh.clone());
-        move |a: f32, b: f32| {
+        move |a: f32, b: f32, c: f32| {
             if let Some(app) = w.upgrade() {
-                f(&app, &sh, a, b);
+                f(&app, &sh, a, b, c);
             }
         }
     };
-    st.on_picker_plane_pick(bind(|app, sh, vivid, light| {
-        pick(app, sh, |from, _| (Lch { l: light.clamp(0.0, 1.0), ..from }, vivid.clamp(0.0, 1.0)));
+    let plane = bind(|app, sh, vivid, light, _| {
+        pick(app, sh, Control::Plane, |from, _| (Lch { l: light.clamp(0.0, 1.0), ..from }, vivid.clamp(0.0, 1.0)));
+    });
+    st.on_picker_plane_pick(move |vivid, light| plane(vivid, light, 0.0));
+    let hue = bind(|app, sh, hue, _, _| pick(app, sh, Control::Slider, |from, vivid| (Lch { h: hue.clamp(0.0, 1.0) % 1.0, ..from }, vivid)));
+    st.on_picker_hue_pick(move |h| hue(h, 0.0, 0.0));
+    st.on_picker_nudge(bind(|app, sh, vivid, light, hue| {
+        pick(app, sh, Control::Other, |from, was| {
+            (Lch { l: (from.l + light).clamp(0.0, 1.0), h: (from.h + hue).rem_euclid(1.0), ..from }, (was + vivid).clamp(0.0, 1.0))
+        });
     }));
-    let hue = bind(|app, sh, hue, _| pick(app, sh, |from, vivid| (Lch { h: hue.clamp(0.0, 1.0) % 1.0, ..from }, vivid)));
-    st.on_picker_hue_pick(move |h| hue(h, 0.0));
     let offer = |f: fn(&AppWindow, &SharedRt, i32)| {
         let (w, sh) = (app.as_weak(), sh.clone());
         move |index: i32| {
@@ -361,6 +583,8 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
     st.on_assist_at(dot_at);
     let sync = offer(|app, sh, _| refresh(app, sh));
     st.on_picker_sync(move || sync(0));
+    let pin = offer(|app, sh, _| toggle_pin(app, sh));
+    st.on_toggle_pin(move || pin(0));
     let (w, sh) = (app.as_weak(), sh.clone());
     st.on_set_picker_v2(move |on| {
         if let Some(app) = w.upgrade() {
@@ -368,7 +592,7 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
             // leave nothing half-shown behind when switching away
             preview(&app, &sh, -1);
             SENSE.with(|sense| *sense.borrow_mut() = Sense::default());
-            show(&app, &[], 0);
+            show(&app, &[], 0, &[]);
             app.global::<State>().set_picker_v2(on);
             refresh(&app, &sh);
         }

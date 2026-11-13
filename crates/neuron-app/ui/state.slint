@@ -400,6 +400,11 @@ export global State {
     callback picker-plane-pick(float, float);           // (vivid, light) — recolour the selected stop
     callback picker-hue-pick(float);
     callback picker-sync();                             // the selected stop changed: re-point the picker
+    callback picker-nudge(float, float, float);         // (vivid, light, hue) steps from the keyboard
+    in-out property <[bool]> light-pins;                // per stop: held against every suggestion
+    in-out property <bool> light-sel-pinned;            // the selected stop is one of them
+    callback toggle-pin();                              // hold the selected stop, or let it go
+    in-out property <int> assist-keyed: -1;             // the offer stepped to from the keyboard and on show, or -1
     in-out property <[AssistOffer]> assist-offers;      // suggestions for the palette being edited: ramps first, then single colours
     in-out property <int> assist-ramps;                 // how many lead the list as ramps; the rest sit in the picker
     pure callback assist-at(float, float, float, float) -> int; // the single-colour offer under plane point (x, y) of (w, h) px, or -1
