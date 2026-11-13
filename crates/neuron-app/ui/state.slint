@@ -419,6 +419,9 @@ export global State {
     in-out property <bool> assist-showing;              // an offer is on the live palette, not yet kept
     in-out property <image> assist-before;              // the palette as it was while one is
     in-out property <bool> assist-keys;                 // the picker has the keyboard
+    in-out property <bool> assist-tab-held;             // Tab is down: the offers show their numbers
+    in-out property <int> assist-prime: -1;             // the row of the first choice (option 1), or -1
+    pure callback assist-option(int) -> int;            // the row of option n, the way back for 0, or -1
     in-out property <int> picker-focus;                 // bumped to hand the picker the keyboard
     callback add-stop(float);                          // (at 0..1) — insert a stop (colour sampled there), select it
     callback remove-stop(int);                         // (stop idx) — delete (a palette never drops below 1 stop)

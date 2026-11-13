@@ -42,9 +42,11 @@ component Keycap inherits Rectangle {
 // and vividness, with a tick at its hue under the rail. Resting on the dot shows it on the stop and
 // says why it is offered; moving off puts the stop back; a click keeps it.
 //
-// Once clicked, the picker takes the keyboard: arrows step lightness and vividness, Shift with
-// left or right steps hue, Tab walks the offers (showing each), Enter keeps the one on show and
-// Escape puts the palette back.
+// Grabbing a stop gives the picker the keyboard: arrows step lightness and vividness, Shift with
+// left or right steps hue. Tab moves a suggestion forward (show the first choice, then keep it);
+// held, it numbers the offers, and a number shows that one (again keeps it). Enter keeps what is
+// on show, Escape puts the palette back or, with nothing on show, lets the keyboard go, and
+// Ctrl+Z takes the way back.
 export component SensePicker inherits VerticalLayout {
     in property <color> current;       // the selected stop's colour
     in property <string> value;        // its bare RRGGBB
@@ -57,6 +59,7 @@ export component SensePicker inherits VerticalLayout {
     // the offer on show: under the pointer, else stepped to from the keyboard
     property <int> lit: pta.dot >= 0 ? pta.dot : State.assist-keyed;
     property <bool> lit-dot: root.lit >= State.assist-ramps && root.lit < State.assist-offers.length;
+    property <bool> prime-dot: State.assist-prime >= State.assist-ramps && State.assist-prime < State.assist-offers.length;
     property <float> step: 0.02;
     // grabbing a stop on the strip hands the picker the keyboard
     property <int> focus-asked: State.picker-focus;
@@ -96,24 +99,62 @@ export component SensePicker inherits VerticalLayout {
             opacity: State.picker-terrain-on ? 1 : 0;
             animate opacity { duration: 250ms; easing: ease-out; }
         }
+        // Tab moves a suggestion forward: the first press shows the first choice, the next keeps
+        // what is on show. Held, it shows every offer's number; Tab with a number (or the number
+        // alone) shows that one, and the same number again keeps it.
         keys := FocusScope {
             x: 0px; y: 0px;
             width: 0px; height: 0px;
-            changed has-focus => { State.assist-keys = self.has-focus; }
+            // a number pressed while Tab was down: letting Tab go then does nothing more
+            property <bool> chord;
+            function draft(row: int) {
+                State.assist-keyed = row;
+                State.assist-preview(row);
+            }
+            function forward() {
+                if (State.assist-keyed >= 0) {
+                    State.assist-accept(State.assist-keyed);
+                } else if (State.assist-prime >= 0) {
+                    self.draft(State.assist-prime);
+                }
+            }
+            changed has-focus => {
+                State.assist-keys = self.has-focus;
+                State.assist-tab-held = false;
+                // a draft never outlives the keyboard that showed it
+                if (!self.has-focus && State.assist-keyed >= 0) { self.draft(-1); }
+            }
             key-pressed(e) => {
-                if (e.text == Key.Tab && State.assist-offers.length > 0) {
-                    State.assist-keyed = State.assist-keyed + 1 >= State.assist-offers.length ? -1 : State.assist-keyed + 1;
-                    State.assist-preview(State.assist-keyed);
+                if (e.text == Key.Tab) {
+                    if (!State.assist-tab-held) {
+                        State.assist-tab-held = true;
+                        self.chord = false;
+                    }
+                    return accept;
+                }
+                if (e.text.is-float() && e.text != "0" && !e.modifiers.control) {
+                    let row = State.assist-option(Math.round(e.text.to-float()));
+                    if (row >= 0) {
+                        if (State.assist-keyed == row) { State.assist-accept(row); } else { self.draft(row); }
+                    }
+                    self.chord = State.assist-tab-held;
                     return accept;
                 }
                 if (e.text == Key.Return && State.assist-keyed >= 0) {
                     State.assist-accept(State.assist-keyed);
                     return accept;
                 }
-                if (e.text == Key.Escape && State.assist-keyed >= 0) {
-                    State.assist-keyed = -1;
-                    State.assist-preview(-1);
+                if (e.text == Key.Escape) {
+                    if (State.assist-keyed >= 0) { self.draft(-1); } else { self.clear-focus(); }
                     return accept;
+                }
+                if (e.modifiers.control && (e.text == "z" || e.text == "Z")) {
+                    let back = State.assist-option(0);
+                    if (back >= 0) {
+                        State.assist-accept(back);
+                        return accept;
+                    }
+                    return reject;
                 }
                 if (e.text == Key.UpArrow) { State.picker-nudge(0, root.step, 0); return accept; }
                 if (e.text == Key.DownArrow) { State.picker-nudge(0, -root.step, 0); return accept; }
@@ -123,6 +164,14 @@ export component SensePicker inherits VerticalLayout {
                 }
                 if (e.text == Key.LeftArrow) {
                     State.picker-nudge(e.modifiers.shift ? 0 : -root.step, 0, e.modifiers.shift ? -0.01 : 0);
+                    return accept;
+                }
+                reject
+            }
+            key-released(e) => {
+                if (e.text == Key.Tab && State.assist-tab-held) {
+                    State.assist-tab-held = false;
+                    if (!self.chord) { self.forward(); }
                     return accept;
                 }
                 reject
@@ -140,7 +189,8 @@ export component SensePicker inherits VerticalLayout {
         for offer[i] in State.assist-offers : Rectangle {
             property <bool> hot: i == root.lit;
             property <bool> born;
-            property <length> d: self.hot ? 14px : 9px;
+            // the first choice sits a little larger: it is the one Tab reaches for
+            property <length> d: self.hot ? 14px : i == State.assist-prime ? 11px : 9px;
             init => { self.born = true; }
             visible: offer.solid;
             width: self.d; height: self.d; border-radius: self.d / 2;
@@ -153,44 +203,47 @@ export component SensePicker inherits VerticalLayout {
             animate opacity { duration: 200ms; easing: ease-out; }
             animate d, x, y { duration: Theme.quick; easing: ease-out; }
         }
-        // why the dot on show is offered, in the half of the plane the dot is not in, with the key
-        // that keeps it when the keyboard is here
-        Rectangle {
-            property <bool> low: root.lit-dot && State.assist-offers[root.lit].light < 0.5;
+        // while Tab is held, each dot carries its number
+        for offer[i] in State.assist-offers : Keycap {
+            visible: offer.solid && State.assist-tab-held;
+            ground: true;
+            key: offer.num;
+            x: clamp(offer.vivid * plane.width + 8px, 0px, plane.width - self.width);
+            y: clamp((1 - offer.light) * plane.height - self.height / 2, 0px, plane.height - self.height);
+        }
+        // why the dot on show is offered, in the half of the plane the dot is not in. With the
+        // keyboard here it also names the first choice before anything is on show, beside the key
+        // that moves it forward.
+        why := Rectangle {
+            property <bool> hint: !root.lit-dot && State.assist-keys && root.prime-dot;
+            property <int> told: root.lit-dot ? root.lit : self.hint ? State.assist-prime : -1;
+            property <bool> low: self.told >= 0 && State.assist-offers[self.told].light < 0.5;
             x: 4px;
             y: self.low ? 4px : plane.height - self.height - 4px;
             width: min(why-row.preferred-width, plane.width - 8px);
             height: 16px;
             border-radius: 8px;
             background: #000000b0;
-            opacity: root.lit-dot ? 1 : 0;
+            opacity: self.told >= 0 && !State.assist-tab-held ? 1 : 0;
             animate opacity { duration: Theme.quick; }
             why-row := HorizontalLayout {
+                property <bool> keyed: State.assist-keys && (why.hint || State.assist-keyed == root.lit);
                 padding-left: 6px;
-                padding-right: State.assist-keys ? 1px : 6px;
+                padding-right: self.keyed ? 1px : 6px;
                 spacing: 5px;
                 alignment: start;
                 Mono {
                     vertical-alignment: center;
                     overflow: elide;
-                    text: root.lit-dot ? State.assist-offers[root.lit].title : "";
-                    color: #ffffffe6;
+                    text: why.told >= 0 ? State.assist-offers[why.told].title : "";
+                    color: why.hint ? #ffffffa0 : #ffffffe6;
                     font-size: Theme.fs-small;
                 }
-                if State.assist-keys : VerticalLayout {
+                if self.keyed : VerticalLayout {
                     alignment: center;
-                    Keycap { key: "enter"; ground: true; }
+                    Keycap { key: "tab"; ground: true; }
                 }
             }
-        }
-        // with the keyboard here and nothing on show, the key that brings the offers up
-        Keycap {
-            x: plane.width - self.width - 4px;
-            y: plane.height - self.height - 4px;
-            ground: true;
-            key: "tab";
-            opacity: State.assist-keys && State.assist-offers.length > 0 && root.lit < 0 ? 1 : 0;
-            animate opacity { duration: Theme.quick; }
         }
         pta := TouchArea {
             // The dot under the pointer. A drag never lands on one: the pointer has to arrive at
@@ -200,9 +253,16 @@ export component SensePicker inherits VerticalLayout {
             property <bool> armed: true;
             property <bool> dragging;
             property <int> dot: self.armed && !self.dragging ? self.under : -1;
+            // the dot whose colour is on the lights. Arriving from nowhere waits a beat, so a
+            // pointer passing over a dot on its way somewhere does not flash the lights; once one
+            // is on show, moving to the next is immediate.
+            property <int> shown: -1;
             changed dot => {
                 State.assist-keyed = -1;
-                State.assist-preview(self.dot);
+                if (self.dot < 0 || self.shown >= 0) {
+                    self.shown = self.dot;
+                    State.assist-preview(self.dot);
+                }
             }
             changed under => { if (self.under < 0 && !self.dragging) { self.armed = true; } }
             mouse-cursor: self.dot >= 0 ? MouseCursor.pointer : MouseCursor.crosshair;
@@ -226,6 +286,14 @@ export component SensePicker inherits VerticalLayout {
                 }
             }
             moved => { if (self.dragging) { self.at(); } }
+        }
+        Timer {
+            interval: 110ms;
+            running: pta.dot >= 0 && pta.shown < 0;
+            triggered => {
+                pta.shown = pta.dot;
+                State.assist-preview(pta.dot);
+            }
         }
     }
     rail := Rectangle {
@@ -291,32 +359,52 @@ export component SensePicker inherits VerticalLayout {
 
 // The whole-palette suggestions for the palette being edited (single colours sit in the picker).
 // Resting on a capsule shows it on the strip and the board; leaving puts the palette back. Only a
-// click keeps it, and the capsule that then says "undo" is the way back. One touch area outside
-// the `for` owns the gesture, so a row update cannot drop the hover. The row opens and closes by
-// height.
+// click keeps it, and the capsule that then says "undo" is the way back. The first choice is the
+// wider capsule at the head of the row: the one Tab reaches for. One touch area outside the `for`
+// owns the gesture, so a row update cannot drop the hover. The row opens and closes by height.
 export component SenseOffers inherits Rectangle {
     property <int> n: min(State.assist-ramps, State.assist-offers.length);
     property <length> cw: 44px;
     property <length> gap: 6px;
-    property <int> hov: ta.has-hover && root.n > 0
-        ? max(0, min(root.n - 1, Math.floor(ta.mouse-x / (root.cw + root.gap)))) : -1;
+    // the head capsule is wider when it holds the first choice
+    property <length> hw: State.assist-prime == 0 ? 60px : root.cw;
+    property <length> span: root.n > 0 ? root.hw + root.gap + (root.n - 1) * (root.cw + root.gap) : 0px;
+    property <int> hov: !ta.has-hover || root.n <= 0 ? -1
+        : ta.mouse-x < root.hw + root.gap ? 0
+        : min(root.n - 1, 1 + Math.floor((ta.mouse-x - root.hw - root.gap) / (root.cw + root.gap)));
+    // the capsule whose palette is on the lights: arriving waits a beat, moving along is immediate
+    property <int> shown: -1;
     property <int> lit: root.hov >= 0 ? root.hov : State.assist-keyed < root.n ? State.assist-keyed : -1;
+    property <bool> hint: root.lit < 0 && State.assist-keys && State.assist-prime >= 0 && State.assist-prime < root.n;
     changed hov => {
         State.assist-keyed = -1;
-        State.assist-preview(root.hov);
+        if (root.hov < 0 || root.shown >= 0) {
+            root.shown = root.hov;
+            State.assist-preview(root.hov);
+        }
     }
     height: root.n > 0 ? 26px : 0px;
     animate height { duration: 200ms; easing: ease-out; }
     clip: true;
+    Timer {
+        interval: 110ms;
+        running: root.hov >= 0 && root.shown < 0;
+        triggered => {
+            root.shown = root.hov;
+            State.assist-preview(root.hov);
+        }
+    }
     for offer[i] in State.assist-offers : Rectangle {
         visible: i < root.n;
-        x: i * (root.cw + root.gap);
+        x: i == 0 ? 0px : root.hw + root.gap + (i - 1) * (root.cw + root.gap);
         y: 0px;
-        width: root.cw; height: 26px;
+        width: i == 0 ? root.hw : root.cw;
+        height: 26px;
         border-radius: 13px;
         border-width: Theme.hair;
-        border-color: i == root.lit ? Theme.accent : Theme.line;
+        border-color: i == root.lit ? Theme.accent : i == State.assist-prime ? Theme.text-faint : Theme.line;
         animate border-color { duration: Theme.quick; }
+        animate width { duration: Theme.quick; easing: ease-out; }
         clip: true;
         Image { source: offer.swatch; width: 100%; height: 100%; image-fit: fill; }
         if offer.back : Rectangle {
@@ -330,33 +418,50 @@ export component SenseOffers inherits Rectangle {
                 font-size: Theme.fs-small;
             }
         }
+        // while Tab is held, each capsule carries its number
+        if State.assist-tab-held && offer.num > 0 : Keycap {
+            ground: true;
+            key: offer.num;
+        }
     }
+    // what the lit capsule does; with the keyboard here and nothing lit, the first choice and the
+    // key that moves it forward
     HorizontalLayout {
-        x: root.n * (root.cw + root.gap) + 2px;
+        x: root.span + 2px;
         y: 0px;
         width: max(0px, parent.width - self.x);
         height: 26px;
         spacing: 6px;
         alignment: start;
+        if root.hint : VerticalLayout {
+            alignment: center;
+            Keycap { key: "tab"; }
+        }
         Mono {
             vertical-alignment: center;
             overflow: elide;
             text: root.lit >= 0 ? State.assist-offers[root.lit].title
-                : root.n == 1 && State.assist-offers[0].back ? "" : "suggested";
+                : root.hint ? State.assist-offers[State.assist-prime].title
+                : root.n == 0 || (root.n == 1 && State.assist-offers[0].back) ? "" : "suggested";
             color: root.lit >= 0 ? Theme.text-mid : Theme.text-faint;
             font-size: Theme.fs-small;
         }
-        if State.assist-keys && root.lit >= 0 && root.hov < 0 : VerticalLayout {
+        if State.assist-keys && root.lit >= 0 && State.assist-keyed == root.lit : VerticalLayout {
             alignment: center;
-            Keycap { key: "enter"; }
+            Keycap { key: "tab"; }
         }
     }
     // pinned to the row's left edge: a sized element with no position is centred in its parent
     ta := TouchArea {
         x: 0px; y: 0px;
-        width: root.n * (root.cw + root.gap);
+        width: root.span;
         height: 26px;
         mouse-cursor: MouseCursor.pointer;
-        clicked => { if (root.hov >= 0) { State.assist-accept(root.hov); } }
+        clicked => {
+            if (root.hov >= 0) {
+                State.assist-accept(root.hov);
+                State.picker-focus += 1;
+            }
+        }
     }
 }

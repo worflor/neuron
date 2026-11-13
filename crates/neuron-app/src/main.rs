@@ -77,6 +77,8 @@ mod worker;
 #[cfg(test)]
 mod apptest;
 #[cfg(test)]
+mod uifit;
+#[cfg(test)]
 mod uilint;
 
 #[cfg(test)]

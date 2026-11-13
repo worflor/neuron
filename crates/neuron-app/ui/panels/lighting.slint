@@ -487,7 +487,18 @@ component RampName inherits Rectangle {
     in property <[color]> ramp;           // the palette sampled forward-then-back (a seamless loop)
     in property <string> prefix: "";      // lead-in ink inside the hover area (the spectrum line's dash)
     property <bool> painted: root.chars.length > 0 && root.ramp.length >= 2;
-    HorizontalLayout {
+    // The name gives way before whatever shares its row: short of room it keeps its own width and
+    // is cut by this box under a fade, rather than pushing its neighbours out of the column.
+    min-width: 0px;
+    preferred-width: row.preferred-width;
+    max-width: row.preferred-width;
+    preferred-height: row.preferred-height;
+    clip: true;
+    property <bool> cut: row.preferred-width > root.width + 0.5px;
+    row := HorizontalLayout {
+        x: 0px;
+        width: self.preferred-width;
+        height: root.height;
         spacing: 0px;
         if root.prefix != "" : Mono { text: root.prefix; color: Theme.text-faint; }
         if !root.painted : Mono { text: root.text; color: Theme.text-faint; overflow: elide; }
@@ -502,9 +513,15 @@ component RampName inherits Rectangle {
             }
         }
     }
+    if root.cut : Rectangle {
+        x: root.width - self.width;
+        width: 20px;
+        height: root.height;
+        background: @linear-gradient(90deg, Theme.bg.with-alpha(0) 0%, Theme.bg 100%);
+    }
     property <float> phase: rta.has-hover ? 0.5 : 0.0;
     animate phase { duration: 1400ms; easing: ease-in-out; }
-    rta := TouchArea {}
+    rta := TouchArea { x: 0px; y: 0px; width: root.width; height: root.height; }
 }
 
 // THE SPECTRUM EDITOR — the active layer's COLOUR PROGRAM (a layer = PATTERN × SPECTRUM; the pattern's

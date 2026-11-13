@@ -396,18 +396,26 @@ fn show(app: &AppWindow, rows: &[Row], chosen: usize, pins: &[bool], doubts: &[O
     st.set_assist_showing(false);
     st.set_light_sel_pinned(pins.get(chosen).copied().unwrap_or(false));
     update_value_model(st.get_light_pins(), pins.to_vec(), |model| st.set_light_pins(model));
-    let rows: Vec<AssistOffer> = rows.iter().map(|Row { offer, dot, slate }| match *dot {
-        Some((vivid, light)) => {
-            let col = offer.stops.get(chosen).map(|s| s.col).unwrap_or_default();
-            AssistOffer { title: offer.title.into(), solid: true, col: rgb_to_color(col), vivid, light, hue: Lch::of(col).h, ..AssistOffer::default() }
+    // the options are numbered by the engines' own ranking, the way back aside: option 1 is
+    // what they would offer first, whichever part of the picker it sits in
+    let ranked = ranking(rows);
+    let rows: Vec<AssistOffer> = rows.iter().enumerate().map(|(i, Row { offer, dot, slate })| {
+        let num = ranked.iter().position(|&row| row == i).map_or(0, |rank| rank as i32 + 1);
+        match *dot {
+            Some((vivid, light)) => {
+                let col = offer.stops.get(chosen).map(|s| s.col).unwrap_or_default();
+                AssistOffer { title: offer.title.into(), solid: true, num, col: rgb_to_color(col), vivid, light, hue: Lch::of(col).h, ..AssistOffer::default() }
+            }
+            None => AssistOffer {
+                title: offer.title.into(),
+                back: slate.is_none(),
+                num,
+                swatch: palette_strip_image(&Palette { stops: offer.stops.clone(), motion: Motion::Hold, interp: offer.interp }),
+                ..AssistOffer::default()
+            },
         }
-        None => AssistOffer {
-            title: offer.title.into(),
-            back: slate.is_none(),
-            swatch: palette_strip_image(&Palette { stops: offer.stops.clone(), motion: Motion::Hold, interp: offer.interp }),
-            ..AssistOffer::default()
-        },
     }).collect();
+    st.set_assist_prime(rows.iter().position(|row| row.num == 1).map_or(-1, |i| i as i32));
     update_value_model(st.get_assist_offers(), rows, |model| st.set_assist_offers(model));
 }
 
@@ -501,6 +509,27 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
     }
 }
 
+/// The rows that carry an offer, best first: in the order the engines put them on the slate,
+/// which is their ranking across every kind of offer.
+fn ranking(rows: &[Row]) -> Vec<usize> {
+    let mut ranked: Vec<(usize, usize)> = rows.iter().enumerate().filter_map(|(i, row)| Some((row.slate?, i))).collect();
+    ranked.sort_unstable();
+    ranked.into_iter().map(|(_, i)| i).collect()
+}
+
+/// The row of option `n` (1 is the first choice), of the way back for 0, or -1.
+fn option_row(n: i32) -> i32 {
+    SENSE.with(|sense| {
+        let sense = sense.borrow();
+        let found = if n == 0 {
+            sense.rows.iter().position(|row| row.slate.is_none())
+        } else {
+            usize::try_from(n - 1).ok().and_then(|at| ranking(&sense.rows).get(at).copied())
+        };
+        found.map_or(-1, |i| i as i32)
+    })
+}
+
 /// Hold the selected stop against every offer, or let it go.
 fn toggle_pin(app: &AppWindow, sh: &SharedRt) {
     let Some((home, palette)) = active(sh) else { return };
@@ -571,9 +600,11 @@ fn sync_picker(app: &AppWindow, palette: &Palette, chosen: usize) {
         }));
     }
     if rail_stale {
+        // what a click on the rail gives: always a hue you can see
+        let (l, vivid) = hue_shows(lch.l, vivid);
         st.set_picker_rail(image(RAIL, 1, |x, _| {
             let h = x as f32 / RAIL as f32;
-            Lch { l: lch.l, c: Lch::max_chroma(lch.l, h) * vivid, h }.rgb()
+            Lch { l, c: Lch::max_chroma(l, h) * vivid, h }.rgb()
         }));
     }
     // the plane's lines depend on the hue it shows; the rail's ridge only on the terrain
@@ -715,6 +746,17 @@ fn wave() -> Image {
     Image::from_rgba8_premultiplied(buf)
 }
 
+/// The lightness and vividness a change of hue lands on. Hue shows nowhere near grey, black or
+/// white, so turning one of those to a hue also brings out enough colour to see it; the rail draws
+/// what this gives, so it always shows hues.
+fn hue_shows(light: f32, vivid: f32) -> (f32, f32) {
+    if vivid < 0.08 || !(0.12..=0.95).contains(&light) {
+        (light.clamp(0.3, 0.85), vivid.max(0.65))
+    } else {
+        (light, vivid)
+    }
+}
+
 /// Recolour the selected stop from picker coordinates.
 fn pick(app: &AppWindow, sh: &SharedRt, control: Control, lch_at: impl FnOnce(Lch, f32) -> (Lch, f32)) {
     settle(app, sh);
@@ -751,11 +793,17 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
         pick(app, sh, Control::Plane, |from, _| (Lch { l: light.clamp(0.0, 1.0), ..from }, vivid.clamp(0.0, 1.0)));
     });
     st.on_picker_plane_pick(move |vivid, light| plane(vivid, light, 0.0));
-    let hue = bind(|app, sh, hue, _, _| pick(app, sh, Control::Slider, |from, vivid| (Lch { h: hue.clamp(0.0, 1.0) % 1.0, ..from }, vivid)));
+    let hue = bind(|app, sh, hue, _, _| {
+        pick(app, sh, Control::Slider, |from, vivid| {
+            let (l, vivid) = hue_shows(from.l, vivid);
+            (Lch { l, h: hue.clamp(0.0, 1.0) % 1.0, ..from }, vivid)
+        })
+    });
     st.on_picker_hue_pick(move |h| hue(h, 0.0, 0.0));
     st.on_picker_nudge(bind(|app, sh, vivid, light, hue| {
         pick(app, sh, Control::Other, |from, was| {
-            (Lch { l: (from.l + light).clamp(0.0, 1.0), h: (from.h + hue).rem_euclid(1.0), ..from }, (was + vivid).clamp(0.0, 1.0))
+            let (l, was) = if hue != 0.0 { hue_shows(from.l, was) } else { (from.l, was) };
+            (Lch { l: (l + light).clamp(0.0, 1.0), h: (from.h + hue).rem_euclid(1.0), ..from }, (was + vivid).clamp(0.0, 1.0))
         });
     }));
     let offer = |f: fn(&AppWindow, &SharedRt, i32)| {
@@ -769,6 +817,7 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
     st.on_assist_preview(offer(preview));
     st.on_assist_accept(offer(accept));
     st.on_assist_at(dot_at);
+    st.on_assist_option(option_row);
     let sync = offer(|app, sh, _| refresh(app, sh));
     st.on_picker_sync(move || sync(0));
     let pin = offer(|app, sh, _| toggle_pin(app, sh));

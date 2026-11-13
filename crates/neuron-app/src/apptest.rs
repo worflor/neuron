@@ -18,6 +18,15 @@ use crate::glue;
 use crate::ui::{AppWindow, State};
 use slint::ComponentHandle;
 
+/// Draw a frame, then hold the laid-out tree to `uifit`'s rules: every GUI test's states are
+/// checked for layout that does not fit its space.
+fn snap(app: &AppWindow) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>, slint::PlatformError> {
+    let frame = app.window().take_snapshot();
+    let test = std::thread::current().name().unwrap_or("a GUI test").to_string();
+    crate::uifit::assert_fits(app.window(), &test);
+    frame
+}
+
 /// Try to bring up a backend + window. Returns None if the platform can't (headless CI with no
 /// display / backend), so callers SKIP rather than fail — the smoke test asserts "doesn't panic",
 /// not "a display exists".
@@ -1001,7 +1010,7 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
     st.set_window_shown(true);
     app.window().set_size(slint::LogicalSize::new(1240.0, 1100.0));
     app.show().expect("show the window");
-    let cold = app.window().take_snapshot().expect("a frame is drawn");
+    let cold = snap(&app).expect("a frame is drawn");
     let demands = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let observed = demands.clone();
     st.on_tile_demand(move |shelf, start, end, warm_start, warm_end| {
@@ -1010,7 +1019,7 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
     app.invoke_sample_light_demand();
     std::thread::sleep(std::time::Duration::from_millis(20));
     slint::platform::update_timers_and_animations();
-    app.window().take_snapshot().expect("viewport geometry is sampled after layout");
+    snap(&app).expect("viewport geometry is sampled after layout");
     assert!(demands.borrow().iter().any(|&(shelf, start, end, _, _)| shelf == 0 && start == 0 && end == 2), "{:#?}", demands.borrow());
     assert!(demands.borrow().iter().all(|&(_, start, end, warm_start, warm_end)|
         warm_start <= start && start <= end && end <= warm_end));
@@ -1019,14 +1028,14 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
         app.window().dispatch_event(WindowEvent::PointerMoved {
             position: LogicalPosition::new(x as f32, y as f32 - dy as f32),
         });
-        app.window().take_snapshot().expect("the tile and its layer control draw while hovered");
+        snap(&app).expect("the tile and its layer control draw while hovered");
     }
     let at = |dx: f32| WindowEvent::PointerMoved { position: LogicalPosition::new(x as f32 + dx, y as f32 + 3.0) };
     // onto the first capsule, then across the drawer as it opens (the drawer animates, so a few
     // frames), then back out
     for (step, dx) in [3.0, 3.0, 30.0, 56.0, 82.0, 3.0].into_iter().enumerate() {
         app.window().dispatch_event(at(dx));
-        let frame = app.window().take_snapshot().expect("a hovered frame is drawn");
+        let frame = snap(&app).expect("a hovered frame is drawn");
         // NEURON_INSPECTOR_SHOTS=<dir> keeps the opening frame and each settled one for a look
         if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
             let dir = std::path::PathBuf::from(dir);
@@ -1038,22 +1047,22 @@ fn lighting_page_draws_pairing_chips_hovered_and_not() {
             for mid in 0..3 {
                 std::thread::sleep(std::time::Duration::from_millis(70));
                 slint::platform::update_timers_and_animations();
-                save(format!("pairs-{step}-t{}.png", (mid + 1) * 70), &app.window().take_snapshot().unwrap());
+                save(format!("pairs-{step}-t{}.png", (mid + 1) * 70), &snap(&app).unwrap());
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
             slint::platform::update_timers_and_animations();
-            save(format!("pairs-{step}-settled.png"), &app.window().take_snapshot().unwrap());
+            save(format!("pairs-{step}-settled.png"), &snap(&app).unwrap());
         }
     }
     app.window().dispatch_event(WindowEvent::PointerExited);
-    let after = app.window().take_snapshot().expect("a frame after the pointer leaves");
+    let after = snap(&app).expect("a frame after the pointer leaves");
     assert!(after.as_bytes().len() == cold.as_bytes().len());
     st.set_light_user_tiles(ModelRc::new(VecModel::from(vec![tile("user:late", &["ice"])])));
     app.window().set_size(slint::LogicalSize::new(920.0, 900.0));
-    app.window().take_snapshot().expect("late metadata and a reflow draw without eager geometry recursion");
+    snap(&app).expect("late metadata and a reflow draw without eager geometry recursion");
     std::thread::sleep(std::time::Duration::from_millis(20));
     slint::platform::update_timers_and_animations();
-    app.window().take_snapshot().expect("reflow demand is sampled after layout");
+    snap(&app).expect("reflow demand is sampled after layout");
     assert!(demands.borrow().iter().any(|&(shelf, _, _, _, _)| shelf == 3));
 }
 
@@ -1088,14 +1097,14 @@ fn lighting_effect_header_draws_painted_name_hovered_and_not() {
     st.set_window_shown(true);
     app.window().set_size(slint::LogicalSize::new(1240.0, 1100.0));
     app.show().expect("show the window");
-    app.window().take_snapshot().expect("the plain-ink fallback name draws");
+    snap(&app).expect("the plain-ink fallback name draws");
     // the painted branch: the header name wears the ramp. Only THIS name paints — the spectrum
     // editor is absent (no has-spectrum here), so `light-name-chars` stays empty.
     st.set_light_effect_chars(ModelRc::new(VecModel::from(
         "wave".chars().map(|c| SharedString::from(c.to_string())).collect::<Vec<_>>(),
     )));
     st.set_light_name_ramp(ModelRc::new(VecModel::from(vec![slint::Color::from_rgb_u8(255, 0, 255); 4])));
-    let painted = app.window().take_snapshot().expect("the painted name draws");
+    let painted = snap(&app).expect("the painted name draws");
     // text antialiasing never yields a pure ramp pixel, so match the ramp's hue loosely
     let mark = |p: &slint::Rgba8Pixel| p.r >= 200 && p.b >= 200 && p.g <= 100;
     let width = painted.width();
@@ -1106,13 +1115,13 @@ fn lighting_effect_header_draws_painted_name_hovered_and_not() {
         app.window().dispatch_event(WindowEvent::PointerMoved {
             position: LogicalPosition::new(x as f32 + dx, y as f32),
         });
-        app.window().take_snapshot().expect("the hover drift reads its bindings while drawn");
+        snap(&app).expect("the hover drift reads its bindings while drawn");
     }
     std::thread::sleep(std::time::Duration::from_millis(30));
     slint::platform::update_timers_and_animations();
-    app.window().take_snapshot().expect("a mid-drift frame draws");
+    snap(&app).expect("a mid-drift frame draws");
     app.window().dispatch_event(WindowEvent::PointerExited);
-    app.window().take_snapshot().expect("the settled name draws after the pointer leaves");
+    snap(&app).expect("the settled name draws after the pointer leaves");
 }
 
 #[test]
@@ -1343,10 +1352,10 @@ fn layer_stack_controls_preserve_identity_and_draw_a_large_scrollable_stack() {
     }).collect::<Vec<_>>())));
     app.window().set_size(slint::LogicalSize::new(1000.0, 1400.0));
     app.show().unwrap();
-    app.window().take_snapshot().expect("large stack draws in a bounded list");
+    snap(&app).expect("large stack draws in a bounded list");
     for index in [999, 500, 0] {
         st.set_selected_layer(index);
-        app.window().take_snapshot().expect("selection scrolls into view without binding loops");
+        snap(&app).expect("selection scrolls into view without binding loops");
     }
 }
 
@@ -1433,6 +1442,12 @@ fn second_picker_offers_preview_accept_and_undo() {
     assert!((st.get_picker_hue() - 0.4).abs() < 1e-6, "a grey keeps the hue it was reached from");
     st.invoke_picker_plane_pick(0.7, 0.5);
     assert!((chosen().h - 0.4).abs() < 0.02, "and comes back out on that hue");
+    st.invoke_picker_plane_pick(0.0, 0.5);
+    st.invoke_picker_hue_pick(0.7);
+    let lifted = chosen();
+    assert!(lifted.c > 0.05 && (lifted.h - 0.7).abs() < 0.02, "a hue picked for a grey shows: {lifted:?}");
+    st.invoke_picker_hue_pick(0.4);
+    st.invoke_picker_plane_pick(0.7, 0.5);
     assert_eq!(st.get_picker_marks().row_count(), 3, "the other stops' hues are ticked on the rail");
 
     // a colour offered for the stop is a dot in the picker, after the ramps in the list
@@ -1523,7 +1538,7 @@ fn second_picker_offers_preview_accept_and_undo() {
     app.window().set_size(slint::LogicalSize::new(1000.0, 1300.0));
     app.show().unwrap();
     let capture = |name: &str| {
-        let frame = app.window().take_snapshot().expect("the second picker draws without binding loops");
+        let frame = snap(&app).expect("the second picker draws without binding loops");
         if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
             let dir = std::path::PathBuf::from(dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1532,6 +1547,23 @@ fn second_picker_offers_preview_accept_and_undo() {
     };
     capture("picker-v2-offers");
 
+    // a long palette name, edited, from the narrowest window up: the spectrum header fits its column
+    {
+        use slint::{ModelRc, SharedString, VecModel};
+        let (chars, ramp) = (st.get_light_name_chars(), st.get_light_name_ramp());
+        let long: Vec<SharedString> = "sunset on light painting · edited".chars().map(|c| c.to_string().into()).collect();
+        st.set_light_name_chars(ModelRc::new(VecModel::from(long)));
+        st.set_light_name_ramp(ModelRc::new(VecModel::from(vec![slint::Color::from_rgb_u8(40, 90, 200), slint::Color::from_rgb_u8(120, 220, 240)])));
+        // 900 is the window's minimum width
+        for width in [900.0, 1000.0, 1240.0, 1600.0] {
+            app.window().set_size(slint::LogicalSize::new(width, 1300.0));
+            snap(&app).expect("a frame at this width");
+        }
+        app.window().set_size(slint::LogicalSize::new(1000.0, 1300.0));
+        st.set_light_name_chars(chars);
+        st.set_light_name_ramp(ramp);
+    }
+
     // by pointer: a pill answers where it is drawn and nowhere beside it. The row is found as what
     // changes when its pills are hidden.
     {
@@ -1539,9 +1571,9 @@ fn second_picker_offers_preview_accept_and_undo() {
         use slint::LogicalPosition;
         let ramps = st.get_assist_ramps();
         assert!(ramps > 0, "the edit draws a whole-palette offer: {:?}", titles());
-        let with = app.window().take_snapshot().unwrap();
+        let with = snap(&app).unwrap();
         st.set_assist_ramps(0);
-        let without = app.window().take_snapshot().unwrap();
+        let without = snap(&app).unwrap();
         st.set_assist_ramps(ramps);
         std::thread::sleep(std::time::Duration::from_millis(250));
         slint::platform::update_timers_and_animations();
@@ -1553,10 +1585,14 @@ fn second_picker_offers_preview_accept_and_undo() {
         let at = |x: usize, y: usize| LogicalPosition::new(x as f32, y as f32);
         let before = stops();
         app.window().dispatch_event(WindowEvent::PointerMoved { position: at(left + ramps as usize * 50 + 60, top + 13) });
-        app.window().take_snapshot().unwrap();
+        snap(&app).unwrap();
         assert!(!st.get_assist_showing() && stops() == before, "beside the pills, nothing is shown");
         app.window().dispatch_event(WindowEvent::PointerMoved { position: at(left + 22, top + 13) });
-        app.window().take_snapshot().unwrap();
+        snap(&app).unwrap();
+        assert!(!st.get_assist_showing(), "passing over a pill does not flash the lights");
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        slint::platform::update_timers_and_animations();
+        snap(&app).unwrap();
         assert!(st.get_assist_showing() && stops() != before, "resting on the first pill shows it");
         std::thread::sleep(std::time::Duration::from_millis(250));
         slint::platform::update_timers_and_animations();
@@ -1564,14 +1600,59 @@ fn second_picker_offers_preview_accept_and_undo() {
         let shown = stops();
         app.window().dispatch_event(WindowEvent::PointerPressed { position: at(left + 22, top + 13), button: PointerEventButton::Left });
         app.window().dispatch_event(WindowEvent::PointerReleased { position: at(left + 22, top + 13), button: PointerEventButton::Left });
-        app.window().take_snapshot().unwrap();
+        snap(&app).unwrap();
         assert_eq!(stops(), shown, "a click on the pill keeps it");
         assert!(!st.get_assist_showing(), "and it is no longer a draft");
         assert_eq!(titles(), ["put it back"]);
         app.window().dispatch_event(WindowEvent::PointerExited);
-        app.window().take_snapshot().unwrap();
+        snap(&app).unwrap();
         st.invoke_assist_accept(0);
         assert_eq!(stops(), before);
+    }
+
+    // by keyboard: Tab shows the first choice and Tab again keeps it; held, Tab numbers the
+    // offers and a number shows that one; Ctrl+Z takes the way back; Escape lets go
+    {
+        use slint::platform::{Key, WindowEvent};
+        let down = |t: slint::SharedString| app.window().dispatch_event(WindowEvent::KeyPressed { text: t });
+        let up = |t: slint::SharedString| app.window().dispatch_event(WindowEvent::KeyReleased { text: t });
+        let press = |t: slint::SharedString| { down(t.clone()); up(t); snap(&app).unwrap(); };
+        st.invoke_set_stop_color(1, "7a5ab4".into());
+        st.set_picker_focus(st.get_picker_focus() + 1);
+        snap(&app).unwrap();
+        assert!(st.get_assist_keys(), "grabbing a stop gives the picker the keyboard");
+        let prime = st.get_assist_prime();
+        assert!(prime >= 0, "an edit has a first choice: {:?}", titles());
+        let before = stops();
+        press(Key::Tab.into());
+        assert_eq!(st.get_assist_keyed(), prime);
+        assert!(st.get_assist_showing() && stops() != before, "Tab shows the first choice");
+        let shown = stops();
+        press(Key::Tab.into());
+        assert!(stops() == shown && !st.get_assist_showing(), "and Tab again keeps it");
+        down(Key::Control.into());
+        press("z".into());
+        up(Key::Control.into());
+        assert_eq!(stops(), before, "Ctrl+Z takes the way back");
+        st.invoke_set_stop_color(1, "6a64c0".into());
+        let before = stops();
+        // the rules alone may offer one option; the chord works the same on any number
+        let n = if st.invoke_assist_option(2) >= 0 { 2 } else { 1 };
+        let second = st.invoke_assist_option(n);
+        if second >= 0 {
+            down(Key::Tab.into());
+            snap(&app).unwrap();
+            assert!(st.get_assist_tab_held(), "held, Tab numbers the offers");
+            press(n.to_string().into());
+            up(Key::Tab.into());
+            snap(&app).unwrap();
+            assert!(st.get_assist_keyed() == second && st.get_assist_showing() && !st.get_assist_tab_held(), "Tab and {n} show that option only");
+            capture("picker-v2-keyed");
+            press(Key::Escape.into());
+            assert!(stops() == before && !st.get_assist_showing(), "Escape puts the palette back");
+        }
+        press(Key::Escape.into());
+        assert!(!st.get_assist_keys(), "and with nothing on show, lets the keyboard go");
     }
 
     st.invoke_assist_preview(0);
@@ -1587,20 +1668,20 @@ fn second_picker_offers_preview_accept_and_undo() {
         st.set_light_doubts(slint::ModelRc::new(slint::VecModel::from(vec![mark(false), mark(false), mark(true), mark(false)])));
     }
     // the terrain fades in: draw once to start it, then let it finish before the frame is kept
-    let _ = app.window().take_snapshot();
+    let _ = snap(&app);
     std::thread::sleep(std::time::Duration::from_millis(400));
     slint::platform::update_timers_and_animations();
     capture("picker-v2-model");
     // turned to the hue the ridge points at, the plane shows the ground itself
     st.invoke_set_stop_color(1, "4678be".into());
-    let _ = app.window().take_snapshot();
+    let _ = snap(&app);
     std::thread::sleep(std::time::Duration::from_millis(400));
     slint::platform::update_timers_and_animations();
     capture("picker-v2-terrain");
     // the guide's section on all this, its heading drawn mid-sheen
     st.invoke_guide_toggle("spectrum".into(), 40.0, 40.0);
     st.invoke_guide_make_sticky();
-    app.window().take_snapshot().unwrap();
+    snap(&app).unwrap();
     app.window().dispatch_event(slint::platform::WindowEvent::PointerScrolled {
         position: slint::LogicalPosition::new(230.0, 300.0), delta_x: 0.0, delta_y: -4000.0,
     });
@@ -1662,7 +1743,7 @@ fn spectrum_controls_reverse_only_the_active_frame_and_draw_relevant_properties(
     app.window().set_size(slint::LogicalSize::new(1000.0, 1600.0));
     app.show().unwrap();
     let capture = |name: &str| {
-        let frame = app.window().take_snapshot().expect("inspector controls draw without binding loops");
+        let frame = snap(&app).expect("inspector controls draw without binding loops");
         // Optional artifacts inspect the complete editor without changing a live device's scene.
         if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
             let dir = std::path::PathBuf::from(dir);

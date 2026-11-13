@@ -8,7 +8,10 @@
 //! callbacks). The software renderer keeps idle cost near zero — true to the anti-bloat motto.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // The entry .slint file `include`s every panel; recompile when any of them changes.
-    slint_build::compile("ui/app.slint")?;
+    // The entry .slint file `include`s every panel; recompile when any of them changes. Debug
+    // builds carry element names and layout kinds, which the tests' geometry checks read.
+    let debug = std::env::var("PROFILE").is_ok_and(|p| p != "release");
+    let config = slint_build::CompilerConfiguration::new().with_debug_info(debug);
+    slint_build::compile_with_config("ui/app.slint", config)?;
     Ok(())
 }
