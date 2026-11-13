@@ -654,12 +654,17 @@ component SpectrumEditor inherits VerticalLayout {
             }
             for s[i] in State.light-stops : handle := Rectangle {
                 property <bool> on: i == root.stop-idx;
+                // pointing at − marks the stop it would remove
+                property <bool> doomed: handle.on && stop-deck.left-hovered;
                 width: 16px;
                 height: parent.height;
                 x: clamp(s.at * strip.width - self.width / 2, 0px, strip.width - self.width);
-                background: handle.on ? Theme.accent-glow : transparent;
+                background: handle.doomed ? Theme.danger-glow : handle.on ? Theme.accent-glow : transparent;
                 border-width: handle.on ? Theme.hair : 0px;
-                border-color: Theme.accent-line;
+                border-color: handle.doomed ? Theme.danger-line : Theme.accent-line;
+                animate background, border-color { duration: Theme.quick; }
+                opacity: handle.doomed ? 0.55 : 1;
+                animate opacity { duration: Theme.quick; }
                 border-radius: 2px;
                 // the colour chip — a grounded, ringed marker (bigger than the old 9px speck) so it reads
                 // as a handle you grab, not a dot floating on the gradient. The selected one is larger with
@@ -669,7 +674,8 @@ component SpectrumEditor inherits VerticalLayout {
                     y: 4px; x: (parent.width - self.width) / 2;
                     background: s.col;
                     border-width: handle.on ? Theme.hair-2 : Theme.hair;
-                    border-color: handle.on ? Theme.text : Theme.text-faint;
+                    border-color: handle.doomed ? Theme.danger : handle.on ? Theme.text : Theme.text-faint;
+                    animate border-color { duration: Theme.quick; }
                 }
                 // A stop the colour model would change reads top to bottom as a sentence: its chip, a
                 // wavy underline, and a pip of the colour the model would rather see. Selecting the
@@ -704,7 +710,35 @@ component SpectrumEditor inherits VerticalLayout {
                     width: 2px;
                     height: parent.height - 19px;
                     y: 19px; x: (parent.width - self.width) / 2;
-                    background: Theme.accent;
+                    background: handle.doomed ? Theme.danger : Theme.accent;
+                }
+            }
+            // pointing at + shows where the new stop lands: midway to the selected stop's right-hand
+            // neighbour, or its left one at the end (the add glue's rule)
+            if stop-deck.right-hovered && State.light-stops.length > 0 : Rectangle {
+                property <int> k: root.stop-idx;
+                property <int> n: State.light-stops.length;
+                property <float> here: State.light-stops[self.k].at;
+                property <float> lands: self.k + 1 < self.n ? (self.here + State.light-stops[self.k + 1].at) / 2
+                    : self.k > 0 ? (self.here + State.light-stops[self.k - 1].at) / 2
+                    : self.here <= 0.5 ? (self.here + 1) / 2 : self.here / 2;
+                width: 16px;
+                height: parent.height;
+                x: clamp(self.lands * strip.width - self.width / 2, 0px, strip.width - self.width);
+                y: 0px;
+                // a ring with no colour of its own yet, and its stem
+                Rectangle {
+                    width: 11px; height: 11px; border-radius: 5.5px;
+                    x: (parent.width - self.width) / 2; y: 4px;
+                    border-width: Theme.hair-2;
+                    border-color: Theme.accent;
+                    background: Theme.accent.with-alpha(0.15);
+                }
+                Rectangle {
+                    width: 2px;
+                    height: parent.height - 19px;
+                    x: (parent.width - self.width) / 2; y: 19px;
+                    background: Theme.accent.with-alpha(0.6);
                 }
             }
         }
@@ -713,10 +747,15 @@ component SpectrumEditor inherits VerticalLayout {
         // half goes visibly DEAD at the last stop (left-enabled) — never a live-looking key that no-ops.
         HorizontalLayout {
             spacing: 7px;
-            SplitButton {
-                left-text: "− remove";
+            stop-deck := SplitButton {
+                // − and +: the hover ink says which removes and which adds, and the strip shows it
+                left-text: "−";
                 left-enabled: State.light-stops.length > 1;
-                right-text: "+ add";
+                right-text: "+";
+                left-hover-tinted: true;
+                left-hover-ink: Theme.danger;
+                right-hover-tinted: true;
+                right-hover-ink: Theme.accent;
                 left-clicked => { State.remove-stop(root.stop-idx); }
                 right-clicked => { State.add-stop(0.5); State.picker-focus += 1; }
             }
@@ -1323,6 +1362,8 @@ export component LightingPanel inherits VerticalLayout {
                             enabled: State.light-stack-count > 0;
                             clicked => { State.stack-current(); }
                         }
+                        // the slack goes here, not into the deck: a Button never grows past its label
+                        Rectangle { horizontal-stretch: 1; }
                         SplitButton {
                             left-text: "\u{2191}"; right-text: "\u{2193}";
                             left-enabled: State.selected-layer >= 0 && State.selected-layer < State.light-stack-count - 1;

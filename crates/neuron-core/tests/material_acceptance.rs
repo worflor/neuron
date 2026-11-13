@@ -16,6 +16,8 @@ use neuron::spectrum::{
 #[test]
 fn test_zero_energy_cold_thermal_emits_black() {
     // Thermal layer with arbitrary colourful spectrum — when cold, it MUST emit 0 light (Rgb::BLACK).
+    // Every key reads up: the real keyboard must not warm the board under test.
+    let _keys = neuron::capture::script_key_reads();
     let def = LayerDef {
         pattern: "thermal".into(),
         spectrum: Spectrum::gradient(vec![
@@ -127,6 +129,7 @@ fn test_spectrum_boundary_modes() {
 
 #[test]
 fn test_compositor_in_place_update_defs() {
+    let _keys = neuron::capture::script_key_reads();
     let mut params = Params::default();
     params.set("speed", 1.0);
 

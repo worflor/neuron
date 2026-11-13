@@ -20,10 +20,14 @@
 export struct GuideBlock {
     code: bool,
     text: string,
+    // a name set above the text in its own animated ink, one letter per entry (prose only), and
+    // where along it the ink turns from purple to yellow (0 means the middle)
+    lead: [string],
+    lead-split: float,
 }
 
 // One section of a guide — a bold heading over a list of prose / code blocks. `shine` spells the
-// heading one letter per entry; a heading given one carries a slow sheen.
+// heading one letter per entry; a heading given one is drawn in Luma-T's ink (LumaInk).
 export struct GuideSection {
     head: string,
     shine: [string],
@@ -292,14 +296,10 @@ export global GuideContent {
                             head: "Suggestions",
                             shine: ["S", "u", "g", "g", "e", "s", "t", "i", "o", "n", "s"],
                             blocks: [
-                                { code: false, text: "The v2 picker suggests colours as you work. Nothing changes until you click." },
-                                { code: false, text: "Dots in the colour square are colours for the stop you're on. Pills under the picker change the whole palette. Point at one to try it on your lights, click to keep it, and undo puts the palette back." },
-                                { code: false, text: "Held stops are left alone. New stops get ideas straight away." },
-                                { code: false, text: "Ask fetches ideas even when Luma-T would leave things as they are. Faint ones are a stretch. Ask again for more." },
-                                { code: false, text: "Roll makes a whole palette. Around keeps the held stops, fresh starts over, mine follows your other palettes, and wildcard is pure chance. The arrow next to roll sets the mode and how wild it gets." },
-                                { code: false, text: "Keys, once you grab a stop: arrows nudge the colour, Tab shows the first idea and Tab again keeps it, Tab with a number picks another, Esc puts things back, R rolls." },
-                                { code: false, text: "Luma-T is the colour model built into Neuron. It reads the whole palette and your change, and runs on this computer. Quiet means it likes what you have." },
-                                { code: false, text: "A squiggle under a stop means Luma-T would change it; the dot below is the colour it has in mind. Rings in the colour square close in on where the stop belongs, and hills on the hue bar peak at its hue. A map, not a rule." },
+                                { code: false, lead: ["L", "u", "m", "a", "-", "T"], lead-split: 0.7, text: "Neuron's generative colour model: 662,635 parameters, running on this computer in real time. A 592k-parameter core proposes colours and a 70k-parameter taste head picks the ones worth showing you. Both were designed and trained from scratch for Neuron, on curated synthetic palettes and public datasets of people's colour choices." },
+                                { code: false, text: "It edits with you. It can finish a move you've started, carry a change through the rest of the palette, tidy the stops around it, colour a stop you've just added, or build a whole palette around the colours you hold. It learns your taste from what you keep and pass over, on this computer." },
+                                { code: false, text: "Its ideas appear as dots in the colour square and pills under the picker. Point to preview, click to keep. Tab takes the first idea, ask brings more, and roll makes a whole new palette." },
+                                { code: false, text: "Squiggles, rings and hills show what it thinks. Hold a stop to keep it out of the suggestions." },
                             ],
                         },
                     ],

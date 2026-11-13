@@ -14,6 +14,10 @@
 //! - **loose-text**: text that is positioned by hand (`x:`), shows data instead of a fixed string,
 //!   and has no `width`, `overflow` or `wrap`. Nothing bounds it, so a long value runs on.
 //!
+//! - **drift**: a `TouchArea` given a width (or height) but no `x` (or `y`) inside an element that is
+//!   not a layout. Slint centres a sized element it is not told where to put, so the touch area
+//!   sits away from what it belongs to and presses land beside the thing drawn.
+//!
 //! A deliberate exception carries `// ui-lint: allow(<rule>) <reason>` on the offending line or
 //! within the six lines above it.
 
@@ -56,8 +60,58 @@ fn allowed(lines: &[&str], at: usize, rule: &str) -> bool {
 }
 
 fn lint(source: &str) -> Vec<Finding> {
-    let lines: Vec<&str> = source.lines().collect();
+    lint_in(source, &std::collections::BTreeSet::new())
+}
+
+/// Whether elements of type `ty` place their children: a built-in layout, or a component that
+/// inherits one (`layouts`, gathered from every source).
+fn places_children(ty: &str, layouts: &std::collections::BTreeSet<String>) -> bool {
+    ty.ends_with("Layout") || layouts.contains(ty)
+}
+
+/// Touch areas sized but not placed inside an element that does not place them.
+fn drift(lines: &[&str], layouts: &std::collections::BTreeSet<String>) -> Vec<Finding> {
     let mut found = Vec::new();
+    // (element type, the brace depth it opened at)
+    let mut open: Vec<(&str, i32)> = Vec::new();
+    let mut depth = 0i32;
+    for (i, line) in lines.iter().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        if let Some(ty) = opened_element(line) {
+            let parent = open.last().map(|(p, _)| *p);
+            if ty == "TouchArea" && parent.is_some_and(|p| !places_children(p, layouts)) {
+                let (mut own, mut d) = (Vec::new(), 1i32);
+                for next in &lines[i + 1..] {
+                    if d == 1 {
+                        own.extend(properties(next));
+                    }
+                    let c = next.split("//").next().unwrap_or("");
+                    d += c.matches('{').count() as i32 - c.matches('}').count() as i32;
+                    if d <= 0 {
+                        break;
+                    }
+                }
+                // a size that fills the parent leaves nothing to centre
+                let sized = |axis: &str, whole: &str| own.iter().any(|(name, value)| *name == axis && *value != "100%" && *value != whole);
+                let placed = |at: &str| own.iter().any(|(name, _)| *name == at);
+                let unplaced = (sized("width", "parent.width") && !placed("x")) || (sized("height", "parent.height") && !placed("y"));
+                if unplaced && !allowed(lines, i, "drift") {
+                    found.push(Finding { line: i + 1, rule: "drift", what: "TouchArea sized but not placed".into() });
+                }
+            }
+            open.push((ty, depth));
+        }
+        depth += code.matches('{').count() as i32 - code.matches('}').count() as i32;
+        while open.last().is_some_and(|(_, at)| *at >= depth) {
+            open.pop();
+        }
+    }
+    found
+}
+
+fn lint_in(source: &str, layouts: &std::collections::BTreeSet<String>) -> Vec<Finding> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut found = drift(&lines, layouts);
     for (i, line) in lines.iter().enumerate() {
         for (name, value) in properties(line) {
             let outside = match name {
@@ -120,10 +174,18 @@ fn ui_sources_keep_elements_and_text_inside_their_bounds() {
     let mut files = Vec::new();
     slint_sources(&root, &mut files);
     assert!(files.len() > 5, "found the ui sources");
+    // components that inherit a layout place their children like one
+    let sources: Vec<(PathBuf, String)> = files.into_iter().map(|f| { let s = std::fs::read_to_string(&f).expect("a ui source is UTF-8"); (f, s) }).collect();
+    let layouts: std::collections::BTreeSet<String> = sources.iter()
+        .flat_map(|(_, s)| s.lines().filter_map(|l| {
+            let rest = l.trim().strip_prefix("export ").unwrap_or(l.trim()).strip_prefix("component ")?;
+            let (name, base) = rest.split_once(" inherits ")?;
+            base.trim().trim_end_matches('{').trim().ends_with("Layout").then(|| name.trim().to_string())
+        }))
+        .collect();
     let mut report = String::new();
-    for file in files {
-        let source = std::fs::read_to_string(&file).expect("a ui source is UTF-8");
-        for f in lint(&source) {
+    for (file, source) in &sources {
+        for f in lint_in(source, &layouts) {
             let shown = file.strip_prefix(&root).unwrap_or(&file).display();
             report.push_str(&format!("\n  ui/{shown}:{}  {}  {}", f.line, f.rule, f.what));
         }
@@ -153,4 +215,11 @@ fn the_rules_catch_the_shapes_they_name() {
     assert_eq!(rules("Mono {\n    text: root.name;\n}"), [], "a layout sizes text it places");
     assert_eq!(rules("Rectangle {\n    x: 4px;\n    Mono {\n        text: root.name;\n    }\n}"), []);
     assert_eq!(rules("// ui-lint: allow(loose-text) sized by its own width\nMono {\n    x: 4px;\n    text: root.name;\n}"), []);
+
+    assert_eq!(rules("Rectangle {\n    ta := TouchArea {\n        width: 40px;\n    }\n}"), [(2, "drift")], "sized, not placed");
+    assert_eq!(rules("Rectangle {\n    TouchArea {\n        x: 0px; width: 40px;\n    }\n}"), [], "placed");
+    assert_eq!(rules("HorizontalLayout {\n    TouchArea {\n        width: 40px;\n    }\n}"), [], "a layout places it");
+    assert_eq!(rules("Rectangle {\n    TouchArea {}\n}"), [], "unsized fills its parent");
+    assert_eq!(rules("Rectangle {\n    TouchArea {\n        width: 100%;\n        height: parent.height;\n    }\n}"), [], "filling is not sizing");
+    assert_eq!(rules("Rectangle {\n    // ui-lint: allow(drift) centred on purpose\n    TouchArea {\n        width: 40px;\n    }\n}"), []);
 }

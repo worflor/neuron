@@ -20,7 +20,7 @@
 import { Theme, Signal } from "theme.slint";
 import { State } from "state.slint";
 import { GuideContent } from "guides.slint";
-import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, SheenTitle, Label, Lamp } from "widgets/controls.slint";
+import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, LumaInk, Label, Lamp } from "widgets/controls.slint";
 
 import { DevicePanel } from "panels/device.slint";
 import { LightingPanel } from "panels/lighting.slint";
@@ -550,7 +550,10 @@ export component AppWindow inherits Window {
             // the tooltip never reaches the click-away catcher behind it. The scroll-event swallow
             // catches any WHEEL the inner Flickable didn't consume (content fits, or it's at a scroll
             // edge), so spinning the wheel over the popup can never scroll the page BEHIND it.
+            // the card takes presses only while it is there to see: not while fading in from nothing, and
+            // not while fading out after closing, when a click belongs to the page beneath
             TouchArea {
+                enabled: State.guide-open && gcard.opacity > 0.5;
                 scroll-event(e) => {
                     accept
                 }
@@ -563,6 +566,7 @@ export component AppWindow inherits Window {
                     // the drag surface BEHIND the title/X (a Text doesn't grab events; the X's own
                     // TouchArea, declared later, sits above and wins its corner) — NotifPlacer pattern.
                     drag := TouchArea {
+                        enabled: State.guide-open && gcard.opacity > 0.5;
                         mouse-cursor: MouseCursor.move;
                         pointer-event(e) => {
                             if (e.kind == PointerEventKind.down) {
@@ -624,6 +628,7 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
                             IconButton {
+                                enabled: State.guide-open && gcard.opacity > 0.5;
                                 glyph: "\u{00d7}";
                                 clicked => { State.guide-close(); }
                             }
@@ -674,12 +679,14 @@ export component AppWindow inherits Window {
                                         letter-spacing: Theme.track-1;
                                         wrap: word-wrap;
                                     }
-                                    if s.shine.length > 0 : SheenTitle { letters: s.shine; }
+                                    if s.shine.length > 0 : LumaInk { letters: s.shine; }
                                     // each block is PROSE (quiet sans, the exception in a mono UI) or a
                                     // CODE CELL (mono on a well, hairline-framed — the same surface as the
                                     // macro editor, so a snippet here looks like where it'll be pasted). The
                                     // code cell is selectable and carries a floating copy button (top-right).
                                     for b in s.blocks : VerticalLayout {
+                                        // a name that carries its own mark, on the line above its words
+                                        if b.lead.length > 0 : LumaInk { letters: b.lead; split: b.lead-split > 0 ? b.lead-split : 0.5; }
                                         if !b.code : Label {
                                             text: b.text;
                                             color: Theme.text-mid;

@@ -7,7 +7,7 @@
 
 import { Theme } from "../theme.slint";
 import { State } from "../state.slint";
-import { Field, Mono, SheenTitle, SplitToggle, SwatchRow } from "controls.slint";
+import { Field, LumaInk, Mono, SplitToggle, SwatchRow } from "controls.slint";
 
 // A key that does something here, drawn as the key. `ground` is for sitting on a colour.
 component Keycap inherits Rectangle {
@@ -74,7 +74,7 @@ export component SensePicker inherits VerticalLayout {
             animate background { duration: Theme.quick; }
         }
         fld := Field {
-            field-width: 110px;
+            fits: "ffffff";
             placeholder: "4af2b0";
             text: root.value;
             invalid: self.has-focus && State.hex-preview-bad;
@@ -459,7 +459,7 @@ export component SenseOffers inherits Rectangle {
         animate border-color, background { duration: Theme.quick; }
         HorizontalLayout {
             alignment: center;
-            SheenTitle {
+            LumaInk {
                 letters: State.assist-asking ? ["m", "o", "r", "e"] : ["a", "s", "k"];
                 ink: root.quiet ? Theme.text-mid : Theme.text-faint;
                 size: Theme.fs-small;
@@ -545,9 +545,9 @@ export component RollButton inherits Rectangle {
             vertical-alignment: center;
             color: rta.has-hover ? Theme.text : Theme.text-mid;
             font-size: Theme.fs-small;
-            font-weight: 700;
+            font-weight: 500;
             font-family: Theme.mono;
-            letter-spacing: Theme.track-2;
+            letter-spacing: Theme.track-1;
         }
         rta := TouchArea {
             mouse-cursor: MouseCursor.pointer;

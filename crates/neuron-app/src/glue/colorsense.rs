@@ -80,6 +80,8 @@ struct Sense {
     control: Option<Control>,
     logged: Option<(usize, Rgb)>,
     offered: bool,
+    /// When the journal's last slate went on screen.
+    offered_at: Option<std::time::Instant>,
     /// The person asked the model outright about this palette: the palette, which round of
     /// options, and the slate that round made for the scene it was made for.
     asking: Option<(Home, Vec<Stop>, usize, Option<(assist::Scene, assist::Slate)>)>,
@@ -87,6 +89,10 @@ struct Sense {
     rolls: Vec<(Home, Offer)>,
     rolled: u64,
 }
+
+/// How long a slate must stay on screen before replacing it counts as passing it over. A slate
+/// swapped out sooner (the rules' answer replaced by the model's a moment later) was never seen.
+const SEEN: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// The most rolls the row keeps.
 const ROLLS: usize = 3;
@@ -103,11 +109,17 @@ thread_local! {
     /// The window and state a model answer is delivered to.
     static HOME: RefCell<Option<(slint::Weak<AppWindow>, SharedRt)>> = const { RefCell::new(None) };
     static JOURNALING: Cell<bool> = const { Cell::new(false) };
+    /// A decision went into the journal: the taste is refitted once the row is drawn.
+    static LEARN: Cell<bool> = const { Cell::new(false) };
 }
 
 fn model() -> Option<Arc<Learned>> {
     MODEL.with(|model| {
         model.borrow_mut().get_or_insert_with(|| {
+            // a test opts into a model with `use_model`; the shipped one is too slow unoptimised
+            if cfg!(test) {
+                return None;
+            }
             // a bundle in the run root's models folder, else Luma-T as Neuron ships it
             let model = Learned::open(&neuron::runroot::run_root().join("models"));
             for note in model.notes() {
@@ -203,19 +215,57 @@ fn active(sh: &SharedRt) -> Option<(Home, Palette)> {
     Some(((s.selected_layer, frame), layer.spectrum.seq.get(frame)?.palette.clone()))
 }
 
-/// The other palettes in the lighting stack: the nearest thing to the person's own library.
+/// The person's own palettes: the rest of the lighting stack first, then their saved effects.
 fn library(sh: &SharedRt, home: Home) -> Vec<Vec<Rgb>> {
     let s = sh.borrow();
     let mut all: Vec<Vec<Rgb>> = Vec::new();
+    let mut add = |colours: Vec<Rgb>| {
+        if !colours.is_empty() && !all.contains(&colours) && all.len() < LIBRARY.0 {
+            all.push(colours);
+        }
+    };
     for (l, layer) in s.light_layers.iter().enumerate() {
         for (f, frame) in layer.spectrum.seq.iter().enumerate() {
-            let colours: Vec<Rgb> = frame.palette.stops.iter().take(LIBRARY.1).map(|stop| stop.col).collect();
-            if (l, f) != home && !colours.is_empty() && !all.contains(&colours) && all.len() < LIBRARY.0 {
-                all.push(colours);
+            if (l, f) != home {
+                add(frame.palette.stops.iter().take(LIBRARY.1).map(|stop| stop.col).collect());
             }
         }
     }
+    for colours in saved_palettes() {
+        add(colours);
+    }
     all
+}
+
+/// The palettes in the person's saved effects, read again only when the effects folder changes.
+fn saved_palettes() -> Vec<Vec<Rgb>> {
+    thread_local! {
+        static SAVED: RefCell<Option<(Option<std::time::SystemTime>, Vec<Vec<Rgb>>)>> = const { RefCell::new(None) };
+    }
+    let dir = neuron::user_effects::effects_dir();
+    let stamp = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+    SAVED.with(|saved| {
+        let mut saved = saved.borrow_mut();
+        if saved.as_ref().is_none_or(|(at, _)| *at != stamp) {
+            let palettes = neuron::user_effects::list().unwrap_or_default().into_iter()
+                .filter_map(|(slug, _, _)| neuron::user_effects::load(&slug).ok())
+                .flat_map(|effect| effect.layers)
+                .flat_map(|layer| layer.spectrum.seq.into_iter().map(|frame| frame.palette.stops.iter().take(LIBRARY.1).map(|stop| stop.col).collect::<Vec<_>>()))
+                .collect();
+            *saved = Some((stamp, palettes));
+        }
+        saved.as_ref().map(|(_, palettes)| palettes.clone()).unwrap_or_default()
+    })
+}
+
+/// Fit the person's taste again from the journal, so what they just took or passed over shapes
+/// the next offers instead of the next launch's.
+fn learn_taste() {
+    if let Some(model) = model() {
+        if let Err(e) = model.relearn(&neuron::runroot::run_root().join("models")) {
+            eprintln!("neuron: colour taste not refitted ({e})");
+        }
+    }
 }
 
 fn same_shape(a: &[Stop], b: &[Stop]) -> bool {
@@ -379,7 +429,12 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
             }
             let offered = |scope: Scope| slate.offers.iter().enumerate().filter(move |(_, offer)| offer.scope == scope);
             // rolls lead the row, newest first; then the engines' palettes, the way back, the dots
-            sense.rolls.retain(|(at, _)| *at == home);
+            // a roll that would move a stop held since it was made is no longer one to offer
+            sense.rolls.retain(|(at, offer)| {
+                *at == home
+                    && (offer.stops.len() != palette.stops.len()
+                        || offer.stops.iter().zip(&palette.stops).enumerate().all(|(i, (new, old))| !pins.get(i).copied().unwrap_or(false) || new.col == old.col))
+            });
             let mut rows: Vec<Row> = sense.rolls.iter().map(|(_, offer)| Row { offer: offer.clone(), slate: None, dot: None, roll: true }).collect();
             rows.extend(offered(Scope::Palette).map(|(i, offer)| Row { offer: offer.clone(), slate: Some(i), dot: None, roll: false }));
             if let Some((_, stops, interp, _)) = &sense.undo {
@@ -398,6 +453,9 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
         });
         st.set_assist_can_ask(model().is_some());
         show(app, &rows, chosen, &pins, &doubts);
+        if LEARN.with(|learn| learn.replace(false)) {
+            learn_taste();
+        }
     }
     sync_picker(app, &palette, chosen);
 }
@@ -420,11 +478,17 @@ fn record(sense: &mut Sense, home: Home, palette: &Palette, chosen: usize, rows:
     }
     if changed {
         let slate: Vec<&[Stop]> = rows.iter().filter(|row| row.slate.is_some()).map(|row| row.offer.stops.as_slice()).collect();
-        if sense.offered {
+        let passed = sense.offered && sense.offered_at.is_some_and(|at| at.elapsed() >= SEEN);
+        if passed {
             wrote = wrote.and(journal.dismissed());
         }
         wrote = wrote.and(journal.shown(&slate));
         sense.offered = !slate.is_empty();
+        sense.offered_at = sense.offered.then(std::time::Instant::now);
+        if passed {
+            // after this borrow of the sense ends
+            LEARN.with(|learn| learn.set(true));
+        }
     }
     written(wrote);
 }
@@ -538,6 +602,7 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
         if journaling(sense, home, &was_stops) {
             let offered = std::mem::take(&mut sense.offered);
             if let Some((_, journal)) = sense.journal.as_mut() {
+                LEARN.with(|learn| learn.set(place.is_some() && offered));
                 written(match place {
                     Some(_) if offered => journal.accepted(choice),
                     Some(_) => Ok(()),
@@ -552,6 +617,9 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
     });
     if let Some((stops, interp)) = taken {
         put(app, sh, stops, interp);
+    }
+    if LEARN.with(|learn| learn.replace(false)) {
+        learn_taste();
     }
 }
 

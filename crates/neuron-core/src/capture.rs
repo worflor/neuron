@@ -193,6 +193,10 @@ pub fn key_down(vk: i32) -> bool {
     if let Some(down) = scripted_key(vk) {
         return down;
     }
+    // the suite never reads the real keyboard: a key held while it runs would change what it checks
+    if cfg!(test) {
+        return false;
+    }
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: GetAsyncKeyState is a pure read of the async key state for a valid VK in 0..256.
     unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }

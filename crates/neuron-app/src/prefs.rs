@@ -91,12 +91,13 @@ pub struct Prefs {
     /// Default is the house look, Directed Intent.
     #[serde(default = "default_material")]
     pub weave_material: String,
-    /// Use the second colour picker and its suggestion row in the spectrum editor. Default off.
-    #[serde(default)]
+    /// Use the second colour picker and its suggestion row in the spectrum editor. Default on.
+    #[serde(default = "default_true")]
     pub picker_v2: bool,
     /// Keep a local record of colour picks and the suggestions shown for them, in the run root's
-    /// `models/picker-sessions.jsonl`, for training a colour model on. Default off; nothing sends it.
-    #[serde(default)]
+    /// `models/picker-sessions.jsonl`: the colour model learns the person's taste from it. Default
+    /// on; it never leaves the machine.
+    #[serde(default = "default_true")]
     pub picker_journal: bool,
     /// What the second picker's roll button starts from (`neuron::assist::roll::Mode::name`).
     #[serde(default = "default_roll_mode")]
@@ -387,8 +388,8 @@ impl Default for Prefs {
             ui_accent: default_accent(),
             weave_accent: default_accent(),
             weave_material: default_material(),
-            picker_v2: false,
-            picker_journal: false,
+            picker_v2: true,
+            picker_journal: true,
             roll_mode: default_roll_mode(),
             roll_wild: default_roll_wild(),
             phoenix: true,

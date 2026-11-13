@@ -24,6 +24,9 @@ fn snap(app: &AppWindow) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>, 
     let frame = app.window().take_snapshot();
     let test = std::thread::current().name().unwrap_or("a GUI test").to_string();
     crate::uifit::assert_fits(app.window(), &test);
+    if let Ok(frame) = &frame {
+        crate::uifit::note(app.window(), frame);
+    }
     frame
 }
 
@@ -1389,7 +1392,8 @@ fn second_picker_offers_preview_accept_and_undo() {
     let titles = || st.get_assist_offers().iter().map(|o| o.title.to_string()).collect::<Vec<_>>();
     let original = stops();
 
-    assert!(!st.get_picker_v2(), "the first picker is the default");
+    assert!(st.get_picker_v2(), "the second picker is the default");
+    st.invoke_set_picker_v2(false);
     st.invoke_set_stop_color(1, "9650aa".into());
     assert!(titles().is_empty(), "the first picker has no suggestions");
     st.invoke_set_stop_color(1, "3c6eb4".into());
@@ -1757,6 +1761,114 @@ fn second_picker_offers_preview_accept_and_undo() {
     st.invoke_set_picker_v2(false);
     assert!(titles().is_empty() && !crate::prefs::picker_v2());
     capture("picker-v1");
+}
+
+/// The second picker under long random sequences of everything a person can do to it: hover,
+/// leave, keep, recolour, nudge, select, hold, ask, roll. After every step, what it promises still
+/// holds: letting go of whatever is on show puts back exactly the palette that was there, nothing
+/// changes the palette without a keep or an edit, a held stop only changes by hand, and the row
+/// never shows an offer it cannot take.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn second_picker_survives_random_sequences() {
+    use neuron::lighting::Rgb;
+    use neuron::spectrum::{Motion, Palette, Spectrum, Stop};
+    use slint::Model;
+    let _cwd = crate::testsupport::cwd_guard("second_picker_random");
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    glue::colorsense::use_model(Some(include_bytes!("../../neuron-core/data/colour-model.golden.lumacore")));
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    let mut layer = neuron::pattern::preset_layer("wave").unwrap();
+    layer.spectrum = Spectrum::from_palette(Palette::new(
+        [(20, 40, 90), (60, 110, 180), (120, 170, 220), (200, 225, 245)].into_iter().enumerate()
+            .map(|(i, (r, g, b))| Stop::new(Rgb::new(r, g, b), i as f32 / 3.0)).collect(),
+        Motion::Hold,
+    ));
+    shared.borrow_mut().light_layers = vec![layer];
+    glue::refresh_layers(&app, &shared);
+    st.invoke_set_picker_v2(true);
+    st.invoke_roll_choose(0, 1);
+    st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
+    st.set_sel_can_light(true); st.set_grid_rows(1); st.set_grid_cols(2);
+    st.set_page(1); st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(1000.0, 1300.0));
+    app.show().unwrap();
+    let stops = || shared.borrow().light_layers[0].spectrum.seq[0].palette.stops.clone();
+
+    // xorshift: the same sequence on every run, so a failure replays
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n.max(1)
+    };
+    let palettes = ["9650aa", "3c6eb4", "d07030", "30c060", "e0e0e0", "202020", "6a64c0"];
+    // the palette with nothing on show, and the stops a hold has fixed with their colours
+    let mut settled = stops();
+    for step in 0..400 {
+        let showing = st.get_assist_showing();
+        let rows = st.get_assist_offers().row_count() as u64;
+        let n = stops().len();
+        let held: Vec<bool> = st.get_light_pins().iter().collect();
+        let op = next(11);
+        let before = stops();
+        let mut undo = false;
+        let what = match op {
+            0 | 1 => { let i = next(rows + 2) as i32 - 1; st.invoke_assist_preview(i); format!("preview {i}") }
+            2 => { st.invoke_assist_preview(-1); "leave".into() }
+            3 => {
+                let i = next(rows + 1) as i32;
+                undo = st.get_assist_offers().row_data(i as usize).is_some_and(|o| o.back);
+                st.invoke_assist_accept(i);
+                format!("accept {i}")
+            }
+            4 => {
+                let i = next(n as u64) as i32;
+                let hex = palettes[next(palettes.len() as u64) as usize];
+                st.invoke_set_stop_color(i, hex.into());
+                format!("recolour {i} {hex}")
+            }
+            5 => { st.invoke_picker_nudge(0.0, 0.03, 0.0); "nudge".into() }
+            6 => { st.set_light_sel_stop(next(n as u64) as i32); st.invoke_picker_sync(); "select".into() }
+            7 => { st.invoke_toggle_pin(); "hold".into() }
+            8 => { st.invoke_assist_ask(); "ask".into() }
+            9 => { st.invoke_roll(); "roll".into() }
+            _ => { st.invoke_picker_plane_pick(next(100) as f32 / 100.0, next(100) as f32 / 100.0); "plane".into() }
+        };
+        let after = stops();
+        let ctx = || format!("step {step} ({what}), showing before {showing}");
+        // whatever was on show, letting go of it puts back the settled palette
+        if matches!(op, 0 | 1 | 2) && !st.get_assist_showing() {
+            assert_eq!(after, settled, "{}: letting go did not restore the palette", ctx());
+        }
+        // a stop held before this step keeps its colour unless this step recoloured it by hand or
+        // took the way back
+        let by_hand = matches!(op, 4 | 5 | 10) || undo;
+        if !by_hand && !st.get_assist_showing() && before.len() == after.len() && held.len() == before.len() {
+            for (i, &h) in held.iter().enumerate() {
+                if h && !showing {
+                    assert_eq!(before[i].col, after[i].col, "{}: held stop {i} moved", ctx());
+                }
+            }
+        }
+        // every row the picker draws is one it can show
+        let drawn = st.get_assist_offers().row_count();
+        assert!(st.get_assist_prime() < drawn as i32 && st.get_assist_keyed() < drawn as i32, "{}: a pointer past the row", ctx());
+        if !st.get_assist_showing() {
+            settled = stops();
+        }
+        if step % 40 == 0 {
+            snap(&app).unwrap();
+        }
+    }
+    st.invoke_assist_preview(-1);
+    snap(&app).unwrap();
+    glue::colorsense::use_model(None);
 }
 
 #[test]

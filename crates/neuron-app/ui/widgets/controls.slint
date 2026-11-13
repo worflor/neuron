@@ -85,30 +85,51 @@ export component SectionTitle inherits Text {
     vertical-alignment: center;   // it shares header rows with a count Mono / a Pill — centre it like Mono
 }
 
-// A heading with a slow, quiet sheen: every few seconds a band of cool light crosses the letters
-// and the ink settles back. One Text per letter, because gradient text is not drawn by every renderer.
-export component SheenTitle inherits HorizontalLayout {
+// Luma-T's mark on a word: every few seconds a purple pours in from the left, thick and slow with a
+// wobbling edge, and past the middle it turns to a quick yellow light that races to the end with a
+// bright front. The two names in "Luma-T" are Amity's purple and Luz's light. It holds, drains back
+// to plain ink, and rests. One Text per letter, because gradient text is not drawn by every
+// renderer; `live: false` holds the ink still and asks no redraws.
+export component LumaInk inherits HorizontalLayout {
     in property <[string]> letters;
     in property <color> ink: Theme.text;
     in property <length> size: Theme.fs-body;
     in property <length> track: Theme.track-1;
-    // false holds the ink still, and the window is not redrawn for it
+    in property <int> weight: 700;
     in property <bool> live: true;
-    // the band's centre in letter widths, from before the first letter to past the last, then a rest
-    property <float> cycle: root.live ? mod(animation-tick() / 1ms, 6400) / 6400 : 0.99;
-    property <float> band: -0.3 + 1.6 * min(1, root.cycle / 0.32);
+    // where along the word the purple gives way to the yellow (0..1); in "Luma-T", after "Luma"
+    in property <float> split: 0.5;
+    property <float> tick: root.live ? animation-tick() / 1ms : 0;
+    // 0..1 through one cycle of 7.2 s
+    property <float> now: root.live ? mod(root.tick, 7200) / 7200 : 0;
+    // the purple takes 2.4 s to reach the split, the yellow 1 s to reach the end
+    property <float> pour: clamp(root.now / 0.34, 0, 1);
+    property <float> race: clamp((root.now - 0.34) / 0.14, 0, 1);
+    property <float> front: root.now < 0.34
+        ? root.split * root.pour * root.pour * (3 - 2 * root.pour)
+        : root.split + (1 - root.split) * (1 - (1 - root.race) * (1 - root.race));
+    // full from 0.48 to 0.78, then it drains
+    property <float> drain: clamp((root.now - 0.78) / 0.12, 0, 1);
     spacing: 0px;
     alignment: start;
     for ch[i] in root.letters : Text {
         property <float> at: (i + 0.5) / max(root.letters.length, 1);
-        property <float> near: max(0, 1 - abs(self.at - root.band) / 0.24);
-        property <float> lift: self.near * self.near * (3 - 2 * self.near);
-        // lilac at the start of the word turning to ice blue at its end
-        property <color> glint: #c4b2ff.mix(#9fe6ff, 1 - self.at);
+        property <bool> light: self.at >= root.split;
+        // purple is thick: a soft edge that wobbles letter to letter; yellow is light: a hard edge
+        property <float> wob: self.light || !root.live ? 0 : 0.035 * Math.sin((root.tick * 0.004 + i * 1.7) * 1rad);
+        property <float> edge: self.light ? 0.06 : 0.18;
+        property <float> reach: clamp((root.front + self.wob - self.at) / self.edge + 0.5, 0, 1);
+        property <float> fill: self.reach * self.reach * (3 - 2 * self.reach) * (1 - root.drain);
+        // purple, turning to yellow just past the split
+        property <color> hue: #a56ef0.mix(#f5c542, 1 - clamp((self.at - root.split) * 6, 0, 1));
+        // the yellow's front burns white as it passes, and a filled yellow letter glints now and then
+        property <float> flare: self.light && root.race < 1 ? max(0, 1 - abs(root.front - self.at) / 0.08) * 0.7 : 0;
+        property <float> glint: self.light && root.live ? 0.18 * max(0, Math.sin((root.tick * 0.006 + i * 2.3) * 1rad)) : 0;
+        property <color> lit: self.hue.mix(#ffffff, 1 - max(self.flare, self.glint));
         text: ch;
-        color: root.ink.mix(self.glint, 1 - 0.8 * self.lift);
+        color: root.ink.mix(self.lit, 1 - self.fill);
         font-family: Theme.mono;
-        font-weight: 700;
+        font-weight: root.weight;
         font-size: root.size;
         letter-spacing: root.track;
         vertical-alignment: center;
@@ -912,7 +933,10 @@ export component Field inherits Rectangle {
     in property <bool> enabled: true;
     in property <string> placeholder;
     in-out property <string> text;
-    in property <length> field-width: 160px;
+    // the longest value this field can ever hold, when that is known (a hex colour: "ffffff"): the
+    // field then sizes itself to it instead of to a guessed width
+    in property <string> fits;
+    in property <length> field-width: root.fits != "" ? fit.preferred-width + 24px : 160px;
     in property <bool> invalid: false;
     // mask the input (a password field) — dots, never the plaintext. Default off, so every
     // existing Field is byte-identical.
@@ -961,6 +985,16 @@ export component Field inherits Rectangle {
             accepted => { root.accepted(self.text); }
             edited => { root.edited(self.text); }
         }
+    }
+    // measures `fits` in the field's own type; never seen (uifit reads it to flag a field drawn far
+    // wider than anything it can hold)
+    fit := Text {
+        x: 0px; y: 0px;
+        width: self.preferred-width;
+        text: root.fits;
+        font-size: Theme.fs-body;
+        font-family: Theme.mono;
+        opacity: 0;
     }
     if root.text == "" : Text {
         x: 10px;
@@ -1950,6 +1984,15 @@ export component SplitButton inherits Rectangle {
     // are set on the right half, PRIMARY wins (a commit-accent half is never also red).
     in property <bool> left-danger: false;
     in property <bool> right-danger: false;
+    // a half that shows what it does only when pointed at: with `*-hover-tinted`, its label takes
+    // this ink on hover, over a faint wash of it
+    in property <bool> left-hover-tinted: false;
+    in property <color> left-hover-ink: Theme.text;
+    in property <bool> right-hover-tinted: false;
+    in property <color> right-hover-ink: Theme.text;
+    // which half is under the pointer and live: lets the thing a half acts on preview the act
+    out property <bool> left-hovered: lta.has-hover && root.l-on;
+    out property <bool> right-hovered: rta.has-hover && root.r-on;
     in property <bool> enabled: true;
     // EITHER half can be gated on its own — e.g. SCAN always lives, APPLY only when a tunable device
     // is selected; or "− remove" goes dead at the last stop while "+ add" stays live. A gated half
@@ -1963,6 +2006,9 @@ export component SplitButton inherits Rectangle {
     property <bool> r-on: root.enabled && root.right-enabled && !root.busy;
     callback left-clicked();
     callback right-clicked();
+    // a deck keeps its own width, as a Button does: left to stretch, it splits a row's slack with
+    // the spacer beside it and its halves read padded (caught by uifit's loose-key warning)
+    horizontal-stretch: 0;
     height: Theme.row-h-sm;
     border-radius: Theme.radius-sm;
     border-width: Theme.hair;
@@ -1979,6 +2025,7 @@ export component SplitButton inherits Rectangle {
             min-width: ltxt.preferred-width + 26px;
             background: !root.l-on ? transparent
                 : lta.pressed ? Theme.well-hi
+                : (lta.has-hover && root.left-hover-tinted) ? root.left-hover-ink.with-alpha(0.1)
                 : lta.has-hover ? Theme.well
                 : transparent;
             animate background { duration: lta.has-hover ? Theme.hover-in : Theme.hover-out; }
@@ -1992,9 +2039,10 @@ export component SplitButton inherits Rectangle {
                     vertical-alignment: center; horizontal-alignment: center;
                     color: !root.l-on ? Theme.text-faint
                         : root.left-danger ? Theme.danger
+                        : (lta.has-hover && root.left-hover-tinted) ? root.left-hover-ink
                         : lta.has-hover ? Theme.text : Theme.text-mid;
-                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                    letter-spacing: Theme.track-2;
+                    font-size: Theme.fs-small; font-weight: 500; font-family: Theme.mono;
+                    letter-spacing: Theme.track-1;
                     animate color { duration: lta.has-hover ? Theme.hover-in : Theme.hover-out; }
                 }
             }
@@ -2013,6 +2061,7 @@ export component SplitButton inherits Rectangle {
             background: !root.r-on ? transparent
                 : rta.pressed ? Theme.well-hi
                 : (root.right-primary && rta.has-hover) ? Theme.accent-glow
+                : (rta.has-hover && root.right-hover-tinted) ? root.right-hover-ink.with-alpha(0.1)
                 : rta.has-hover ? Theme.well
                 : (root.right-primary ? Theme.bg-2 : transparent);
             animate background { duration: rta.has-hover ? Theme.hover-in : Theme.hover-out; }
@@ -2034,9 +2083,10 @@ export component SplitButton inherits Rectangle {
                         : !root.r-on ? Theme.text-faint
                         : root.right-primary ? Theme.accent
                         : root.right-danger ? Theme.danger
+                        : (rta.has-hover && root.right-hover-tinted) ? root.right-hover-ink
                         : (rta.has-hover ? Theme.text : Theme.text-mid);
-                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                    letter-spacing: Theme.track-2;
+                    font-size: Theme.fs-small; font-weight: root.right-primary ? 700 : 500; font-family: Theme.mono;
+                    letter-spacing: Theme.track-1;
                     animate color { duration: rta.has-hover ? Theme.hover-in : Theme.hover-out; }
                 }
             }
@@ -2266,7 +2316,7 @@ export component ColorPicker inherits VerticalLayout {
         // field-far-right void that made the spectrum row feel broken.
         if root.label != "" : Rectangle {}
         fld := Field {
-            field-width: 110px;
+            fits: "ffffff";
             placeholder: "4af2b0";
             text: root.value;
             // danger hairline ONLY when it's genuinely wrong (bad char / overlong) — a half-typed value stays neutral
