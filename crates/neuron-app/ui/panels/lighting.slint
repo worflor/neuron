@@ -658,7 +658,8 @@ component SpectrumEditor inherits VerticalLayout {
                 property <bool> doomed: handle.on && stop-deck.left-hovered;
                 width: 16px;
                 height: parent.height;
-                x: clamp(s.at * strip.width - self.width / 2, 0px, strip.width - self.width);
+                // on a whole pixel, so the stem under the chip draws sharp
+                x: clamp(Math.round((s.at * strip.width - self.width / 2) / 1px) * 1px, 0px, strip.width - self.width);
                 background: handle.doomed ? Theme.danger-glow : handle.on ? Theme.accent-glow : transparent;
                 border-width: handle.on ? Theme.hair : 0px;
                 border-color: handle.doomed ? Theme.danger-line : Theme.accent-line;
@@ -724,7 +725,7 @@ component SpectrumEditor inherits VerticalLayout {
                     : self.here <= 0.5 ? (self.here + 1) / 2 : self.here / 2;
                 width: 16px;
                 height: parent.height;
-                x: clamp(self.lands * strip.width - self.width / 2, 0px, strip.width - self.width);
+                x: clamp(Math.round((self.lands * strip.width - self.width / 2) / 1px) * 1px, 0px, strip.width - self.width);
                 y: 0px;
                 // a ring with no colour of its own yet, and its stem
                 Rectangle {

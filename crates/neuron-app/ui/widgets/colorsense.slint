@@ -320,8 +320,9 @@ export component SensePicker inherits VerticalLayout {
             animate opacity { duration: 250ms; easing: ease-out; }
         }
         // the other stops' hues hang from the top edge; suggested hues stand on the bottom one
+        // thin marks sit on whole pixels, or they draw blurred across two
         for mark in State.picker-marks : Rectangle {
-            x: clamp(mark * rail.width, 0px, rail.width - 1px);
+            x: clamp(Math.round(mark * rail.width / 1px) * 1px, 0px, rail.width - 1px);
             y: 0px;
             width: 1px; height: 5px;
             background: #ffffffc8;
@@ -329,7 +330,7 @@ export component SensePicker inherits VerticalLayout {
         for offer[i] in State.assist-offers : Rectangle {
             property <bool> hot: i == root.lit;
             visible: offer.solid;
-            x: clamp(offer.hue * rail.width - 1px, 0px, rail.width - 2px);
+            x: clamp(Math.round(offer.hue * rail.width / 1px) * 1px - 1px, 0px, rail.width - 2px);
             y: parent.height - self.height;
             width: 2px;
             height: self.hot ? 9px : 6px;

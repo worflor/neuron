@@ -356,11 +356,28 @@ fn ghost_touch(nodes: &[Node]) -> Vec<String> {
 /// two rows of pixels.
 fn soft_hairlines(nodes: &[Node], scale: f32) -> Vec<String> {
     let off = |v: f32| ((v * scale).fract() - 0.5).abs() < 0.4;
-    nodes.iter()
-        .filter(|n| matches!(n.kind, Kind::Hairline) && shown(n))
-        .filter(|n| (n.rect.w <= 2.0 && off(n.rect.x)) || (n.rect.h <= 2.0 && off(n.rect.y)))
-        .map(|n| format!("{}: a {:.1}×{:.1} rule at ({:.2}, {:.2}) falls between pixels", n.path, n.rect.w, n.rect.h, n.rect.x, n.rect.y))
-        .collect()
+    // the element the fraction starts at: the highest ancestor still off the pixel grid on that axis
+    let source = |mut i: usize, vertical: bool| {
+        let at = |n: &Node| if vertical { n.rect.y } else { n.rect.x };
+        while let Some(p) = nodes[i].parent.filter(|&p| off(at(&nodes[p]))) {
+            i = p;
+        }
+        i
+    };
+    let mut causes: std::collections::BTreeMap<(usize, bool), usize> = std::collections::BTreeMap::new();
+    for (i, n) in nodes.iter().enumerate().filter(|(_, n)| matches!(n.kind, Kind::Hairline) && shown(n)) {
+        if n.rect.w <= 2.0 && off(n.rect.x) {
+            *causes.entry((source(i, false), false)).or_default() += 1;
+        }
+        if n.rect.h <= 2.0 && off(n.rect.y) {
+            *causes.entry((source(i, true), true)).or_default() += 1;
+        }
+    }
+    causes.into_iter().map(|((i, vertical), count)| {
+        let n = &nodes[i];
+        let (axis, at) = if vertical { ("y", n.rect.y) } else { ("x", n.rect.x) };
+        format!("{}: starts at {axis} = {at:.2}, between pixels, so {count} thin rule(s) inside it draw blurred", n.path)
+    }).collect()
 }
 
 /// Text too close in lightness to what is drawn behind it, read off the frame: the most common
