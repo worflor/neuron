@@ -87,8 +87,13 @@ jobs:
             echo "no usable base ref: assuming code changed"
             echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-
-          changed="$(git diff --name-only "$base" "${{ github.sha }}")"
+          # Any failure to work out what changed runs everything, never nothing: a force push
+          # names a "before" the rewritten history no longer has, and under `set -e` a failed
+          # diff used to fail this job and skip every test.
+          if ! changed="$(git diff --name-only "$base" "${{ github.sha }}" 2>&1)"; then
+            echo "cannot diff against $base ($changed): assuming code changed"
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           echo "changed files:"; echo "$changed" | sed 's/^/  /'
 
           # Everything that cannot affect a build. Anything not matched here counts as code,
