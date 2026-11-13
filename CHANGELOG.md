@@ -31,7 +31,7 @@ the colour picker grew a brain: Luma-T, a tiny colour model that edits with you.
 - **shared device files** can't attach commands to keys a built-in definition doesn't have.
 
 ## 0.1.7 · 2026-11-08
-macros and shared files get locked down, and keyboards you reported now light up properly.
+a hardening pass. i went through neuron trying to break it and fixed what fell out: macros and shared setups locked down, and the keyboards you reported now light up properly.
 
 ### new
 - **a macro API reference,** in `docs/reference/MACROS.md`.
@@ -70,7 +70,8 @@ tagged but never published. everything here went out in 0.1.7.
 - **updates you already have** skip the download and backup, and clean up after themselves.
 
 ## 0.1.5 · 2026-10-13
-lighting grows up: layers, gradients, pairings, and a lab for hardware neuron doesn't know yet.
+a much faster lighting page. then it kept going: layers, gradients, pairings, and a lab for hardware neuron doesn't know yet.
+![lighting layers: an exploded engine render beside the real spectrum editor](artifacts/promo/release-v0.1.5/diagonal-screenshot-draft.png)
 
 ### new
 - **lighting layers.** an ordered stack with visibility, duplicates, per-layer opacity and blends (normal, screen, add, multiply, cutout), and dissolves between looks.
@@ -89,7 +90,8 @@ lighting grows up: layers, gradients, pairings, and a lab for hardware neuron do
 - **animation timing:** effect swaps, Comet retriggering, Heat on repeated timestamps and the breathing loop's seam.
 
 ## 0.1.4 · 2026-10-04
-controllers, Wildlife, and a CLI that can set up everything.
+more intentional UI, general controllers, and a little wildlife on your keyboard.
+![Wildlife: neuron's lighting rendered on a mock keyboard](docs/media/release-v0.1.4-wildlife.webp)
 
 ### new
 - **controllers.** general controller input on Windows, radial casting with a stick, Xbox-protocol pad rumble, device badges and sensor reads.
@@ -103,7 +105,7 @@ controllers, Wildlife, and a CLI that can set up everything.
 - **hardened by trying to break it:** controller identity, Naga side-plate binds, clipboard formats, screenshots and nested actions.
 
 ## 0.1.3 · 2026-09-29
-games' lighting, picked apart.
+games' lighting, picked apart. Overwatch paints a lot onto your keys; now you can see what each part of it is.
 
 ### new
 - **Chroma lab.** splits a game's lighting into ambient, held keys, animated keys and repeating effects, with replay, hiding and a colour lens.
@@ -115,7 +117,7 @@ games' lighting, picked apart.
 - **one signal language** for colours and lamps. faders take typed values, reset and fine adjustment.
 
 ## 0.1.2 · 2026-09-26
-quieter, sturdier, safer.
+quieter in the tray. neuron lives there, so it shouldn't be busy while nothing's happening.
 
 ### better
 - **less idle work** in dispatch, capture, the tray, audio, gestures and previews.
@@ -128,12 +130,14 @@ quieter, sturdier, safer.
 - **profile updates** no longer trip over each other across processes.
 
 ## 0.1.1 · 2026-09-20
+Windows beta. the updater finds beta releases, and the docs got shorter and truer.
+
 ### fixed
 - **updates** find prereleases and download from private repositories.
 - **the docs** for install, platforms, troubleshooting and macros.
 
 ## 0.1.0 · 2026-09-19
-the first public beta.
+beta mk1. the first public one.
 
 ### new
 - **neuron.** a Windows tray app and CLI for Razer device control, profiles, remaps, lighting, macros and audio. input stays disarmed until you arm it, and every device write is checked by reading it back.
