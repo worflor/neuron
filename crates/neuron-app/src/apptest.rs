@@ -2002,3 +2002,101 @@ fn scene_restore_waits_for_the_ownership_handoff_barrier() {
     let time = Duration::from_millis(66);
     assert_eq!(live.render_cycle(time, time, time).unwrap().accepted_scene_revision, 1);
 }
+
+/// The update pill in every phase, hovered across its keys, then its what's-new drawer with an
+/// image, and SYSTEM's UPDATES block with the installed notes: each frame held to uifit's rules.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn update_pill_drawer_and_system_notes_draw_and_fit() {
+    use crate::ui::{NoteMedia, NoteRow};
+    use slint::platform::WindowEvent;
+    use slint::{LogicalPosition, ModelRc, VecModel};
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let st = app.global::<State>();
+    let row = |kind: &str, title: &str, body: &str| NoteRow { kind: kind.into(), title: title.into(), body: body.into() };
+    let notes = ModelRc::new(VecModel::from(vec![
+        row("head", "", "the in-app updater, and patch notes you can read before you install."),
+        row("group", "new", ""),
+        row("item", "updates.", "neuron checks for signed releases and installs them in one click, then proves the new version before it lets go of the old one."),
+        row("item", "", "a plain item without a lead, long enough to wrap across the drawer more than once so the wrap is checked."),
+        row("group", "fixed", ""),
+        row("item", "patch notes.", "shown inline."),
+        row("thanks", "", "thanks: @someone, @another"),
+    ]));
+    let mut px = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(320, 120);
+    for (i, p) in px.make_mut_slice().iter_mut().enumerate() {
+        *p = slint::Rgba8Pixel { r: (i % 320) as u8, g: 80, b: 160, a: 255 };
+    }
+    let media = ModelRc::new(VecModel::from(vec![NoteMedia { img: slint::Image::from_rgba8(px), alt: "the pill".into(), ratio: 120.0 / 320.0 }]));
+    st.set_app_version("0.1.7".into());
+    st.set_update_version("0.1.8".into());
+    st.set_update_notes(notes.clone());
+    st.set_update_media(media.clone());
+    st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(1240.0, 800.0));
+    app.show().expect("show the window");
+    let settle = |app: &AppWindow| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        slint::platform::update_timers_and_animations();
+        snap(app).expect("a frame is drawn")
+    };
+    let shots = std::env::var_os("NEURON_INSPECTOR_SHOTS").map(std::path::PathBuf::from);
+    let save = |name: &str, f: &slint::SharedPixelBuffer<slint::Rgba8Pixel>| {
+        if let Some(dir) = &shots {
+            std::fs::create_dir_all(dir).unwrap();
+            image::save_buffer(dir.join(format!("update-{name}.png")), f.as_bytes(), f.width(), f.height(), image::ColorType::Rgba8).unwrap();
+        }
+    };
+    for (phase, progress, error) in [
+        ("available", 0.0, ""),
+        ("downloading", 0.42, ""),
+        ("ready", 1.0, ""),
+        ("installing", 1.0, ""),
+        ("error", 0.0, "hash mismatch"),
+        ("updated", 0.0, ""),
+        ("rolled-back", 0.0, ""),
+    ] {
+        st.set_update_phase(phase.into());
+        st.set_update_progress(progress);
+        st.set_update_error(error.into());
+        st.set_update_install_queued(phase == "downloading");
+        snap(&app).expect("the pill grows in");
+        let frame = settle(&app);
+        save(phase, &frame);
+        for x in (700..1100).step_by(25) {
+            app.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(x as f32, 28.0) });
+            snap(&app).expect("a hovered pill frame is drawn");
+        }
+        app.window().dispatch_event(WindowEvent::PointerExited);
+    }
+    st.set_update_phase("available".into());
+    st.set_update_notes_open(true);
+    snap(&app).expect("the drawer opens");
+    let open = settle(&app);
+    save("drawer", &open);
+    for y in (60..520).step_by(40) {
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(1000.0, y as f32) });
+        snap(&app).expect("a hovered drawer frame is drawn");
+    }
+    st.set_update_notes_open(false);
+    settle(&app);
+    st.set_update_phase("".into());
+    settle(&app);
+
+    st.set_installed_notes(notes);
+    st.set_installed_media(media);
+    st.set_update_enabled(true);
+    st.set_update_status("v0.1.7 · up to date".into());
+    st.set_page(3);
+    app.window().set_size(slint::LogicalSize::new(1240.0, 1400.0));
+    settle(&app);
+    st.set_installed_notes_open(true);
+    snap(&app).expect("the installed notes open in place");
+    let system = settle(&app);
+    save("system", &system);
+    app.window().dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(600.0, 700.0), delta_x: 0.0, delta_y: -4000.0 });
+    let bottom = settle(&app);
+    save("system-bottom", &bottom);
+}

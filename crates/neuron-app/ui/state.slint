@@ -18,7 +18,7 @@ import {
     PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTileMeta, EffectParam,
     SpectrumStop, SpectrumFrame, GradientPreset, PairChip, AssistOffer, StopDoubt,
     ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene,
-    LightingLayerChoice, LightingPresetChoice
+    LightingLayerChoice, LightingPresetChoice, NoteRow, NoteMedia
 } from "models.slint";
 
 export global State {
@@ -986,4 +986,30 @@ export global State {
 
     // generic: jump to a page (the ONE audited navigation entrypoint for tray + cross-panel links)
     callback goto-page(int);
+
+    // ── UPDATES — the header pill and the SYSTEM row ─────────────────────
+    // phase: "" (nothing to show) · "available" · "downloading" · "ready" · "installing" ·
+    // "error" (update-error says what, in a few words) · "updated" (this launch is a fresh install)
+    in-out property <string> update-phase: "";
+    in-out property <string> update-version: "";     // the incoming (or just-installed) version, no "v"
+    in-out property <float> update-progress: 0;      // 0..1 while downloading
+    in-out property <string> update-error: "";
+    in-out property <bool> update-install-queued: false;   // "& install" was pressed mid-download
+    in-out property <[NoteRow]> update-notes;        // the incoming release's notes (or the installed one's)
+    in-out property <[NoteMedia]> update-media;
+    in-out property <bool> update-notes-open: false; // the what's-new drawer under the pill
+    in-out property <string> update-status: "";      // SYSTEM line: "up to date · checked 2h ago", "off: …"
+    in-out property <bool> update-checking: false;
+    in-out property <bool> update-enabled: false;    // this copy can update itself at all
+    in-out property <bool> update-auto: true;        // automatic checks (pref)
+    // the installed version's own notes, bundled in the binary, for SYSTEM's what's-new
+    in-out property <[NoteRow]> installed-notes;
+    in-out property <[NoteMedia]> installed-media;
+    in-out property <bool> installed-notes-open: false;
+    callback update-download();
+    callback update-install();      // download if needed, then install and restart
+    callback update-dismiss();
+    callback update-check-now();
+    callback update-set-auto(bool);
+    callback update-open-release();
 }

@@ -45,13 +45,15 @@ pub enum Kind {
     SidePlate,
     /// A Chroma game left a scene the user asked to hear about (e.g. its menu, so a match began).
     Game,
+    /// A signed Neuron release newer than the running one became available. Once per version.
+    Update,
 }
 
 impl Kind {
     /// Every kind, in declaration order — the canonical list to iterate (config gates, the test
     /// probe, …). Call sites derive from this instead of hardcoding a subset, so a new variant is
     /// picked up everywhere by adding one arm here (and to [`Kind::slug`]).
-    pub const ALL: [Kind; 11] = [
+    pub const ALL: [Kind; 12] = [
         Kind::Dpi,
         Kind::Sniper,
         Kind::Scroll,
@@ -63,6 +65,7 @@ impl Kind {
         Kind::Battery,
         Kind::SidePlate,
         Kind::Game,
+        Kind::Update,
     ];
     /// Stable slug — the config key and the leitmotif identity seed.
     #[must_use]
@@ -79,6 +82,7 @@ impl Kind {
             Kind::Battery => "battery",
             Kind::SidePlate => "side_plate",
             Kind::Game => "game",
+            Kind::Update => "update",
         }
     }
 }
@@ -417,6 +421,20 @@ pub fn game_scene(game: &str, what: &str) {
         },
         title: game.to_string(),
         ident: format!("game:{}", game.to_lowercase()),
+        prev: None,
+    });
+}
+
+/// A verified release `version` is ready to download. The updater posts this at most once per
+/// version, so it is not a repeated nag.
+pub fn update_available(version: &str) {
+    emit(Confirmation {
+        kind: Kind::Update,
+        shape: Shape::Discrete {
+            label: format!("v{version}"),
+        },
+        title: "Update".into(),
+        ident: "update".into(),
         prev: None,
     });
 }

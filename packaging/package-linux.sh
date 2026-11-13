@@ -35,7 +35,8 @@ fi
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target-lane-release-linux}"
 if [[ "${NEURON_SKIP_BUILD:-0}" != 1 ]]; then
-    cargo build --release -p neuron-app -p neuron-cli --locked
+    # Marks the binaries as a packaged release, which is what lets the in-app updater run.
+    NEURON_RELEASE_BUILD=1 cargo build --release -p neuron-app -p neuron-cli --locked
 fi
 cli="$CARGO_TARGET_DIR/release/neuron"
 app="$CARGO_TARGET_DIR/release/neuron-app"

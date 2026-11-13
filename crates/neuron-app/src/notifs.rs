@@ -1086,6 +1086,7 @@ fn kind_anchor(k: Kind) -> i32 {
         Kind::SidePlate => 5,
         // a game alert means "come back", so it takes the top of the register
         Kind::Game => 6,
+        Kind::Update => 1,
     }
 }
 
@@ -1162,6 +1163,7 @@ fn kind_glyph(k: Kind) -> crate::overlay::WedgeGlyph {
         Kind::Battery => G::Battery,
         Kind::SidePlate => G::SidePlate,
         Kind::Game => G::Screen,
+        Kind::Update => G::Network,
     }
 }
 
@@ -1218,6 +1220,7 @@ fn emit_sample(kind: Kind) {
         Kind::Battery => confirm::battery(20, "Battery low", Some(45)),
         Kind::SidePlate => confirm::side_plate("12-button"),
         Kind::Game => confirm::game_scene("Overwatch", "left menu"),
+        Kind::Update => confirm::update_available("0.1.8"),
     }
 }
 

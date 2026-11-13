@@ -344,6 +344,21 @@ export struct OrganRow {
     detail: string,
 }
 
+// One row of release notes, drawn as plain styled text: kind "head" (the headline), "group" (a
+// subsection title), "item" (a bullet with an optional bold lead), "thanks".
+export struct NoteRow {
+    kind: string,
+    title: string,
+    body: string,
+}
+
+// A notes image, decoded off the UI thread; `ratio` is height / width.
+export struct NoteMedia {
+    img: image,
+    alt: string,
+    ratio: float,
+}
+
 // One sector of the radial preview.
 export struct RadialSector {
     label: string,

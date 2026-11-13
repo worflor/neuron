@@ -87,6 +87,11 @@ tar = "0.4"
 flate2 = "1"
 dirs = "6"
 
+# The self-updater (update/): `ureq` fetches GitHub release metadata and assets over rustls;
+# `ring` (already rustls's crypto provider) verifies the release manifest's Ed25519 signature.
+ureq = "3"
+ring = "0.17"
+
 # Build-time only: fetch + verify the python-build-standalone tarball for the build target.
 # `ureq` is a small blocking HTTP client (rustls, no OpenSSL); `sha2` checks the download
 # against the release's SHA256SUMS manifest. `sha2` is also used by compatibility bundle hashing.

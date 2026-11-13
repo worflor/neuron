@@ -167,6 +167,13 @@ pub struct Prefs {
     /// they only fire for scenes the user flagged.
     #[serde(default = "default_true")]
     pub notif_game: bool,
+    /// One card when a newer signed release first becomes available. Default on.
+    #[serde(default = "default_true")]
+    pub notif_update: bool,
+    /// Check GitHub Releases for a newer signed version (shortly after launch, then every ~12 h).
+    /// Off leaves the manual "check now". Default on.
+    #[serde(default = "default_true")]
+    pub update_auto: bool,
     /// Audio-cue master volume, 0..1. Default 0.7.
     #[serde(default = "default_notif_volume")]
     pub notif_volume: f32,
@@ -409,6 +416,8 @@ impl Default for Prefs {
             notif_battery: true,
             notif_side_plate: true,
             notif_game: true,
+            notif_update: true,
+            update_auto: true,
             notif_volume: default_notif_volume(),
             notif_sound: default_notif_sound(),
             notif_panel: true,
@@ -506,6 +515,8 @@ impl Prefs {
         salvage!("notif_battery", notif_battery);
         salvage!("notif_side_plate", notif_side_plate);
         salvage!("notif_game", notif_game);
+        salvage!("notif_update", notif_update);
+        salvage!("update_auto", update_auto);
         salvage!("notif_volume", notif_volume);
         salvage!("notif_sound", notif_sound);
         salvage!("notif_panel", notif_panel);
@@ -604,6 +615,7 @@ impl Prefs {
             Kind::Battery => self.notif_battery,
             Kind::SidePlate => self.notif_side_plate,
             Kind::Game => self.notif_game,
+            Kind::Update => self.notif_update,
         }
     }
 }
@@ -775,6 +787,22 @@ pub fn set_weave_material(slug: &str) -> String {
     }
 }
 
+/// Read the automatic update-check preference (default ON).
+pub fn update_auto() -> bool {
+    Prefs::load_cached().update_auto
+}
+
+/// Persist the automatic update-check preference, returning a user-facing status line.
+pub fn set_update_auto(v: bool) -> String {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut p = Prefs::load();
+    p.update_auto = v;
+    match p.save() {
+        Ok(()) => format!("automatic update checks {}", if v { "on" } else { "off" }),
+        Err(e) => format!("update setting not saved: {e}"),
+    }
+}
+
 /// Read the PHOENIX auto-restart preference (default ON).
 pub fn phoenix() -> bool {
     Prefs::load().phoenix
@@ -899,6 +927,7 @@ pub fn set_notif_event(slug: &str, v: bool) -> String {
         "battery" => p.notif_battery = v,
         "side_plate" => p.notif_side_plate = v,
         "game" => p.notif_game = v,
+        "update" => p.notif_update = v,
         _ => return format!("unknown notify event '{slug}'"),
     }
     match p.save() {
@@ -1590,6 +1619,8 @@ mod tests {
             notif_battery: !d.notif_battery,
             notif_side_plate: !d.notif_side_plate,
             notif_game: !d.notif_game,
+            notif_update: !d.notif_update,
+            update_auto: !d.update_auto,
             notif_volume: 0.125,
             notif_sound: "test-sound".into(),
             notif_panel: !d.notif_panel,

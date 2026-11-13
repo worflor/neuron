@@ -619,6 +619,17 @@ The app uses a flight recorder and crash log to turn silent failures into visibl
 - The UI heartbeat watches organ heartbeats and surfaces stalled dispatch/weave workers on a slower cadence than the tray/hotkey pump.
 - Worker loops that own core interaction are panic-walled and continue where possible.
 
+### 6.3.1 Self-Update
+
+`neuron::update` (core) holds the logic; `neuron-app/src/updater.rs` is one `neuron-updater` worker that sleeps on a condvar (naps of at most 15 min, so a deadline passed during system sleep is seen soon after resume) and posts finished views to the UI with `invoke_from_event_loop`.
+
+- **Trust.** A release carries `neuron-update.json` and `neuron-update.json.sig`: Ed25519 over `neuron-update-manifest-v1\n` plus the file's exact bytes, verified with the key in `update/release-key.pub` before the JSON is parsed. The manifest names the version, the release-notes section (markdown, so the notes are signed), notes media (path, size, SHA-256) and per-platform assets (`windows-x86_64-setup`, `windows-x86_64-portable`, `linux-x86_64`). Downgrades, the same version and a version that rolled back are never offered. Asset URLs must sit under the repository's release download prefix and match the listing's size.
+- **Transport.** `GET /repos/worflor/neuron/releases/latest` with `If-None-Match`; a 304 re-verifies the cached manifest in `update/manifest/`. 403/429 with an exhausted limit records `retry_at`. Failures back off from 15 min, doubling to 12 h. Downloads go to `<name>.part`, resume with `Range`, restart on a 200, and are renamed only after size and hash match; a mismatch deletes the partial file.
+- **Who may update.** `policy::availability`: off for Steam (the `steam` feature, `steam_appid.txt`, `SteamAppId`), source builds (a cargo `target` ancestor), builds without `NEURON_RELEASE_BUILD` (set by the packaging scripts), `NEURON_NO_UPDATE`, and copies that are neither Setup-managed (`unins000.exe`) nor marked portable. An elevated process refuses to install.
+- **Install.** Setup copies run the verified setup with `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`; Setup signals the tray's shutdown event, provisions the broker and restarts the tray, as it does for the standalone updater. Portable copies run the release's own `neuron-update` script, extracted from the verified archive, from a detached wrapper that waits for this process to exit, passes `-NoRelaunch`, records the exit code in `update/handoff/outcome.txt` and relaunches whatever is then installed. The next launch compares its version with `state.pending` to report success, or the script's last `FLAG`.
+- **Never brick.** `guard::keep_previous` stages the running program files into `update/previous/<version>/` (Setup: the whole program directory; portable: only the paths the new package ships, so config stays out). The new version is on probation: `guard::on_launch` (first thing in `main`, before any device) counts launches, a clean quit uncounts one, and 60 s up after dispatch and tray start ends probation and deletes the kept copy. A third unproven launch copies the kept files back from a detached wrapper, keeps the crash log as `update/failed-<version>-crash.log`, records `skip`, and starts the previous version, which shows one line and a report link. Config is never part of the kept copy or the restore.
+- **Releases.** After packaging, the release workflow's Windows job runs `neuron-release manifest` (built with the CLI) with the `NEURON_UPDATE_SIGNING_KEY` secret, verifies the result, and the publish job attaches both files. `neuron-release` refuses a key whose public half is not the compiled-in one; a tag push without the secret fails. Key generation is `neuron-release keygen`, which writes to `%USERPROFILE%\.neuron\release-signing\` and refuses to replace an existing key.
+
 ### 6.4 Ownership Rules
 
 Only one subsystem may own a physical trigger at a time:
@@ -653,6 +664,7 @@ Unless noted otherwise, files resolve under the **run root**:
 | Durable pockets & screenshots | `runtime/pockets/`, `screenshots/` | `pocket.rs`, `screenshot.rs` |
 | Device backups | `backups/*.json` | `runtime.rs`, `backup.rs` |
 | Reliability log | `neuron-crash.log` | `flight.rs`, panic/native hooks |
+| Updater record, downloads & kept copy | `update/state.json`, `update/manifest/`, `update/downloads/`, `update/media/`, `update/previous/<version>/`, `update/handoff/` | `neuron::update`, `updater.rs` |
 
 Runtime state that can be recomputed should not be persisted as truth. The UI should seed from device/config truth at install and after invalidating operations.
 

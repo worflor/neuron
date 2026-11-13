@@ -3616,6 +3616,7 @@ dependencies = [
  "proptest",
  "quick-xml 0.36.2",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

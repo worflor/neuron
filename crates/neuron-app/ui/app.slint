@@ -21,6 +21,7 @@ import { Theme, Signal } from "theme.slint";
 import { State } from "state.slint";
 import { GuideContent } from "guides.slint";
 import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, LumaInk, Label, Lamp } from "widgets/controls.slint";
+import { UpdatePill, UpdateDrawer } from "widgets/update.slint";
 
 import { DevicePanel } from "panels/device.slint";
 import { LightingPanel } from "panels/lighting.slint";
@@ -148,6 +149,7 @@ export component AppWindow inherits Window {
                 if (State.import-open) { State.import-open = false; return accept; }
                 if (State.profile-sheet-open) { State.profile-sheet-open = false; return accept; }
                 if (State.guide-open) { State.guide-close(); return accept; }
+                if (State.update-notes-open) { State.update-notes-open = false; return accept; }
                 if (root.arm-confirm) { root.arm-confirm = false; return accept; }
                 if (State.editing-sector >= 0) { State.editing-sector = -1; return accept; }
                 if (State.gesture-bind-target != "") { State.gesture-bind-target = ""; return accept; }
@@ -234,6 +236,12 @@ export component AppWindow inherits Window {
                                     letter-spacing: Theme.track-4;
                                     vertical-alignment: center;
                                 }
+                            }
+                            // UPDATE — a release waits (or just landed). It sits left of the
+                            // profile pill, which never moves.
+                            upd-slot := HorizontalLayout {
+                                horizontal-stretch: 0;
+                                if State.update-phase != "" : UpdatePill {}
                             }
                             // PROFILE — opens the profiles sheet (save/apply/rules from anywhere).
                             Pill {
@@ -489,6 +497,26 @@ export component AppWindow inherits Window {
                 // the sheet's own lower edge.
                 menu := ProfilesMenu { width: parent.viewport-width; height: parent.viewport-height; }
             }
+        }
+    }
+
+    // ── WHAT'S NEW — the update pill's drawer, dropping from under the pill. Click-away closes it;
+    // no scrim, the app stays live. ──
+    Rectangle {
+        visible: State.update-notes-open || upd-drawer.opacity > 0.01;
+        if State.update-notes-open : TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { State.update-notes-open = false; }
+        }
+        upd-drawer := UpdateDrawer {
+            open: State.update-notes-open;
+            width: min(420px, parent.width - Theme.pad-page * 2);
+            height: min(self.preferred-height, parent.height - 80px);
+            x: clamp(upd-slot.absolute-position.x + upd-slot.width - self.width, Theme.pad-page, max(Theme.pad-page, parent.width - self.width - Theme.pad-page));
+            y: State.update-notes-open ? 50px : 42px;
+            opacity: State.update-notes-open ? 1.0 : 0.0;
+            animate opacity, y { duration: Theme.settle; easing: ease-out; }
         }
     }
 

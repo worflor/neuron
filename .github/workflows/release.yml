@@ -139,12 +139,30 @@ jobs:
           CARGO_TARGET_DIR: target
         run: ./packaging/package-windows.ps1 -Version '${{ needs.preflight.outputs.version }}'
 
+      # The in-app updater acts only on a manifest signed with the key compiled into Neuron. The
+      # package step built the signing tool alongside the CLI; the key reaches this step only.
+      - name: Sign the update manifest
+        shell: pwsh
+        env:
+          NEURON_UPDATE_SIGNING_KEY: ${{ secrets.NEURON_UPDATE_SIGNING_KEY }}
+        run: |
+          if (-not $env:NEURON_UPDATE_SIGNING_KEY) {
+            if ('${{ github.event_name }}' -eq 'push') { throw 'NEURON_UPDATE_SIGNING_KEY is not set; a tagged release must carry a signed update manifest' }
+            Write-Output '::warning::NEURON_UPDATE_SIGNING_KEY is not set; this test build has no update manifest'
+            exit 0
+          }
+          & target/release/neuron-release.exe manifest --version '${{ needs.preflight.outputs.version }}' --dist dist --repo-root . --key-env NEURON_UPDATE_SIGNING_KEY
+          if ($LASTEXITCODE -ne 0) { throw 'update manifest signing failed' }
+          & target/release/neuron-release.exe verify --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'the signed update manifest does not verify' }
+
       - uses: actions/upload-artifact@v7
         with:
           name: package-windows
           path: |
             dist/*-setup.exe
             dist/*.zip
+            dist/neuron-update.json*
           if-no-files-found: error
 
   publish:
@@ -201,6 +219,9 @@ jobs:
           notes=".github/releases/${VERSION}.md"
           if [ -f "$notes" ]; then notes_args=(--notes-file "$notes"); else notes_args=(--generate-notes); fi
           assets=(dist/*-setup.exe dist/*.zip dist/SHA256SUMS.txt)
+          for manifest in dist/neuron-update.json dist/neuron-update.json.sig; do
+            if [ -f "$manifest" ]; then assets+=("$manifest"); fi
+          done
           if ! gh release create "$VERSION" "${assets[@]}" \
             --draft \
             --title "neuron $VERSION" \

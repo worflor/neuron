@@ -63,6 +63,7 @@ mod sound;
 mod strokelab;
 mod surface;
 mod undo;
+mod updater;
 mod shutdown;
 mod teleport;
 mod tray;
@@ -205,6 +206,11 @@ fn main() {
             eprintln!("[neuron] config migration incomplete: {err}; leaving the app closed so it cannot write partial config");
             std::process::exit(1);
         }
+    }
+    // A just-installed version that keeps failing to start hands off to restoring the previous one,
+    // before anything here touches a device.
+    if !elevated_purge && updater::launch_guard() {
+        return;
     }
     // Tells `neuron status` / live signalling which run root this app serves.
     neuron::livesync::publish_app_root();
@@ -565,6 +571,8 @@ fn main() {
     // injected into the live dispatch Engine); when a macro asks (neuron.ask) the same thread
     // presents the binary radial instead (green=yes / red=no / vertical=pass). Live-path only,
     // like the dispatch runtime — tests never start it.
+    // UPDATES — one sleeping worker: a check shortly after launch, then every ~12 h or on demand.
+    updater::start(weak.clone());
     beacon::start(weak);
 
     // ── RECONCILER (Chunk B: mic-mute launch sync) ────────────────────────
@@ -884,6 +892,7 @@ fn main() {
     buttonfw::restore_all();
     neuron::haptics::stop_all();
     restore_devices_to_firmware();
+    updater::clean_exit();
     // The tray wake thread-local holds `resident`; release it while worker threads are alive.
     tray.uninstall_wake();
     // keep the tray alive for the whole loop

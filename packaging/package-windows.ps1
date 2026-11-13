@@ -61,7 +61,10 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Chroma broker release build failed' }
         $previousBrokerHash = $env:NEURON_BROKER_SHA256
         $previousInstallerHash = $env:NEURON_BROKER_INSTALLER_SHA256
+        $previousReleaseBuild = $env:NEURON_RELEASE_BUILD
         try {
+            # Marks the binaries as a packaged release, which is what lets the in-app updater run.
+            $env:NEURON_RELEASE_BUILD = '1'
             $env:NEURON_BROKER_SHA256 = (Get-FileHash -LiteralPath (Join-Path $target 'release\neuron-chroma-broker.exe') -Algorithm SHA256).Hash
             $env:NEURON_BROKER_INSTALLER_SHA256 = (Get-FileHash -LiteralPath (Join-Path $repo 'packaging/windows/install-chroma-broker.ps1') -Algorithm SHA256).Hash
             & cargo build --release -p neuron-app -p neuron-cli --locked
@@ -71,6 +74,8 @@ try {
             else { $env:NEURON_BROKER_SHA256 = $previousBrokerHash }
             if ($null -eq $previousInstallerHash) { Remove-Item Env:NEURON_BROKER_INSTALLER_SHA256 -ErrorAction SilentlyContinue }
             else { $env:NEURON_BROKER_INSTALLER_SHA256 = $previousInstallerHash }
+            if ($null -eq $previousReleaseBuild) { Remove-Item Env:NEURON_RELEASE_BUILD -ErrorAction SilentlyContinue }
+            else { $env:NEURON_RELEASE_BUILD = $previousReleaseBuild }
         }
     }
 

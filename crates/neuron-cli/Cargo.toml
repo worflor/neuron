@@ -20,6 +20,11 @@ publish.workspace = true
 name = "neuron"
 path = "src/main.rs"
 
+# Maintainer tool: generates the release signing key and signs `neuron-update.json`.
+[[bin]]
+name = "neuron-release"
+path = "src/release_tool.rs"
+
 [dependencies]
 # idle-power-write: the sleep-timer SET (0x07/0x03) is hardware-confirmed on the Naga V2
 # Pro, so the CLI ships with it enabled; still verify-gated (every write re-reads 0x07/0x83

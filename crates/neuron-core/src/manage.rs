@@ -377,6 +377,8 @@ pub const APP_PREF_KINDS: &[(&str, &str)] = &[
     ("notif_battery", "bool"),
     ("notif_side_plate", "bool"),
     ("notif_game", "bool"),
+    ("notif_update", "bool"),
+    ("update_auto", "bool"),
     ("notif_volume", "float"),
     ("notif_sound", "string"),
     ("notif_panel", "bool"),

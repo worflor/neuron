@@ -15,6 +15,14 @@ for runtime and hardware verification.
 The Windows release includes the app and CLI, so updating it closes and reopens neuron. The
 updater does not touch user config.
 
+Release builds also update themselves from inside the app: a header pill offers a newer signed
+release, and its `& install` drives the same lifecycle this script does (Windows Setup for an
+installed copy, this script for a portable one). If the user is in the app, that is the shorter
+path. It is off for source builds, Steam copies and when `NEURON_NO_UPDATE` is set. Its state is
+in the run root's `update/` folder. A version that failed to start after an in-app update was
+rolled back automatically and is recorded as `skip` in `update/state.json`; the failed version's
+crash log is kept beside it as `failed-<version>-crash.log`.
+
 ## How to run the script
 
 On Windows:

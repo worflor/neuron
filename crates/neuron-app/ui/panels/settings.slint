@@ -3,7 +3,8 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 import { Theme, Signal } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, SplitToggle, SplitButton, Contact, SubLabel, ColorPicker, Palette, Field, ConfirmButton, Lamp } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, SplitToggle, SplitButton, Contact, SubLabel, ColorPicker, Palette, Field, ConfirmButton, Lamp, Disclosure } from "../widgets/controls.slint";
+import { NotesView } from "../widgets/update.slint";
 import { State } from "../state.slint";
 import { ChromaStreamRow, DiagRow } from "../models.slint";
 
@@ -565,6 +566,12 @@ component PingIcon inherits Rectangle {
         Rectangle { x: 3px; y: 1.5px; width: 10px; height: 13px; border-radius: 2.5px; border-width: 1.5px; border-color: root.ink; }
         Rectangle { x: 6.75px; y: 5px; width: 2.5px; height: 2.5px; border-radius: 1.25px; background: root.ink; }
         Rectangle { x: 6.75px; y: 9px; width: 2.5px; height: 2.5px; border-radius: 1.25px; background: root.ink; }
+    }
+    // UPDATE — an arrow landing in a tray: a new release is ready to fetch
+    if root.slug == "update" : Rectangle {
+        Rectangle { x: 7.25px; y: 1px; width: 1.5px; height: 9px; background: root.ink; }
+        Rectangle { x: 4.5px; y: 6.5px; width: 7px; height: 1.5px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 2px; y: 10px; width: 12px; height: 5px; border-radius: 1.5px; border-width: 1.5px; border-color: root.ink; }
     }
     // GAME — a screen on a stand (the notification's own glyph): a scene changed in a game you
     // aren't looking at
@@ -1517,6 +1524,7 @@ export component SettingsPanel inherits VerticalLayout {
                 spacing: 8px;
                 VerticalLayout {
                     spacing: 3px;
+                    alignment: start;
                     SectionTitle { text: "ABOUT"; }
                     Mono { text: "neuron " + (State.app-version == "" ? "unknown" : State.app-version); color: Theme.text-mid; }
                     Mono { text: "© 2026 Woflo Labs"; color: Theme.text-faint; }
@@ -1528,6 +1536,55 @@ export component SettingsPanel inherits VerticalLayout {
                     Mono { text: State.run-dir == "" ? "" : State.run-dir; color: Theme.text-faint; overflow: elide; }
                 }
                 Rectangle {}
+                // ── UPDATES — this copy's own: the last check, a manual one, the automatic switch,
+                // and the running version's notes, which open in place ──
+                VerticalLayout {
+                    width: 380px;
+                    spacing: 7px;
+                    alignment: start;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            SectionTitle { text: "UPDATES"; }
+                            Mono { text: State.update-status; color: Theme.text-faint; overflow: elide; }
+                        }
+                        Rectangle {}
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "check now";
+                                busy: State.update-checking;
+                                enabled: State.update-enabled;
+                                clicked => { State.update-check-now(); }
+                            }
+                        }
+                    }
+                    Toggle {
+                        caption: "check automatically";
+                        checked: State.update-auto;
+                        enabled: State.update-enabled;
+                        toggled(v) => { State.update-set-auto(v); }
+                    }
+                    if State.installed-notes.length > 0 : Disclosure {
+                        label: "what's new in " + State.app-version;
+                        open: State.installed-notes-open;
+                        toggled => { State.installed-notes-open = !State.installed-notes-open; }
+                    }
+                    Rectangle {
+                        height: State.installed-notes-open ? installed.preferred-height : 0px;
+                        clip: true;
+                        animate height { duration: Theme.settle; easing: ease-out; }
+                        installed := NotesView {
+                            y: 0;
+                            width: parent.width;
+                            height: self.preferred-height;
+                            rows: State.installed-notes;
+                            media: State.installed-media;
+                        }
+                    }
+                }
             }
         }
     }

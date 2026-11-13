@@ -48,7 +48,8 @@ anyhow.workspace = true
 # selector can fall back during backend construction, but graphics initialization can
 # fail later when the window opens, so selection is not a driver compatibility test.
 slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg", "renderer-software"] }
-image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+# webp/jpeg: release-notes images (docs/media is webp), decoded off the UI thread.
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "jpeg"] }
 cpal.workspace = true
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
@@ -105,6 +106,8 @@ slint-build = "1.16"
 
 [features]
 default = []
+# A Steam build: Steam updates the app, so the self-updater stays off.
+steam = []
 # Opt-in experimental WGPU UI renderer; layered overlays and materials remain CPU paths.
 wgpu-renderer = ["slint/renderer-femtovg-wgpu", "slint/unstable-wgpu-28"]
 

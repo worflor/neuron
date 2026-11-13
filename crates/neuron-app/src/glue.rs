@@ -841,6 +841,7 @@ fn ping_copy(k: neuron::confirm::Kind) -> (&'static str, &'static str, &'static 
         Kind::Layer => ("layer", "layer", "HyperShift"),
         Kind::Macro => ("beacon", "beacon", "macro notify"),
         Kind::Game => ("game", "game", "scene alerts"),
+        Kind::Update => ("update", "update", "new release"),
     }
 }
 
@@ -866,6 +867,7 @@ fn ping_slot(k: neuron::confirm::Kind) -> (u8, u8) {
         Kind::Layer => (2, 1),
         Kind::Macro => (2, 2),
         Kind::Game => (2, 3),
+        Kind::Update => (2, 4),
     }
 }
 
@@ -1764,6 +1766,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
             .to_string()
             .into(),
     );
+    crate::updater::install(app);
 
     // initial population — every readout seeded from persisted/device truth.
     refresh_devices(app, &shared);
@@ -11505,6 +11508,14 @@ fn open_in_file_manager(path: &std::path::Path) {
     let _ = std::process::Command::new("open").arg(path).spawn();
     #[cfg(all(not(windows), not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Open a web link in the default browser. Best effort, like [`open_in_file_manager`].
+pub(crate) fn open_external(url: &str) {
+    if !url.starts_with("https://") {
+        return;
+    }
+    open_in_file_manager(std::path::Path::new(url));
 }
 
 fn open_config_dir() {
