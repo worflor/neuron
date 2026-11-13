@@ -12,11 +12,12 @@ Read the installed CLI's command interface:
 
 ```powershell
 .\neuron.exe --help
-.\neuron.exe dpi --help
+.\neuron.exe feel --help
 ```
 
-Use the command groups and options shown by that build. For complete setup
-authoring, follow [neuron-cli](../neuron-cli/SKILL.md).
+Use the command groups and options shown by that build (older releases expose `feel` verbs as
+top-level commands such as `dpi` and `dpi-stages`). For complete setup authoring, follow
+[neuron-cli](../neuron-cli/SKILL.md).
 
 ## Safe any time: read-only
 
@@ -27,12 +28,12 @@ These only read. Run them freely to answer questions or check things before a ch
 | `list` | connected, recognised devices |
 | `info` | firmware, device mode, battery |
 | `battery` | battery level and charging |
-| `dpi` (no number) | current DPI |
-| `polling` (no number) | current polling rate |
-| `brightness` (no number) | current lighting brightness |
-| `scroll` (no number) | current scroll-wheel stage |
-| `lod` (no options) | current lift-off distance |
-| `game-mode` (no argument) | keyboard game mode state |
+| `feel dpi` (no number) | current DPI |
+| `feel polling` (no number) | current polling rate |
+| `feel brightness` (no number) | current lighting brightness |
+| `feel scroll` (no number) | current scroll-wheel stage |
+| `feel lod` (no options) | current lift-off distance |
+| `feel game-mode` (no argument) | keyboard game mode state |
 | `storage` | onboard memory usage |
 | `backup` | saves every device's full state to `backups\*.json` (writes a file, not the device) |
 | `verify <backup.json>` | compares a device to a saved backup |
@@ -50,18 +51,18 @@ For a hardware write:
 
 | command | what it changes |
 |---|---|
-| `dpi <n>` · `dpi-stages <…>` | DPI, or the whole DPI stage table |
-| `polling <hz>` | polling rate |
-| `brightness <0-100>` | lighting brightness |
-| `scroll <stage>` · `lod …` | scroll stage, lift-off distance |
-| `game-mode on\|off` · `remap …` · `mode …` | game mode, thumb-button remap, device control mode |
+| `feel dpi <n>` · `feel stages <…>` | DPI, or the whole DPI stage table |
+| `feel polling <hz>` | polling rate |
+| `feel brightness <0-100>` | lighting brightness |
+| `feel scroll <stage>` · `feel lod …` | scroll stage, lift-off distance |
+| `feel game-mode on\|off` · `bind` / `button` · `mode …` | game mode, button binds / firmware buttons, device control mode |
 | `lighting effect …` · `profile apply <name>` | lighting, or a whole profile |
 
 Most writes are **volatile**: they take effect now and reset when the device power-cycles.
 
-**One exception: `scroll <stage>` stores to onboard memory by default**, matching what Synapse
+**One exception: `feel scroll <stage>` stores to onboard memory by default**, matching what Synapse
 sends. Tell the user that before running it, and add `--volatile` if they only want it until the
-next power cycle. `dpi-stages` stores only with `--persist`. Never add `--persist` unless the user
+next power cycle. `feel stages` stores only with `--persist`. Never add `--persist` unless the user
 asks for it.
 
 A write that doesn't take prints an error, never a fake success. If you get one, report it. Don't

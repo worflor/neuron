@@ -100,7 +100,7 @@ prepare a draft via the handoff reference; do not manufacture a native finding.
 
 For Linux, receiver/wired comparisons or a second OS, read
 [platforms.md](references/platforms.md). Stay on the current machine unless the
-person requests a second-host run; an available Fedora box is not automatic access.
+person requests a second-host run; an available Linux host is not automatic access.
 
 ## Optional guided input experiment
 

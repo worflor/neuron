@@ -15,7 +15,8 @@ preference. Normal startup enables live dispatch; safe mode is not equivalent.
    restart, invoke the intended executable with `--shutdown-existing`, then wait
    for the old process to exit. If it does not exit, diagnose rather than launching
    a duplicate owner or assuming shutdown succeeded.
-2. With Computer Use, pass an explicit process identifier, not a bare path:
+2. With desktop/computer-use automation (for example, `sky.launch_app`), pass an
+   explicit process identifier, not a bare path:
 
    ```javascript
    await sky.launch_app({ app: "process:C:\\absolute\\path\\neuron-app.exe" });
@@ -26,12 +27,13 @@ preference. Normal startup enables live dispatch; safe mode is not equivalent.
    `Start-Process -FilePath (Resolve-Path .\target\release\neuron-app.exe).Path`
    from the repository, without hidden-window options.
 3. Confirm the running process's executable path matches the requested build.
-   Refresh `sky.list_windows()` and select the returned Neuron window; inspect
-   it with `sky.get_window_state` and bring it forward with `sky.activate_window`.
-   Startup can outlast the launch tool's initial window wait: re-enumerate before
-   retrying the launch. Report success only after seeing the rendered window or
-   receiving the user's confirmation. A PID, Session 1, host connections, or a
-   zero/nonzero `MainWindowHandle` is not sufficient visibility evidence.
+   Re-enumerate desktop windows and inspect and activate the returned Neuron window
+   (with `sky.list_windows()`, `sky.get_window_state`, and `sky.activate_window` when
+   available). Startup can outlast the launch tool's initial window wait:
+   re-enumerate before retrying the launch. Report success only after seeing the
+   rendered window or receiving the user's confirmation. A PID, Session 1, host
+   connections, or a zero/nonzero `MainWindowHandle` is not sufficient visibility
+   evidence.
 
 Leave a working app running. Do not rebuild a release executable while it is open.
 
@@ -162,7 +164,7 @@ exact text.
 If `gh` is installed and logged in:
 
 ```powershell
-gh issue create --repo worflor/neuron --title "<title>" --body-file <draft.md> --label bug --label needs-triage --label area:<area>
+gh issue create --repo worflor/neuron --title "<title>" --body-file <draft.md> --label bug --label area:<area>
 ```
 
 Labels only stick if the user has triage rights on the repo. For everyone else GitHub silently drops

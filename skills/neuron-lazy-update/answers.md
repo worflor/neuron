@@ -3,7 +3,8 @@
 Answer from the installed build and the sources below, and name the evidence
 used. State any uncertainty that affects the answer.
 
-A release install includes `README.md` and `SECURITY.md` next to the exes. Everything else is in the
+A release install includes `README.md` and `SECURITY.md` next to the exes (current
+Windows packages also bundle `docs/` and `skills/`). Everything else is in the
 repository: https://github.com/worflor/neuron
 
 | the question is about… | look here |

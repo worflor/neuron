@@ -351,7 +351,7 @@ Not reachable from the CLI, and why:
 | Scroll stage table, in-game polling split, Snap Tap | the writes are behind `hyperscroll-write`, `ingame-poll-write`, `snap-tap-write` until confirmed on hardware; the CLI does not enable them. Profile fields for them can still be authored |
 | Live lighting preview, brush painting, stroke previews | interactive by nature (`cast run`, `radial pick`, `lighting run` are the terminal equivalents) |
 | Teleport/whiteboard "try now", overlay instruments | drawn by the resident app; bind them (`--action teleport`) |
-| Chroma lab names, hides, scenes | held only in the app's lab state; binds to lab effects work (`--trigger game-light:APP/EFFECT`) |
+| Chroma lab names, hides, scenes | persisted by the app in `chroma/<exe>.toml` and edited from the live Chroma lab; binds to lab effects still work from the CLI (`--trigger game-light:APP/EFFECT`) |
 | Weave material knobs, input arm stance, pause writes | per-session app state, not persisted |
 | OBS password | a secret; set it in the app |
 | Start with Windows | a registry value owned by the app |

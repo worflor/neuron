@@ -2,8 +2,7 @@
 > doc, and the map most worth reading first. What it *does* is [`GDD.md`](GDD.md).
 >
 > **provenance:** drafted with LLM assistance during implementation. Sections may
-> predate the current code; verify details against the tree. The runtime boundary
-> was updated in September 2026.
+> predate the current code; verify details against the tree.
 
 # Neuron Technical Design Document
 
@@ -61,7 +60,7 @@ Startup flow:
 6. Build the Slint window eagerly but hidden, install `glue`, and retain the window plus app runtime in `Resident`.
 7. Seed the tray from that real resident runtime, avoiding a second throwaway config/runtime load.
 8. Start live dispatch with `dispatch::LiveRuntime::start`. On non-Windows builds, the UI reports live dispatch as unavailable instead of pretending a device backend exists.
-9. Leave the Python Macro Host sidecar cold until input is armed or a macro editor action needs it.
+9. Leave the Python Macro Host sidecars cold at startup; they warm only on a manual GUI arm, a macro invocation, or a macro editor action.
 10. Start the beacon/spellweaving service.
 11. Show the window unless launch preferences request tray startup. `--tray` only starts hidden when `app.toml` says start-minimized; autostart can be configured for tray or visible-window launch.
 12. Run `slint::run_event_loop_until_quit`.
@@ -631,17 +630,27 @@ Only one subsystem may own a physical trigger at a time:
 
 ## 7. Persistence Model
 
+Unless noted otherwise, files resolve under the **run root**:
+
 | Data | File | Writer |
 |---|---|---|
-| GUI prefs | `app.toml` | `prefs.rs`, `glue.rs` |
+| GUI prefs & live lighting stack | `app.toml` | `prefs.rs`, `glue.rs`, `manage.rs` |
 | Device profiles | `profiles/<name>.toml` | `profile.rs`, `runtime.rs` |
 | Device-control bindings | `bindings.toml` | `bindings.rs`, CLI/manual paths |
 | Imported/GUI rules | `profiles/*.rules.toml`; GUI-authored rules use `profiles/gui.rules.toml` | importer/editor paths |
-| App focus rules | `apps.toml` | `runtime.rs`, `glue.rs` |
-| Cast/radial/glyph action config | `cast.toml` | `editor.rs`, `glue.rs`; core `cast.rs` owns the path/types/load behavior |
+| App focus rules | `apps.toml` | `profile.rs`, `runtime.rs`, `glue.rs` |
+| Cast/radial/glyph action config | `cast.toml` | `editor.rs`, `glue.rs`; core `cast.rs` owns path/load/save |
 | Feel/HyperShift timing | `feel.toml` | `feel.rs`, `glue.rs`; `controls.rs` reads it during `build_runtime` |
+| Durable device feel intent | `feel-intent.toml` | `feel_intent.rs`, `intent.rs`, `runtime.rs` |
+| Device badges & emblem words | `badges.toml`; optional read-only `emblems.toml` | `badge.rs`, `setup.rs`, `glue.rs` |
+| Device & controller definitions | `devices/*.toml`, `devices/auto/<dialect>-<pid>.toml`, `layouts/*.toml` | `synth.rs`, `registry.rs`, `layout.rs` |
+| Saved lighting effects | `effects/*.toml` | `user_effects.rs`, `light_metadata.rs` |
 | Gesture vault | `gestures.json` | `gesture.rs`, `glue.rs` |
-| Macro scripts | `macros/scripts/*.py` | macro editor |
+| Macro scripts, options & state | `macros/scripts/*.py`, `macros/options/*.json`; per-macro store in user local data `macro_state/<id>.json` (`NEURON_MACRO_STATE`) | `macro_host.rs`, macro editor |
+| Colour model overrides & pick journal | optional `models/colour-model.lumacore`, `models/colour-taste.lumataste`; `models/picker-sessions.jsonl` | `learned.rs`, `glue/colorsense.rs` |
+| Chroma lab per-game state & captures | `chroma/<exe>.toml`, `chroma/captures/` | `chroma_lab.rs` |
+| Overlay & instrument state | `board.toml`, `glance.toml`, `runtime/twin.knbk` | `whiteboard.rs`, `glance.rs`, `knockback.rs` |
+| Durable pockets & screenshots | `runtime/pockets/`, `screenshots/` | `pocket.rs`, `screenshot.rs` |
 | Device backups | `backups/*.json` | `runtime.rs`, `backup.rs` |
 | Reliability log | `neuron-crash.log` | `flight.rs`, panic/native hooks |
 

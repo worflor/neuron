@@ -18,26 +18,9 @@ i don't run Synapse anymore. neuron handles my Naga V2 Pro and BlackWidow Chroma
 |---|---|
 | **status** | Windows beta; daily-driven on the Naga V2 Pro and BlackWidow Chroma V2. Other Razer devices need their own testing |
 | **platforms** | Windows 10/11 download. Linux app and CLI build from source, but Razer hardware control is unverified there; macOS has no backend yet |
-| **under the hood** | shared trigger → action engine; read-back checks for supported settings; an [evidence ledger](crates/neuron-core/protocol/ledger.toml) for the hardware protocol |
+| **under the hood** | shared trigger → action engine; verified hardware reads/writes; an [evidence ledger](crates/neuron-core/protocol/ledger.toml) for the protocol |
+| **docs** | [features (GDD)](docs/GDD.md) · [architecture (TDD)](docs/TDD.md) · [project status](docs/STATUS.md) |
 | **license** | mostly GPL-3.0-or-later with an exception; some research components have separate community-source terms. [details](LICENSE.md) |
-
----
-
-## contents
-
-- [why this exists](#why-this-exists)
-- [the idea: `trigger → action`](#the-idea-trigger--action)
-- [what it does](#what-it-does)
-- [won't surprise you](#wont-surprise-you)
-- [get it](#get-it)
-- [help test your hardware](#help-neuron-on-your-hardware) · [contributing](#contributing)
-- [honesty: proven, gated, absent](#honesty-proven-gated-absent)
-- [philosophy / non-goals](#philosophy--non-goals)
-
-the full feature depth — every subsystem, up close — lives in
-**[the feature design doc](docs/GDD.md)**. how it's built is
-**[the technical design doc](docs/TDD.md)**. what actually works today, graded
-honestly, is **[state of the project](docs/STATUS.md)**.
 
 ---
 
@@ -45,16 +28,7 @@ honestly, is **[state of the project](docs/STATUS.md)**.
 
 i've been through Synapse 1, 2, 3... and then 4 showed up and wanted to tell me when to update my mouse software. i said nuh uh. i like my Razer hardware. i just got tired of what came with controlling it.
 
-i wanted the basic stuff to work without an account, background clutter or having to fight a settings app. then i wanted better lighting. then i wanted to cast spells with my mouse. you can probably see where this went :P
-
-so neuron has a few rules:
-
-- **stay local.** no Neuron account, telemetry or cloud sync. settings are plain TOML files you can read and keep.
-- **don't fight the user.** one resident app, one shared action engine. change what you asked for, not three other settings on the way.
-- **don't guess at hardware.** settings with getters are checked against the device; live lighting checks its protocol replies. unverified writes stay gated.
-- **more, never bloat.** extra features are welcome when they earn their place. another mandatory background service isn't.
-
-neuron isn't a one-for-one Synapse clone. it's the replacement i use, with room for things Synapse was never going to do.
+i wanted the basic stuff to work without an account, background clutter or having to fight a settings app. then i wanted better lighting. then i wanted to cast spells with my mouse, and somehow ended up training a small neural network to help pick palette colours. you can probably see where this went :P
 
 
 ## the idea: `trigger → action`
@@ -82,6 +56,30 @@ that isn't a description of the architecture, it's the reason the thing is worth
 
 the short tour. each line links into [the feature doc](docs/GDD.md), which has the real depth.
 
+| | |
+|---|---|
+| **[device control](docs/GDD.md#talks-to-your-gear)** | DPI and stage cycles, polling, brightness, scroll stages, lift-off, battery and idle settings on supported hardware. no Synapse needed. |
+| **[lighting](docs/GDD.md#lighting)** | layer effects (fire, shallow-water ripples, typing heat, audio meters), gradients, blends and typing reactions. build palettes with [Luma-T](#luma-t-autocomplete-for-the-colour-picker), paint per-key lighting, use live system data, and fade smoothly between looks. |
+| **[buttons & profiles](docs/GDD.md#the-spine)** | remap supported controls, use HyperShift and Naga side-plate layers, and switch profiles automatically for different apps. |
+| **[spellweaving & radial](docs/GDD.md#spellweaving)** | draw a glyph or flick a wheel to trigger the same actions as a button. teleport windows, summon tools, even draw on your screen. |
+| **[macros & beacons](docs/GDD.md#macros--beacons)** | Python macros, a visual block editor, persistent state and on-screen questions from your scripts. BOUND by default, RAW when you want full Python. |
+| **[audio & other actions](docs/reference/CLI.md#triggers-and-actions)** | bind mic mute/gain, output switching, clipboard cleanup, screenshots, undo and window actions to your controls. |
+| **[games & RGB tools](docs/reference/PROTOCOL-HOST.md)** | opt-in Chroma and OpenRGB connections let games paint through Neuron alongside your own lighting, with a Chroma lab to isolate, recolour, hide or react to game effects. early, and still being tested across games. |
+| **[life after Synapse](docs/GDD.md#life-after-synapse)** | import supported Synapse exports, clean up its Windows services, and investigate unfamiliar devices. |
+| **[gamepads](docs/GDD.md#controllers-and-anything-else-with-buttons)** | buttons, sticks and triggers can become binds. aim the radial with a stick and use rumble where it's been verified on Windows. |
+| **[app & CLI](docs/reference/CLI.md)** | use the app to set things up, or the CLI to change the same settings by hand. configs stay on disk as plain TOML. |
+
+### Luma-T: autocomplete for the colour picker
+
+yes, the app built to escape a 2GB mouse driver now has an AI in the colour picker.
+
+**[Luma-T](docs/GDD.md#lighting)** is a 663k-parameter generative colour model built right into neuron, designed to collaborate with you while you edit and play with your lighting. it doesn't even need a GPU or an internet connection. two small models work side by side in real time: a **592k colour model** that imagines where your palette could go next, and a **70k taste model** that decides what's actually worth showing you.
+
+- **see what it's thinking.** colours that feel out of place get an IntelliSense-style amber squiggle. behind the colour square, faint contour rings trace where stronger fits live, and hills along the hue bar point toward matching hues.
+- **preview in an instant.** auto-predict suggestions for the colour you're editing land right inside the square as dots; full-palette adjustments appear as pills underneath. hover to try them live across your palette and gear, click to keep (or drive it like Cursor Tab: `Tab` to preview, `Tab` or `Enter` to keep), `Esc` to let go, or `hold` any colour to lock it down.
+- **only speaks when it beats yours.** the taste model measures every idea against leaving your palette untouched. if yours already wins, it stays quiet. hit `ask` (`more` for another round) whenever you want second opinions, or `roll` (`R`) to generate a cohesive palette around the colours you held or your own presets.
+- **adapts to your taste.** every suggestion you keep or pass over shapes its taste right on your machine. turn it off anytime in preferences, or drop in your own model.
+
 <p align="center"><img src="docs/media/lighting-aurora-loop.webp" alt="The lighting page: an aurora effect running on the keyboard render while every catalog tile plays its own preview" width="100%"></p>
 
 <table>
@@ -99,22 +97,12 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 
 <p align="center"><img src="docs/media/device-feel.webp" alt="The device page: dpi with its stage table on the fader, the side plate readout, and the verify-gated shelf for unconfirmed writes" width="100%"></p>
 
-| | |
-|---|---|
-| **[device control](docs/GDD.md#talks-to-your-gear)** | DPI and stage cycles, polling, brightness, scroll stages, lift-off, battery and idle settings on supported hardware. no Synapse needed. |
-| **[lighting](docs/GDD.md#lighting)** | layer effects, gradients, blends and typing reactions. paint per-key lighting, use live system data, and fade between looks instead of resetting everything. |
-| **[buttons & profiles](docs/GDD.md#the-spine)** | remap supported controls, use HyperShift and Naga side-plate layers, and switch profiles automatically for different apps. |
-| **[spellweaving & radial](docs/GDD.md#spellweaving)** | draw a glyph or flick a wheel to trigger the same actions as a button. teleport windows, summon tools, even draw on your screen. |
-| **[macros & beacons](docs/GDD.md#macros--beacons)** | Python macros, a visual block editor, persistent state and on-screen questions from your scripts. BOUND by default, RAW when you want full Python. |
-| **[audio & other actions](docs/reference/CLI.md#triggers-and-actions)** | bind mic mute/gain, output switching, clipboard transforms, screenshots, undo and window actions to your controls. |
-| **[games & RGB tools](docs/reference/PROTOCOL-HOST.md)** | opt-in Chroma and OpenRGB connections let games paint through Neuron alongside your own lighting. early, and still being tested across games. |
-| **[life after Synapse](docs/GDD.md#life-after-synapse)** | import supported Synapse exports, clean up its Windows services, and investigate unfamiliar devices. |
-| **[gamepads](docs/GDD.md#controllers-and-anything-else-with-buttons)** | buttons, sticks and triggers can become binds. aim the radial with a stick and use rumble where it's been verified on Windows. |
-| **[app & CLI](docs/reference/CLI.md)** | use the app to set things up, or the CLI to change the same settings by hand. configs stay on disk as plain TOML. |
-
-<p align="center"><img src="docs/media/macro-blocks.webp" alt="The macro workshop in blocks view: press, ask, then a yes branch and a no branch" width="100%"></p>
-
-<p align="center"><img src="docs/media/profiles-sheet.webp" alt="The profiles sheet: saved profiles with their dpi, polling, brightness and lighting, and auto-switch by app" width="55%"></p>
+<table>
+<tr>
+<td width="58%"><img src="docs/media/macro-blocks.webp" alt="The macro workshop in blocks view: press, ask, then a yes branch and a no branch"></td>
+<td width="42%"><img src="docs/media/profiles-sheet.webp" alt="The profiles sheet: saved profiles with their dpi, polling, brightness and lighting, and auto-switch by app"></td>
+</tr>
+</table>
 
 ## won't surprise you
 
@@ -128,10 +116,10 @@ neuron can change hardware settings, send input and run Python. the boring safet
 </table>
 
 - **[input has a switch](docs/GDD.md#the-arm-gate).** a normal Windows launch arms live binds when the input engine starts. `--safe` keeps input disarmed and device writes paused. disarming is instant; turning input back on manually asks first. tests can't arm real input.
-- **[hardware changes get checked](docs/GDD.md#writes-that-verify-themselves).** settings like DPI and polling read back what the device accepted. writes without enough evidence stay gated or are explicitly flagged in the evidence ledger. live lighting frames use checked protocol replies rather than pretending every LED update has a matching getter.
+- **[hardware changes get checked](docs/GDD.md#writes-that-verify-themselves).** settings like DPI and polling check back with your device to confirm what landed. anything neuron isn't sure your hardware supports stays locked unless you explicitly opt in.
 - **[notifications are yours](docs/GDD.md#confirmations).** on-screen cards tell you when supported changes land. move them, quiet them, or turn them off entirely.
 
-and yes, Neuron can run full Python if you choose RAW macros. that's your computer's authority, not a sandbox. [here's the actual security model](SECURITY.md).
+and if you turn on RAW Python macros, they run with your Windows account's full permissions, not inside a sandbox. [here's the actual security model](SECURITY.md).
 
 ## get it
 
@@ -156,44 +144,31 @@ if you already use OpenCode, Claude Code or something similar, Neuron includes [
 
 ### build
 
-windows packages provide an installer and portable zip, each with the app and CLI. both include the license bundle, the agent skills, and a `SOURCE.txt` naming the source commit and build method. linux packaging is deferred; the source still builds there.
-
-the windows builds are **not code-signed**. windows SmartScreen may warn on first run. check `SHA256SUMS.txt` against the downloaded installer or zip, then read the packaged `SOURCE.txt` for the exact commit and build method. github-built artifacts may also carry a provenance attestation; locally built artifacts do not. when an attestation is attached, verify it with:
-
-```
-gh attestation verify neuron-<version>-windows-x86_64.zip --repo worflor/neuron
-```
-
-the installer places neuron in `%LOCALAPPDATA%\Programs\Neuron` and adds a Start menu shortcut. the zip stays portable: extract it anywhere writable and run `neuron-app.exe`.
-
-windows packages include the native Chroma broker. Windows Setup provisions it before
-replacing app files after one elevation prompt; declining cancels without leaving a partial
-installer-managed update. the portable updater provisions it automatically after copying the
-app, and a manually extracted portable copy asks when Connections first needs it. the tray and
-macros stay at limited privilege. repeat installs do not prompt again while the protected broker
-already matches the package.
-Chroma REST and OpenRGB work without elevation.
-
 ```
 cargo build --release      # -> target/release/neuron.exe (CLI) + neuron-app.exe (GUI)
 .\validate.ps1             # the gates: the suite, disarmed. the same ones CI runs.
 ```
 
-if the window cannot open on a VM, remote desktop, or an older graphics driver, launch the app with `NEURON_RENDERER=software`. that selects Slint's software UI renderer for that run; it does not change device control or the Windows overlay instruments.
+on a VM, remote desktop, or older GPU driver, pass `NEURON_RENDERER=software` to use Slint's software UI renderer without affecting device control or overlays. Linux builds from source (`cargo build --release`), with packaging deferred.
+
+<details>
+<summary><b>release verification, Chroma broker & build profiles</b></summary>
+
+- **release verification:** GitHub-built Windows archives include `SHA256SUMS.txt`, `SOURCE.txt`, and provenance attestations (`gh attestation verify neuron-<version>-windows-x86_64.zip --repo worflor/neuron`).
+- **Chroma broker:** Windows packages provision the native Chroma broker after one UAC prompt so the tray and macros stay at limited privilege; Chroma REST and OpenRGB work without elevation.
+- **cargo profiles:** `--profile release-size` builds small, `--profile release-fast` builds quick, and `RUSTFLAGS="-C target-cpu=native"` enables native codegen outside the repo. `Cargo.toml` keeps `unwind` (not `abort`) so cleanup runs and panics get logged instead of leaving your gear mid-state.
+
+</details>
 
 ### where your config lives
 
 both binaries resolve every runtime path against one **run root**, so the tray app (autostarted from `System32`) and a CLI you type from anywhere read the same config. it is never the working directory. the same three rules decide it on both platforms:
 
-- **the binary's own folder** when the release archive carries `portable.flag`. this is the portable layout: copy the folder, keep your setup.
-- **the per-user data dir** for installer and source builds — `%LOCALAPPDATA%\neuron` on windows, `$XDG_DATA_HOME/neuron` (usually `~/.local/share/neuron`) on linux. config stays across installer upgrades and out of `target/`, where one `cargo clean` would destroy it.
-- **`NEURON_RUN_DIR`** whenever you set it, which wins over both. pin it if you want your config somewhere specific.
+- **the binary's own folder** when the release archive carries `portable.flag`. copy the folder, keep your setup.
+- **the per-user data dir** for installer and source builds: `%LOCALAPPDATA%\neuron` on windows, `$XDG_DATA_HOME/neuron` (usually `~/.local/share/neuron`) on linux. config survives installer upgrades and `cargo clean`.
+- **`NEURON_RUN_DIR`** whenever you set it, which wins over both.
 
-a symlink on your `PATH` doesn't change any of this: the binary resolves its real location, so a marked portable copy stays portable and `~/.local/bin/neuron` is safe.
-
-upgrading from v0.1.1's Windows installer, or from a build that kept config in `target/release`? the first launch carries the old beside-the-executable config forward and prints where it went. it copies rather than moves, so the old folder stays put as a backup. if that copy fails, neuron reports the error and stops before using partial config; the next launch retries.
-
-the normal `--release` build is tuned for snappy runtime (ThinLTO, stripped). use `--profile release-size` if you want it small, `--profile release-fast` if you want it quick, and `RUSTFLAGS="-C target-cpu=native"` outside the repo for native codegen. we keep cargo's default `unwind` (not `abort`), deliberately (see the comment in `Cargo.toml`): cleanup still runs when something panics, so the app never leaves your gear in a state you didn't ask for. every panic gets logged.
+a symlink on your `PATH` doesn't change any of this: the binary resolves its real location, so a marked portable copy stays portable and `~/.local/bin/neuron` is safe. upgrading from an older beside-the-executable layout copies config forward on first launch and leaves the old folder as a backup.
 
 ### the CLI
 
@@ -230,10 +205,7 @@ gui       neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 
 </details>
 
-Clipboard tools live on the same Trigger → Action path: ordered bounded text transforms,
-full-format pockets, in-session displaced-state history, and screen/window/region screenshots.
-`neuron pocket --help` lists pocket management and history commands; `neuron action list` shows the
-typed action forms.
+clipboard tools live on the same `Trigger → Action` path: ordered bounded text transforms, full-format pockets, in-session displaced-state history, and screen/window/region screenshots. `neuron pocket --help` lists pocket management and history commands; `neuron action list` shows the typed action forms.
 
 ## help neuron on your hardware
 
@@ -255,41 +227,34 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 ## honesty: proven, gated, absent
 
-[the full status page](docs/STATUS.md) tracks feature maturity and hardware testing. this is the device-control evidence, including things i haven't verified yet.
+[the full status page](docs/STATUS.md) tracks feature maturity and hardware testing; the [protocol ledger](crates/neuron-core/protocol/ledger.toml) holds the byte-level evidence.
 
 Linux builds from source but still needs native Razer hardware testing. [OpenRazer](https://github.com/openrazer/openrazer) is the mature Linux option for now; [OpenRGB](https://openrgb.org) covers broader RGB hardware. Neuron's Logitech HID++ discovery remains experimental and read-only.
-
-what's proven, what's gated, and what's still missing:
 
 | capability | status |
 |---|---|
 | reads: dpi, battery, polling, brightness, storage, lighting state | **proven** on hardware |
-| dpi · polling · lighting settings | **proven** on named hardware; setters with paired getters read back the result. live lighting frames validate protocol replies |
-| brightness write | **proven**: matrix and legacy setters read back the same varstore and LED region; live round-trip checked on the Naga V2 Pro and BlackWidow Chroma V2 |
+| dpi · polling · lighting settings | **proven** on named hardware; setters read back and live lighting checks protocol replies |
+| brightness write | **proven**: matrix and legacy setters round-trip checked on the Naga V2 Pro and BlackWidow Chroma V2 |
 | dpi-stage table · scroll-stage select | **wire-confirmed** off synapse (USBPcap) + round-tripped |
-| symmetric lift-off distance | **proven**: reads back clean on the Naga |
-| asymmetric lift-off distance (split lift/landing) | **proven**: set/read round-trip on the Naga (the `0x0B/0x85` getter echoes mode=async + the lift/landing pair; the physical split confirmed by feel) |
-| idle/sleep timer | **proven**: set/read round-trip on the naga (write echoes back on the getter); behind the `idle-power-write` feature, which both shipped binaries turn on (a bare `neuron-core` library build leaves it off) |
-| thumb-grid binds in firmware (`02/0C`) | **proven** live on the Naga V2 Pro: read back through `02/8C`, and the pressed key emitted the bound one. volatile direct profile, **normal mode only**, re-applied by neuron on connect and wake (`neuron button plan` / `apply` from the CLI). `15/02` reads back but does not change what a key emits, so nothing uses it any more |
-| in-game hi-res polling · scroll *stage* table · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested, still read-back-verified |
+| symmetric & asymmetric lift-off distance | **proven**: set/read round-trip on the Naga (`0x0B/0x85` echoes split lift/landing; confirmed by feel) |
+| idle/sleep timer | **proven**: set/read round-trip on the Naga (enabled in shipped binaries via `idle-power-write`) |
+| thumb-grid binds in firmware (`02/0C`) | **proven** on the Naga V2 Pro: volatile, **normal mode only**, read back via `02/8C` and re-applied on connect/wake |
+| in-game hi-res polling · scroll *stage* table · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested |
 | debounce | **no known opcode**: bails with a "needs RE" note, never a blind write |
-| saving binds into an onboard slot | **known, unused**: `02/0C` with profile 1-5 persists across power cycles per naga-companion; neuron keeps binds volatile |
+| saving binds into an onboard slot | **known, unused**: `02/0C` slots 1–5 persist across power cycles, but neuron keeps binds volatile |
 
 things it flat-out doesn't do, so you know before you install:
 
 - **doesn't crack synapse's encrypted cloud profiles.** the AES'd account cache is the lock-in, and we don't touch it. the plaintext in-app *export* is what migration can read.
-- **doesn't pretend CPython is a hostile-code sandbox.** BOUND is the safer default capability tier, not an adversarial isolation promise. RAW remains full unsandboxed Python one explicit source line away; if you choose RAW, it can do anything your user account can.
-- **no telemetry, no account, no cloud.**
+- **doesn't pretend CPython is a hostile-code sandbox.** BOUND macros run in a restricted Python mode; RAW macros aren't sandboxed and can do anything your Windows account can.
+- **no telemetry, account, or cloud.** Luma-T runs completely offline too.
 
 ## philosophy / non-goals
 
-- no cloud. no account. no telemetry. ever.
-- do what's asked, change nothing else.
-- the device's own numbers are the truth: no weird filters or translations.
-- novelty done well (spellweaving, radial, the open effects engine) is the fun. reheated gimmicks are not, and won't be added.
-- lean is a feature. every background cost has to earn itself.
-- more than synapse is fine; bloat is not. every extra thing here is deliberate and low-level, or it doesn't ship.
+- do what's asked, change nothing else; if neuron doesn't know something about your hardware, it says so instead of guessing.
+- lean is a feature. every background cost has to earn itself, and extra features only ship if they stay deliberate and low-level.
+- novelty done well (spellweaving, radial, the open effects engine, Luma-T) is the fun. reheated gimmicks are not.
 - started on my desk. i'm building the tools to make it work on more of yours, one verified device at a time.
-- when neuron doesn't know something about your hardware, it says so instead of guessing.
 
 built from first principles because the alternative is a 2GB login screen for a mouse.

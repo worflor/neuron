@@ -197,13 +197,16 @@ from the build directory; ask before removing either.
 | FLAG | meaning | what to tell the user or do |
 |---|---|---|
 | `HASH_MISMATCH` (STOP) | the download doesn't match its published checksum | don't install; it may be corrupted or tampered with |
+| `FOREIGN_ASSET` (STOP) | a release asset URL points outside the expected GitHub release prefix | don't install; stop and report the URL mismatch |
 | `ATTESTATION_FAILED` (STOP) | provenance check failed | don't install; point them to the GitHub issues page |
 | `NO_CHECKSUMS` / `NOT_IN_CHECKSUMS` (STOP) | can't verify the download | don't install |
 | `DOWNGRADE` | target is older than what's installed | only proceed if the user explicitly wants to go back |
 | `STOP_UNCONFIRMED` | something is using neuron's exe, and it can't be identified | user quits neuron from the tray, then rerun |
+| `APP_RUNNING` (Linux, STOP) | the resident Linux app is running during update | ask the user to quit it from the tray menu, then rerun |
 | `CANNOT_STOP` | neuron is running elevated | same as above |
 | `NOT_WRITABLE` | can't write to the install folder | see **Admin rights** |
 | `TASK_ELSEWHERE` | autostart points at a different neuron folder | report both roles; proceed when the requested target is already clear |
+| `TASK_AMBIGUOUS` | autostart tasks point at more than one folder | report the folders and resolve which copy owns startup |
 | `STALE_COPY` | another discovered copy is older than the latest stable release | report the path and version; do not assume it was deliberately archived |
 | `UNSAFE_STARTUP_TASK` | an older task can start neuron elevated at sign-in; update stops before copying | see **Admin rights**, then rerun the updater |
 | `STARTUP_TASK_QUERY_FAILED` | the startup task's privilege level could not be read | resolve the task query before updating |
@@ -211,7 +214,7 @@ from the build directory; ask before removing either.
 | `CHROMA_BROKER_OTHER_USER` | the machine-wide broker belongs to another Windows user | use the owning account to update or uninstall Neuron |
 | `CHROMA_BROKER_OWNER_UNKNOWN` | protected broker state exists without a valid owner receipt | repair or remove that state from an administrator PowerShell, then retry |
 | `INSTALLER_ROLLBACK_REQUIRED` | a Windows Setup install cannot be restored by copying a ZIP backup | reinstall the wanted setup version |
-| `SETUP_REQUIRED` / `SETUP_HASH_MISMATCH` | an installer-managed update lacks its matching verified setup | download the complete release assets and retry |
+| `SETUP_REQUIRED` / `SETUP_NOT_IN_CHECKSUMS` / `SETUP_HASH_MISMATCH` | an installer-managed update lacks its matching verified setup | download the complete release assets and retry |
 | `LEGACY_INSTALLER_DOWNGRADE` | v0.1.1 predates the limited-tray broker boundary | use a portable copy for historical testing |
 | `RELAUNCH_SKIPPED` | the updater is elevated, so relaunch would inherit administrator privileges | start neuron from a normal PowerShell after the update |
 | `SOURCE_BUILD` | developer build | see **Source builds** |

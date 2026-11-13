@@ -6,7 +6,7 @@ made available for this investigation; otherwise give them the short command lis
 or a handoff for an agent running there. Do not make them install Rust or change
 their hardware setup to submit an inventory.
 
-## Linux / Fedora
+## Linux
 
 Check the actual `neuron compat --help` before running commands. If the installed
 build lacks the collector, use the updater route only when a matching supported
@@ -26,7 +26,7 @@ needs the person's agreement; an unmodified failure remains useful to triage.
 
 ## Compare observations, not temporary IDs
 
-For a requested wired/receiver/Bluetooth or Windows/Fedora comparison, collect a
+For a requested wired/receiver/Bluetooth or Windows/Linux comparison, collect a
 new local dossier for each condition. Record the person's connection mode and the
 exact Neuron version beside each reviewed issue draft. Export the intended device
 from each dossier separately; do not merge private files or edit verified bundles.
