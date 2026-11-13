@@ -105,7 +105,7 @@ more intentional UI, general controllers, and a little wildlife on your keyboard
 - **hardened by trying to break it:** controller identity, Naga side-plate binds, clipboard formats, screenshots and nested actions.
 
 ## 0.1.3 · 2026-09-29
-games' lighting, picked apart. Overwatch paints a lot onto your keys; now you can see what each part of it is.
+games' lighting, picked apart. a game paints a lot onto your keys; now you can see what each part of it is.
 
 ### new
 - **Chroma lab.** splits a game's lighting into ambient, held keys, animated keys and repeating effects, with replay, hiding and a colour lens.
