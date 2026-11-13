@@ -1531,6 +1531,49 @@ fn second_picker_offers_preview_accept_and_undo() {
         }
     };
     capture("picker-v2-offers");
+
+    // by pointer: a pill answers where it is drawn and nowhere beside it. The row is found as what
+    // changes when its pills are hidden.
+    {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        use slint::LogicalPosition;
+        let ramps = st.get_assist_ramps();
+        assert!(ramps > 0, "the edit draws a whole-palette offer: {:?}", titles());
+        let with = app.window().take_snapshot().unwrap();
+        st.set_assist_ramps(0);
+        let without = app.window().take_snapshot().unwrap();
+        st.set_assist_ramps(ramps);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        slint::platform::update_timers_and_animations();
+        let width = with.width() as usize;
+        let changed: Vec<usize> = with.as_slice().iter().zip(without.as_slice()).enumerate()
+            .filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect();
+        let top = changed.iter().map(|i| i / width).min().expect("the pills draw");
+        let left = changed.iter().filter(|i| *i / width < top + 26).map(|i| i % width).min().unwrap();
+        let at = |x: usize, y: usize| LogicalPosition::new(x as f32, y as f32);
+        let before = stops();
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: at(left + ramps as usize * 50 + 60, top + 13) });
+        app.window().take_snapshot().unwrap();
+        assert!(!st.get_assist_showing() && stops() == before, "beside the pills, nothing is shown");
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: at(left + 22, top + 13) });
+        app.window().take_snapshot().unwrap();
+        assert!(st.get_assist_showing() && stops() != before, "resting on the first pill shows it");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        slint::platform::update_timers_and_animations();
+        capture("picker-v2-draft");
+        let shown = stops();
+        app.window().dispatch_event(WindowEvent::PointerPressed { position: at(left + 22, top + 13), button: PointerEventButton::Left });
+        app.window().dispatch_event(WindowEvent::PointerReleased { position: at(left + 22, top + 13), button: PointerEventButton::Left });
+        app.window().take_snapshot().unwrap();
+        assert_eq!(stops(), shown, "a click on the pill keeps it");
+        assert!(!st.get_assist_showing(), "and it is no longer a draft");
+        assert_eq!(titles(), ["put it back"]);
+        app.window().dispatch_event(WindowEvent::PointerExited);
+        app.window().take_snapshot().unwrap();
+        st.invoke_assist_accept(0);
+        assert_eq!(stops(), before);
+    }
+
     st.invoke_assist_preview(0);
     capture("picker-v2-previewing");
     st.invoke_assist_preview(-1);
@@ -1554,6 +1597,24 @@ fn second_picker_offers_preview_accept_and_undo() {
     std::thread::sleep(std::time::Duration::from_millis(400));
     slint::platform::update_timers_and_animations();
     capture("picker-v2-terrain");
+    // the guide's section on all this, its heading drawn mid-sheen
+    st.invoke_guide_toggle("spectrum".into(), 40.0, 40.0);
+    st.invoke_guide_make_sticky();
+    app.window().take_snapshot().unwrap();
+    app.window().dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+        position: slint::LogicalPosition::new(230.0, 300.0), delta_x: 0.0, delta_y: -4000.0,
+    });
+    app.window().dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+        position: slint::LogicalPosition::new(230.0, 300.0), delta_x: 0.0, delta_y: 70.0,
+    });
+    // a full sheen cycle when frames are being kept, so one of them catches the band mid-word
+    let frames = if std::env::var_os("NEURON_INSPECTOR_SHOTS").is_some() { 28 } else { 2 };
+    for frame in 0..frames {
+        std::thread::sleep(std::time::Duration::from_millis(240));
+        slint::platform::update_timers_and_animations();
+        capture(&format!("picker-v2-guide-{frame}"));
+    }
+    st.set_guide_open(false);
     glue::colorsense::use_model(None);
     st.invoke_set_picker_v2(false);
     assert!(titles().is_empty() && !crate::prefs::picker_v2());

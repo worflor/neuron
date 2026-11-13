@@ -20,7 +20,7 @@
 import { Theme, Signal } from "theme.slint";
 import { State } from "state.slint";
 import { GuideContent } from "guides.slint";
-import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, Label, Lamp } from "widgets/controls.slint";
+import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, SheenTitle, Label, Lamp } from "widgets/controls.slint";
 
 import { DevicePanel } from "panels/device.slint";
 import { LightingPanel } from "panels/lighting.slint";
@@ -667,13 +667,14 @@ export component AppWindow inherits Window {
                                     spacing: 8px;
                                     // the section legend — SectionTitle in full ink (a heading, not a
                                     // signal), kept at the guide's own body size + track-1.
-                                    SectionTitle {
+                                    if s.shine.length == 0 : SectionTitle {
                                         text: s.head;
                                         color: Theme.text;
                                         font-size: Theme.fs-body;
                                         letter-spacing: Theme.track-1;
                                         wrap: word-wrap;
                                     }
+                                    if s.shine.length > 0 : SheenTitle { letters: s.shine; }
                                     // each block is PROSE (quiet sans, the exception in a mono UI) or a
                                     // CODE CELL (mono on a well, hairline-framed — the same surface as the
                                     // macro editor, so a snippet here looks like where it'll be pasted). The

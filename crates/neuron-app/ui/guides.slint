@@ -22,9 +22,11 @@ export struct GuideBlock {
     text: string,
 }
 
-// One section of a guide — a bold heading over a list of prose / code blocks.
+// One section of a guide — a bold heading over a list of prose / code blocks. `shine` spells the
+// heading one letter per entry; a heading given one carries a slow sheen.
 export struct GuideSection {
     head: string,
+    shine: [string],
     blocks: [GuideBlock],
 }
 
@@ -288,14 +290,14 @@ export global GuideContent {
                         },
                         {
                             head: "Suggestions",
+                            shine: ["S", "u", "g", "g", "e", "s", "t", "i", "o", "n", "s"],
                             blocks: [
-                                { code: false, text: "Switch the picker to v2 and Neuron suggests colours while you work. A suggestion never changes anything by itself: you look, and you decide." },
-                                { code: false, text: "Change a colour and small dots may appear in the colour square. Each is another colour that would suit this palette. Rest the pointer on a dot to see it on your lights, move away to put things back, click to keep it." },
-                                { code: false, text: "Pills under the picker do the same for the whole palette, such as carrying your change through the colours beside it. Once you keep one, an undo pill takes you back." },
-                                { code: false, text: "Add a stop and the dots suggest a colour for it. Hold keeps the selected stop exactly as it is: no suggestion will touch it." },
-                                { code: false, text: "Click the colour square to use the keyboard. Arrows nudge the colour, Tab steps through the suggestions, Enter keeps the one on show and Esc backs out." },
-                                { code: false, text: "The everyday suggestions are built in. Luma-T, a colour model still in the making, adds its own once it is installed: it has studied a great many palettes and compares yours with what it learned. It runs on this computer and sends nothing anywhere. When it stays quiet, it thinks your palette is fine as it is." },
-                                { code: false, text: "With Luma-T installed you also see what it thinks before it suggests anything. A small amber squiggle under a stop means Luma-T would change that one, and the little dot beneath the squiggle is the colour it has in mind; select the stop to try it. Rings in the colour square, like the lines on a hiking map, close in on where Luma-T feels a colour at this spot belongs, and the hills along the bottom of the hue bar rise where the right hue is. Aim for the middle of the rings, or ignore them: they are a map, not a rule." },
+                                { code: false, text: "The v2 picker works on your colours with you. Nothing changes until you click." },
+                                { code: false, text: "Dots in the colour square are colours that would suit the stop you're on. Rest on one to see it on your lights, click to keep it. Pills below do the same for the whole palette, and the undo pill takes back the last one you kept." },
+                                { code: false, text: "Hold a stop and suggestions leave it exactly as it is. A new stop gets ideas straight away." },
+                                { code: false, text: "Grab a stop and the keyboard is yours: arrows nudge the colour, Tab steps through suggestions, Enter keeps one, Esc lets it go." },
+                                { code: false, text: "The ideas come from Luma-T, Neuron's own colour model, made for one job: exploring a palette alongside you. It reads the whole palette and the change you're making, and answers with a few directions worth a look. It runs on this computer. When it's quiet, it likes what you have." },
+                                { code: false, text: "It also shows its thinking. A squiggle under a stop means Luma-T would change it, and the dot beneath is the colour it has in mind. Rings in the colour square close in on where it thinks this stop belongs, like a hiking map, and hills on the hue bar rise at the hue. A map, not a rule." },
                             ],
                         },
                     ],

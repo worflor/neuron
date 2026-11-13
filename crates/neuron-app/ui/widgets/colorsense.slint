@@ -9,6 +9,27 @@ import { Theme } from "../theme.slint";
 import { State } from "../state.slint";
 import { Field, Mono, SwatchRow } from "controls.slint";
 
+// A key that does something here, drawn as the key. `ground` is for sitting on a colour.
+component Keycap inherits Rectangle {
+    in property <string> key;
+    in property <bool> ground;
+    width: k.preferred-width + 8px;
+    height: 14px;
+    border-radius: 3px;
+    border-width: Theme.hair;
+    border-color: root.ground ? #ffffff50 : Theme.line;
+    background: root.ground ? #000000b0 : Theme.well;
+    k := Mono {
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.key;
+        color: root.ground ? #ffffffd8 : Theme.text-mid;
+        font-size: Theme.fs-small;
+    }
+}
+
 // A colour as three independent moves: the plane sets lightness (up) and vividness (right) at the
 // current hue, the rail below sets hue at the current lightness and vividness. Each surface shows
 // the colours a click on it would give, and the rail carries a tick for every other stop's hue.
@@ -37,6 +58,9 @@ export component SensePicker inherits VerticalLayout {
     property <int> lit: pta.dot >= 0 ? pta.dot : State.assist-keyed;
     property <bool> lit-dot: root.lit >= State.assist-ramps && root.lit < State.assist-offers.length;
     property <float> step: 0.02;
+    // grabbing a stop on the strip hands the picker the keyboard
+    property <int> focus-asked: State.picker-focus;
+    changed focus-asked => { keys.focus(); }
     spacing: 9px;
     HorizontalLayout {
         spacing: 10px;
@@ -73,7 +97,9 @@ export component SensePicker inherits VerticalLayout {
             animate opacity { duration: 250ms; easing: ease-out; }
         }
         keys := FocusScope {
+            x: 0px; y: 0px;
             width: 0px; height: 0px;
+            changed has-focus => { State.assist-keys = self.has-focus; }
             key-pressed(e) => {
                 if (e.text == Key.Tab && State.assist-offers.length > 0) {
                     State.assist-keyed = State.assist-keyed + 1 >= State.assist-offers.length ? -1 : State.assist-keyed + 1;
@@ -127,27 +153,44 @@ export component SensePicker inherits VerticalLayout {
             animate opacity { duration: 200ms; easing: ease-out; }
             animate d, x, y { duration: Theme.quick; easing: ease-out; }
         }
-        // why the dot on show is offered, in the half of the plane the dot is not in
+        // why the dot on show is offered, in the half of the plane the dot is not in, with the key
+        // that keeps it when the keyboard is here
         Rectangle {
             property <bool> low: root.lit-dot && State.assist-offers[root.lit].light < 0.5;
             x: 4px;
             y: self.low ? 4px : plane.height - self.height - 4px;
-            width: min(why.preferred-width + 12px, plane.width - 8px);
+            width: min(why-row.preferred-width, plane.width - 8px);
             height: 16px;
             border-radius: 8px;
             background: #000000b0;
             opacity: root.lit-dot ? 1 : 0;
             animate opacity { duration: Theme.quick; }
-            why := Mono {
-                x: 6px;
-                width: parent.width - 12px;
-                height: parent.height;
-                vertical-alignment: center;
-                overflow: elide;
-                text: root.lit-dot ? State.assist-offers[root.lit].title : "";
-                color: #ffffffe6;
-                font-size: Theme.fs-small;
+            why-row := HorizontalLayout {
+                padding-left: 6px;
+                padding-right: State.assist-keys ? 1px : 6px;
+                spacing: 5px;
+                alignment: start;
+                Mono {
+                    vertical-alignment: center;
+                    overflow: elide;
+                    text: root.lit-dot ? State.assist-offers[root.lit].title : "";
+                    color: #ffffffe6;
+                    font-size: Theme.fs-small;
+                }
+                if State.assist-keys : VerticalLayout {
+                    alignment: center;
+                    Keycap { key: "enter"; ground: true; }
+                }
             }
+        }
+        // with the keyboard here and nothing on show, the key that brings the offers up
+        Keycap {
+            x: plane.width - self.width - 4px;
+            y: plane.height - self.height - 4px;
+            ground: true;
+            key: "tab";
+            opacity: State.assist-keys && State.assist-offers.length > 0 && root.lit < 0 ? 1 : 0;
+            animate opacity { duration: Theme.quick; }
         }
         pta := TouchArea {
             // The dot under the pointer. A drag never lands on one: the pointer has to arrive at
@@ -203,6 +246,7 @@ export component SensePicker inherits VerticalLayout {
         // the other stops' hues hang from the top edge; suggested hues stand on the bottom one
         for mark in State.picker-marks : Rectangle {
             x: clamp(mark * rail.width, 0px, rail.width - 1px);
+            y: 0px;
             width: 1px; height: 5px;
             background: #ffffffc8;
         }
@@ -267,6 +311,7 @@ export component SenseOffers inherits Rectangle {
     for offer[i] in State.assist-offers : Rectangle {
         visible: i < root.n;
         x: i * (root.cw + root.gap);
+        y: 0px;
         width: root.cw; height: 26px;
         border-radius: 13px;
         border-width: Theme.hair;
@@ -286,17 +331,29 @@ export component SenseOffers inherits Rectangle {
             }
         }
     }
-    Mono {
+    HorizontalLayout {
         x: root.n * (root.cw + root.gap) + 2px;
-        y: (26px - self.height) / 2;
+        y: 0px;
         width: max(0px, parent.width - self.x);
-        overflow: elide;
-        text: root.lit >= 0 ? State.assist-offers[root.lit].title
-            : root.n == 1 && State.assist-offers[0].back ? "" : "suggested";
-        color: root.lit >= 0 ? Theme.text-mid : Theme.text-faint;
-        font-size: Theme.fs-small;
+        height: 26px;
+        spacing: 6px;
+        alignment: start;
+        Mono {
+            vertical-alignment: center;
+            overflow: elide;
+            text: root.lit >= 0 ? State.assist-offers[root.lit].title
+                : root.n == 1 && State.assist-offers[0].back ? "" : "suggested";
+            color: root.lit >= 0 ? Theme.text-mid : Theme.text-faint;
+            font-size: Theme.fs-small;
+        }
+        if State.assist-keys && root.lit >= 0 && root.hov < 0 : VerticalLayout {
+            alignment: center;
+            Keycap { key: "enter"; }
+        }
     }
+    // pinned to the row's left edge: a sized element with no position is centred in its parent
     ta := TouchArea {
+        x: 0px; y: 0px;
         width: root.n * (root.cw + root.gap);
         height: 26px;
         mouse-cursor: MouseCursor.pointer;

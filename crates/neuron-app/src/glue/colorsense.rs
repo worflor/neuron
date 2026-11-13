@@ -392,6 +392,8 @@ fn show(app: &AppWindow, rows: &[Row], chosen: usize, pins: &[bool], doubts: &[O
     update_value_model(st.get_light_doubts(), marks, |model| st.set_light_doubts(model));
     st.set_assist_ramps(rows.iter().filter(|row| row.dot.is_none()).count() as i32);
     st.set_assist_keyed(-1);
+    // the row is only rebuilt with nothing on show
+    st.set_assist_showing(false);
     st.set_light_sel_pinned(pins.get(chosen).copied().unwrap_or(false));
     update_value_model(st.get_light_pins(), pins.to_vec(), |model| st.set_light_pins(model));
     let rows: Vec<AssistOffer> = rows.iter().map(|Row { offer, dot, slate }| match *dot {
@@ -447,7 +449,14 @@ fn preview(app: &AppWindow, sh: &SharedRt, index: i32) {
         }
     });
     match step {
-        Some((stops, interp)) => put(app, sh, stops, interp),
+        Some((stops, interp)) => {
+            put(app, sh, stops, interp);
+            if let Some((stops, interp)) = SENSE.with(|sense| sense.borrow().stash.clone()) {
+                let st = app.global::<State>();
+                st.set_assist_before(palette_strip_image(&Palette { stops, motion: Motion::Hold, interp }));
+                st.set_assist_showing(true);
+            }
+        }
         // nothing was on show: an answer that arrived meanwhile may now be
         None => refresh(app, sh),
     }

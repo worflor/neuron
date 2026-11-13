@@ -570,7 +570,9 @@ component SpectrumEditor inherits VerticalLayout {
             // which colour picker (and, with the second, its suggestions) this editor uses
             VerticalLayout {
                 alignment: center;
+                // a fixed size: the name beside it changes length, the toggle does not
                 SplitToggle {
+                    width: 84px;
                     options: ["v1", "v2"];
                     index: State.picker-v2 ? 1 : 0;
                     picked(i) => { State.set-picker-v2(i == 1); }
@@ -587,7 +589,10 @@ component SpectrumEditor inherits VerticalLayout {
             height: 34px;
             border-radius: Theme.radius-sm;
             border-width: Theme.hair;
-            border-color: Theme.line;
+            // a suggestion on show is a draft: the strip's edge says so until it is kept or let go
+            property <bool> draft: State.picker-v2 && State.assist-showing;
+            border-color: self.draft ? Theme.accent : Theme.line;
+            animate border-color { duration: Theme.quick; }
             background: Theme.well;
             clip: true;
             // the live gradient fill — the ACTIVE frame's palette swatch. Gated on a non-empty sequence
@@ -597,11 +602,29 @@ component SpectrumEditor inherits VerticalLayout {
                 width: 100%; height: 100%;
                 image-fit: fill;
             }
+            // and the palette as it was runs along its foot, so the change reads as a before and after;
+            // keeping the draft folds it away
+            Rectangle {
+                x: 0px;
+                y: parent.height - self.height;
+                width: parent.width;
+                height: strip.draft ? 8px : 0px;
+                animate height { duration: Theme.quick; easing: ease-out; }
+                clip: true;
+                background: Theme.accent;
+                Image {
+                    source: State.assist-before;
+                    x: 0px; y: 1px;
+                    width: parent.width; height: 7px;
+                    image-fit: fill;
+                }
+            }
             strip-ta := TouchArea {
                 mouse-cursor: MouseCursor.ew-resize;
                 pointer-event(ev) => {
                     if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
                         State.strip-press(clamp(self.mouse-x / strip.width, 0.0, 1.0));
+                        State.picker-focus += 1;
                     }
                 }
                 moved => {
@@ -676,7 +699,7 @@ component SpectrumEditor inherits VerticalLayout {
                 left-enabled: State.light-stops.length > 1;
                 right-text: "+ add";
                 left-clicked => { State.remove-stop(root.stop-idx); }
-                right-clicked => { State.add-stop(0.5); }
+                right-clicked => { State.add-stop(0.5); State.picker-focus += 1; }
             }
             if State.picker-v2 : Button {
                 height: Theme.row-h-sm;

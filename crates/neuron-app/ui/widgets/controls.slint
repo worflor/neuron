@@ -85,6 +85,34 @@ export component SectionTitle inherits Text {
     vertical-alignment: center;   // it shares header rows with a count Mono / a Pill — centre it like Mono
 }
 
+// A heading with a slow, quiet sheen: every few seconds a band of cool light crosses the letters
+// and the ink settles back. One Text per letter, because gradient text is not drawn by every renderer.
+export component SheenTitle inherits HorizontalLayout {
+    in property <[string]> letters;
+    in property <color> ink: Theme.text;
+    in property <length> size: Theme.fs-body;
+    in property <length> track: Theme.track-1;
+    // the band's centre in letter widths, from before the first letter to past the last, then a rest
+    property <float> cycle: mod(animation-tick() / 1ms, 6400) / 6400;
+    property <float> band: -0.3 + 1.6 * min(1, root.cycle / 0.32);
+    spacing: 0px;
+    alignment: start;
+    for ch[i] in root.letters : Text {
+        property <float> at: (i + 0.5) / max(root.letters.length, 1);
+        property <float> near: max(0, 1 - abs(self.at - root.band) / 0.24);
+        property <float> lift: self.near * self.near * (3 - 2 * self.near);
+        // lilac at the start of the word turning to ice blue at its end
+        property <color> glint: #c4b2ff.mix(#9fe6ff, 1 - self.at);
+        text: ch;
+        color: root.ink.mix(self.glint, 1 - 0.8 * self.lift);
+        font-family: Theme.mono;
+        font-weight: 700;
+        font-size: root.size;
+        letter-spacing: root.track;
+        vertical-alignment: center;
+    }
+}
+
 // A line of guidance prose — the ONE place sans is allowed (long-form readability). Dim by default.
 export component Label inherits Text {
     color: Theme.text-dim;
