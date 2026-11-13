@@ -94,6 +94,10 @@ struct Sense {
 /// swapped out sooner (the rules' answer replaced by the model's a moment later) was never seen.
 const SEEN: std::time::Duration = std::time::Duration::from_millis(800);
 
+/// The most capsules the suggestion row shows: what fits the inspector column beside the ask
+/// capsule and a caption.
+const PILLS: usize = 5;
+
 /// The most rolls the row keeps.
 const ROLLS: usize = 3;
 
@@ -435,7 +439,11 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
                     && (offer.stops.len() != palette.stops.len()
                         || offer.stops.iter().zip(&palette.stops).enumerate().all(|(i, (new, old))| !pins.get(i).copied().unwrap_or(false) || new.col == old.col))
             });
-            let mut rows: Vec<Row> = sense.rolls.iter().map(|(_, offer)| Row { offer: offer.clone(), slate: None, dot: None, roll: true }).collect();
+            // the row holds PILLS capsules beside the ask capsule; older rolls give way to the
+            // engines' palettes and the way back, the newest roll is always shown
+            let palettes = offered(Scope::Palette).count() + usize::from(sense.undo.is_some());
+            let room = PILLS.saturating_sub(palettes).max(1);
+            let mut rows: Vec<Row> = sense.rolls.iter().take(room).map(|(_, offer)| Row { offer: offer.clone(), slate: None, dot: None, roll: true }).collect();
             rows.extend(offered(Scope::Palette).map(|(i, offer)| Row { offer: offer.clone(), slate: Some(i), dot: None, roll: false }));
             if let Some((_, stops, interp, _)) = &sense.undo {
                 let offer = Offer { id: "undo", title: "put it back", scope: Scope::Palette, stops: stops.clone(), interp: *interp, reach: false };

@@ -113,8 +113,6 @@ component PanelPage inherits Flickable {
 }
 
 export component AppWindow inherits Window {
-    // each side's share of the width past the content ceiling, in whole pixels (see the work area)
-    property <length> gutter: Math.floor(max(0px, root.width - 2 * Theme.pad-page - Theme.content-max) / 2 / 1px) * 1px;
     callback sample-light-demand();
     sample-light-demand => { lighting_panel.sample-demand(); }
 
@@ -262,19 +260,19 @@ export component AppWindow inherits Window {
                     padding-bottom: 14px;
                     // the CONTENT CEILING: pages live in a centred column bounded by
                     // Theme.content-max, so a maximized window widens the margins instead of
-                    // stretching every control to the glass edge. Constraint-based (max-width +
-                    // weighted gutter spacers), NOT `width: min(parent.width, …)` — a child reading
-                    // its layout parent's width is a binding loop. The gutters split any
-                    // past-the-ceiling slack evenly, centring the column. Each is capped at its
-                    // whole-pixel half of that slack, read off the window: below the ceiling the cap
-                    // is 0 and the column fills exactly. Uncapped, their tiny stretch took a sliver
-                    // of slack at every width and put every page between pixels, blurring each
-                    // hairline on it.
+                    // stretching every control to the glass edge. Constraint-based, reading no width:
+                    // a constraint that reads the window's width feeds back into the window's own
+                    // size limits (a binding loop, and the whole UI flickered on hover). The column
+                    // prefers the ceiling: below it, it shrinks to exactly the room there is; past it,
+                    // the centred alignment splits the rest. (Gutter spacers with a tiny stretch took
+                    // a sliver of slack at every width and put every page between pixels, blurring
+                    // each hairline on it.)
                     HorizontalLayout {
                         padding-left: Theme.pad-page;
                         padding-right: Theme.pad-page;
-                        Rectangle { horizontal-stretch: 0.001; max-width: root.gutter; }
+                        alignment: center;
                         Rectangle {
+                            preferred-width: Theme.content-max;
                             horizontal-stretch: 1;
                             max-width: Theme.content-max;
                         // DEVICE owns its OWN inner inspector Flickable (fixed-footprint pane, scrolls
@@ -307,7 +305,6 @@ export component AppWindow inherits Window {
                             }
                         }
                         }
-                        Rectangle { horizontal-stretch: 0.001; max-width: root.gutter; }
                     }
                 }
             }

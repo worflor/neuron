@@ -24,6 +24,8 @@
 //!   usually give.
 //! - **soft hairline**: a 1-2 px rule on a fractional position, drawn blurred across two pixels.
 //! - **faint text**: text under 1.6:1 against the most common colour behind it in the frame.
+//! - **cut off**: a touch area, text or capsule partly past the edge of an ancestor that clips it
+//!   (scrolling aside), so part of it cannot be seen or pressed.
 //! - **roomy field**: a `Field` drawn far wider than the longest value it declares it can hold
 //!   (`fits`), so every legal state sits in a box mostly empty.
 //!
@@ -189,6 +191,10 @@ struct Node {
     faded: bool,
     /// The colour of its text, when it shows some.
     ink: Option<slint::Color>,
+    /// It clips what it draws (a rounded card or capsule).
+    clips: bool,
+    /// A scrolling view is among the ancestors that clip it: being cut there is scrolling.
+    scrolled: bool,
     kind: Kind,
 }
 
@@ -240,9 +246,10 @@ fn scan(window: &slint::Window) -> Vec<Node> {
     let size = window.size().to_logical(window.scale_factor());
     let screen = Rect { x: 0.0, y: 0.0, w: size.width, h: size.height };
     let mut nodes: Vec<Node> = Vec::new();
-    // (item, parent index, parent's window origin, the room the parent leaves its children, faded)
-    let mut stack = vec![(root, None::<usize>, (0.0f32, 0.0f32), screen, false)];
-    while let Some((item, parent, origin, room, faded)) = stack.pop() {
+    // (item, parent index, parent's window origin, the room the parent leaves its children, faded,
+    // whether that room was cut by a scrolling view)
+    let mut stack = vec![(root, None::<usize>, (0.0f32, 0.0f32), screen, false, false)];
+    while let Some((item, parent, origin, room, faded, scrolled)) = stack.pop() {
         let g = item.geometry();
         let rect = Rect { x: origin.0 + g.origin.x, y: origin.1 + g.origin.y, w: g.size.width, h: g.size.height };
         let name = (0..item.element_count().unwrap_or(0))
@@ -282,10 +289,11 @@ fn scan(window: &slint::Window) -> Vec<Node> {
             Kind::Other
         };
         // what this item lets its children draw in
-        let clips = item.downcast::<Clip>().is_some_and(|c| c.as_pin_ref().clip()) || item.downcast::<Flickable>().is_some();
+        let scrolls = item.downcast::<Flickable>().is_some();
+        let clips = item.downcast::<Clip>().is_some_and(|c| c.as_pin_ref().clip()) || scrolls;
         let inside = if clips { room.cut(rect) } else { room };
         let index = nodes.len();
-        nodes.push(Node { path, rect, room, parent, faded, ink, kind });
+        nodes.push(Node { path, rect, room, parent, faded, ink, clips: clips && !scrolls, scrolled, kind });
         // children are pushed in reverse so they pop in drawing order
         let mut children = Vec::new();
         let mut child = item.first_child();
@@ -294,7 +302,7 @@ fn scan(window: &slint::Window) -> Vec<Node> {
             children.push(c);
         }
         for c in children.into_iter().rev() {
-            stack.push((c, Some(index), (rect.x, rect.y), inside, faded));
+            stack.push((c, Some(index), (rect.x, rect.y), inside, faded, scrolled || scrolls));
         }
     }
     nodes
@@ -436,6 +444,42 @@ fn roomy_fields(nodes: &[Node]) -> Vec<String> {
         .collect()
 }
 
+/// Things cut off by an ancestor that clips: a touch area, a line of text or a capsule partly
+/// outside the room it is given (scrolling aside). The part past the edge is not there to see or
+/// press: a row that grew past its column, a label pushed out of its box.
+fn cut_off(nodes: &[Node]) -> Vec<String> {
+    nodes.iter()
+        .filter(|n| !n.faded && !n.scrolled && (matches!(n.kind, Kind::Touch) || n.ink.is_some() || n.clips))
+        .filter_map(|n| {
+            let seen = n.rect.cut(n.room).area();
+            let whole = n.rect.area();
+            (seen > 1.0 && seen < whole * 0.97 && whole - seen > 16.0).then(|| {
+                format!("{}: {:.0}% of it is cut off by an ancestor's edge", n.path, 100.0 * (1.0 - seen / whole))
+            })
+        })
+        .collect()
+}
+
+/// Where the element whose path ends with `name` is drawn, in window coordinates: (x, y, w, h).
+pub(crate) fn rect_of(window: &slint::Window, name: &str) -> Option<(f32, f32, f32, f32)> {
+    scan(window).into_iter().find(|n| n.path.ends_with(name) && shown(n)).map(|n| (n.rect.x, n.rect.y, n.rect.w, n.rect.h))
+}
+
+/// How much of the window blinks across three frames taken a moment apart with nothing done in
+/// between: pixels that change and then change back (a and c alike, b different). A hover fade
+/// or a running animation moves one way and does not count; a flicker does. 0..1 of the window.
+pub(crate) fn blink(a: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, b: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, c: &slint::SharedPixelBuffer<slint::Rgba8Pixel>) -> f32 {
+    if a.width() != b.width() || b.width() != c.width() || a.height() != c.height() || a.height() != b.height() {
+        return 1.0;
+    }
+    let far = |p: &slint::Rgba8Pixel, q: &slint::Rgba8Pixel| {
+        (i32::from(p.r) - i32::from(q.r)).abs() + (i32::from(p.g) - i32::from(q.g)).abs() + (i32::from(p.b) - i32::from(q.b)).abs()
+    };
+    let (a, b, c) = (a.as_slice(), b.as_slice(), c.as_slice());
+    let blinking = (0..a.len()).filter(|&i| far(&a[i], &c[i]) <= 12 && far(&a[i], &b[i]) >= 60).count();
+    blinking as f32 / a.len().max(1) as f32
+}
+
 fn short(text: &str) -> String {
     let mut out: String = text.chars().take(32).collect();
     if text.chars().count() > 32 {
@@ -463,5 +507,6 @@ pub(crate) fn note(window: &slint::Window, frame: &slint::SharedPixelBuffer<slin
     found.extend(soft_hairlines(&nodes, window.scale_factor()));
     found.extend(faint_text(&nodes, frame));
     found.extend(roomy_fields(&nodes));
+    found.extend(cut_off(&nodes));
     warn(found);
 }

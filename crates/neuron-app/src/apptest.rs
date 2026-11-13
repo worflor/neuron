@@ -1713,6 +1713,36 @@ fn second_picker_offers_preview_accept_and_undo() {
         }
         assert_eq!(stops(), resting, "unkept rolls leave the palette as it was");
         st.invoke_roll_choose(0, 1);
+
+        // hovering the roll button and its arrow changes only the hover, steadily: three frames a
+        // moment apart never show something that appears and goes again
+        use slint::platform::WindowEvent;
+        let (rx, ry, rw, rh) = crate::uifit::rect_of(app.window(), "RollButton").expect("the roll button is drawn");
+        for x in [rx + 12.0, rx + rw - 8.0, rx + 12.0] {
+            app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(x, ry + rh / 2.0) });
+            let mut frames = Vec::new();
+            for _ in 0..5 {
+                frames.push(snap(&app).unwrap());
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                slint::platform::update_timers_and_animations();
+            }
+            for w in frames.windows(3) {
+                let blinking = crate::uifit::blink(&w[0], &w[1], &w[2]);
+                assert!(blinking < 0.002, "hovering the roll button at x {x:.0} flickers {:.1}% of the window", blinking * 100.0);
+            }
+        }
+        app.window().dispatch_event(WindowEvent::PointerExited);
+
+        // spamming roll and ask never grows the row past its column or leaves a draft stuck
+        for i in 0..12 {
+            if i % 3 == 0 { st.invoke_roll(); } else { st.invoke_assist_ask(); }
+            snap(&app).unwrap();
+            assert!(st.get_assist_ramps() <= 5, "the row holds at most five capsules, not {}", st.get_assist_ramps());
+        }
+        capture("picker-v2-spammed");
+        st.invoke_assist_preview(-1);
+        assert!(!st.get_assist_showing(), "letting go after a spree leaves nothing on show");
+        assert_eq!(stops(), resting, "and the palette as it was");
         glue::colorsense::use_model(None);
     }
 
