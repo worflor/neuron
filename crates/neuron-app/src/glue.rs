@@ -10701,10 +10701,18 @@ fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_fra
         neuron::spectrum::palette_name(palette).chars().map(|c| SharedString::from(c.to_string())).collect::<Vec<_>>(),
         |model| st.set_light_name_chars(model));
     const RAMP: usize = 24;
+    // a letter is lifted to at least this OKLab lightness, its hue kept: a navy stop drawn as is
+    // would be all but invisible on the dark ground (about 5:1 against it from here)
+    const READABLE: f32 = 0.62;
     let ramp: Vec<slint::Color> = (0..RAMP)
         .chain((0..RAMP).rev())
         .map(|j| {
-            let c = palette.sample(j as f32 / (RAMP - 1) as f32);
+            let mut lch = neuron::assist::Lch::of(palette.sample(j as f32 / (RAMP - 1) as f32));
+            if lch.l < READABLE {
+                lch.l = READABLE;
+                lch.c = lch.c.min(neuron::assist::Lch::max_chroma(READABLE, lch.h));
+            }
+            let c = lch.rgb();
             slint::Color::from_rgb_u8(c.r, c.g, c.b)
         })
         .collect();
