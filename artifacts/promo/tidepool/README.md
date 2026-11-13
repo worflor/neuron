@@ -14,7 +14,7 @@ over the Esc corner up to a three-quarter view of the whole board, lit by the Ti
 - **The keyboard is a stylised model**, the generic 6×22 fixture from the ignored
   `.local/showcase` harness (its `render_showcase.py` builds it from Neuron's core key map), not a
   scan of a real board.
-- **Staging lives in the scene:** the camera move and focus, a dark desk to catch the light, the
+- **Staging lives in the scene:** the camera move and focus, the fixture's floor and
   studio lights and a soft glow in the compositor. `--led-power` sets the fixture's optical output
   and never changes an RGB value.
 

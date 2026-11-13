@@ -9,9 +9,9 @@ Run through the showcase harness's bpy runner, which supplies the keyboard fixtu
 
 The keyboard, its key map, its materials and the per-frame painting come from
 `.local/showcase/tools/render_showcase.py`; every LED colour is the frame file's RGB, unchanged.
-This script adds only staging: a perspective camera on a dolly, a shallow focus, a desk to catch
-the light, and a glow in the compositor. Options: --start/--count to render part, --scale and
---samples for tests, --still N for one frame.
+This script adds only staging: a perspective camera on a dolly, a shallow focus and a glow in the
+compositor; the board stands on the fixture's own studio floor. Options: --start/--count to render
+part, --scale and --samples for tests, --still N for one frame.
 """
 import argparse
 import json
@@ -66,11 +66,6 @@ def main():
     lo = Vector((min(p.x for p in points), min(p.y for p in points), min(p.z for p in points)))
     hi = Vector((max(p.x for p in points), max(p.y for p in points), max(p.z for p in points)))
     centre, width = (lo + hi) / 2, hi.x - lo.x
-
-    # a dark satin desk under the board, to catch the light the keys throw down
-    bpy.ops.mesh.primitive_plane_add(size=width * 8, location=(centre.x, centre.y, lo.z - 0.0005))
-    desk = bpy.context.active_object
-    desk.data.materials.append(fixture.surface_material("Desk", (0.012, 0.013, 0.016), roughness=0.32))
 
     # a perspective camera gliding from low over the left of the board to a high three-quarter view
     cam_data = bpy.data.cameras.new("Cinematic")
