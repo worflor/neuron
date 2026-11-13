@@ -422,6 +422,15 @@ export global State {
     in-out property <bool> assist-tab-held;             // Tab is down: the offers show their numbers
     in-out property <int> assist-prime: -1;             // the row of the first choice (option 1), or -1
     pure callback assist-option(int) -> int;            // the row of option n, the way back for 0, or -1
+    in-out property <bool> assist-can-ask;              // a colour model is there to ask outright
+    in-out property <bool> assist-asking;               // it was asked about the palette as it is
+    callback assist-ask();                              // ask it outright, or for its next few options
+    in-out property <[string]> roll-modes;              // what a roll can start from, by name
+    in-out property <[string]> roll-wilds;              // how far it can stray, by name
+    in-out property <int> roll-mode;
+    in-out property <int> roll-wild;
+    callback roll();                                    // roll a palette and put it on show
+    callback roll-choose(int, int);                     // (mode, wildness) for the next rolls
     in-out property <int> picker-focus;                 // bumped to hand the picker the keyboard
     callback add-stop(float);                          // (at 0..1) — insert a stop (colour sampled there), select it
     callback remove-stop(int);                         // (stop idx) — delete (a palette never drops below 1 stop)

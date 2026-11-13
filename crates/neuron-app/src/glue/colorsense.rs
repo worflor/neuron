@@ -26,8 +26,9 @@
 use super::*;
 use crate::ui::{AssistOffer, StopDoubt};
 use neuron::assist::journal::{Control, Journal};
-use neuron::assist::learned::{Learned, Terrain};
-use neuron::assist::{self, Lch, Offer, Scope};
+use neuron::assist::learned::{Asked, Learned, Terrain};
+use neuron::assist::roll::{self, Mode, Wild};
+use neuron::assist::{self, Engine, Lch, Offer, Scope};
 use neuron::spectrum::{Interp, Motion, Palette, Stop};
 use std::sync::{Arc, Condvar, Mutex, Once, PoisonError};
 
@@ -38,10 +39,12 @@ type Home = (usize, usize);
 #[derive(Clone)]
 struct Row {
     offer: Offer,
-    /// Its place in the slate; `None` for the way back, which needs no slate.
+    /// Its place in the slate; `None` for the way back and for a roll, which need no slate.
     slate: Option<usize>,
     /// Where a single-colour offer sits on the picker plane: (vividness, lightness).
     dot: Option<(f32, f32)>,
+    /// A palette the roll button made.
+    roll: bool,
 }
 
 #[derive(Default)]
@@ -77,7 +80,16 @@ struct Sense {
     control: Option<Control>,
     logged: Option<(usize, Rgb)>,
     offered: bool,
+    /// The person asked the model outright about this palette: the palette, which round of
+    /// options, and the slate that round made for the scene it was made for.
+    asking: Option<(Home, Vec<Stop>, usize, Option<(assist::Scene, assist::Slate)>)>,
+    /// Palettes rolled for a palette, newest first, and how many rolls there have been.
+    rolls: Vec<(Home, Offer)>,
+    rolled: u64,
 }
+
+/// The most rolls the row keeps.
+const ROLLS: usize = 3;
 
 /// The most palettes, and colours of each, handed to an engine as the person's other work.
 const LIBRARY: (usize, usize) = (8, 12);
@@ -96,10 +108,12 @@ thread_local! {
 fn model() -> Option<Arc<Learned>> {
     MODEL.with(|model| {
         model.borrow_mut().get_or_insert_with(|| {
-            Learned::load(&neuron::runroot::run_root().join("models")).map(|model| model.map(Arc::new)).unwrap_or_else(|e| {
-                eprintln!("neuron: colour model not loaded ({e})");
-                None
-            })
+            // a bundle in the run root's models folder, else Luma-T as Neuron ships it
+            let model = Learned::open(&neuron::runroot::run_root().join("models"));
+            for note in model.notes() {
+                eprintln!("neuron: colour model: {note}");
+            }
+            Some(Arc::new(model))
         }).clone()
     })
 }
@@ -117,7 +131,13 @@ static DESK: (Mutex<Option<(Arc<Learned>, assist::Scene)>>, Condvar) = (Mutex::n
 
 /// Everything the model and the rules have to say about `scene`.
 fn both(model: &Learned, scene: &assist::Scene) -> (assist::Slate, Option<Terrain>) {
-    (assist::propose(&assist::Chain(&[model, &assist::Rules]), scene), model.terrain(scene))
+    (assist::propose(&assist::Chain(&engines(model)), scene), model.terrain(scene))
+}
+
+/// The model, and the fixed rules unless the model's silence is a judgement of its own (a taste
+/// head that chose to leave the palette alone) that the rules would only talk over.
+fn engines(model: &Learned) -> Vec<&dyn Engine> {
+    if model.answers_alone() { vec![model] } else { vec![model, &assist::Rules] }
 }
 
 /// Ask the model about `scene` on its own thread. The answer comes back through [`deliver`].
@@ -318,8 +338,10 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
                         (slate, Some(terrain))
                     }
                     Some(model) => {
+                        // until the model answers, the rules do, unless it answers alone
+                        let interim = if model.answers_alone() { assist::propose(&assist::Chain(&[]), &scene) } else { assist::propose(&assist::Rules, &scene) };
                         ask(model, scene.clone());
-                        (assist::propose(&assist::Rules, &scene), Some(None))
+                        (interim, Some(None))
                     }
                     None => (assist::propose(&assist::Rules, &scene), Some(None)),
                 },
@@ -332,6 +354,22 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
                 None => {}
             }
             sense.terrain_of = ground;
+            if sense.asking.as_ref().is_some_and(|(at, then, _, _)| *at != home || *then != palette.stops) {
+                sense.asking = None;
+            }
+            // asked outright, the model lists what it would otherwise keep to itself
+            let slate = match (sense.asking.as_mut(), model()) {
+                (Some((_, _, round, made)), Some(model)) => {
+                    if made.as_ref().is_none_or(|(asked, _)| *asked != scene) {
+                        let asked = Asked { model: &model, round: *round };
+                        let mut all: Vec<&dyn Engine> = vec![&asked];
+                        all.extend(engines(&model));
+                        *made = Some((scene.clone(), assist::propose(&assist::Chain(&all), &scene)));
+                    }
+                    made.as_ref().map_or(slate, |(_, asked)| asked.clone())
+                }
+                _ => slate,
+            };
             // a doubt about another stop is a mark on that stop, not something to pick here
             let mut doubts: Vec<Option<Rgb>> = vec![None; palette.stops.len()];
             for offer in slate.offers.iter().filter(|offer| offer.scope == Scope::Aside) {
@@ -340,20 +378,25 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
                 }
             }
             let offered = |scope: Scope| slate.offers.iter().enumerate().filter(move |(_, offer)| offer.scope == scope);
-            let mut rows: Vec<Row> = offered(Scope::Palette).map(|(i, offer)| Row { offer: offer.clone(), slate: Some(i), dot: None }).collect();
+            // rolls lead the row, newest first; then the engines' palettes, the way back, the dots
+            sense.rolls.retain(|(at, _)| *at == home);
+            let mut rows: Vec<Row> = sense.rolls.iter().map(|(_, offer)| Row { offer: offer.clone(), slate: None, dot: None, roll: true }).collect();
+            rows.extend(offered(Scope::Palette).map(|(i, offer)| Row { offer: offer.clone(), slate: Some(i), dot: None, roll: false }));
             if let Some((_, stops, interp, _)) = &sense.undo {
-                let offer = Offer { id: "undo", title: "put it back", scope: Scope::Palette, stops: stops.clone(), interp: *interp };
-                rows.push(Row { offer, slate: None, dot: None });
+                let offer = Offer { id: "undo", title: "put it back", scope: Scope::Palette, stops: stops.clone(), interp: *interp, reach: false };
+                rows.push(Row { offer, slate: None, dot: None, roll: false });
             }
             rows.extend(offered(Scope::Stop).filter_map(|(i, offer)| {
                 let lch = Lch::of(offer.stops.get(chosen)?.col);
-                Some(Row { offer: offer.clone(), slate: Some(i), dot: Some((vividness(lch), lch.l.clamp(0.0, 1.0))) })
+                Some(Row { offer: offer.clone(), slate: Some(i), dot: Some((vividness(lch), lch.l.clamp(0.0, 1.0))), roll: false })
             }));
+            st.set_assist_asking(sense.asking.is_some());
             record(sense, home, &palette, chosen, &rows);
             sense.slate = Some((scene, slate));
             sense.rows = rows.clone();
             (rows, pins, doubts)
         });
+        st.set_assist_can_ask(model().is_some());
         show(app, &rows, chosen, &pins, &doubts);
     }
     sync_picker(app, &palette, chosen);
@@ -399,16 +442,18 @@ fn show(app: &AppWindow, rows: &[Row], chosen: usize, pins: &[bool], doubts: &[O
     // the options are numbered by the engines' own ranking, the way back aside: option 1 is
     // what they would offer first, whichever part of the picker it sits in
     let ranked = ranking(rows);
-    let rows: Vec<AssistOffer> = rows.iter().enumerate().map(|(i, Row { offer, dot, slate })| {
+    let rows: Vec<AssistOffer> = rows.iter().enumerate().map(|(i, Row { offer, dot, slate, roll })| {
         let num = ranked.iter().position(|&row| row == i).map_or(0, |rank| rank as i32 + 1);
         match *dot {
             Some((vivid, light)) => {
                 let col = offer.stops.get(chosen).map(|s| s.col).unwrap_or_default();
-                AssistOffer { title: offer.title.into(), solid: true, num, col: rgb_to_color(col), vivid, light, hue: Lch::of(col).h, ..AssistOffer::default() }
+                AssistOffer { title: offer.title.into(), solid: true, num, reach: offer.reach, col: rgb_to_color(col), vivid, light, hue: Lch::of(col).h, ..AssistOffer::default() }
             }
             None => AssistOffer {
                 title: offer.title.into(),
-                back: slate.is_none(),
+                back: slate.is_none() && !roll,
+                rolled: *roll,
+                reach: offer.reach,
                 num,
                 swatch: palette_strip_image(&Palette { stops: offer.stops.clone(), motion: Motion::Hold, interp: offer.interp }),
                 ..AssistOffer::default()
@@ -477,7 +522,7 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
         let mut sense = sense.borrow_mut();
         let sense = &mut *sense;
         let index = usize::try_from(index).ok()?;
-        let Row { offer, slate: place, .. } = sense.rows.get(index).cloned()?;
+        let Row { offer, slate: place, roll: rolled, .. } = sense.rows.get(index).cloned()?;
         let (was_stops, was_interp) = sense.stash.take().unwrap_or((palette.stops.clone(), palette.interp));
         // an engine offer is only good for the scene it was made for; the way back needs no slate
         let current = match place {
@@ -496,11 +541,12 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
                 written(match place {
                     Some(_) if offered => journal.accepted(choice),
                     Some(_) => Ok(()),
+                    None if rolled => Ok(()),
                     None => journal.undo(&offer.stops),
                 });
             }
         }
-        sense.undo = place.is_some().then(|| (home, was_stops, was_interp, offer.stops.clone()));
+        sense.undo = (place.is_some() || rolled).then(|| (home, was_stops, was_interp, offer.stops.clone()));
         sense.base = None;
         Some((offer.stops, offer.interp))
     });
@@ -522,12 +568,88 @@ fn option_row(n: i32) -> i32 {
     SENSE.with(|sense| {
         let sense = sense.borrow();
         let found = if n == 0 {
-            sense.rows.iter().position(|row| row.slate.is_none())
+            sense.rows.iter().position(|row| row.slate.is_none() && !row.roll)
         } else {
             usize::try_from(n - 1).ok().and_then(|at| ranking(&sense.rows).get(at).copied())
         };
         found.map_or(-1, |i| i as i32)
     })
+}
+
+/// Put the first choice on show, with the keyboard on it.
+fn draft_first(app: &AppWindow, sh: &SharedRt) {
+    let st = app.global::<State>();
+    let first = st.get_assist_prime();
+    if first >= 0 {
+        preview(app, sh, first);
+        st.set_assist_keyed(first);
+    }
+}
+
+/// Ask the model outright about the palette as it is, or, asked already, for its next few
+/// options. The first answer goes on show.
+fn ask_more(app: &AppWindow, sh: &SharedRt) {
+    settle(app, sh);
+    let Some((home, palette)) = active(sh) else { return };
+    if model().is_none() {
+        return;
+    }
+    SENSE.with(|sense| {
+        let mut sense = sense.borrow_mut();
+        let round = match &sense.asking {
+            Some((at, then, round, _)) if *at == home && *then == palette.stops => round + 1,
+            _ => 0,
+        };
+        sense.asking = Some((home, palette.stops.clone(), round, None));
+    });
+    refresh(app, sh);
+    draft_first(app, sh);
+}
+
+fn roll_choice() -> (Mode, Wild) {
+    let (mode, wild) = crate::prefs::roll_choice();
+    (Mode::from_name(&mode).unwrap_or(Mode::Around), Wild::from_name(&wild).unwrap_or(Wild::Lively))
+}
+
+/// Roll a palette in the chosen mode and put it on show at the head of the row.
+fn roll_now(app: &AppWindow, sh: &SharedRt) {
+    settle(app, sh);
+    let Some((home, palette)) = active(sh) else { return };
+    let chosen = selected(app, palette.stops.len());
+    let (mode, wild) = roll_choice();
+    let others = library(sh, home);
+    let model = model();
+    let (held, count) = SENSE.with(|sense| {
+        let mut sense = sense.borrow_mut();
+        sense.rolled += 1;
+        let held = sense.pins.as_ref().filter(|(at, _)| *at == home).map(|(_, pins)| pins.clone()).unwrap_or_default();
+        (held, sense.rolled)
+    });
+    let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let seed = clock ^ count.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // a roll that lands on the palette as it is would look like nothing happened
+    let Some(stops) = (0..4u64)
+        .map(|attempt| roll::roll(model.as_deref(), &roll::Roll { stops: &palette.stops, held: &held, selected: chosen, library: &others, mode, wild, seed: seed.wrapping_add(attempt) }))
+        .find(|stops| !roll::same(stops, &palette.stops))
+    else {
+        return;
+    };
+    let title = match mode {
+        Mode::Around => "rolled around this",
+        Mode::Fresh => "a fresh roll",
+        Mode::Mine => "rolled like your others",
+        Mode::Wildcard => "a wildcard",
+    };
+    SENSE.with(|sense| {
+        let mut sense = sense.borrow_mut();
+        let offer = Offer { id: "roll", title, scope: Scope::Palette, stops, interp: palette.interp, reach: false };
+        sense.rolls.insert(0, (home, offer));
+        sense.rolls.truncate(ROLLS);
+    });
+    refresh(app, sh);
+    let st = app.global::<State>();
+    preview(app, sh, 0);
+    st.set_assist_keyed(0);
 }
 
 /// Hold the selected stop against every offer, or let it go.
@@ -818,6 +940,37 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
     st.on_assist_accept(offer(accept));
     st.on_assist_at(dot_at);
     st.on_assist_option(option_row);
+    let (w, sh2) = (app.as_weak(), sh.clone());
+    st.on_assist_ask(move || {
+        if let Some(app) = w.upgrade() {
+            ask_more(&app, &sh2);
+        }
+    });
+    let (w, sh2) = (app.as_weak(), sh.clone());
+    st.on_roll(move || {
+        if let Some(app) = w.upgrade() {
+            roll_now(&app, &sh2);
+        }
+    });
+    let names = |all: &[&'static str]| ModelRc::new(VecModel::from(all.iter().map(|n| SharedString::from(*n)).collect::<Vec<_>>()));
+    st.set_roll_modes(names(&Mode::ALL.map(Mode::name)));
+    st.set_roll_wilds(names(&Wild::ALL.map(Wild::name)));
+    let shown = |app: &AppWindow| {
+        let (mode, wild) = roll_choice();
+        let st = app.global::<State>();
+        st.set_roll_mode(Mode::ALL.iter().position(|m| *m == mode).unwrap_or(0) as i32);
+        st.set_roll_wild(Wild::ALL.iter().position(|w| *w == wild).unwrap_or(1) as i32);
+    };
+    shown(app);
+    let w = app.as_weak();
+    st.on_roll_choose(move |mode, wild| {
+        let mode = Mode::ALL.get(mode.max(0) as usize).copied().unwrap_or(Mode::Around);
+        let wild = Wild::ALL.get(wild.max(0) as usize).copied().unwrap_or(Wild::Lively);
+        crate::prefs::set_roll_choice(mode.name(), wild.name());
+        if let Some(app) = w.upgrade() {
+            shown(&app);
+        }
+    });
     let sync = offer(|app, sh, _| refresh(app, sh));
     st.on_picker_sync(move || sync(0));
     let pin = offer(|app, sh, _| toggle_pin(app, sh));

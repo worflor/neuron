@@ -92,8 +92,10 @@ export component SheenTitle inherits HorizontalLayout {
     in property <color> ink: Theme.text;
     in property <length> size: Theme.fs-body;
     in property <length> track: Theme.track-1;
+    // false holds the ink still, and the window is not redrawn for it
+    in property <bool> live: true;
     // the band's centre in letter widths, from before the first letter to past the last, then a rest
-    property <float> cycle: mod(animation-tick() / 1ms, 6400) / 6400;
+    property <float> cycle: root.live ? mod(animation-tick() / 1ms, 6400) / 6400 : 0.99;
     property <float> band: -0.3 + 1.6 * min(1, root.cycle / 0.32);
     spacing: 0px;
     alignment: start;

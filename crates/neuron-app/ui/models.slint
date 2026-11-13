@@ -225,6 +225,8 @@ export struct AssistOffer {
     solid: bool,         // the offer recolours only the selected stop: draw `col`, not the ramp
     back: bool,          // the way back to the palette the last accepted offer replaced
     num: int,            // its number on the keyboard, 1 for the first choice; 0 for the way back
+    reach: bool,         // offered only because the model was asked: drawn hollow
+    rolled: bool,        // a palette the roll button made
     col: color,
     vivid: float,        // where `col` sits in the picker (solid offers only)
     light: float,

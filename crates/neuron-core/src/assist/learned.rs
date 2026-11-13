@@ -32,6 +32,8 @@ use crate::lighting::Rgb;
 
 mod taste;
 pub use taste::{Person, Taste};
+mod asked;
+pub use asked::Asked;
 
 /// The bundle [`Learned::load`] looks for in its folder.
 pub const BUNDLE: &str = "colour-model.lumacore";
@@ -1390,7 +1392,7 @@ impl Engine for Learned {
                     }
                     stop
                 }).collect();
-                out.push(Offer { id, title, scope, stops, interp: scene.interp });
+                out.push(Offer { id, title, scope, stops, interp: scene.interp, reach: false });
             }
         };
         if scene.open {
@@ -1421,7 +1423,7 @@ impl Engine for Learned {
             let mut stops = scene.stops.clone();
             stops[stop].col = colour(&better);
             let scope = if stop == active { Scope::Stop } else { Scope::Aside };
-            out.push(Offer { id: "doubt", title: "would sit better here", scope, stops, interp: scene.interp });
+            out.push(Offer { id: "doubt", title: "would sit better here", scope, stops, interp: scene.interp, reach: false });
         }
         out
     }

@@ -7,7 +7,7 @@
 
 import { Theme } from "../theme.slint";
 import { State } from "../state.slint";
-import { Field, Mono, SwatchRow } from "controls.slint";
+import { Field, Mono, SheenTitle, SplitToggle, SwatchRow } from "controls.slint";
 
 // A key that does something here, drawn as the key. `ground` is for sitting on a colour.
 component Keycap inherits Rectangle {
@@ -111,11 +111,14 @@ export component SensePicker inherits VerticalLayout {
                 State.assist-keyed = row;
                 State.assist-preview(row);
             }
+            // with nothing to show, Tab asks the model outright
             function forward() {
                 if (State.assist-keyed >= 0) {
                     State.assist-accept(State.assist-keyed);
                 } else if (State.assist-prime >= 0) {
                     self.draft(State.assist-prime);
+                } else if (State.assist-can-ask) {
+                    State.assist-ask();
                 }
             }
             changed has-focus => {
@@ -146,6 +149,10 @@ export component SensePicker inherits VerticalLayout {
                 }
                 if (e.text == Key.Escape) {
                     if (State.assist-keyed >= 0) { self.draft(-1); } else { self.clear-focus(); }
+                    return accept;
+                }
+                if ((e.text == "r" || e.text == "R") && !e.modifiers.control) {
+                    State.roll();
                     return accept;
                 }
                 if (e.modifiers.control && (e.text == "z" || e.text == "Z")) {
@@ -196,9 +203,10 @@ export component SensePicker inherits VerticalLayout {
             width: self.d; height: self.d; border-radius: self.d / 2;
             x: clamp(offer.vivid * plane.width - self.d / 2, 0px, plane.width - self.d);
             y: clamp((1 - offer.light) * plane.height - self.d / 2, 0px, plane.height - self.d);
-            background: offer.col;
-            border-width: self.hot ? 1.5px : 1px;
-            border-color: self.hot ? Theme.accent : offer.light > 0.62 ? #00000090 : #ffffffb0;
+            // a colour offered only because the model was asked is a ring of that colour: a reach
+            background: offer.reach ? offer.col.with-alpha(0.3) : offer.col;
+            border-width: offer.reach ? 2px : self.hot ? 1.5px : 1px;
+            border-color: self.hot ? Theme.accent : offer.reach ? offer.col : offer.light > 0.62 ? #00000090 : #ffffffb0;
             opacity: self.born ? 1 : 0;
             animate opacity { duration: 200ms; easing: ease-out; }
             animate d, x, y { duration: Theme.quick; easing: ease-out; }
@@ -359,16 +367,22 @@ export component SensePicker inherits VerticalLayout {
 
 // The whole-palette suggestions for the palette being edited (single colours sit in the picker).
 // Resting on a capsule shows it on the strip and the board; leaving puts the palette back. Only a
-// click keeps it, and the capsule that then says "undo" is the way back. The first choice is the
-// wider capsule at the head of the row: the one Tab reaches for. One touch area outside the `for`
-// owns the gesture, so a row update cannot drop the hover. The row opens and closes by height.
+// click keeps it, and the capsule that then says "undo" is the way back. Rolls lead the row, newest
+// first. The first choice is drawn a little wider: the one Tab reaches for. A capsule the model
+// offers only because it was asked is drawn faint, a reach rather than a recommendation.
+//
+// At the row's end, with a model to ask, the ask capsule: when the model is quiet it asks anyway,
+// and asked once it asks for the next few. One touch area outside the `for` owns the gesture over
+// the capsules, so a row update cannot drop the hover.
 export component SenseOffers inherits Rectangle {
     property <int> n: min(State.assist-ramps, State.assist-offers.length);
-    property <length> cw: 44px;
-    property <length> gap: 6px;
+    property <length> cw: 40px;
+    property <length> gap: 5px;
     // the head capsule is wider when it holds the first choice
-    property <length> hw: State.assist-prime == 0 ? 60px : root.cw;
+    property <length> hw: State.assist-prime == 0 ? 54px : root.cw;
     property <length> span: root.n > 0 ? root.hw + root.gap + (root.n - 1) * (root.cw + root.gap) : 0px;
+    property <bool> quiet: State.assist-prime < 0;
+    property <length> label-x: root.span + (State.assist-can-ask ? root.cw + root.gap : 0px) + 2px;
     property <int> hov: !ta.has-hover || root.n <= 0 ? -1
         : ta.mouse-x < root.hw + root.gap ? 0
         : min(root.n - 1, 1 + Math.floor((ta.mouse-x - root.hw - root.gap) / (root.cw + root.gap)));
@@ -383,7 +397,7 @@ export component SenseOffers inherits Rectangle {
             State.assist-preview(root.hov);
         }
     }
-    height: root.n > 0 ? 26px : 0px;
+    height: root.n > 0 || State.assist-can-ask ? 26px : 0px;
     animate height { duration: 200ms; easing: ease-out; }
     clip: true;
     Timer {
@@ -406,7 +420,13 @@ export component SenseOffers inherits Rectangle {
         animate border-color { duration: Theme.quick; }
         animate width { duration: Theme.quick; easing: ease-out; }
         clip: true;
-        Image { source: offer.swatch; width: 100%; height: 100%; image-fit: fill; }
+        Image {
+            source: offer.swatch;
+            width: 100%; height: 100%;
+            image-fit: fill;
+            opacity: offer.reach && i != root.lit ? 0.5 : 1;
+            animate opacity { duration: Theme.quick; }
+        }
         if offer.back : Rectangle {
             background: #000000a8;
             Mono {
@@ -424,16 +444,47 @@ export component SenseOffers inherits Rectangle {
             key: offer.num;
         }
     }
+    // ask the model outright: "ask" while it has nothing to say, "more" once asked
+    ask := Rectangle {
+        property <bool> live: root.quiet && (ata.has-hover || State.assist-keys);
+        visible: State.assist-can-ask;
+        x: root.span;
+        y: 0px;
+        width: root.cw;
+        height: 26px;
+        border-radius: 13px;
+        border-width: Theme.hair;
+        border-color: ata.has-hover ? Theme.text-faint : Theme.line;
+        background: ata.pressed ? Theme.well-hi : ata.has-hover ? Theme.well : transparent;
+        animate border-color, background { duration: Theme.quick; }
+        HorizontalLayout {
+            alignment: center;
+            SheenTitle {
+                letters: State.assist-asking ? ["m", "o", "r", "e"] : ["a", "s", "k"];
+                ink: root.quiet ? Theme.text-mid : Theme.text-faint;
+                size: Theme.fs-small;
+                track: 0px;
+                live: ask.live;
+            }
+        }
+        ata := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => {
+                State.assist-ask();
+                State.picker-focus += 1;
+            }
+        }
+    }
     // what the lit capsule does; with the keyboard here and nothing lit, the first choice and the
     // key that moves it forward
     HorizontalLayout {
-        x: root.span + 2px;
+        x: root.label-x;
         y: 0px;
         width: max(0px, parent.width - self.x);
         height: 26px;
         spacing: 6px;
         alignment: start;
-        if root.hint : VerticalLayout {
+        if root.hint || (root.lit < 0 && State.assist-keys && root.quiet && State.assist-can-ask) : VerticalLayout {
             alignment: center;
             Keycap { key: "tab"; }
         }
@@ -442,7 +493,7 @@ export component SenseOffers inherits Rectangle {
             overflow: elide;
             text: root.lit >= 0 ? State.assist-offers[root.lit].title
                 : root.hint ? State.assist-offers[State.assist-prime].title
-                : root.n == 0 || (root.n == 1 && State.assist-offers[0].back) ? "" : "suggested";
+                : "";
             color: root.lit >= 0 ? Theme.text-mid : Theme.text-faint;
             font-size: Theme.fs-small;
         }
@@ -462,6 +513,106 @@ export component SenseOffers inherits Rectangle {
                 State.assist-accept(root.hov);
                 State.picker-focus += 1;
             }
+        }
+    }
+}
+
+// Roll a palette: the wide half rolls one and puts it on show at the head of the suggestion row,
+// the narrow half opens the drawer that sets what a roll starts from and how far it strays.
+export component RollButton inherits Rectangle {
+    in-out property <bool> open;
+    property <length> more: 22px;
+    width: 76px;
+    height: Theme.row-h-sm;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    border-color: root.open ? Theme.accent-line : Theme.line;
+    animate border-color { duration: Theme.quick; }
+    clip: true;
+    Rectangle {
+        x: 0px; y: 0px;
+        width: root.width - root.more;
+        height: root.height;
+        background: rta.pressed ? Theme.well-hi : rta.has-hover ? Theme.well : transparent;
+        animate background { duration: rta.has-hover ? Theme.hover-in : Theme.hover-out; }
+        Text {
+            y: rta.pressed ? 1px : 0px;
+            animate y { duration: Theme.press-throw; }
+            width: parent.width;
+            height: parent.height;
+            text: "roll";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: rta.has-hover ? Theme.text : Theme.text-mid;
+            font-size: Theme.fs-small;
+            font-weight: 700;
+            font-family: Theme.mono;
+            letter-spacing: Theme.track-2;
+        }
+        rta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => {
+                State.roll();
+                State.picker-focus += 1;
+            }
+        }
+    }
+    Rectangle {
+        x: root.width - root.more;
+        y: 0px;
+        width: Theme.hair;
+        height: root.height;
+        background: Theme.line;
+    }
+    Rectangle {
+        x: root.width - root.more + Theme.hair;
+        y: 0px;
+        width: root.more - Theme.hair;
+        height: root.height;
+        background: root.open ? Theme.accent-glow : mta.has-hover ? Theme.well : transparent;
+        animate background { duration: Theme.quick; }
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "▾";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: root.open ? Theme.accent : mta.has-hover ? Theme.text : Theme.text-dim;
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+        }
+        mta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => { root.open = !root.open; }
+        }
+    }
+}
+
+// What a roll starts from and how far it strays, in a drawer that opens under the roll button.
+// Choosing where to start rolls one straight away; the wildness applies to the next roll.
+export component RollDrawer inherits Rectangle {
+    in property <bool> open;
+    height: root.open ? lay.preferred-height : 0px;
+    animate height { duration: 200ms; easing: ease-out; }
+    clip: true;
+    lay := VerticalLayout {
+        x: 0px; y: 0px;
+        width: root.width;
+        height: self.preferred-height;
+        spacing: 6px;
+        SplitToggle {
+            options: State.roll-modes;
+            index: State.roll-mode;
+            picked(i) => {
+                State.roll-choose(i, State.roll-wild);
+                State.roll();
+                State.picker-focus += 1;
+            }
+        }
+        SplitToggle {
+            options: State.roll-wilds;
+            index: State.roll-wild;
+            picked(i) => { State.roll-choose(State.roll-mode, i); }
         }
     }
 }

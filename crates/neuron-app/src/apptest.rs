@@ -1655,6 +1655,63 @@ fn second_picker_offers_preview_accept_and_undo() {
         assert!(!st.get_assist_keys(), "and with nothing on show, lets the keyboard go");
     }
 
+    // asking: a model that has nothing to volunteer still answers when asked, and again with more
+    {
+        glue::colorsense::use_model(Some(include_bytes!("../../neuron-core/data/colour-model.golden.lumacore")));
+        let resting = stops();
+        st.set_light_sel_stop(2);
+        st.invoke_picker_sync();
+        snap(&app).unwrap();
+        assert!(st.get_assist_can_ask(), "with a model there is something to ask");
+        st.invoke_assist_ask();
+        snap(&app).unwrap();
+        assert!(st.get_assist_asking() && st.get_assist_showing(), "asking puts its first answer on show");
+        let first: Vec<String> = titles();
+        assert!(!first.is_empty());
+        st.invoke_assist_preview(-1);
+        st.invoke_assist_ask();
+        snap(&app).unwrap();
+        assert!(st.get_assist_showing(), "asking again shows its next answer");
+        capture("picker-v2-asked");
+        st.invoke_assist_preview(-1);
+        assert_eq!(stops(), resting, "nothing asked for is kept without a click");
+    }
+
+    // rolling: a roll leads the row and goes on show; held stops stay; a fresh roll has its own size
+    {
+        let resting = stops();
+        st.invoke_toggle_pin();
+        let held = st.get_light_sel_stop() as usize;
+        st.invoke_roll_choose(0, 1);
+        st.invoke_roll();
+        snap(&app).unwrap();
+        let offers: Vec<_> = st.get_assist_offers().iter().collect();
+        assert!(offers.first().is_some_and(|o| o.rolled) && st.get_assist_showing(), "the roll leads the row, on show");
+        let rolled = stops();
+        assert!(rolled.len() == resting.len() && rolled[held] == resting[held] && rolled != resting, "around this palette, the held stop stays");
+        capture("picker-v2-rolled");
+        st.invoke_roll();
+        snap(&app).unwrap();
+        assert!(st.get_assist_offers().iter().take_while(|o| o.rolled).count() == 2, "rolls stack, newest first");
+        st.invoke_assist_accept(0);
+        assert!(!st.get_assist_showing() && stops() != resting, "a click keeps a roll");
+        assert!(st.get_assist_offers().iter().any(|o| o.back), "and the way back is there");
+        st.invoke_assist_accept(st.invoke_assist_option(0));
+        assert_eq!(stops(), resting);
+        st.invoke_toggle_pin();
+        st.invoke_roll_choose(1, 2);
+        assert_eq!(crate::prefs::roll_choice(), ("fresh".to_string(), "wild".to_string()), "the choice is saved");
+        for _ in 0..6 {
+            st.invoke_roll();
+            let n = stops().len();
+            assert!((3..=8).contains(&n), "a fresh roll has three to eight stops: {n}");
+            st.invoke_assist_preview(-1);
+        }
+        assert_eq!(stops(), resting, "unkept rolls leave the palette as it was");
+        st.invoke_roll_choose(0, 1);
+        glue::colorsense::use_model(None);
+    }
+
     st.invoke_assist_preview(0);
     capture("picker-v2-previewing");
     st.invoke_assist_preview(-1);

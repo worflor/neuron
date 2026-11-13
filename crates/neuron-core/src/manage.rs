@@ -358,6 +358,8 @@ pub const APP_PREF_KINDS: &[(&str, &str)] = &[
     ("weave_material", "string"),
     ("picker_v2", "bool"),
     ("picker_journal", "bool"),
+    ("roll_mode", "string"),
+    ("roll_wild", "string"),
     ("phoenix", "bool"),
     ("notif_enabled", "bool"),
     ("notif_placement", "string"),

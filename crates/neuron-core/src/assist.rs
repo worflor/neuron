@@ -18,6 +18,7 @@
 
 pub mod journal;
 pub mod learned;
+pub mod roll;
 
 use crate::lighting::Rgb;
 use crate::spectrum::{oklab_in_gamut, oklab_to_rgb, rgb_to_oklab, Interp, Stop};
@@ -101,6 +102,9 @@ pub struct Offer {
     pub scope: Scope,
     pub stops: Vec<Stop>,
     pub interp: Interp,
+    /// The engine would have kept quiet about it and offers it only because the person asked:
+    /// drawn as a reach, not a recommendation.
+    pub reach: bool,
 }
 
 /// Something that proposes offers. It may return anything; [`propose`] keeps what is valid.
@@ -265,7 +269,7 @@ fn follow(scene: &Scene) -> Option<Offer> {
         let c = lab(s.col);
         Stop::new(rgb([c[0] + shift[0] * w, c[1] + shift[1] * w, c[2] + shift[2] * w]), s.at)
     }).collect();
-    Some(Offer { id: "follow", title: "carry the change through", scope: Scope::Palette, stops, interp: scene.interp })
+    Some(Offer { id: "follow", title: "carry the change through", scope: Scope::Palette, stops, interp: scene.interp, reach: false })
 }
 
 /// The selected stop sits between two others: the colour that lies on the way from one to the
@@ -288,7 +292,7 @@ fn between(scene: &Scene) -> Option<Offer> {
     let mid = Lch { l: la.l + (lb.l - la.l) * t, c: la.c + (lb.c - la.c) * t, h: (ha + turn * t).rem_euclid(1.0) };
     let mut stops = scene.stops.clone();
     stops[i].col = mid.rgb();
-    Some(Offer { id: "between", title: "sit between its neighbours", scope: Scope::Stop, stops, interp: scene.interp })
+    Some(Offer { id: "between", title: "sit between its neighbours", scope: Scope::Stop, stops, interp: scene.interp, reach: false })
 }
 
 /// A ramp that runs dark to light (or back) with a stop that turns the other way: put the inner
@@ -320,7 +324,7 @@ fn pace(scene: &Scene) -> Option<Offer> {
         let c = lab(s.col);
         Stop::new(rgb([target(s), c[1], c[2]]), s.at)
     }).collect();
-    Some(Offer { id: "pace", title: "even out the light", scope: Scope::Palette, stops, interp: scene.interp })
+    Some(Offer { id: "pace", title: "even out the light", scope: Scope::Palette, stops, interp: scene.interp, reach: false })
 }
 
 /// Mixed directly, two vivid colours far apart in hue pass through a dull middle. Offer the mix
@@ -340,6 +344,7 @@ fn mix(scene: &Scene) -> Option<Offer> {
         scope: Scope::Palette,
         stops: scene.stops.clone(),
         interp: Interp::Hsv,
+        reach: false,
     })
 }
 
@@ -358,7 +363,7 @@ fn vivid(scene: &Scene) -> Option<Offer> {
     }
     let mut stops = scene.stops.clone();
     stops[i].col = Lch { c: usual.min(Lch::max_chroma(own.l, own.h)), ..own }.rgb();
-    Some(Offer { id: "vivid", title: "match the others' vividness", scope: Scope::Stop, stops, interp: scene.interp })
+    Some(Offer { id: "vivid", title: "match the others' vividness", scope: Scope::Stop, stops, interp: scene.interp, reach: false })
 }
 
 #[cfg(test)]
@@ -470,7 +475,7 @@ mod tests {
             let offer = |id, edit: &dyn Fn(&mut Vec<Stop>)| {
                 let mut stops = scene.stops.clone();
                 edit(&mut stops);
-                Offer { id, title: "", scope: Scope::Palette, stops, interp: scene.interp }
+                Offer { id, title: "", scope: Scope::Palette, stops, interp: scene.interp, reach: false }
             };
             let red = Rgb::new(255, 0, 0);
             let mut all = vec![

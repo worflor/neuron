@@ -98,6 +98,12 @@ pub struct Prefs {
     /// `models/picker-sessions.jsonl`, for training a colour model on. Default off; nothing sends it.
     #[serde(default)]
     pub picker_journal: bool,
+    /// What the second picker's roll button starts from (`neuron::assist::roll::Mode::name`).
+    #[serde(default = "default_roll_mode")]
+    pub roll_mode: String,
+    /// How far a roll strays from the colour model's first choice (`roll::Wild::name`).
+    #[serde(default = "default_roll_wild")]
+    pub roll_wild: String,
     /// PHOENIX — let the OS relaunch Neuron after a crash/hang (`RegisterApplicationRestart`). Default
     /// ON: the always-on flight recorder + an automatic respawn is the whole reliability story. Takes
     /// effect at the next launch (the OS registration happens once, at startup).
@@ -383,6 +389,8 @@ impl Default for Prefs {
             weave_material: default_material(),
             picker_v2: false,
             picker_journal: false,
+            roll_mode: default_roll_mode(),
+            roll_wild: default_roll_wild(),
             phoenix: true,
             notif_enabled: true,
             notif_placement: default_notif_placement(),
@@ -478,6 +486,8 @@ impl Prefs {
         salvage!("weave_material", weave_material);
         salvage!("picker_v2", picker_v2);
         salvage!("picker_journal", picker_journal);
+        salvage!("roll_mode", roll_mode);
+        salvage!("roll_wild", roll_wild);
         salvage!("phoenix", phoenix);
         salvage!("notif_enabled", notif_enabled);
         salvage!("notif_placement", notif_placement);
@@ -652,6 +662,30 @@ pub fn picker_v2() -> bool {
 /// Whether colour picks are recorded to the run root for training a colour model.
 pub fn picker_journal() -> bool {
     Prefs::load().picker_journal
+}
+
+fn default_roll_mode() -> String {
+    "around".into()
+}
+
+fn default_roll_wild() -> String {
+    "lively".into()
+}
+
+/// The roll button's mode and wildness, by name.
+pub fn roll_choice() -> (String, String) {
+    let p = Prefs::load();
+    (p.roll_mode, p.roll_wild)
+}
+
+/// Persist the roll button's mode and wildness. A failed save keeps them for this session only.
+pub fn set_roll_choice(mode: &str, wild: &str) {
+    let _transaction = PREFS_TRANSACTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut p = Prefs::load();
+    (p.roll_mode, p.roll_wild) = (mode.to_string(), wild.to_string());
+    if let Err(e) = p.save() {
+        eprintln!("neuron: roll choice not saved: {e}");
+    }
 }
 
 /// Persist the colour picker choice. A failed save keeps the choice for this session only.
@@ -1536,6 +1570,8 @@ mod tests {
             weave_material: "test-mat".into(),
             picker_v2: !d.picker_v2,
             picker_journal: !d.picker_journal,
+            roll_mode: "fresh".into(),
+            roll_wild: "wild".into(),
             phoenix: !d.phoenix,
             notif_enabled: !d.notif_enabled,
             notif_placement: "test-place".into(),

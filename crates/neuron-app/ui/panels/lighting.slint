@@ -5,7 +5,7 @@
 import { Theme, Signal } from "../theme.slint";
 import { ChromaLab } from "chromalab.slint";
 import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Picker, DefaultChip } from "../widgets/controls.slint";
-import { SensePicker, SenseOffers } from "../widgets/colorsense.slint";
+import { SensePicker, SenseOffers, RollButton, RollDrawer } from "../widgets/colorsense.slint";
 import { ListView } from "std-widgets.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
@@ -566,6 +566,8 @@ component SpectrumEditor inherits VerticalLayout {
         : 0;
     // the timeline is collapsed for a single palette; it expands on demand or when a sequence exists.
     property <bool> tl-open: false;
+    // the roll button's drawer: what a roll starts from and how far it strays
+    property <bool> roll-open: false;
 
     // ── GRADIENT STRIP — the active palette's stops ──────────────────────
     VerticalLayout {
@@ -725,8 +727,12 @@ component SpectrumEditor inherits VerticalLayout {
                 clicked => { State.toggle-pin(); }
             }
             Rectangle { horizontal-stretch: 1; }
-            Mono { text: "stop " + (root.stop-idx + 1) + " of " + State.light-stops.length; color: Theme.text-faint; }
+            if !State.picker-v2 : Mono { text: "stop " + (root.stop-idx + 1) + " of " + State.light-stops.length; color: Theme.text-faint; }
+            // the second picker rolls palettes where the first shows the stop count: the strip's
+            // chips already count the stops
+            if State.picker-v2 : RollButton { open <=> root.roll-open; }
         }
+        if State.picker-v2 : RollDrawer { open: root.roll-open; }
         // the selected stop's colour — the SHARED prism picker (the SAME component the SYSTEM accents
         // use). `pick` commits the hex; `preview` recolours the stop live so the strip + the board
         // update in real time as the prism is dragged. Both route through set-stop-color(idx, hex).
