@@ -1500,9 +1500,13 @@ fn second_picker_offers_preview_accept_and_undo() {
         assert_eq!(titles(), ["put it back"], "a coloured stop is no longer open");
         st.invoke_assist_accept(0);
         assert_eq!(stops(), added);
-        // and the model's answer to an edit arrives with the rules'
+        // and the model's answer to an edit arrives with the rules', with its terrain and doubts
         st.invoke_set_stop_color(new as i32, "30c060".into());
         assert!(!titles().is_empty());
+        assert_eq!(st.get_light_doubts().row_count(), added.len(), "one doubt flag per stop");
+        if st.get_picker_terrain_on() {
+            assert!(st.get_picker_terrain().size().width > 0, "a terrain that is on has been drawn");
+        }
     }
     assert!(offered, "no new stop was offered a colour");
     shared.borrow_mut().light_layers[0].spectrum.seq[0].palette.stops = before_adding;
@@ -1511,6 +1515,7 @@ fn second_picker_offers_preview_accept_and_undo() {
     st.set_light_sel_stop(1);
     st.invoke_picker_sync();
     st.invoke_set_stop_color(1, "8c5aa0".into());
+    assert!(!st.get_picker_terrain_on(), "no model, no terrain");
 
     st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
     st.set_sel_can_light(true); st.set_grid_rows(1); st.set_grid_cols(2);
@@ -1529,6 +1534,27 @@ fn second_picker_offers_preview_accept_and_undo() {
     st.invoke_assist_preview(0);
     capture("picker-v2-previewing");
     st.invoke_assist_preview(-1);
+    // with a model: its terrain behind the plane and a doubted stop marked on the strip. The
+    // frame uses a trained bundle when NEURON_LUMA_BRIDGE names a folder holding one.
+    let trained = std::env::var_os("NEURON_LUMA_BRIDGE").and_then(|folder| std::fs::read(std::path::Path::new(&folder).join("core-v4.3.lumacore")).ok());
+    glue::colorsense::use_model(Some(trained.as_deref().unwrap_or(include_bytes!("../../neuron-core/data/colour-model.golden.lumacore"))));
+    st.invoke_set_stop_color(1, "a05a8c".into());
+    if !st.get_light_doubts().iter().any(|doubt| doubt.on) {
+        let mark = |on| crate::ui::StopDoubt { on, col: slint::Color::from_rgb_u8(90, 150, 210) };
+        st.set_light_doubts(slint::ModelRc::new(slint::VecModel::from(vec![mark(false), mark(false), mark(true), mark(false)])));
+    }
+    // the terrain fades in: draw once to start it, then let it finish before the frame is kept
+    let _ = app.window().take_snapshot();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    slint::platform::update_timers_and_animations();
+    capture("picker-v2-model");
+    // turned to the hue the ridge points at, the plane shows the ground itself
+    st.invoke_set_stop_color(1, "4678be".into());
+    let _ = app.window().take_snapshot();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    slint::platform::update_timers_and_animations();
+    capture("picker-v2-terrain");
+    glue::colorsense::use_model(None);
     st.invoke_set_picker_v2(false);
     assert!(titles().is_empty() && !crate::prefs::picker_v2());
     capture("picker-v1");

@@ -629,6 +629,26 @@ component SpectrumEditor inherits VerticalLayout {
                     border-width: handle.on ? Theme.hair-2 : Theme.hair;
                     border-color: handle.on ? Theme.text : Theme.text-faint;
                 }
+                // A stop the colour model would change reads top to bottom as a sentence: its chip, a
+                // wavy underline, and a pip of the colour the model would rather see. Selecting the
+                // stop brings that colour into the picker as a dot.
+                if State.picker-v2 && !handle.on && State.light-doubts.length > i && State.light-doubts[i].on : Rectangle {
+                    width: 12px; height: 13px;
+                    y: 17px; x: (parent.width - self.width) / 2;
+                    Image {
+                        source: State.doubt-wave;
+                        colorize: Theme.warn;
+                        width: 12px; height: 4px;
+                        y: 0px;
+                    }
+                    Rectangle {
+                        width: 7px; height: 7px; border-radius: 3.5px;
+                        x: 2.5px; y: 6px;
+                        background: State.light-doubts[i].col;
+                        border-width: 1px;
+                        border-color: Theme.warn;
+                    }
+                }
                 // a held stop wears a bar across its foot: suggestions leave it where it is
                 if State.picker-v2 && State.light-pins.length > i && State.light-pins[i] : Rectangle {
                     width: 8px; height: 2px;

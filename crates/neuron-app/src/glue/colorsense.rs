@@ -15,13 +15,18 @@
 //! The rules answer at once. The model is asked on its own thread, once a drag has settled, and
 //! its answer joins the row when it arrives if the palette is still the one it was asked about.
 //! A stop just added is offered colours before anyone has picked one; a pinned stop is left alone
-//! by every offer. With `picker_journal` set in the preferences, picks and what was offered are
+//! by every offer. The model also says where it has doubts: a stop it would move is marked on the
+//! strip, and its colour for that stop is a dot once the stop is selected. Behind the plane it
+//! draws its terrain for the selected stop like a relief map: rings around the colours it would
+//! put at that place in the palette, and on the rail a skyline that stands tallest at the hues
+//! where that ground is highest. A doubted stop shows the colour the model would rather see. The terrain reads the rest of the palette, not the stop's own
+//! colour, so it holds still while the stop is dragged. With `picker_journal` set in the preferences, picks and what was offered are
 //! appended to `models/picker-sessions.jsonl` in the run root ([`neuron::assist::journal`]).
 
 use super::*;
-use crate::ui::AssistOffer;
+use crate::ui::{AssistOffer, StopDoubt};
 use neuron::assist::journal::{Control, Journal};
-use neuron::assist::learned::Learned;
+use neuron::assist::learned::{Learned, Terrain};
 use neuron::assist::{self, Lch, Offer, Scope};
 use neuron::spectrum::{Interp, Motion, Palette, Stop};
 use std::sync::{Arc, Condvar, Mutex, Once, PoisonError};
@@ -46,8 +51,13 @@ struct Sense {
     /// What is on offer (capsules first, then dots), and the scene and slate it came from.
     rows: Vec<Row>,
     slate: Option<(assist::Scene, assist::Slate)>,
-    /// The model's slate for a scene, held until nothing is on show.
-    pending: Option<(assist::Scene, assist::Slate)>,
+    /// The model's answer for a scene, held until nothing is on show.
+    pending: Option<(assist::Scene, assist::Slate, Option<Terrain>)>,
+    /// The model's terrain for the selected stop, what it was made from ([`ground_key`]), and the
+    /// hue it was last drawn at.
+    terrain: Option<Terrain>,
+    terrain_of: u64,
+    terrain_at: Option<u32>,
     /// The palette to return to while an offer is shown on hover.
     stash: Option<(Vec<Stop>, Interp)>,
     /// After an offer is taken: the palette it replaced and the stops it left, until either changes.
@@ -105,8 +115,9 @@ pub(crate) fn use_model(bundle: Option<&[u8]>) {
 /// worked on: during a drag only the palette it ends on is worth an answer.
 static DESK: (Mutex<Option<(Arc<Learned>, assist::Scene)>>, Condvar) = (Mutex::new(None), Condvar::new());
 
-fn both(model: &Learned, scene: &assist::Scene) -> assist::Slate {
-    assist::propose(&assist::Chain(&[model, &assist::Rules]), scene)
+/// Everything the model and the rules have to say about `scene`.
+fn both(model: &Learned, scene: &assist::Scene) -> (assist::Slate, Option<Terrain>) {
+    (assist::propose(&assist::Chain(&[model, &assist::Rules]), scene), model.terrain(scene))
 }
 
 /// Ask the model about `scene` on its own thread. The answer comes back through [`deliver`].
@@ -121,9 +132,9 @@ fn ask(model: Arc<Learned>, scene: assist::Scene) {
             drop(next);
             std::thread::sleep(SETTLE);
             let Some((model, scene)) = DESK.0.lock().unwrap_or_else(PoisonError::into_inner).take() else { continue };
-            let slate = both(&model, &scene);
+            let (slate, terrain) = both(&model, &scene);
             if DESK.0.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
-                let _ = slint::invoke_from_event_loop(move || deliver(scene, slate));
+                let _ = slint::invoke_from_event_loop(move || deliver(scene, slate, terrain));
             }
         };
         if !crate::worker::spawn_detached("neuron-colour-model", work) {
@@ -134,13 +145,29 @@ fn ask(model: Arc<Learned>, scene: assist::Scene) {
     DESK.1.notify_one();
 }
 
-/// The model's slate for `scene` has arrived. It is used if the palette is still that scene.
-fn deliver(scene: assist::Scene, slate: assist::Slate) {
-    SENSE.with(|sense| sense.borrow_mut().pending = Some((scene, slate)));
+/// The model's answer for `scene` has arrived. It is used if the palette is still that scene.
+fn deliver(scene: assist::Scene, slate: assist::Slate, terrain: Option<Terrain>) {
+    SENSE.with(|sense| sense.borrow_mut().pending = Some((scene, slate, terrain)));
     let home = HOME.with(|home| home.borrow().as_ref().and_then(|(app, sh)| Some((app.upgrade()?, sh.clone()))));
     if let Some((app, sh)) = home {
         refresh(&app, &sh);
     }
+}
+
+/// A value that changes when anything a terrain reads changes: everything in the scene except the
+/// selected stop's own colour and the edit history.
+fn ground_key(scene: &assist::Scene) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (i, stop) in scene.stops.iter().enumerate() {
+        let col = if i == scene.selected { Rgb::default() } else { stop.col };
+        (col.r, col.g, col.b, stop.at.to_bits()).hash(&mut h);
+    }
+    for c in scene.library.iter().flatten() {
+        (c.r, c.g, c.b).hash(&mut h);
+    }
+    (scene.selected, &scene.pins, scene.library.len()).hash(&mut h);
+    h.finish()
 }
 
 /// How much of the chroma the display shows at a colour's lightness and hue it uses.
@@ -243,7 +270,7 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
     }
     let Some((home, palette)) = active(sh) else {
         SENSE.with(|sense| *sense.borrow_mut() = Sense::default());
-        show(app, &[], 0, &[]);
+        show(app, &[], 0, &[], &[]);
         return;
     };
     let chosen = selected(app, palette.stops.len());
@@ -251,7 +278,7 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
     let showing = SENSE.with(|sense| sense.borrow().stash.is_some());
     if !showing {
         let others = library(sh, home);
-        let (rows, pins) = SENSE.with(|sense| {
+        let (rows, pins, doubts) = SENSE.with(|sense| {
             let mut sense = sense.borrow_mut();
             let sense = &mut *sense;
             if sense.base.as_ref().is_some_and(|(at, base)| *at != home || !same_shape(base, &palette.stops)) {
@@ -279,19 +306,39 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
             };
             // The engines are only asked again when something they read has changed. The rules
             // answer here; the model's answer for the same scene replaces theirs when it arrives.
-            let arrived = sense.pending.take().filter(|(asked, _)| *asked == scene);
+            let arrived = sense.pending.take().filter(|(asked, _, _)| *asked == scene);
             let held = sense.slate.take().filter(|(asked, _)| *asked == scene);
-            let slate = match arrived.or(held) {
-                Some((_, slate)) => slate,
-                None => match model() {
-                    Some(model) if cfg!(test) => both(&model, &scene),
+            // `Some` replaces the terrain; a slate that was already here keeps the one it came with
+            let (slate, terrain) = match (arrived, held) {
+                (Some((_, slate, terrain)), _) => (slate, Some(terrain)),
+                (None, Some((_, slate))) => (slate, None),
+                (None, None) => match model() {
+                    Some(model) if cfg!(test) => {
+                        let (slate, terrain) = both(&model, &scene);
+                        (slate, Some(terrain))
+                    }
                     Some(model) => {
                         ask(model, scene.clone());
-                        assist::propose(&assist::Rules, &scene)
+                        (assist::propose(&assist::Rules, &scene), Some(None))
                     }
-                    None => assist::propose(&assist::Rules, &scene),
+                    None => (assist::propose(&assist::Rules, &scene), Some(None)),
                 },
             };
+            // an answer on its way does not blank a terrain made from the same surroundings
+            let ground = ground_key(&scene);
+            match terrain {
+                Some(None) if ground == sense.terrain_of && model().is_some() => {}
+                Some(terrain) => (sense.terrain, sense.terrain_at) = (terrain, None),
+                None => {}
+            }
+            sense.terrain_of = ground;
+            // a doubt about another stop is a mark on that stop, not something to pick here
+            let mut doubts: Vec<Option<Rgb>> = vec![None; palette.stops.len()];
+            for offer in slate.offers.iter().filter(|offer| offer.scope == Scope::Aside) {
+                if let Some(stop) = offer.stops.iter().zip(&palette.stops).position(|(new, old)| new.col != old.col) {
+                    doubts[stop].get_or_insert(offer.stops[stop].col);
+                }
+            }
             let offered = |scope: Scope| slate.offers.iter().enumerate().filter(move |(_, offer)| offer.scope == scope);
             let mut rows: Vec<Row> = offered(Scope::Palette).map(|(i, offer)| Row { offer: offer.clone(), slate: Some(i), dot: None }).collect();
             if let Some((_, stops, interp, _)) = &sense.undo {
@@ -305,9 +352,9 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
             record(sense, home, &palette, chosen, &rows);
             sense.slate = Some((scene, slate));
             sense.rows = rows.clone();
-            (rows, pins)
+            (rows, pins, doubts)
         });
-        show(app, &rows, chosen, &pins);
+        show(app, &rows, chosen, &pins, &doubts);
     }
     sync_picker(app, &palette, chosen);
 }
@@ -339,8 +386,10 @@ fn record(sense: &mut Sense, home: Home, palette: &Palette, chosen: usize, rows:
     written(wrote);
 }
 
-fn show(app: &AppWindow, rows: &[Row], chosen: usize, pins: &[bool]) {
+fn show(app: &AppWindow, rows: &[Row], chosen: usize, pins: &[bool], doubts: &[Option<Rgb>]) {
     let st = app.global::<State>();
+    let marks: Vec<StopDoubt> = doubts.iter().map(|doubt| StopDoubt { on: doubt.is_some(), col: rgb_to_color(doubt.unwrap_or_default()) }).collect();
+    update_value_model(st.get_light_doubts(), marks, |model| st.set_light_doubts(model));
     st.set_assist_ramps(rows.iter().filter(|row| row.dot.is_none()).count() as i32);
     st.set_assist_keyed(-1);
     st.set_light_sel_pinned(pins.get(chosen).copied().unwrap_or(false));
@@ -518,6 +567,26 @@ fn sync_picker(app: &AppWindow, palette: &Palette, chosen: usize) {
             Lch { l: lch.l, c: Lch::max_chroma(lch.l, h) * vivid, h }.rgb()
         }));
     }
+    // the plane's lines depend on the hue it shows; the rail's ridge only on the terrain
+    let (plane, rail) = SENSE.with(|sense| {
+        let mut sense = sense.borrow_mut();
+        let (fresh, turned) = (sense.terrain_at.is_none(), sense.terrain_at != Some(hue_key));
+        sense.terrain_at = Some(hue_key);
+        let terrain = sense.terrain.as_ref();
+        (turned.then(|| terrain.and_then(|terrain| contours(terrain, lch.h))), fresh.then(|| terrain.and_then(ridge)))
+    });
+    if let Some(plane) = plane {
+        st.set_picker_terrain_on(plane.is_some());
+        if let Some(plane) = plane {
+            st.set_picker_terrain(plane);
+        }
+    }
+    if let Some(rail) = rail {
+        st.set_picker_ridge_on(rail.is_some());
+        if let Some(rail) = rail {
+            st.set_picker_ridge(rail);
+        }
+    }
     // the other stops' hues, so the rail shows where the rest of the palette sits
     let marks: Vec<f32> = palette.stops.iter().enumerate()
         .filter(|(i, _)| *i != chosen)
@@ -526,6 +595,115 @@ fn sync_picker(app: &AppWindow, palette: &Palette, chosen: usize) {
         .map(|other| other.h)
         .collect();
     update_value_model(st.get_picker_marks(), marks, |model| st.set_picker_marks(model));
+}
+
+/// The terrain over the picker plane at hue `h`, drawn like a relief map: three rings at set
+/// heights of the whole terrain's peak, the inner ones brighter, each a light line in a dark halo
+/// so it reads over any colour, and a faint wash on the summit. A terrain whose high ground lies
+/// at another hue leaves this plane empty; the rail shows where to turn.
+fn contours(terrain: &Terrain, h: f32) -> Option<Image> {
+    // twice the plane's drawn size, so the lines come out smooth
+    const GRID: (usize, usize) = (384, 192);
+    /// Height of each ring as a share of the peak, and how bright its line is.
+    const RINGS: [(f32, f32); 3] = [(0.08, 0.5), (0.32, 0.75), (0.66, 1.0)];
+    const LINE: f32 = 1.5;
+    const HALO: f32 = 3.5;
+    let top = terrain.peak();
+    if !(top > 0.0 && top.is_finite()) {
+        return None;
+    }
+    let angle = h * std::f32::consts::TAU;
+    let (cos, sin) = (angle.cos(), angle.sin());
+    let light = |y: usize| 1.0 - y as f32 / (GRID.1 - 1) as f32;
+    let rooms: Vec<f32> = (0..GRID.1).map(|y| Lch::max_chroma(light(y), h)).collect();
+    let height: Vec<f32> = (0..GRID.0 * GRID.1).map(|i| {
+        let (x, y) = (i % GRID.0, i / GRID.0);
+        let c = rooms[y] * x as f32 / (GRID.0 - 1) as f32;
+        terrain.density([light(y), c * cos, c * sin]) / top
+    }).collect();
+    if height.iter().all(|v| *v < RINGS[0].0) {
+        return None;
+    }
+    let at = |x: usize, y: usize| height[y.min(GRID.1 - 1) * GRID.0 + x.min(GRID.0 - 1)];
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(GRID.0 as u32, GRID.1 as u32);
+    for (i, px) in buf.make_mut_slice().iter_mut().enumerate() {
+        let (x, y) = (i % GRID.0, i / GRID.0);
+        let here = height[i];
+        // how far, in pixels, this point is from each ring: its height's distance over the slope
+        let slope = ((at(x + 1, y) - at(x.saturating_sub(1), y)) / 2.0).hypot((at(x, y + 1) - at(x, y.saturating_sub(1))) / 2.0).max(1e-6);
+        let (mut line, mut halo) = (0.0f32, 0.0f32);
+        for (level, bright) in RINGS {
+            let far = (here - level).abs() / slope;
+            line = line.max((LINE - far).clamp(0.0, 1.0) * bright);
+            halo = halo.max(((HALO - far) / HALO).clamp(0.0, 1.0) * 0.45 * bright);
+        }
+        let wash = ((here - RINGS[1].0) / (RINGS[2].0 - RINGS[1].0)).clamp(0.0, 1.0) * 0.08;
+        let white = (line * 0.85).max(wash);
+        let alpha = white + halo * (1.0 - white);
+        if alpha > 0.004 {
+            // premultiplied: white ink over a black halo
+            let ink = (white * 255.0) as u8;
+            *px = Rgba8Pixel { r: ink, g: ink, b: ink, a: (alpha * 255.0) as u8 };
+        }
+    }
+    Some(Image::from_rgba8_premultiplied(buf))
+}
+
+/// The terrain along the hue rail, as a skyline standing on the rail's foot: at each hue, a hill
+/// as tall as the highest ground anywhere at that hue.
+fn ridge(terrain: &Terrain) -> Option<Image> {
+    const SIZE: (usize, usize) = (360, 32);
+    const SIDE: usize = 16;
+    /// The tallest a hill stands, as a share of the rail's height.
+    const RISE: f32 = 0.72;
+    let top = terrain.peak();
+    if !(top > 0.0 && top.is_finite()) {
+        return None;
+    }
+    let hills: Vec<f32> = (0..SIZE.0).map(|x| {
+        let h = x as f32 / SIZE.0 as f32;
+        let angle = h * std::f32::consts::TAU;
+        let (cos, sin) = (angle.cos(), angle.sin());
+        let mut best = 0.0f32;
+        for l in 1..SIDE {
+            let l = l as f32 / SIDE as f32;
+            let room = Lch::max_chroma(l, h);
+            for c in 0..=SIDE {
+                let c = room * c as f32 / SIDE as f32;
+                best = best.max(terrain.density([l, c * cos, c * sin]));
+            }
+        }
+        (best / top).min(1.0).sqrt() * RISE * SIZE.1 as f32
+    }).collect();
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(SIZE.0 as u32, SIZE.1 as u32);
+    for (i, px) in buf.make_mut_slice().iter_mut().enumerate() {
+        let (x, y) = (i % SIZE.0, i / SIZE.0);
+        // how far below the hilltop this pixel is; ground too low to matter draws nothing
+        let under = hills[x] - (SIZE.1 - 1 - y) as f32;
+        if hills[x] > 1.5 && under > 0.0 {
+            let edge = (2.0 - under).clamp(0.0, 1.0);
+            let white = (0.44 + 0.5 * edge) * under.min(1.0);
+            let ink = (white * 255.0) as u8;
+            *px = Rgba8Pixel { r: ink, g: ink, b: ink, a: ink };
+        }
+    }
+    Some(Image::from_rgba8_premultiplied(buf))
+}
+
+/// The mark under a stop the model doubts: a short wave, white so the theme can colour it.
+fn wave() -> Image {
+    const SIZE: (usize, usize) = (48, 16);
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(SIZE.0 as u32, SIZE.1 as u32);
+    for (i, px) in buf.make_mut_slice().iter_mut().enumerate() {
+        let (x, y) = ((i % SIZE.0) as f32, (i / SIZE.0) as f32);
+        let turn = x / SIZE.0 as f32 * 3.0 * std::f32::consts::PI;
+        let line = SIZE.1 as f32 / 2.0 + 4.6 * turn.sin();
+        // distance to the curve, corrected for its slope so the stroke keeps one width
+        let lean = (4.6 * 3.0 * std::f32::consts::PI / SIZE.0 as f32 * turn.cos()).hypot(1.0);
+        let ink = ((3.0 - (y - line).abs() / lean).clamp(0.0, 1.0) * 255.0) as u8;
+        *px = Rgba8Pixel { r: ink, g: ink, b: ink, a: ink };
+    }
+    Image::from_rgba8_premultiplied(buf)
 }
 
 /// Recolour the selected stop from picker coordinates.
@@ -549,6 +727,7 @@ fn pick(app: &AppWindow, sh: &SharedRt, control: Control, lch_at: impl FnOnce(Lc
 pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     st.set_picker_v2(crate::prefs::picker_v2());
+    st.set_doubt_wave(wave());
     JOURNALING.set(crate::prefs::picker_journal());
     HOME.with(|home| *home.borrow_mut() = Some((app.as_weak(), sh.clone())));
     let bind = |f: fn(&AppWindow, &SharedRt, f32, f32, f32)| {
@@ -592,7 +771,7 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
             // leave nothing half-shown behind when switching away
             preview(&app, &sh, -1);
             SENSE.with(|sense| *sense.borrow_mut() = Sense::default());
-            show(&app, &[], 0, &[]);
+            show(&app, &[], 0, &[], &[]);
             app.global::<State>().set_picker_v2(on);
             refresh(&app, &sh);
         }

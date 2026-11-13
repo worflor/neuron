@@ -214,6 +214,11 @@ export struct EffectRow {
 // `kind` groups the tile ("effect" | "data" | "stub"); `swatch` is the rendered preview image (the
 // tile IS the effect, running). Selection is derived in the view (slug == State.light-effect).
 // One suggestion for the palette being edited: a whole-palette ramp, or (solid) one stop's colour.
+export struct StopDoubt {
+    on: bool,            // the colour model would change this stop
+    col: color,          // to this
+}
+
 export struct AssistOffer {
     title: string,       // a few plain words for what taking it does
     swatch: image,       // the palette as it would be

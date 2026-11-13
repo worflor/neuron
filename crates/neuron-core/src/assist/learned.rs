@@ -8,7 +8,7 @@
 //! (`follow`)? Which stops look out of place (`repair`)? Every answer is weighed against leaving
 //! the palette alone, and the bundle's margins decide what is worth offering.
 //!
-//! This is a port of Luma's core v4 (layout 5, the revision 2 runtime) from its bridge
+//! This is a port of Luma's core v4.1 to v4.3 (layout 5, the revision 3 runtime) from its bridge
 //! specification, for stops on a line. The network is data: [`Learned::load`] reads a `.lumacore`
 //! bundle from a folder, and no trained weights are compiled in. Each stop becomes one token (its
 //! colour, position, flags, the colour its neighbours imply and what it was before the edit) and
@@ -50,6 +50,14 @@ const MODES: usize = 5;
 /// How far, in OKLab, a suggestion may sit from the colour it would replace. The policy margins
 /// were fitted on requests with this budget.
 const BUDGET: f64 = 0.18;
+/// The narrowest spread, in OKLab, a terrain is given.
+const GRAIN: f64 = 0.03;
+/// The largest per-stop OKLab distance under which two palettes look the same, and under which
+/// two options are one.
+const VISIBLE: f64 = 0.01;
+const DISTINCT: f64 = 0.02;
+/// The strengths a companion edit is also offered at.
+const STRENGTHS: [f64; 2] = [0.5, 0.25];
 /// The longest change the model was trained to take as an intent.
 const NUDGE: f64 = 0.10;
 
@@ -99,6 +107,10 @@ struct Margins {
     spoil: f64,
     /// The best option must beat keeping by more than this for the answer to be "change".
     keep: f64,
+    /// Repair only: a stop may change when the model's belief that it should stay is under this.
+    stop: f64,
+    /// The least an option must change some stop by (OKLab) to be worth showing.
+    visible: f64,
 }
 
 /// A request: a palette in display sRGB (`0..1`), in position order.
@@ -239,7 +251,7 @@ impl Learned {
         let (width, heads, blocks, components, style) = (size("width")?, size("heads")?, size("blocks")?, size("components")?, size("style")?);
         let policy = &config["policy"];
         let stated = |v: &serde_json::Value, word: &str| v.is_null() || v == word;
-        if config["layout"] != 5 || config["revision"] != 2 || config["order"] != "weight" || width % heads != 0
+        if config["layout"] != 5 || config["revision"] != 3 || config["order"] != "weight" || width % heads != 0
             || !stated(&policy["measure"], "density") || !stated(&policy["joint"], "pseudo")
         {
             return Err("unsupported colour model layout, revision or policy".into());
@@ -273,7 +285,9 @@ impl Learned {
             if entry.is_null() {
                 return Ok(None);
             }
-            Ok(Some(Margins { spoil: number(&entry["spoil"], "policy margin")?, keep: number(&entry["keep"], "policy margin")? }))
+            let stop = if entry["stop"].is_null() { 1.0 } else { number(&entry["stop"], "policy margin")? };
+            let visible = if entry["visible"].is_null() { VISIBLE } else { number(&entry["visible"], "policy margin")? };
+            Ok(Some(Margins { spoil: number(&entry["spoil"], "policy margin")?, keep: number(&entry["keep"], "policy margin")?, stop, visible }))
         };
         let optional = |v: &serde_json::Value, what: &str, otherwise: f64| if v.is_null() { Ok(otherwise) } else { number(v, what) };
         let features = SPACE + INTENT + style + 1;
@@ -511,6 +525,12 @@ impl Learned {
         kept
     }
 
+    /// How much of a stop's answer is "no change": the last component and every one that sits on it.
+    fn keep_probability(&self, mix: &Mixture) -> f64 {
+        let anchor = mix.means[self.components];
+        softmax(&mix.logits).iter().zip(&mix.means).filter(|(_, mean)| distance(**mean, anchor) < self.merge).map(|(w, _)| w).sum()
+    }
+
     /// For each palette in `candidates`, the summed log-density of its free stops' colours. With
     /// several free stops, each is rated with the other free stops already at the candidate's colours.
     fn score(&self, inp: &Inputs, positions: &[f64], condition: &Condition, candidates: &[Vec<Lab>]) -> Vec<f64> {
@@ -553,10 +573,7 @@ impl Learned {
         out.offerable = true;
         let condition = Condition { intent: ask.intent, style: ask.style };
         let mix = self.run(&inputs, ask.positions, &condition);
-        out.keep_probability = stops.iter().map(|&k| {
-            let anchor = mix[k].means[self.components];
-            softmax(&mix[k].logits).iter().zip(&mix[k].means).filter(|(_, mean)| distance(**mean, anchor) < self.merge).map(|(w, _)| w).sum()
-        }).collect();
+        out.keep_probability = stops.iter().map(|&k| self.keep_probability(&mix[k])).collect();
         let margins = match ask.task {
             Task::Masked => self.masked,
             Task::Refine => ask.intent.and(self.intent).or(self.refine),
@@ -590,10 +607,11 @@ impl Learned {
                 }
             }
             Task::Follow => {
-                // each stop's own leading mode, each stop's leading move, and that move at half strength
+                // Each stop's own leading mode, each stop's leading move, and that move at half and
+                // quarter strength. The edit was the owner's, so "leave it" gets no head start.
                 let (mut mixed, mut carry) = (current.clone(), current.clone());
                 for &stop in &stops {
-                    let ranked = self.modes(&mix[stop], if asked { 0.0 } else { self.favour });
+                    let ranked = self.modes(&mix[stop], 0.0);
                     if let Some((component, _)) = ranked.iter().find(|row| row.0 != anchor) {
                         carry[stop] = oklab(display(mix[stop].means[*component]));
                         if ranked[0].0 != anchor {
@@ -601,37 +619,42 @@ impl Learned {
                         }
                     }
                 }
-                let half: Vec<Lab> = (0..n).map(|k| {
-                    if distance(carry[k], current[k]) > 0.0 { oklab(display(std::array::from_fn(|c| current[k][c] + 0.5 * (carry[k][c] - current[k][c])))) } else { current[k] }
-                }).collect();
+                let graded = |strength: f64| -> Vec<Lab> {
+                    (0..n).map(|k| {
+                        if distance(carry[k], current[k]) > 0.0 { oklab(display(std::array::from_fn(|c| current[k][c] + strength * (carry[k][c] - current[k][c])))) } else { current[k] }
+                    }).collect()
+                };
                 let mut chosen: Vec<Vec<Lab>> = Vec::new();
-                for reading in [mixed, carry, half] {
-                    if far(&reading, current) > 1e-6 && chosen.iter().all(|other| far(&reading, other) > 0.005) {
+                for reading in [mixed, carry.clone(), graded(STRENGTHS[0]), graded(STRENGTHS[1])] {
+                    if far(&reading, current) >= VISIBLE && chosen.iter().all(|other| far(&reading, other) >= DISTINCT) {
                         chosen.push(reading);
                     }
                 }
                 for reading in chosen {
-                    candidates.push(settle(legal(ask, &free, &reading, None), &|j| free[j]));
+                    candidates.push(settle(legal(ask, &free, &reading, None), &|j| free[j] && Some(j) != ask.active));
                 }
             }
             Task::Repair => {
-                // every free stop's leading mode, that at half strength, and every stop's likeliest move
-                let reading = |every: bool| -> Vec<Lab> {
-                    let mut lab = current.clone();
-                    for &stop in &stops {
-                        let stay = inputs.shown[stop];
-                        let ranked = self.modes(&mix[stop], if stay && !asked { self.favour } else { 0.0 });
-                        let first = ranked.iter().map(|row| row.0).find(|c| !(stay && *c == anchor));
-                        if let Some(first) = first.filter(|first| every || ranked[0].0 == *first) {
-                            lab[stop] = oklab(display(mix[stop].means[first]));
+                // A stop may change only when the model is unsure it should stay. Of those stops,
+                // "top" moves the ones whose leading mode is a move and "wide" moves every one; the
+                // third reading is top at half strength.
+                let (mut top, mut wide) = (current.clone(), current.clone());
+                for (&stop, keep) in stops.iter().zip(&out.keep_probability) {
+                    let stay = inputs.shown[stop];
+                    if stay && *keep >= margins.stop {
+                        continue;
+                    }
+                    let ranked = self.modes(&mix[stop], if stay && !asked { self.favour } else { 0.0 });
+                    if let Some(first) = ranked.iter().map(|row| row.0).find(|c| !(stay && *c == anchor)) {
+                        wide[stop] = oklab(display(mix[stop].means[first]));
+                        if ranked[0].0 == first {
+                            top[stop] = wide[stop];
                         }
                     }
-                    lab
-                };
-                let top = reading(false);
+                }
                 let half: Vec<Lab> = (0..n).map(|k| std::array::from_fn(|c| current[k][c] + 0.5 * (top[k][c] - current[k][c]))).collect();
-                for reading in [top, half, reading(true)] {
-                    candidates.push(settle(legal(ask, &free, &reading, None), &|j| free[j]));
+                for reading in [top, half, wide] {
+                    candidates.push(settle(legal(ask, &free, &reading, None), &|j| inputs.free[j]));
                 }
             }
         }
@@ -640,19 +663,34 @@ impl Learned {
         }
         let in_lab = |rgb: &[Srgb]| -> Vec<Lab> { rgb.iter().map(|c| oklab(*c)).collect() };
         let palettes: Vec<Vec<Lab>> = std::iter::once(ask.rgb).chain(candidates.iter().map(Vec::as_slice)).map(in_lab).collect();
-        let mut scores = self.score(&inputs, ask.positions, &condition, &palettes);
-        if !one {
+        let mut scores: Vec<f64> = if ask.task == Task::Repair {
+            // A repair is rated by the model's doubt about the stops it changes: the mean, over
+            // those stops, of the log-odds that the stop should not stay as it is.
+            let odds: Vec<f64> = out.keep_probability.iter().map(|keep| {
+                let keep = keep.clamp(1e-6, 1.0 - 1e-6);
+                ((1.0 - keep) / keep).ln()
+            }).collect();
+            palettes.iter().map(|palette| {
+                let changed: Vec<f64> = stops.iter().zip(&odds).filter(|(k, _)| (0..3).any(|c| (palette[**k][c] - current[**k][c]).abs() > 1e-12)).map(|(_, odds)| *odds).collect();
+                if changed.is_empty() { 0.0 } else { changed.iter().sum::<f64>() / changed.len() as f64 }
+            }).collect()
+        } else {
+            self.score(&inputs, ask.positions, &condition, &palettes)
+        };
+        if ask.task == Task::Follow {
             scores.iter_mut().for_each(|s| *s /= stops.len() as f64);
         }
         let duplicate = match ask.radius {
             Some(radius) if radius > 0.0 && radius < 2.0 => self.duplicate.min(0.5 * radius),
             _ => self.duplicate,
         };
+        // an option has to look different from the palette as it stands and from every better option
+        let (near, twin) = (margins.visible.max(duplicate), DISTINCT.max(duplicate));
         let mut order: Vec<usize> = (1..palettes.len()).collect();
         order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
         let mut chosen: Vec<usize> = Vec::new();
         for i in order {
-            let repeats = far(&palettes[i], &palettes[0]) < duplicate || chosen.iter().any(|&j| far(&palettes[i], &palettes[j]) < duplicate);
+            let repeats = far(&palettes[i], &palettes[0]) < near || chosen.iter().any(|&j| far(&palettes[i], &palettes[j]) < twin);
             if scores[i] - scores[0] > margins.spoil && !repeats {
                 chosen.push(i);
             }
@@ -666,14 +704,17 @@ impl Learned {
 }
 
 /// The flags of the pass a request's candidates come from. `single` frees only the active stop,
-/// which is how a one-stop request is asked whatever its scope.
+/// which is how a one-stop request is asked whatever its scope. A repair has no active stop, and
+/// a stop its owner just set is held: context for the others, never a target.
 fn inputs(ask: &Ask, free: &[bool], single: bool) -> Inputs {
     let n = ask.rgb.len();
     let mut free = free.to_vec();
     let mut pinned = ask.pins.to_vec();
     let mut recent: Vec<bool> = (0..n).map(|i| ask.recent.contains(&i)).collect();
     let mut shown = vec![true; n];
-    if let Some(k) = ask.active {
+    let repair = ask.task == Task::Repair;
+    let active = ask.active.filter(|_| !repair);
+    if let Some(k) = active {
         match ask.task {
             // the stop just committed is the context the others answer
             Task::Follow => (free[k], pinned[k], recent[k]) = (false, true, true),
@@ -687,6 +728,9 @@ fn inputs(ask: &Ask, free: &[bool], single: bool) -> Inputs {
         }
     }
     for k in 0..n {
+        if repair && recent[k] {
+            (free[k], pinned[k]) = (false, true);
+        }
         pinned[k] = pinned[k] && !free[k];
     }
     let lab: Vec<Lab> = ask.rgb.iter().map(|c| oklab(*c)).collect();
@@ -697,7 +741,7 @@ fn inputs(ask: &Ask, free: &[bool], single: bool) -> Inputs {
         free,
         known: shown.clone(),
         shown,
-        active: ask.active,
+        active,
         recent,
     }
 }
@@ -809,43 +853,152 @@ fn legal(ask: &Ask, free: &[bool], sample: &[Lab], masked: Option<usize>) -> Vec
     rgb
 }
 
+/// A scene in the model's terms.
+struct Frame {
+    rgb: Vec<Srgb>,
+    /// The palette before the edit in progress, when the selected stop is the one it recoloured.
+    was: Option<Vec<Srgb>>,
+    positions: Vec<f64>,
+    style: Vec<f64>,
+    pins: Vec<bool>,
+    /// The pins of a one-stop request: the palette's ends too, unless one is the stop asked about,
+    /// as in the requests the margins were fitted on.
+    ends: Vec<bool>,
+    here: Vec<bool>,
+    everywhere: Vec<bool>,
+    active: usize,
+}
+
+impl Frame {
+    fn ask(&self) -> Ask<'_> {
+        Ask { task: Task::Refine, rgb: &self.rgb, before: None, positions: &self.positions, pins: &self.pins, scope: &self.everywhere, active: Some(self.active), recent: &[], radius: Some(BUDGET), count: 1, intent: None, style: &self.style }
+    }
+
+    /// The request about the selected stop alone: a colour for a stop that has none, or another
+    /// colour for one that does.
+    fn stop(&self, open: bool) -> Ask<'_> {
+        let task = if open { Task::Masked } else { Task::Refine };
+        Ask { task, before: self.was.as_deref().filter(|_| !open), pins: &self.ends, scope: &self.here, ..self.ask() }
+    }
+}
+
+/// Where the model would put a colour at the selected stop's place if the stop had none: its
+/// answer as a density over OKLab. It reads the rest of the palette and not the stop's own colour,
+/// so it holds still while that colour is dragged. Drawn behind a picker it is the ground a
+/// suggestion stands on.
+pub struct Terrain {
+    /// Weight, mean and spread of each part.
+    parts: Vec<(f64, Lab, Lab)>,
+}
+
+impl Terrain {
+    /// The density at its highest part's centre, in the units of [`Terrain::density`]: what a
+    /// colour's density is to be compared with. Zero for an empty terrain.
+    #[must_use]
+    pub fn peak(&self) -> f32 {
+        self.parts.iter().map(|part| self.density(part.1.map(|v| v as f32))).fold(0.0, f32::max)
+    }
+
+    /// The density at an OKLab colour, up to a constant factor.
+    #[must_use]
+    pub fn density(&self, lab: [f32; 3]) -> f32 {
+        self.parts.iter().map(|(weight, mean, sigma)| {
+            let z: f64 = (0..3).map(|d| ((f64::from(lab[d]) - mean[d]) / sigma[d]).powi(2)).sum();
+            weight * (-0.5 * z).exp() / (sigma[0] * sigma[1] * sigma[2])
+        }).sum::<f64>() as f32
+    }
+}
+
+impl Learned {
+    fn frame(&self, scene: &Scene) -> Option<Frame> {
+        let n = scene.stops.len();
+        let active = scene.selected;
+        if n < 2 || active >= n || scene.stops.windows(2).any(|pair| pair[1].at <= pair[0].at) {
+            return None;
+        }
+        let unit = |c: Rgb| [f64::from(c.r) / 255.0, f64::from(c.g) / 255.0, f64::from(c.b) / 255.0];
+        let support: Vec<Vec<Lab>> = scene.library.iter().map(|palette| palette.iter().map(|c| oklab(unit(*c))).collect()).collect();
+        let pins: Vec<bool> = (0..n).map(|i| scene.pinned(i)).collect();
+        let edited = scene.before.as_ref().filter(|before| scene.selected_is_edited() && before.iter().zip(&scene.stops).all(|(was, now)| was.at == now.at));
+        Some(Frame {
+            rgb: scene.stops.iter().map(|s| unit(s.col)).collect(),
+            was: edited.map(|before| before.iter().map(|s| unit(s.col)).collect()),
+            positions: scene.stops.iter().map(|s| 2.0 * f64::from(s.at) - 1.0).collect(),
+            style: self.style_vector(&support),
+            ends: (0..n).map(|i| i != active && (pins[i] || i == 0 || i == n - 1)).collect(),
+            pins,
+            here: (0..n).map(|i| i == active).collect(),
+            everywhere: vec![true; n],
+            active,
+        })
+    }
+
+    /// The model's view of where a colour at the selected stop's place belongs. `None` when it has
+    /// no say: a held stop, a palette of one.
+    #[must_use]
+    pub fn terrain(&self, scene: &Scene) -> Option<Terrain> {
+        let frame = self.frame(scene).filter(|frame| !frame.pins[frame.active])?;
+        let ask = frame.stop(true);
+        let inputs = inputs(&ask, &frame.here, true);
+        let mix = self.run(&inputs, ask.positions, &Condition { intent: None, style: ask.style }).swap_remove(frame.active);
+        // A part narrower than a picker can show is widened to that: drawn at its true spread it
+        // is a spike no pointer finds, and it would dwarf the ground around it.
+        let parts = softmax(&mix.logits).into_iter().zip(mix.means.iter().zip(&mix.sigmas)).map(|(weight, (mean, sigma))| (weight, *mean, sigma.map(|s| s.max(GRAIN)))).collect();
+        Some(Terrain { parts })
+    }
+
+    /// The free stops a repair would change first: the model is unsure they should stay, and
+    /// would move them even with "leave it" favoured. Each comes with the colour it would rather
+    /// see there.
+    fn doubts(&self, ask: &Ask) -> Vec<(usize, Srgb)> {
+        let n = ask.rgb.len();
+        let free: Vec<bool> = (0..n).map(|i| ask.scope[i] && !ask.pins[i]).collect();
+        let Some(margins) = self.repair.filter(|_| n >= 2) else { return Vec::new() };
+        let inputs = inputs(ask, &free, false);
+        if !inputs.free.contains(&true) {
+            return Vec::new();
+        }
+        let mix = self.run(&inputs, ask.positions, &Condition { intent: None, style: ask.style });
+        let mut sample = inputs.lab.clone();
+        let mut moved = Vec::new();
+        for stop in (0..n).filter(|stop| inputs.free[*stop]) {
+            let leading = self.modes(&mix[stop], self.favour)[0].0;
+            if leading != self.components && self.keep_probability(&mix[stop]) < margins.stop {
+                sample[stop] = oklab(display(mix[stop].means[leading]));
+                moved.push(stop);
+            }
+        }
+        let rgb = legal(ask, &free, &sample, None);
+        moved.into_iter().filter(|&stop| distance(oklab(rgb[stop]), inputs.lab[stop]) >= self.duplicate).map(|stop| (stop, rgb[stop])).collect()
+    }
+}
+
 impl Engine for Learned {
-    /// What the model has to say about `scene`, as up to four kinds of offer:
+    /// What the model has to say about `scene`:
     ///
     /// - A stop nobody has coloured yet (`scene.open`): colours it could take.
     /// - The stop the edit in progress has recoloured: colours it could be instead. A short move is
     ///   put to the model as a request made from the colour the stop had (roughly this way, about
     ///   this far), which it answers readily; a long one as the colour now tried, which it argues
     ///   with only when sure. The colour is never called settled: told that, the model never argues.
-    /// - How the other stops could answer that edit.
-    /// - Stops that look out of place beside it. The edited stop is held.
+    /// - How the other stops could answer that edit, and a tidy of the stops beside it.
+    /// - Its doubts, edit or no edit: each stop it would move even with "leave it" favoured, as an
+    ///   offer that changes that stop alone ([`Scope::Aside`] unless the stop is the selected one).
+    ///   The stop being edited is held and never doubted.
     ///
-    /// One-stop requests mark the palette's ends as pinned unless one is the stop asked about, as
-    /// in the requests the margins were fitted on. Other palettes in `scene.library` set the style.
+    /// Other palettes in `scene.library` set the style.
     fn offers(&self, scene: &Scene) -> Vec<Offer> {
-        let n = scene.stops.len();
-        let active = scene.selected;
-        if n < 2 || active >= n || scene.stops.windows(2).any(|pair| pair[1].at <= pair[0].at) {
-            return Vec::new();
-        }
-        let unit = |c: Rgb| [f64::from(c.r) / 255.0, f64::from(c.g) / 255.0, f64::from(c.b) / 255.0];
-        let rgb: Vec<Srgb> = scene.stops.iter().map(|s| unit(s.col)).collect();
-        let positions: Vec<f64> = scene.stops.iter().map(|s| 2.0 * f64::from(s.at) - 1.0).collect();
-        let support: Vec<Vec<Lab>> = scene.library.iter().map(|palette| palette.iter().map(|c| oklab(unit(*c))).collect()).collect();
-        let style = self.style_vector(&support);
-        let pins: Vec<bool> = (0..n).map(|i| scene.pinned(i)).collect();
-        let ends: Vec<bool> = (0..n).map(|i| i != active && (pins[i] || i == 0 || i == n - 1)).collect();
-        let here: Vec<bool> = (0..n).map(|i| i == active).collect();
-        let everywhere = vec![true; n];
-        let ask = Ask { task: Task::Refine, rgb: &rgb, before: None, positions: &positions, pins: &pins, scope: &everywhere, active: Some(active), recent: &[], radius: Some(BUDGET), count: 1, intent: None, style: &style };
+        let Some(frame) = self.frame(scene) else { return Vec::new() };
+        let (active, ask) = (frame.active, frame.ask());
+        let byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+        let colour = |c: &Srgb| Rgb::new(byte(c[0]), byte(c[1]), byte(c[2]));
         let mut out = Vec::new();
         let mut offer = |answer: Answer, id: &'static str, title: &'static str, scope: Scope| {
             for option in answer.options.iter().filter(|_| !answer.keep) {
-                let byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
-                let stops = scene.stops.iter().zip(&option.rgb).zip(&rgb).map(|((stop, new), old)| {
+                let stops = scene.stops.iter().zip(&option.rgb).zip(&frame.rgb).map(|((stop, new), old)| {
                     let mut stop = *stop;
                     if scope == Scope::Stop || new != old {
-                        stop.col = Rgb::new(byte(new[0]), byte(new[1]), byte(new[2]));
+                        stop.col = colour(new);
                     }
                     stop
                 }).collect();
@@ -853,31 +1006,35 @@ impl Engine for Learned {
             }
         };
         if scene.open {
-            if !pins[active] {
-                offer(self.answer(&Ask { task: Task::Masked, pins: &ends, scope: &here, count: 3, ..ask }), "fits", "a colour for this stop", Scope::Stop);
+            if !frame.pins[active] {
+                offer(self.answer(&Ask { count: 3, ..frame.stop(true) }), "fits", "a colour for this stop", Scope::Stop);
             }
             return out;
         }
-        let Some(before) = scene.before.as_ref().filter(|_| scene.selected_is_edited()) else { return out };
-        if before.iter().zip(&scene.stops).any(|(was, now)| was.at != now.at) {
-            return out;
+        let held: Vec<bool> = (0..frame.rgb.len()).map(|i| frame.pins[i] || (i == active && frame.was.is_some())).collect();
+        if let Some(was) = &frame.was {
+            if !frame.pins[active] {
+                let (from, to) = (oklab(was[active]), oklab(frame.rgb[active]));
+                let answer = if distance(from, to) <= NUDGE {
+                    let mut origin = frame.rgb.clone();
+                    origin[active] = was[active];
+                    let wanted: Lab = std::array::from_fn(|d| to[d] - from[d]);
+                    self.answer(&Ask { rgb: &origin, before: None, count: 2, intent: Some(wanted), ..frame.stop(false) })
+                } else {
+                    self.answer(&Ask { count: 2, ..frame.stop(false) })
+                };
+                offer(answer, "fits", "fits this palette", Scope::Stop);
+            }
+            offer(self.answer(&Ask { task: Task::Follow, before: Some(was), ..ask }), "follow", "carry the change through", Scope::Palette);
+            offer(self.answer(&Ask { task: Task::Repair, before: Some(was), pins: &held, active: None, recent: &[active], ..ask }), "tidy", "tidy the rest", Scope::Palette);
         }
-        let was: Vec<Srgb> = before.iter().map(|s| unit(s.col)).collect();
-        if !pins[active] {
-            let (from, to) = (oklab(was[active]), oklab(rgb[active]));
-            let answer = if distance(from, to) <= NUDGE {
-                let mut origin = rgb.clone();
-                origin[active] = was[active];
-                let wanted: Lab = std::array::from_fn(|d| to[d] - from[d]);
-                self.answer(&Ask { rgb: &origin, pins: &ends, scope: &here, count: 2, intent: Some(wanted), ..ask })
-            } else {
-                self.answer(&Ask { before: Some(&was), pins: &ends, scope: &here, count: 2, ..ask })
-            };
-            offer(answer, "fits", "fits this palette", Scope::Stop);
+        let recent: &[usize] = if frame.was.is_some() { &[active] } else { &[] };
+        for (stop, better) in self.doubts(&Ask { task: Task::Repair, before: frame.was.as_deref(), pins: &held, active: None, recent, ..ask }) {
+            let mut stops = scene.stops.clone();
+            stops[stop].col = colour(&better);
+            let scope = if stop == active { Scope::Stop } else { Scope::Aside };
+            out.push(Offer { id: "doubt", title: "would sit better here", scope, stops, interp: scene.interp });
         }
-        let held: Vec<bool> = (0..n).map(|i| pins[i] || i == active).collect();
-        offer(self.answer(&Ask { task: Task::Follow, before: Some(&was), ..ask }), "follow", "carry the change through", Scope::Palette);
-        offer(self.answer(&Ask { task: Task::Repair, before: Some(&was), pins: &held, active: None, recent: &[active], ..ask }), "tidy", "tidy the rest", Scope::Palette);
         out
     }
 }
@@ -1073,14 +1230,14 @@ mod tests {
     }
 
     /// The same check for a trained bundle against the vectors Luma publishes with it. Point
-    /// `NEURON_LUMA_BRIDGE` at the folder holding `core-v4.lumacore` and `golden-v4.jsonl`.
+    /// `NEURON_LUMA_BRIDGE` at the folder holding `core-v4.3.lumacore` and `golden-v4.3.jsonl`.
     #[test]
     #[ignore = "needs a Luma bridge folder in NEURON_LUMA_BRIDGE"]
     fn matches_luma_vectors() {
         let folder = std::path::PathBuf::from(std::env::var_os("NEURON_LUMA_BRIDGE").expect("NEURON_LUMA_BRIDGE"));
-        let model = Learned::parse(&std::fs::read(folder.join("core-v4.lumacore")).unwrap()).unwrap();
+        let model = Learned::parse(&std::fs::read(folder.join("core-v4.3.lumacore")).unwrap()).unwrap();
         let started = std::time::Instant::now();
-        let seen = check(&model, &std::fs::read_to_string(folder.join("golden-v4.jsonl")).unwrap());
+        let seen = check(&model, &std::fs::read_to_string(folder.join("golden-v4.3.jsonl")).unwrap());
         println!("{}: {seen:?} in {:?}", model.name(), started.elapsed());
         assert!(seen.values().map(|tally| tally[0]).sum::<usize>() >= 30);
     }
@@ -1113,9 +1270,9 @@ mod tests {
     fn the_engine_speaks_only_about_an_edit_or_a_new_stop() {
         let model = Learned::parse(SMALL).unwrap();
         let mut s = scene(&[(12, 45, 34), (200, 40, 190), (67, 190, 116), (206, 229, 128)]);
-        assert!(model.offers(&s).is_empty(), "a resting palette");
+        assert!(model.offers(&s).iter().all(|offer| offer.id == "doubt"), "a resting palette draws doubts at most");
         s.before = Some(s.stops.clone());
-        assert!(model.offers(&s).is_empty(), "an edit that has not touched the selected stop");
+        assert!(model.offers(&s).iter().all(|offer| offer.id == "doubt"), "an edit that has not touched the selected stop");
         s.stops.truncate(1);
         s.before.as_mut().unwrap().truncate(1);
         s.selected = 0;
@@ -1145,9 +1302,28 @@ mod tests {
                     match offer.scope {
                         Scope::Stop => assert!(changed.iter().all(|i| *i == edited), "{}: {changed:?}", offer.id),
                         Scope::Palette => assert!(!changed.contains(&edited), "{}: the edited stop moved", offer.id),
+                        Scope::Aside => assert!(changed.len() == 1 && changed[0] != edited, "{}: {changed:?}", offer.id),
                     }
                 }
+                let terrain = model.terrain(&s);
+                assert_eq!(terrain.is_some(), pin != Some(edited), "a terrain for a free stop, none for a held one");
+                if let Some(terrain) = terrain {
+                    let here = oklab([f64::from(s.stops[edited].col.r) / 255.0, f64::from(s.stops[edited].col.g) / 255.0, f64::from(s.stops[edited].col.b) / 255.0]).map(|v| v as f32);
+                    assert!(terrain.density(here).is_finite() && terrain.density(here) >= 0.0);
+                    assert!(terrain.peak() > 0.0 && terrain.peak().is_finite());
+                    s.stops[edited].col = Rgb::new(1, 2, 3);
+                    let moved = model.terrain(&s).unwrap();
+                    assert_eq!(moved.density(here), terrain.density(here), "the stop's own colour does not shape its terrain");
+                    s.stops[edited].col = Rgb::new(colour.0, colour.1, colour.2);
+                }
+                // a resting palette: only doubts, one stop each, never a held one
                 s.before = None;
+                for offer in model.offers(&s) {
+                    *kinds.entry(offer.id).or_default() += 1;
+                    let changed: Vec<usize> = (0..5).filter(|&i| offer.stops[i].col != s.stops[i].col).collect();
+                    assert!(offer.id == "doubt" && changed.len() == 1 && Some(changed[0]) != pin, "{}: {changed:?}", offer.id);
+                    assert_eq!(offer.scope == Scope::Stop, changed[0] == edited);
+                }
                 s.open = true;
                 for offer in model.offers(&s) {
                     *kinds.entry("new").or_default() += 1;
@@ -1157,6 +1333,7 @@ mod tests {
         }
         let seen = |kind: &str| kinds.get(kind).copied().unwrap_or(0);
         assert!(seen("fits") > 0 && seen("new") > 0 && seen("follow") + seen("tidy") > 0, "the spread reaches every scope: {kinds:?}");
+
     }
 
     #[test]

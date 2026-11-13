@@ -5,7 +5,7 @@
 
     python colour-model.py <luma checkout>
 
-Builds a small random-weight core (layout 5, revision 2 runtime), then uses Luma's own bridge tools
+Builds a small random-weight core (layout 5, revision 3 runtime), then uses Luma's own bridge tools
 to write it as a bundle and to record what the Python runtime answers for requests on a gradient.
 The results land beside this script:
 
@@ -33,12 +33,13 @@ ASKS = ("lighter", "darker", "warmer", "cooler", "more chroma", "less chroma")
 def tiny(folder):
     """A core small enough to commit, with margins loose enough that every task offers and keeps."""
     rng = np.random.default_rng(20261113)
-    margins = {"spoil": -8.0, "keep": -3.0}
+    margins = {"spoil": -8.0, "keep": -3.0, "visible": .03}
     joint = {"spoil": -60.0, "keep": -25.0}
     config = {"width": 16, "heads": 2, "blocks": 2, "components": 3, "sigma": [.008, .25], "merge": .02,
-              "order": "weight", "layout": 5, "cone": .5, "style": 4, "revision": 2, "favour": .5,
+              "order": "weight", "layout": 5, "cone": .5, "style": 4, "revision": 3, "favour": .5,
               "policy": {"measure": "density", "joint": "pseudo", "duplicate": .02,
-                         "masked": margins, "refine": margins, "intent": margins, "follow": joint, "repair": joint}}
+                         "masked": margins, "refine": margins, "intent": margins, "follow": joint,
+                         "repair": {"stop": .999, "evidence": "keep", "spoil": -14.0, "keep": -6.0, "visible": .03}}}
     width, k, style, lanes = config["width"], config["components"], config["style"], 8
     shapes = {"embed.0": (width, 87 + 5 + style + 1), "embed.2": (width, width),
               "bias.0": (lanes, 14), "bias.2": (config["blocks"] * config["heads"], lanes),

@@ -83,8 +83,12 @@ impl Scene {
 /// palette offer as a ramp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
+    /// The selected stop alone.
     Stop,
     Palette,
+    /// One stop that is not the selected one: something to mark where that stop is shown, and to
+    /// offer as a colour once it is selected.
+    Aside,
 }
 
 /// One alternative: the whole palette as it would be.

@@ -13,6 +13,10 @@ import { Field, Mono, SwatchRow } from "controls.slint";
 // current hue, the rail below sets hue at the current lightness and vividness. Each surface shows
 // the colours a click on it would give, and the rail carries a tick for every other stop's hue.
 //
+// With a colour model installed, the plane carries a relief map: rings close in on the colours it
+// would put at this stop's place in the palette, and a skyline on the rail stands tallest at the
+// hues where those lie. They come from the other stops, so they hold still while this one is dragged.
+//
 // A suggested colour for the stop sits on the plane as a dot of that colour, at its own lightness
 // and vividness, with a tick at its hue under the rail. Resting on the dot shows it on the stop and
 // says why it is offered; moving off puts the stop back; a click keeps it.
@@ -60,6 +64,14 @@ export component SensePicker inherits VerticalLayout {
         animate border-color { duration: Theme.quick; }
         clip: true;
         Image { source: State.picker-plane; width: 100%; height: 100%; image-fit: fill; }
+        // the model's ground for this stop, as a relief map: rings close in on where it belongs
+        Image {
+            source: State.picker-terrain;
+            width: 100%; height: 100%;
+            image-fit: fill;
+            opacity: State.picker-terrain-on ? 1 : 0;
+            animate opacity { duration: 250ms; easing: ease-out; }
+        }
         keys := FocusScope {
             width: 0px; height: 0px;
             key-pressed(e) => {
@@ -180,6 +192,14 @@ export component SensePicker inherits VerticalLayout {
         border-color: Theme.line;
         clip: true;
         Image { source: State.picker-rail; width: 100%; height: 100%; image-fit: fill; }
+        // the model's ground by hue: a skyline on the rail's foot, tallest where it would turn to
+        Image {
+            source: State.picker-ridge;
+            width: 100%; height: 100%;
+            image-fit: fill;
+            opacity: State.picker-ridge-on ? 1 : 0;
+            animate opacity { duration: 250ms; easing: ease-out; }
+        }
         // the other stops' hues hang from the top edge; suggested hues stand on the bottom one
         for mark in State.picker-marks : Rectangle {
             x: clamp(mark * rail.width, 0px, rail.width - 1px);

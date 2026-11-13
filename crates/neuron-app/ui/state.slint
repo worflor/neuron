@@ -16,7 +16,7 @@ import {
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTileMeta, EffectParam,
-    SpectrumStop, SpectrumFrame, GradientPreset, PairChip, AssistOffer,
+    SpectrumStop, SpectrumFrame, GradientPreset, PairChip, AssistOffer, StopDoubt,
     ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene,
     LightingLayerChoice, LightingPresetChoice
 } from "models.slint";
@@ -402,6 +402,12 @@ export global State {
     callback picker-sync();                             // the selected stop changed: re-point the picker
     callback picker-nudge(float, float, float);         // (vivid, light, hue) steps from the keyboard
     in-out property <[bool]> light-pins;                // per stop: held against every suggestion
+    in-out property <[StopDoubt]> light-doubts;         // per stop: whether the colour model would change it, and to what
+    in-out property <image> doubt-wave;                 // the wavy mark under a doubted stop (white; colourized where drawn)
+    in-out property <image> picker-terrain;             // contour lines over the plane: where the model would move the stop
+    in-out property <bool> picker-terrain-on;
+    in-out property <image> picker-ridge;               // over the rail: a skyline of how high that ground gets at each hue
+    in-out property <bool> picker-ridge-on;
     in-out property <bool> light-sel-pinned;            // the selected stop is one of them
     callback toggle-pin();                              // hold the selected stop, or let it go
     in-out property <int> assist-keyed: -1;             // the offer stepped to from the keyboard and on show, or -1
