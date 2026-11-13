@@ -9,6 +9,7 @@ repository: https://github.com/worflor/neuron
 | the question is about… | look here |
 |---|---|
 | what neuron is, what it does, install basics | `README.md` |
+| everyday install, update, uninstall and troubleshooting answers | [docs/FAQ.md](https://github.com/worflor/neuron/blob/main/docs/FAQ.md) |
 | feature availability and verification | [docs/STATUS.md](https://github.com/worflor/neuron/blob/main/docs/STATUS.md) |
 | which device writes are proven, gated, or unsupported | `README.md`, section *honesty: proven, gated, absent* |
 | how a feature behaves in detail (lighting, binds, spellweaving, macros, the app pages) | [docs/GDD.md](https://github.com/worflor/neuron/blob/main/docs/GDD.md) |

@@ -1,5 +1,10 @@
 # Implementation Plan: Virtual Contact Reservoir & Event-Driven Commitment Dynamics
 
+> **Implementation status (checked against the tree, 2026-11-13):** not implemented. None of
+> `ObservationBarrier`, `ObservationPump`, `observations_since_into`, `rebaseline_held`,
+> `quiesce_all` or `presentation_peak` exists in `crates/`. "Approved and sealed" below describes
+> the plan's review state, not shipped code. Names and line references are design-time anchors.
+
 > **Document Status:** Final Implementation Specification (v8 — Fully Approved & Sealed)  
 > **Target Subsystem:** `crates/neuron-core/src/pattern.rs` (`Ignite` / Reactive) and `crates/neuron-core/src/capture.rs` (`ObservationBarrier`)  
 > **Scope Gate:** Strictly scoped to **Reactive (`Ignite`)**. Ring/Ripple is kept out of scope to preserve its proven single-wave and wave-pool invariants.  

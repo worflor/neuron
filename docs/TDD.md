@@ -7,7 +7,10 @@
 
 # Neuron Technical Design Document
 
-Original draft: 2026-06-19
+Where to look for what: the runtime model is §3-4, the dispatch pipeline §4-5.3, the write
+gate §5.5, device identity and input decode §5.8, safety contracts §6, persistence §7,
+tests §8, known risks §9. Update this file when a new worker, config file or dispatch
+source is added (see [`AGENTS.md`](../AGENTS.md#keeping-the-docs-true)).
 
 ## 1. Purpose
 
@@ -646,6 +649,11 @@ Runtime state that can be recomputed should not be persisted as truth. The UI sh
 
 ## 8. Current Test Surface
 
+The gate is `.\validate.ps1` (`-Mode full` adds clippy, the feature matrix and a release build);
+CI runs the same script. Under `cfg(test)` the transport is deny-by-default, so no test reaches
+real hardware, and no test arms real input. Anything the suite cannot see (hardware, GUI
+behavior, audio) is verified by running the app; see AGENTS.md.
+
 Primary commands:
 
 ```powershell
@@ -680,17 +688,18 @@ Coverage that already exists:
 - Gesture/radial/rhythm/twin/scene/overlay helper tests.
 - Engram integration tests.
 
-Gaps CLOSED in the 2026-07-09 pre-release hardening pass (each name is the shipped test):
+Invariants pinned by a named test (start here when changing the matching code):
 
-- ✅ Worker consumes a config edit: `dispatch::tests::reload_consumes_a_config_edit` — file edit + `LiveCommand::Reload` + one `live_tick` provably changes what the live engine resolves.
-- ✅ Live-dispatch simulation seam: the worker's closures were extracted into `live_edge`/`live_tick` over a `LiveCtx` (built once, survives listener reopens — zero behavior change), with `LiveCtx::for_tests`; inject / reload-clear / latch-reconcile / channel-disconnect are each pinned (`inject_fires_through_the_same_engine`, `reload_clears_held_state`, `hypershift_latch_reconciles`, `tick_survives_command_channel_disconnect`).
-- ✅ Safety stance transitions: `safety.rs` tests pin all four stances' gate pairs, idempotence, and gate independence — no real input armed, globals restored by RAII guard.
-- ✅ `DeviceSession::with_writable` stale-handle retry: `device.rs` tests (`with_writable_retries_once_recovers_from_a_stale_handle_and_rehandshakes`, `…keeps_the_first_failure_in_context…`) via the `with_writable_via` resolve seam (no enumeration, no hardware).
-- ✅ Beacon trigger ownership + persistence audit + startup-order contracts: beacon ownership predicates pinned in `beacon.rs` tests; the persistence audit lives in `testsupport.rs` (path-derivation assertions + a behavioral save sample under `cwd_guard`); main.rs's three comment-only startup orderings are now `debug_assert` contracts (`glue::ui_installed` before `hidwatch::start`, `host::start_attempted` before `build_window`) plus an upgraded CONTRACT comment for the set-armed-before-dispatch ordering.
-- ✅ Sidecar death regression: `tests/macro_host_respawn.rs` — kill the sidecar mid-session, prove dispatch stays non-blocking and the documented recovery path works.
-- ✅ (Bonus, same pass) Wire-pair atomicity: `dialect::tests::two_handles_never_cross_read_replies_on_one_pipe`; writer pause gate: `writer.rs::pauser_actually_parks_the_stream_not_just_documents_it`; poison-discipline convention: `testsupport.rs conventions::no_bare_poison_unwraps_in_production_code` (132 production sites converted 2026-07-09).
+- A config edit plus `LiveCommand::Reload` plus one `live_tick` changes what the live engine resolves: `dispatch::tests::reload_consumes_a_config_edit`. The worker's logic is `live_edge` / `live_tick` over a `LiveCtx` (`LiveCtx::for_tests`); inject, reload-clear, latch reconcile and a disconnected command channel are pinned by `inject_fires_through_the_same_engine`, `reload_clears_held_state`, `hypershift_latch_reconciles`, `tick_survives_command_channel_disconnect`.
+- The four safety stances, their gate pairs and gate independence: `safety.rs` tests (no real input is armed; globals are restored by an RAII guard).
+- `DeviceSession::with_writable` retries a stale handle once and re-handshakes: `device.rs` tests, e.g. `with_writable_retries_once_recovers_from_a_stale_handle_and_rehandshakes`.
+- Beacon trigger ownership: predicates in `beacon.rs` tests. Persistence paths and a save sample: `testsupport.rs`. Startup ordering is `debug_assert` contracts in `main.rs` (`glue::ui_installed` before `hidwatch::start`, `host::start_attempted` before `build_window`).
+- A killed macro sidecar leaves dispatch non-blocking and recovers: `tests/macro_host_respawn.rs`.
+- Two handles never cross-read replies on one pipe: `dialect::tests::two_handles_never_cross_read_replies_on_one_pipe`. The host writer's pause gate parks the stream: `writer.rs::pauser_actually_parks_the_stream_not_just_documents_it`. No bare poison `unwrap` in production code: `testsupport.rs` `conventions::no_bare_poison_unwraps_in_production_code`.
+- Layout bleed and unbounded text in `.slint`: `uilint.rs`; layout children outside their layout in drawn test frames: `uifit.rs`.
+- Every opcode has a ledger entry with evidence its grade can carry: `neuron-core/tests/protocol_ledger.rs`.
 
-Still open (honest):
+Still open:
 
 - A deterministic no-hardware transport fixture proving device-bound diagnostics skip rather than silently pass (diagnostics already report skip in practice; the fixture that PINS it is unwritten).
 
@@ -783,16 +792,16 @@ Mitigation:
 - Keep feature-specific briefs under `docs/briefs/` but link their status to actual code.
 - Update this TDD when new workers, config files, or dispatch sources are added.
 
-### Risk: Device Input Model Is Implicit
+### Risk: Device Input Model Is Partial
 
-`DeviceDef` models lighting geometry richly (rows/cols/effects/key-cell map) but has **no symmetric input model**: no table of the buttons/keys a device exposes, their identities, or their default onboard functions. `EventKind` — the registry's vocabulary for device-pushed events — has exactly one variant (`MuteState`); every other pushed event (04-family macro/DPI/scroll buttons, `05` DPI/scroll/power/plate) is a hardcoded vocabulary in `hidwatch.rs`, not evidence-typed registry data. Two consequences follow. (1) **New non-standard hardware needs hand-work** the discovery path can't cover: a novel keyboard geometry mis-places vitals/reactive lighting (the `razer_key_cell` map in `lighting.rs` is one family-standard ANSI 6×22 convention, not per-device data), and a new event class has nowhere to be named. (2) **Custody-complementarity is unmodeled and therefore silent**: to read the macro keys neuron must take Razer driver-mode custody, which is the same act that stops the firmware handling FN combos — so the onboard fn-row/media layer goes dark and nothing re-provides it (observed live: the BlackWidow consumer pipe emits nothing under driver custody). The def cannot express "these are the decisions you inherit when you open this pipe."
+`DeviceDef` models lighting geometry richly (rows/cols/effects/key-cell map). Its input side is narrower: `[[buttons]]` lists only the firmware-assignable buttons (on-device id and stock usage), `custody` says whether neuron keeps the device in driver or normal mode, and `fn_binds`, `side_plates` and `side_plate_binds` carry the Fn row and plate maps. There is no table of every button or key a device exposes. `EventKind`, the registry's vocabulary for device-pushed events, has exactly one variant (`MuteState`); the other pushed events (04-family macro/DPI/scroll buttons, `05` DPI/scroll/power/plate) are a hardcoded vocabulary in `hidwatch.rs`, not evidence-typed registry data. Two consequences follow. (1) **New non-standard hardware needs hand-work** the discovery path can't cover: a novel keyboard geometry mis-places vitals/reactive lighting (the `razer_key_cell` map in `lighting.rs` is one family-standard ANSI 6×22 convention, not per-device data), and a new event class has nowhere to be named. (2) **What custody removes is not enumerated**: to read the macro keys neuron must take Razer driver-mode custody, which is the same act that stops the firmware handling FN combos, so the onboard fn-row/media layer goes dark unless neuron re-provides it (the BlackWidow consumer pipe emits nothing under driver custody; `fn_binds` is the re-provision for the Chroma V2). The def records which mode neuron holds, not the decisions inherited by opening a pipe.
 
 Mitigation:
 
 - Treat the hardcoded 04/05 decode in `hidwatch.rs` as a staging area, not the final home; the module header already flags this.
-- The tractable next artifact is a passive **report-shape ledger** inside the app — read-only-open the secondary/unclaimed pipes, dedupe seen report shapes per unit, mark decoded (matches a `Proven` vocab) vs unknown, surface the unknowns for promotion. It is zero wire-risk (getters/reads only), it turns every desk into a discovery instrument, and a scratch prototype already validated the current vocabulary and the boundaries above. It would have surfaced the side-plate codes and the Seiren mute event without manual poking.
-- A per-device `[input]` block + expanded `EventKind` (evidence-typed like commands) is the larger move; design it as a *custody ledger* — what taking a pipe's custody removes from firmware — not just a button list.
-- Until that exists, keep binding storage `(page, usage, pid)`-keyed and honest that it is disjoint from the device model.
+- A passive **report-shape ledger** is the tractable next artifact (not built): read-only-open the secondary/unclaimed pipes, dedupe seen report shapes per unit, mark decoded (matches a `Proven` vocab) vs unknown, and surface the unknowns for promotion. It is zero wire-risk (reads only).
+- A per-device `[input]` block plus an expanded `EventKind` (evidence-typed like commands) is the larger move; design it as a *custody ledger* (what taking a pipe's custody removes from firmware), not just a button list.
+- Until then, keep binding storage `(page, usage, pid)`-keyed and honest that it is disjoint from the device model.
 
 ### Risk: Silent Preference Fallback
 

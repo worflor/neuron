@@ -40,6 +40,7 @@ everything in neuron is **one primitive**. *something happened* (a `Trigger`) so
 | `MicTap` | the mic's mute is toggled at the device |
 | `Hold` | a hypershift layer is held |
 | `Cast` | the spellweave activation rhythm fires |
+| `GameLight` | a connected Chroma game plays a recurring lighting effect, as the Chroma lab grouped it; it may only drive feedback actions, never input, clicks, macros or commands |
 
 **the actions**, *do this:*
 
@@ -149,7 +150,7 @@ the trigger side, up close: everything you can make *fire* an action, from a pla
 
 releasing one input drops only *its* layer, so two held layers don't stomp each other. this is the fix razer never shipped.
 
-**side-plate layers.** the naga's magnetic side plates swap the buttons under your thumb — twelve, six, two — so which binds even *exist* depends on which plate is on. neuron reads the plate off the report the mouse pushes when you seat it (there's no getter to poll; the report is the detection) and makes it a **latched layer**: binds tagged `plate:12-button` are live exactly while that plate is seated, swapping to the six displaces them instead of stacking, and pulling the plate off clears them. it's the same layer machinery as hypershift with one difference that matters — a held layer is an *act*, a seated plate is a *state*, so a hypershift bind still wins over a plate bind for the same button, and losing window focus drops your held layers but never your plate. binding twelve buttons and then swapping plates used to leave six binds quietly pointing at buttons that weren't there any more.
+**side-plate layers.** the naga's magnetic side plates swap the buttons under your thumb — twelve, six, two — so which binds even *exist* depends on which plate is on. neuron reads the plate off the report the mouse pushes when you seat it (there's no getter to poll; the report is the detection) and makes it a **latched layer**: binds tagged `plate:12-button` are live exactly while that plate is seated, swapping to the six displaces them instead of stacking, and pulling the plate off clears them. it's the same layer machinery as hypershift with one difference that matters — a held layer is an *act*, a seated plate is a *state*, so a hypershift bind still wins over a plate bind for the same button, and losing window focus drops your held layers but never your plate.
 
 **app-aware switching** is a tiny read-only query of the foreground exe (no hooks): a rule like `valorant → game profile` fires on `valorant.exe` by substring. rules are read top to bottom and the first match wins; name a fallback profile and closing the game puts you back on it, which is the half synapse gets right and most remaps forget.
 
@@ -216,8 +217,6 @@ a macro can drive neuron itself, too. through the broker it can set DPI, flip a 
 
 don't want to write python? the GUI has a **block builder**: drag typed nodes (type, click, open, ask, notify, plus `if` / `repeat` / `for-each`) and it edits the same Python source document. module-level imports, options, helpers, comments around the entry, and the BOUND/RAW directive survive structural edits; statements the visual model does not understand remain raw Python nodes.
 
-> this replaced an earlier engine that compiled your *Rust* to a dll at trigger time and hot-loaded it. genuinely sub-microsecond, genuinely a pain: whole toolchain, compile-at-press lag. the Macro Host keeps the speed without the jank.
-
 **beacons: a macro can stop and ask you something.** `neuron.ask("deploy it?")` pauses just that one macro and floats a quiet line at the top of your monitor: no focus steal, no dialog box. hold your cast trigger and an answer wheel appears under the cursor: flick west for yes, east for no, up or down to pass (the macro takes its default). bailing costs nothing. answering doesn't synthesise any input, so `ask` and `notify` work even in SAFE mode. a macro can talk to you while every keystroke is disarmed. and on the CLI the same question just shows up in your terminal (`[beacon] asks: deploy it?  [y/n]`), so it works headless too.
 
 every helper, with an example of each, is in [the macro API reference](reference/MACROS.md).
@@ -278,12 +277,12 @@ it works out which services are razer's by asking windows who installed them (no
 ### discover new devices
 
 ```
-neuron discover
+neuron adopt
 ```
 
 point it at a `razer_report` candidate and it probes the command space (finding the right pipe by vendor id and a 91-byte feature report, wherever it lives) then sorts each reply by its *shape*: an enum, a level, an x/y pair, a table, a string. line two devices up and the pattern falls out: a command they both answer is shared protocol, one only a single device answers is that device's own trick. this gives unfamiliar devices a starting definition; each device family still needs its own checks before we call its controls verified.
 
-an unfamiliar device can be probed, synthesized, and written to the run root's `devices/auto/razer-<pid>.toml` as a starting def. `neuron adopt` (or `discover --emit`) forces the pass by hand; `adopt --dry-run` prints the TOML instead of writing it.
+an unfamiliar device is probed, synthesized, and written to the run root's `devices/auto/razer-<pid>.toml` as a starting def. `neuron adopt` runs the pass by hand; `adopt --dry-run` prints the TOML instead of writing it. (`neuron discover` is the older, hidden debug form of the same probe.) Direct-attached Logitech HID++ devices are adopted the same way, read-only and without hardware verification.
 
 the file is the memo, not the input — it records what the device answered, and is ordinary editable config from then on. curated defs in `crates/neuron-core/devices/` shadow an auto one, and exist for the few things no getter reveals: a wire-captured command, a side-plate map, a transaction-id era the heuristic guessed wrong.
 

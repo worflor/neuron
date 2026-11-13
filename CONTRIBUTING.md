@@ -36,15 +36,7 @@ the honest map, graded by how much groundwork is already done.
 
 ## the layout
 
-so you know where things live:
-
-- `neuron-core` is the headless engine (protocol, registry, lighting, the trigger/action spine, gestures, macros) and it's portable by construction.
-- `neuron-app` is the GUI and live driver on Windows; its Linux GUI has partial runtime backends.
-- `neuron-cli` is a thin front-end.
-- `neuron-host` is a separate protocol hub (an OpenRGB / Chroma-REST bridge, so neuron can drive a mixed-brand rig).
-- [`engram`](https://github.com/worflor/engram) is the Woflo Labs gesture codec, included under its own terms.
-
-the rule everywhere: semantics live in `neuron-core` as typed, tested code; device wiring lives in data.
+[AGENTS.md](AGENTS.md#the-tree) has the crate map, and [where each kind of change goes](AGENTS.md#where-a-change-goes). the rule everywhere: semantics live in `neuron-core` as typed, tested code; device wiring lives in data.
 
 ## the gates
 
@@ -62,11 +54,7 @@ The CI build jobs are configured for code changes; docs-only changes skip them.
 
 **don't run `cargo fmt --all`.** the source is hand-formatted and there's no `rustfmt.toml` pinning that style, so a blanket format rewrites ~1900 sites across the repo and buries your change in noise. match the surrounding style. Clippy is a gate in full mode; address warnings in code you change.
 
-three hard invariants:
-
-1. **tests may never arm input.** there's a test whose only job is enforcing that. don't break it.
-2. **no guessing at hardware.** supported setting writes read back through their getters; streaming lighting checks replies. new unverified commands need a gate or an explicit ledger exception, and a passing mock test isn't physical verification.
-3. **more, never bloat.** neuron does a lot on purpose, but every addition must justify its complexity and background cost.
+the three hard invariants (tests may never arm input; no guessing at hardware; more, never bloat) are spelled out in [AGENTS.md](AGENTS.md#the-invariants-spelled-out). a passing mock test isn't physical verification, and new unverified commands need a gate or an explicit ledger exception.
 
 the SYSTEM diagnostics bench is the quickest read-only check when a device is on your desk. it's evidence, not a guarantee that every control works.
 

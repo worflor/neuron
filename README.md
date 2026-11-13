@@ -164,10 +164,6 @@ the windows builds are **not code-signed**. windows SmartScreen may warn on firs
 gh attestation verify neuron-<version>-windows-x86_64.zip --repo worflor/neuron
 ```
 
-The `open / run` action uses the existing shell helper. A Windows URL example is
-`start "" "https://example.com"`; a bare URL is not a shell command. Shell scripts use that
-same helper, while Python macros alone use the warm Macro Host.
-
 the installer places neuron in `%LOCALAPPDATA%\Programs\Neuron` and adds a Start menu shortcut. the zip stays portable: extract it anywhere writable and run `neuron-app.exe`.
 
 windows packages include the native Chroma broker. Windows Setup provisions it before
@@ -222,7 +218,7 @@ neuron macro prelude                 the `neuron` module reference (ctx + helper
 `neuron <noun> <verb>`, with `--json` on everything. the full reference is **[docs/reference/CLI.md](docs/reference/CLI.md)**; an agent driving it reads **[skills/neuron-cli](skills/neuron-cli/SKILL.md)**.
 
 ```
-devices   list · info · battery · adopt · storage · mode · backup · verify · badge · button
+devices   list · info · battery · adopt · storage · mode · backup · verify · badge · button · compat
 feel      feel (show · timing · sniper · dpi · polling · stages · scroll · lod · brightness ·
           game-mode · idle)
 input     bind · control · action · trigger · cast · gesture · radial · macro · pocket ·
@@ -249,7 +245,7 @@ want to dig deeper? [Compatibility Lab](docs/reference/COMPATIBILITY-LAB.md#try-
 
 want to write code or design an effect instead? there's plenty to pick up without learning the whole tree. [CONTRIBUTING.md](CONTRIBUTING.md) has the device work, lighting patterns, presets, protocol adapters and larger ports, with the groundwork for each spelled out. [neuron · orbit](https://github.com/users/worflor/projects/1) is the issue board; anything in *Up for grabs* is ready to claim.
 
-new to the tree? [AGENTS.md](AGENTS.md) is the quick orientation. tests can't arm input, and unknown hardware commands don't get a free pass. those rules aren't negotiable.
+new to the tree? [AGENTS.md](AGENTS.md) is the orientation for people and coding agents alike: the tree, where each kind of change goes, the gates, and which doc owns which topic. tests can't arm input, and unknown hardware commands don't get a free pass. those rules aren't negotiable.
 
 ### the legal bit
 

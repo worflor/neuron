@@ -51,11 +51,17 @@ code; device wiring lives in data.**
 | `crates/engram` | Woflo Labs trajectory codec — the eigenmotion math behind gesture recognition. Its own license; see `LICENSE.md`. |
 | `crates/neuron-testkit` | Shared test scaffolding: mock transport, fault injection. |
 
-Non-code state that matters: `profiles/*.toml` (a profile is one object — its
-settings, its lighting, and its binds), `*.rules.toml` sidecars, `cast.toml`,
-`feel.toml`. Device definitions live in `crates/neuron-core/devices/` (curated) and
-in the run root's `devices/auto/` (auto-synthesized; a curated file shadows an auto
-one).
+The cargo package of `neuron-core` is named `neuron` (`cargo test -p neuron`); the
+CLI binary is also `neuron`, the GUI binary `neuron-app`.
+
+Non-code state that matters lives in the **run root** (`neuron config path`; the
+rules are in the README's "where your config lives"; the file table is
+[`docs/TDD.md` §7](docs/TDD.md#7-persistence-model)): `profiles/*.toml` (a profile is
+one object — its settings, its lighting, and its binds), `*.rules.toml` sidecars,
+`cast.toml`, `feel.toml`. Device definitions live in `crates/neuron-core/devices/`
+(curated) and in the run root's `devices/auto/` (auto-synthesized; a curated file
+shadows an auto one). Tests resolve their own run root beside the test binary and
+never touch the user's.
 
 ## Where to read next
 
@@ -66,6 +72,13 @@ one).
 | How it's built — runtime model, dispatch flow, safety contracts, risks | [`docs/TDD.md`](docs/TDD.md) |
 | The protocol hub's design | [`docs/reference/PROTOCOL-HOST.md`](docs/reference/PROTOCOL-HOST.md) |
 | What actually works today, honestly graded | [`docs/STATUS.md`](docs/STATUS.md) |
+| The wire facts and the evidence behind each | [`crates/neuron-core/protocol/ledger.toml`](crates/neuron-core/protocol/ledger.toml); the user-facing proven / gated / absent table is in the README |
+| What changed in each release | [`CHANGELOG.md`](CHANGELOG.md); the trust and threat model is [`SECURITY.md`](SECURITY.md) |
+| End-user questions: install, update, uninstall, troubleshooting | [`docs/FAQ.md`](docs/FAQ.md) |
+| Every CLI verb | [`docs/reference/CLI.md`](docs/reference/CLI.md) |
+| Compatibility Lab: what the read-only collector does and doesn't claim | [`docs/reference/COMPATIBILITY-LAB.md`](docs/reference/COMPATIBILITY-LAB.md) |
+| A design in flight, a plan, an investigation | [`docs/briefs/`](docs/briefs) — working memory, not current truth: a brief's own status line says whether it is built |
+| Dated research and diagnosis snapshots | [`docs/archive/`](docs/archive/README.md) — not current, not authoritative |
 | How to send a change | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 | The label taxonomy, if you're filing or picking up issues | [`.github/LABELS.md`](.github/LABELS.md) |
 | You're helping a *user* install, update, or run neuron, not changing its code | [`skills/neuron-lazy-update/SKILL.md`](skills/neuron-lazy-update/SKILL.md) |
@@ -76,7 +89,26 @@ one).
 **The code is the source of truth.** `docs/TDD.md` and `docs/reference/PROTOCOL-HOST.md` both
 carry a banner saying an LLM wrote them while building neuron. That banner is
 accurate, and it is not a disclaimer to skim past: these docs are a map, and a map
-can be stale. Verify against the tree before you lean on a detail.
+can be stale. Verify against the tree before you lean on a detail. When docs and code
+disagree, the code says what is true today; whether the code or the doc is the mistake
+is the owner's call, so flag a disagreement you cannot settle instead of silently
+picking a side.
+
+## Where a change goes
+
+Semantics are typed, tested code in `neuron-core`; device wiring is data. Start from
+the existing seam, and read a neighbouring example before writing yours.
+
+| you are adding or changing | it goes in | what proves it |
+|---|---|---|
+| a trigger or action | `Trigger` in `neuron-core/src/engine.rs`; `Action` and `Intent` in `action.rs`; the picker list `ACTION_PALETTE` in `authoring.rs`; app and window intents in `neuron-app/src/dispatch.rs`. Never a second dispatch path. | engine/executor tests; any input synthesis or device write is `risky` |
+| a device or opcode | a curated TOML in `crates/neuron-core/devices/` (or let `synth.rs` write an auto one); a new opcode needs its entry in `protocol/ledger.toml` | `tests/protocol_ledger.rs`; then a hardware read-back and the diagnostics bench, naming the device |
+| a lighting pattern or preset | one entry in `REGISTRY` (pattern) or `presets()` in `neuron-core/src/pattern.rs`; factory, knobs and tile derive from it | the suite, then look at it in the running app; real-keyboard behavior stays "unverified" until run |
+| a GUI page or control | `.slint` under `neuron-app/ui/panels` and `ui/widgets`; callbacks in `src/glue.rs`; a how-to entry is a `GuideEntry` in `ui/guides.slint` plus a `GuideButton` | `uilint.rs`, `uifit.rs`, a frame in `apptest.rs`, then launch it |
+| a CLI verb | `crates/neuron-cli/src`; authoring logic stays in core (`authoring.rs`) so the GUI shares it; document it in `docs/reference/CLI.md` | CLI tests (a test keeps the `--help` groups in step with the command tree) |
+| a macro helper | `neuron-core/src/macros`; update `docs/reference/MACROS.md` and `skills/neuron-macros` | the `tests/macro_*` suites; BOUND vs RAW authority is `risky` |
+| a protocol-host adapter | `neuron-host/src/adapters` | `neuron-host` tests, a capture-and-replay fixture from `neuron-testkit` |
+| a persisted setting or config file | a file under the run root, loaded through the `salvage.rs` pattern so one bad value cannot cost the whole file; add it to the table in `docs/TDD.md` §7 | the suite; a save/reload test |
 
 ## The gates
 
@@ -91,7 +123,7 @@ this script rather than maintaining separate cargo commands. A local pass
 checks the same code gates; it cannot replace a platform or hardware run.
 
 ```powershell
-.\validate.ps1 -Mode full    # + feature matrix, release build, the CI-safe ignored tests
+.\validate.ps1 -Mode full    # + clippy, feature matrix, release build, the CI-safe ignored tests
 .\validate.ps1 -Locked       # add --locked, exactly reproducing a CI run
 ```
 
@@ -111,7 +143,8 @@ cannot prove hardware behavior without a real device, or Windows behavior when a
 Win32 seam resolves to a Linux stub. If you touched input, overlays, the tray, or
 audio, name the platform and hardware you tested in the PR.
 
-The platform-free gates — rustfmt and a parse of every shipped `.ps1` — have their own lane:
+The platform-free gates (rustfmt, a parse of every shipped shell and `.ps1` script,
+cargo-deny, cargo-audit) have their own lane:
 
 ```bash
 pwsh ./validate.ps1 -Mode lint
@@ -231,6 +264,40 @@ place links to it.
 - **Stay inside the box.** Slint compiles an element placed past its parent and text with nothing
   bounding it; both only show when the right data arrives. `src/uilint.rs` fails the suite on those
   two shapes. Bound the element or the text; a deliberate exception takes its allow marker and reason.
+  Shapes that only break with particular data are caught at runtime: every frame a GUI test in
+  `apptest.rs` draws goes through `src/uifit.rs`, which fails when a layout's child lies outside the
+  layout (its contents needed more room than it got). Give a new UI state a frame there, with the
+  longest data it can show, at the window's minimum width.
+
+## Keeping the docs true
+
+Each topic has one home; everything else links to it instead of restating it.
+
+| topic | home |
+|---|---|
+| what a feature does and why it is shaped that way | `docs/GDD.md` |
+| how it is built: workers, flow, gates, persistence, risks | `docs/TDD.md` |
+| what works today, graded, with dated evidence | `docs/STATUS.md` |
+| device-write evidence | `protocol/ledger.toml`, summarized in the README table |
+| a command, helper or protocol surface | its `docs/reference/` file |
+| what changed, and when | `CHANGELOG.md` and git history, never the design docs |
+
+When you change code, update its home in the same change:
+
+- A user-visible behavior: GDD, plus the CLI reference or macro reference if it has a
+  command or helper.
+- A new worker, config file, or dispatch source: TDD.
+- What a capability actually does on hardware, or what you tested it on: STATUS and, for
+  a device write, the ledger and the README table. Never upgrade a grade without
+  dated evidence; say what is unverified.
+- A new opcode: its ledger entry, or `tests/protocol_ledger.rs` fails.
+
+Docs follow the same rules as comments. Write what is true now: no "used to", no what
+was tried, no session narration, no hype, no repeated explanations. History goes in the
+commit message and changelog. A design note for work not yet built goes in
+`docs/briefs/` with a status line saying so; once it ships, move what is durable into
+GDD or TDD and leave the brief as a record. A convention worth enforcing belongs in a
+test or lint (as `uilint.rs` and the protocol ledger do), then a line here at most.
 
 ## Verifying your work honestly
 
