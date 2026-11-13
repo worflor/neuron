@@ -8,7 +8,7 @@
 //! (`follow`)? Which stops look out of place (`repair`)? Every answer is weighed against leaving
 //! the palette alone, and the bundle's margins decide what is worth offering.
 //!
-//! This is a port of Luma's core v4.1 to v4.3 (layout 5, the revision 3 runtime) from its bridge
+//! This is a port of Luma's core v4.1 to v4.4 (layout 5, the revision 3 runtime) from its bridge
 //! specification, for stops on a line. The network is data: [`Learned::load`] reads a `.lumacore`
 //! bundle from a folder, and no trained weights are compiled in. Each stop becomes one token (its
 //! colour, position, flags, the colour its neighbours imply and what it was before the edit) and
@@ -28,8 +28,14 @@ use sha2::{Digest, Sha256};
 use super::{Engine, Offer, Scene, Scope};
 use crate::lighting::Rgb;
 
+mod taste;
+pub use taste::{Person, Taste};
+
 /// The bundle [`Learned::load`] looks for in its folder.
 pub const BUNDLE: &str = "colour-model.lumacore";
+/// The most of a picking journal read for a person's taste: its newest part, so a journal kept for
+/// months still loads in a moment and the taste follows what the person picks now.
+const JOURNAL_TAIL: u64 = 8 << 20;
 const MAGIC: &[u8; 8] = b"LUMACORE";
 const FORMAT: &str = "luma.core-bridge.v1";
 /// Token values before the intent and the style vector, the intent's own, and a pair's.
@@ -182,9 +188,34 @@ struct Near {
     delta: Vec<Vec<f64>>,
 }
 
+/// The last `most` bytes of a text file, from the first whole line in them; bytes that are not
+/// UTF-8 become replacement characters, so one damaged record costs only its own line.
+fn read_tail(path: &Path, most: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let start = size.saturating_sub(most);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(most).read_to_end(&mut bytes)?;
+    if start > 0 {
+        let first = bytes.iter().position(|b| *b == b'\n').map_or(bytes.len(), |at| at + 1);
+        bytes.drain(..first);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// A loaded colour model.
 pub struct Learned {
     name: String,
+    /// The sha256 of the weights the bundle was exported from: what a taste head is bound to.
+    weights_sha256: String,
+    /// The taste head that chooses among the core's readings, when one sits beside the bundle.
+    taste: Option<Taste>,
+    /// The taste of the person picking, from their journal, once it holds enough decided slates.
+    person: Option<Person>,
+    /// What [`Learned::load`] found beside the core and could not use.
+    notes: Vec<String>,
     heads: usize,
     components: usize,
     /// Width of the style vector without its presence flag.
@@ -218,11 +249,70 @@ pub struct Learned {
 impl Learned {
     /// Read the bundle in `folder`. `Ok(None)` when there is none; an error when one is there and
     /// cannot be used.
+    ///
+    /// A taste head beside it ([`taste::BUNDLE`]) is attached when it was trained with these core
+    /// weights. A head that cannot be used (damaged, or left over from another core) leaves the
+    /// core working on its own slate, and says so in [`Learned::notes`]. With a head, the newest
+    /// part of the person's picking journal beside it ([`taste::JOURNAL`]) is read for their own
+    /// taste; the taste is read once, when the model loads.
     pub fn load(folder: &Path) -> Result<Option<Learned>, String> {
-        match std::fs::read(folder.join(BUNDLE)) {
-            Ok(bytes) => Learned::parse(&bytes).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("{BUNDLE}: {e}")),
+        let mut model = match std::fs::read(folder.join(BUNDLE)) {
+            Ok(bytes) => Learned::parse(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{BUNDLE}: {e}")),
+        };
+        match std::fs::read(folder.join(taste::BUNDLE)) {
+            Ok(bytes) => {
+                if let Err(e) = Taste::parse(&bytes).and_then(|head| model.attach(head)) {
+                    model.notes.push(format!("{} not used: {e}", taste::BUNDLE));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => model.notes.push(format!("{} not used: {e}", taste::BUNDLE)),
+        }
+        if model.taste.is_some() {
+            match read_tail(&folder.join(taste::JOURNAL), JOURNAL_TAIL) {
+                Ok(journal) => model.person = model.taste.as_ref().and_then(|head| head.person(&journal)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => model.notes.push(format!("{} not read: {e}", taste::JOURNAL)),
+            }
+        }
+        Ok(Some(model))
+    }
+
+    /// What loading found beside the core and could not use, in words for a log.
+    #[must_use]
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// Let `head` choose this model's offers. Refused when it was trained with other core weights,
+    /// or when this bundle does not say which weights it holds.
+    pub fn attach(&mut self, head: Taste) -> Result<(), String> {
+        if self.weights_sha256.is_empty() || head.core() != self.weights_sha256 {
+            return Err(format!("{} was trained with another colour model", head.name()));
+        }
+        self.taste = Some(head);
+        Ok(())
+    }
+
+    /// The taste head choosing the offers, if any.
+    #[must_use]
+    pub fn taste(&self) -> Option<&Taste> {
+        self.taste.as_ref()
+    }
+
+    /// Whether the offers read a person's own taste.
+    #[must_use]
+    pub fn knows_the_person(&self) -> bool {
+        self.person.is_some()
+    }
+
+    /// The answer to a request: the taste head's when there is one, else the core's own slate.
+    fn choose(&self, ask: &Ask) -> Answer {
+        match &self.taste {
+            Some(head) => self.tasted(head, ask, taste::Kind::of(ask.task)),
+            None => self.answer(ask),
         }
     }
 
@@ -300,6 +390,10 @@ impl Learned {
         let pooled = palette.bias.len();
         Ok(Learned {
             name: doc["name"].as_str().unwrap_or("colour model").to_string(),
+            weights_sha256: doc["source"]["weights_sha256"].as_str().unwrap_or("").to_ascii_lowercase(),
+            taste: None,
+            person: None,
+            notes: Vec::new(),
             heads,
             components,
             style,
@@ -1007,7 +1101,7 @@ impl Engine for Learned {
         };
         if scene.open {
             if !frame.pins[active] {
-                offer(self.answer(&Ask { count: 3, ..frame.stop(true) }), "fits", "a colour for this stop", Scope::Stop);
+                offer(self.choose(&Ask { count: 3, ..frame.stop(true) }), "fits", "a colour for this stop", Scope::Stop);
             }
             return out;
         }
@@ -1019,14 +1113,14 @@ impl Engine for Learned {
                     let mut origin = frame.rgb.clone();
                     origin[active] = was[active];
                     let wanted: Lab = std::array::from_fn(|d| to[d] - from[d]);
-                    self.answer(&Ask { rgb: &origin, before: None, count: 2, intent: Some(wanted), ..frame.stop(false) })
+                    self.choose(&Ask { rgb: &origin, before: None, count: 2, intent: Some(wanted), ..frame.stop(false) })
                 } else {
-                    self.answer(&Ask { count: 2, ..frame.stop(false) })
+                    self.choose(&Ask { count: 2, ..frame.stop(false) })
                 };
                 offer(answer, "fits", "fits this palette", Scope::Stop);
             }
-            offer(self.answer(&Ask { task: Task::Follow, before: Some(was), ..ask }), "follow", "carry the change through", Scope::Palette);
-            offer(self.answer(&Ask { task: Task::Repair, before: Some(was), pins: &held, active: None, recent: &[active], ..ask }), "tidy", "tidy the rest", Scope::Palette);
+            offer(self.choose(&Ask { task: Task::Follow, before: Some(was), ..ask }), "follow", "carry the change through", Scope::Palette);
+            offer(self.choose(&Ask { task: Task::Repair, before: Some(was), pins: &held, active: None, recent: &[active], ..ask }), "tidy", "tidy the rest", Scope::Palette);
         }
         let recent: &[usize] = if frame.was.is_some() { &[active] } else { &[] };
         for (stop, better) in self.doubts(&Ask { task: Task::Repair, before: frame.was.as_deref(), pins: &held, active: None, recent, ..ask }) {
@@ -1133,8 +1227,8 @@ fn log_density(mix: &Mixture, colour: Lab) -> f64 {
     let total = mix.logits.iter().map(|l| (l - top).exp()).sum::<f64>().ln();
     let parts: Vec<f64> = (0..mix.logits.len()).map(|c| {
         let mut part = mix.logits[c] - top - total - 1.5 * std::f64::consts::TAU.ln();
-        for d in 0..3 {
-            let z = (colour[d] - mix.means[c][d]) / mix.sigmas[c][d];
+        for ((value, mean), sigma) in colour.iter().zip(&mix.means[c]).zip(&mix.sigmas[c]) {
+            let z = (value - mean) / sigma;
             part -= 0.5 * z * z;
         }
         part - (mix.sigmas[c][0].ln() + mix.sigmas[c][1].ln() + mix.sigmas[c][2].ln())
@@ -1150,6 +1244,9 @@ mod tests {
 
     const SMALL: &[u8] = include_bytes!("../../data/colour-model.golden.lumacore");
     const SMALL_CASES: &str = include_str!("../../data/colour-model.golden.jsonl");
+    const SMALL_TASTE: &[u8] = include_bytes!("../../data/colour-taste.golden.lumataste");
+    const SMALL_TASTE_CASES: &str = include_str!("../../data/colour-taste.golden.jsonl");
+    const SMALL_JOURNAL: &str = include_str!("../../data/colour-taste.golden-journal.json");
 
     /// Run every gradient request in `cases` through `model` and compare with the recorded
     /// answers. Returns, per task, (requests, answers that change something, options).
@@ -1230,16 +1327,126 @@ mod tests {
     }
 
     /// The same check for a trained bundle against the vectors Luma publishes with it. Point
-    /// `NEURON_LUMA_BRIDGE` at the folder holding `core-v4.3.lumacore` and `golden-v4.3.jsonl`.
+    /// `NEURON_LUMA_BRIDGE` at the folder holding `<core>.lumacore` and `golden-<version>.jsonl`
+    /// (`NEURON_LUMA_CORE` names the core, `core-v4.4` by default).
     #[test]
     #[ignore = "needs a Luma bridge folder in NEURON_LUMA_BRIDGE"]
     fn matches_luma_vectors() {
         let folder = std::path::PathBuf::from(std::env::var_os("NEURON_LUMA_BRIDGE").expect("NEURON_LUMA_BRIDGE"));
-        let model = Learned::parse(&std::fs::read(folder.join("core-v4.3.lumacore")).unwrap()).unwrap();
+        let core = std::env::var("NEURON_LUMA_CORE").unwrap_or_else(|_| "core-v4.4".into());
+        let model = Learned::parse(&std::fs::read(folder.join(format!("{core}.lumacore"))).unwrap()).unwrap();
         let started = std::time::Instant::now();
-        let seen = check(&model, &std::fs::read_to_string(folder.join("golden-v4.3.jsonl")).unwrap());
+        let seen = check(&model, &std::fs::read_to_string(folder.join(format!("golden-{}.jsonl", core.trim_start_matches("core-")))).unwrap());
         println!("{}: {seen:?} in {:?}", model.name(), started.elapsed());
         assert!(seen.values().map(|tally| tally[0]).sum::<usize>() >= 30);
+    }
+
+    /// The taste head port against the small head's vectors: readings, both token groups, scores, a
+    /// person's term and the decision, and a person fitted from a journal.
+    #[test]
+    fn the_taste_head_matches_the_reference_implementation() {
+        let mut model = Learned::parse(SMALL).unwrap();
+        model.attach(Taste::parse(SMALL_TASTE).unwrap()).unwrap();
+        let taste = model.taste.take().unwrap();
+        let (requests, offers) = taste::check::vectors(&mut model, &taste, SMALL_TASTE_CASES);
+        assert!(requests >= 100 && offers >= 30 && offers < requests, "{requests} requests, {offers} offers");
+        let journal: serde_json::Value = serde_json::from_str(SMALL_JOURNAL).unwrap();
+        let lines: Vec<&str> = journal["journal"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        let got = *taste.person(&lines.join("\n")).expect("the journal decides enough slates").weights();
+        let want: Vec<f64> = journal["weights"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-9), "{got:?} vs {want:?}");
+        assert!(taste.person(&lines[..4].join("\n")).is_none(), "a person is not read from too few decided slates");
+        // Records the format could not have written change nothing (as in Luma's reader).
+        let junk = [
+            "{not json", "[1, 2]",
+            r#"{"event":"drag","active":99,"rgb":[0.1,0.1,0.1]}"#, r#"{"event":"drag","active":1,"rgb":[2.0,0,0]}"#,
+            r#"{"event":"undo","palette":"x"}"#, r#"{"event":"undo","palette":[]}"#,
+            r#"{"event":"suggestion_shown","slate":[[[0.1,0.1]]]}"#, r#"{"event":"suggestion_accepted","choice":0}"#,
+            r#"{"event":"suggestion_shown","slate":[]}"#, r#"{"event":"suggestion_accepted","choice":5}"#,
+            r#"{"event":"suggestion_shown","slate":[]}"#, r#"{"event":"suggestion_dismissed"}"#,
+        ];
+        let damaged: Vec<&str> = lines[..1].iter().copied().chain(junk).chain(lines[1..].iter().copied()).collect();
+        let again = *taste.person(&damaged.join("\n")).expect("the damaged journal still decides enough slates").weights();
+        assert!(again.iter().zip(&got).all(|(a, b)| (a - b).abs() < 1e-12), "{again:?} vs {got:?}");
+    }
+
+    /// A bundle whose arrays overlap, or whose weights are not all numbers, is refused even when its
+    /// hash is right, and a head that cannot be used leaves the core working on its own slate.
+    #[test]
+    fn a_head_with_bad_numbers_is_refused_and_the_core_works_without_it() {
+        let rehash = |mut bundle: Vec<u8>, change: &dyn Fn(&mut [u8], &mut String)| -> Vec<u8> {
+            let len = u32::from_le_bytes(bundle[12..16].try_into().unwrap()) as usize;
+            let start = (16 + len).div_ceil(64) * 64;
+            let mut header = String::from_utf8(bundle[16..16 + len].to_vec()).unwrap();
+            let old: String = Sha256::digest(&bundle[start..]).iter().map(|b| format!("{b:02x}")).collect();
+            change(&mut bundle[start..], &mut header);
+            let new: String = Sha256::digest(&bundle[start..]).iter().map(|b| format!("{b:02x}")).collect();
+            let header = header.replace(&old, &new);
+            assert_eq!(header.len(), len);
+            bundle[16..16 + len].copy_from_slice(header.as_bytes());
+            bundle
+        };
+        let nan = rehash(SMALL_TASTE.to_vec(), &|payload, _| payload[..4].copy_from_slice(&f32::NAN.to_le_bytes()));
+        assert!(Taste::parse(&nan).err().is_some_and(|e| e.contains("not a number")), "a weight that is not a number");
+        let overlap = rehash(SMALL_TASTE.to_vec(), &|_, header| *header = header.replacen("\"offset\":0,", "\"offset\":4,", 1));
+        assert!(Taste::parse(&overlap).is_err(), "arrays that overlap");
+
+        let folder = std::env::temp_dir().join(format!("neuron-taste-load-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(BUNDLE), SMALL).unwrap();
+        std::fs::write(folder.join(taste::BUNDLE), &nan).unwrap();
+        let model = Learned::load(&folder).unwrap().expect("the core loads");
+        assert!(model.taste().is_none() && !model.knows_the_person());
+        assert!(model.notes().iter().any(|n| n.contains(taste::BUNDLE)), "{:?}", model.notes());
+        std::fs::write(folder.join(taste::BUNDLE), SMALL_TASTE).unwrap();
+        let journal: serde_json::Value = serde_json::from_str(SMALL_JOURNAL).unwrap();
+        let lines: Vec<&str> = journal["journal"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        // a journal larger than what is read: the newest part, from its first whole line, decides
+        let mut text = "x".repeat(JOURNAL_TAIL as usize);
+        text.push('\n');
+        text.push_str(&lines.join("\n"));
+        std::fs::write(folder.join(taste::JOURNAL), text).unwrap();
+        let model = Learned::load(&folder).unwrap().expect("the core loads");
+        let _ = std::fs::remove_dir_all(&folder);
+        assert!(model.taste().is_some() && model.knows_the_person() && model.notes().is_empty(), "{:?}", model.notes());
+    }
+
+    #[test]
+    fn a_taste_head_for_another_model_or_damaged_is_refused() {
+        assert!(Taste::parse(SMALL_TASTE).is_ok());
+        let mut damaged = SMALL_TASTE.to_vec();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert!(Taste::parse(&damaged).is_err(), "a changed weight");
+        assert!(Taste::parse(&SMALL_TASTE[..SMALL_TASTE.len() - 4]).is_err(), "a cut payload");
+        assert!(Taste::parse(SMALL).is_err(), "a core bundle is not a head");
+        let mut model = Learned::parse(SMALL).unwrap();
+        model.weights_sha256 = "another model".into();
+        assert!(model.attach(Taste::parse(SMALL_TASTE).unwrap()).is_err(), "a head trained with other core weights");
+    }
+
+    /// The taste head against the vectors Luma publishes with it: every reading, both token groups,
+    /// the scores, a person's term and the decision. `NEURON_LUMA_BRIDGE` holds the core and the head
+    /// (`NEURON_LUMA_TASTE` names the head, `taste-head-v6` by default, and `NEURON_LUMA_CORE` its core,
+    /// `core-v4.4`) with their vectors.
+    #[test]
+    #[ignore = "needs a Luma bridge folder in NEURON_LUMA_BRIDGE"]
+    fn matches_luma_taste_vectors() {
+        let folder = std::path::PathBuf::from(std::env::var_os("NEURON_LUMA_BRIDGE").expect("NEURON_LUMA_BRIDGE"));
+        let head = std::env::var("NEURON_LUMA_TASTE").unwrap_or_else(|_| "taste-head-v6".into());
+        let core = std::env::var("NEURON_LUMA_CORE").unwrap_or_else(|_| "core-v4.4".into());
+        let mut model = Learned::parse(&std::fs::read(folder.join(format!("{core}.lumacore"))).unwrap()).unwrap();
+        model.attach(Taste::parse(&std::fs::read(folder.join(format!("{head}.lumataste"))).unwrap()).unwrap()).unwrap();
+        let taste = model.taste.take().unwrap();
+        let started = std::time::Instant::now();
+        let (requests, offers) = taste::check::vectors(&mut model, &taste, &std::fs::read_to_string(folder.join(format!("golden-{head}.jsonl"))).unwrap());
+        println!("{head}: {requests} requests, {offers} offers, in {:?}", started.elapsed());
+        assert!(requests >= 30 && offers >= 10);
+        let journal: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(folder.join(format!("golden-{head}-journal.json"))).unwrap()).unwrap();
+        let lines: Vec<&str> = journal["journal"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        let person = taste.person(&lines.join("\n")).expect("the journal decides enough slates");
+        let want: Vec<f64> = journal["weights"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        let got = person.weights();
+        assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-9), "a person's weights from their journal: {got:?} vs {want:?}");
     }
 
     #[test]
@@ -1283,7 +1490,14 @@ mod tests {
     /// Every offer the engine makes over a spread of edits keeps to what its kind may touch.
     #[test]
     fn each_kind_of_offer_changes_only_what_it_may() {
-        let model = Learned::parse(SMALL).unwrap();
+        let mut tasted = Learned::parse(SMALL).unwrap();
+        tasted.attach(Taste::parse(SMALL_TASTE).unwrap()).unwrap();
+        for model in [Learned::parse(SMALL).unwrap(), tasted] {
+            offers_keep_to_their_scope(&model);
+        }
+    }
+
+    fn offers_keep_to_their_scope(model: &Learned) {
         let base = [(12, 45, 34), (60, 120, 80), (67, 190, 116), (150, 210, 120), (206, 229, 128)];
         let mut kinds: HashMap<&str, usize> = HashMap::new();
         for (edited, colour) in [(1, (200, 40, 190)), (2, (70, 180, 120)), (3, (20, 20, 160)), (0, (240, 240, 240)), (2, (255, 0, 0)), (4, (90, 60, 30))] {
