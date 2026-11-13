@@ -204,7 +204,7 @@ impl Taste {
             Ok(values)
         };
         let linear = |name: &str, out: usize, inp: usize| -> Result<Linear, String> {
-            Ok(Linear { weight: take(&format!("{name}.weight"), &[out, inp])?, bias: take(&format!("{name}.bias"), &[out])? })
+            Ok(Linear::dense(take(&format!("{name}.weight"), &[out, inp])?, take(&format!("{name}.bias"), &[out])?))
         };
         let count = doc["members"].as_u64().filter(|m| (1..=64).contains(m)).ok_or("taste bundle: members")? as usize;
         let members = (0..count).map(|i| {
@@ -213,7 +213,7 @@ impl Taste {
                 in_core: linear(&format!("{p}in_core"), width, CORE)?,
                 in_request: linear(&format!("{p}in_request"), width, REQUEST)?,
                 embed: linear(&format!("{p}embed"), width, width)?,
-                norm: Linear { weight: take(&format!("{p}norm.weight"), &[width])?, bias: take(&format!("{p}norm.bias"), &[width])? },
+                norm: Linear::gain(take(&format!("{p}norm.weight"), &[width])?, take(&format!("{p}norm.bias"), &[width])?),
                 head_in: linear(&format!("{p}head_in"), hidden, 3 * width)?,
                 head_out: linear(&format!("{p}head_out"), 3, hidden)?,
             })
@@ -272,12 +272,25 @@ impl Taste {
     /// enough slates (or when the bundle carries no rules for it).
     #[must_use]
     pub fn person(&self, journal: &str) -> Option<Person> {
-        let rules = self.rules.as_ref()?;
+        self.read(journal).0
+    }
+
+    /// [`Taste::person`], and how many slates the journal shows taken or dismissed.
+    pub(super) fn read(&self, journal: &str) -> (Option<Person>, usize) {
+        let Some(rules) = self.rules.as_ref() else { return (None, 0) };
         let (pairs, decided) = journal_pairs(journal);
         if decided < rules.min_decided || pairs.is_empty() {
-            return None;
+            return (None, decided);
         }
-        Some(Person { weights: fit(&pairs, &rules.scale, rules.ridge) }).filter(|p| p.weights.iter().all(|w| w.is_finite()))
+        let person = Some(Person { weights: fit(&pairs, &rules.scale, rules.ridge) }).filter(|p| p.weights.iter().all(|w| w.is_finite()));
+        (person, decided)
+    }
+
+    /// How many decided slates a journal needs before a person's taste is read from it; `None`
+    /// when the bundle carries no rules for one.
+    #[must_use]
+    pub fn needs(&self) -> Option<usize> {
+        self.rules.as_ref().map(|rules| rules.min_decided)
     }
 
     /// Member-averaged logits per row (row 0 is "keep"): acceptable, pick, needs work.
@@ -685,17 +698,7 @@ impl Learned {
         if let [only] = stops[..] {
             return rows.iter().map(|row| vec![(log_density(&mix[only], row[only]), log_mass(&mix[only], row[only]))]).collect();
         }
-        rows.iter().map(|row| {
-            stops.iter().map(|&s| {
-                let mut scene = inp.clone();
-                for k in stops.iter().copied().filter(|k| *k != s) {
-                    scene.lab[k] = row[k];
-                    scene.shown[k] = true;
-                }
-                let mix = &self.run(&scene, positions, condition)[s];
-                (log_density(mix, row[s]), log_mass(mix, row[s]))
-            }).collect()
-        }).collect()
+        self.rated(inp, positions, condition, rows, &stops, |mix, colour| (log_density(mix, colour), log_mass(mix, colour)))
     }
 
     /// Both token groups for "keep" (row 0) and every candidate: Luma's `taste.describe`.
@@ -807,7 +810,7 @@ impl Learned {
         out.offerable = true;
         let palettes: Vec<Vec<Srgb>> = named.iter().map(|(_, rgb)| rgb.clone()).collect();
         let mut scores = self.scores(taste, ask, kind, &palettes);
-        if let (Some(person), Some(rules)) = (self.person.as_ref(), taste.rules.as_ref()) {
+        if let (Some(person), Some(rules)) = (self.known_person(), taste.rules.as_ref()) {
             for (pick, extra) in scores.pick.iter_mut().zip(person.preference(rules, ask.rgb, &palettes)) {
                 *pick += extra;
             }
@@ -886,7 +889,7 @@ pub(super) mod check {
                 intent: (!input["intent"].is_null()).then(|| triple(&input["intent"])),
                 style: &[],
             };
-            model.person = case["person_weights"].as_array().map(|w| Person::new(std::array::from_fn(|k| w[k].as_f64().unwrap())));
+            model.set_person(case["person_weights"].as_array().map(|w| Person::new(std::array::from_fn(|k| w[k].as_f64().unwrap()))));
             let output = &case["output"];
             let named = model.readings(taste, &ask, kind);
             let want = output["candidates"].as_array().unwrap();
@@ -922,7 +925,7 @@ pub(super) mod check {
                     close(*a, b, &format!("{id} acceptable"));
                 }
                 close(scores.keep, output["keep_score"].as_f64().unwrap(), &format!("{id} keep score"));
-                if let (Some(person), Some(rules), Some(want)) = (model.person.as_ref(), taste.rules.as_ref(), output["personal"].as_array()) {
+                if let (Some(person), Some(rules), Some(want)) = (model.known_person(), taste.rules.as_ref(), output["personal"].as_array()) {
                     for (a, b) in person.preference(rules, &rgb, &palettes).iter().zip(want) {
                         close(*a, b.as_f64().unwrap(), &format!("{id} personal"));
                     }
@@ -935,7 +938,7 @@ pub(super) mod check {
             requests += 1;
             offers += usize::from(!keep);
         }
-        model.person = None;
+        model.set_person(None);
         (requests, offers)
     }
 }

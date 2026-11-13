@@ -8,6 +8,9 @@
 *.bin   binary
 *.png   binary
 *.dll   binary
+# Luma colour-model bundles: their payload hash covers every byte (src/assist/learned.rs).
+*.lumacore  binary
+*.lumataste binary
 *.tape  binary
 
 # Generated. Collapsed in review and excluded from language stats.

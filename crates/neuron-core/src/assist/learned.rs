@@ -9,8 +9,9 @@
 //! the palette alone, and the bundle's margins decide what is worth offering.
 //!
 //! This is a port of Luma's core v4.1 to v4.4 (layout 5, the revision 3 runtime) from its bridge
-//! specification, for stops on a line. The network is data: [`Learned::load`] reads a `.lumacore`
-//! bundle from a folder, and no trained weights are compiled in. Each stop becomes one token (its
+//! specification, for stops on a line. The network is data. Neuron ships Luma-T, Luma's core v4.4
+//! with taste head v6 ([`Learned::builtin`]); a `.lumacore` bundle in the models folder replaces
+//! it ([`Learned::open`]), for trying another checkpoint. Each stop becomes one token (its
 //! colour, position, flags, the colour its neighbours imply and what it was before the edit) and
 //! each pair of stops a few numbers about how far apart they sit, which bias attention. A request
 //! may carry an intent (a wanted change in OKLab, placed on the free stops) and a style vector
@@ -22,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{PoisonError, RwLock};
 
 use sha2::{Digest, Sha256};
 
@@ -36,6 +38,17 @@ pub const BUNDLE: &str = "colour-model.lumacore";
 /// The most of a picking journal read for a person's taste: its newest part, so a journal kept for
 /// months still loads in a moment and the taste follows what the person picks now.
 const JOURNAL_TAIL: u64 = 8 << 20;
+/// Luma-T as Neuron ships it: the core bundle and the taste head bound to it.
+const BUILTIN: (&[u8], &[u8]) = (include_bytes!("../../data/luma-t/colour-model.lumacore"), include_bytes!("../../data/luma-t/colour-taste.lumataste"));
+
+/// How far the model is from knowing the person picking: slates taken or dismissed in their
+/// journal, how many it needs, and whether their taste is in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Learning {
+    pub decided: usize,
+    pub needed: usize,
+    pub known: bool,
+}
 const MAGIC: &[u8; 8] = b"LUMACORE";
 const FORMAT: &str = "luma.core-bridge.v1";
 /// Token values before the intent and the style vector, the intent's own, and a pair's.
@@ -74,11 +87,153 @@ type Srgb = [f64; 3];
 struct Linear {
     weight: Vec<f64>,
     bias: Vec<f64>,
+    /// `W` packed for [`Linear::apply_all`]: for each run of [`PANEL`] outputs (the last one
+    /// padded with zero weights), every input's weights for them side by side, input by input.
+    /// Empty for a normalisation.
+    panels: Vec<f64>,
+    inputs: usize,
 }
 
+/// Outputs a packed panel holds: one register tile's width.
+const PANEL: usize = 8;
+
 impl Linear {
+    /// A dense layer from a row-major `[out, in]` weight and its bias.
+    fn dense(weight: Vec<f64>, bias: Vec<f64>) -> Linear {
+        let out = bias.len();
+        let inputs = weight.len().checked_div(out).unwrap_or(0);
+        let mut panels = vec![0.0; out.div_ceil(PANEL) * PANEL * inputs];
+        if inputs > 0 {
+            for (r, row) in weight.chunks_exact(inputs).enumerate() {
+                let (panel, lane) = (r / PANEL, r % PANEL);
+                for (i, w) in row.iter().enumerate() {
+                    panels[(panel * inputs + i) * PANEL + lane] = *w;
+                }
+            }
+        }
+        Linear { weight, bias, panels, inputs }
+    }
+
+    /// A normalisation's per-channel gain and offset.
+    fn gain(weight: Vec<f64>, bias: Vec<f64>) -> Linear {
+        Linear { weight, bias, panels: Vec::new(), inputs: 0 }
+    }
+
     fn apply(&self, x: &[f64]) -> Vec<f64> {
         self.bias.iter().zip(self.weight.chunks_exact(x.len())).map(|(b, row)| b + dot(row, x)).collect()
+    }
+
+    /// [`Linear::apply`] to every row of `xs`, as one matrix product over the packed panels: each
+    /// panel is read once, in order, for all the rows. Every output is the bias plus the in-order
+    /// sum over the inputs that the one-row product makes.
+    fn apply_all(&self, xs: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let out = self.bias.len();
+        if self.inputs == 0 || xs.iter().any(|x| x.len() != self.inputs) {
+            return xs.iter().map(|x| self.apply(x)).collect();
+        }
+        let mut ys: Vec<Vec<f64>> = xs.iter().map(|_| vec![0.0; out]).collect();
+        product(&self.panels, self.inputs, out, xs, &mut ys);
+        for y in &mut ys {
+            for (v, b) in y.iter_mut().zip(&self.bias) {
+                *v += b;
+            }
+        }
+        ys
+    }
+}
+
+/// `ys[t] = W · xs[t]` for every row `t`, from `W` packed as [`Linear::panels`]. Every row of
+/// `xs` is `inputs` long and every row of `ys` `out` long.
+fn product(panels: &[f64], inputs: usize, out: usize, xs: &[Vec<f64>], ys: &mut [Vec<f64>]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor reports AVX2, the only feature `product_avx2` is compiled for.
+        unsafe { product_avx2(panels, inputs, out, xs, ys) };
+        return;
+    }
+    product_portable(panels, inputs, out, xs, ys);
+}
+
+/// The portable product: a panel at a time, each row's eight outputs summed over the inputs in
+/// order from zero.
+fn product_portable(panels: &[f64], inputs: usize, out: usize, xs: &[Vec<f64>], ys: &mut [Vec<f64>]) {
+    for (p, panel) in panels.chunks_exact(inputs * PANEL).enumerate() {
+        let (at, width) = (p * PANEL, PANEL.min(out - p * PANEL));
+        for (x, y) in xs.iter().zip(ys.iter_mut()) {
+            let mut acc = [0.0f64; PANEL];
+            for (a, w) in x.iter().zip(panel.chunks_exact(PANEL)) {
+                for (v, w) in acc.iter_mut().zip(w) {
+                    *v += a * w;
+                }
+            }
+            y[at..at + width].copy_from_slice(&acc[..width]);
+        }
+    }
+}
+
+/// The product with AVX2: four rows by a panel's eight outputs in eight registers while the
+/// input passes, then one row at a time for the rows left. A multiply then an add per term
+/// (never fused), so every output rounds exactly as [`product_portable`] rounds it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn product_avx2(panels: &[f64], inputs: usize, out: usize, xs: &[Vec<f64>], ys: &mut [Vec<f64>]) {
+    use std::arch::x86_64::{__m256d, _mm256_add_pd, _mm256_loadu_pd, _mm256_mul_pd, _mm256_set1_pd, _mm256_setzero_pd, _mm256_storeu_pd};
+    if panels.len() != out.div_ceil(PANEL) * PANEL * inputs || xs.len() != ys.len() || ys.iter().any(|y| y.len() != out) {
+        product_portable(panels, inputs, out, xs, ys);
+        return;
+    }
+    // A finished tile row: its eight outputs, of which the panel's last may hold fewer.
+    let keep = |y: &mut [f64], at: usize, lo: __m256d, hi: __m256d| {
+        let mut lanes = [0.0f64; PANEL];
+        // SAFETY: `lanes` holds eight values, the two stores four each.
+        unsafe {
+            _mm256_storeu_pd(lanes.as_mut_ptr(), lo);
+            _mm256_storeu_pd(lanes.as_mut_ptr().add(4), hi);
+        }
+        let width = PANEL.min(out - at);
+        y[at..at + width].copy_from_slice(&lanes[..width]);
+    };
+    let rows = xs.len();
+    for p in 0..out.div_ceil(PANEL) {
+        // SAFETY: panel `p` starts `p * inputs * PANEL` into `panels`, whose length was checked.
+        let panel = unsafe { panels.as_ptr().add(p * inputs * PANEL) };
+        let at = p * PANEL;
+        let mut t = 0;
+        while t + 4 <= rows {
+            let x = [xs[t].as_ptr(), xs[t + 1].as_ptr(), xs[t + 2].as_ptr(), xs[t + 3].as_ptr()];
+            let mut acc = [_mm256_setzero_pd(); 8];
+            for i in 0..inputs {
+                // SAFETY: `i < inputs`: the loads lie in the panel (`inputs * PANEL` long) and each
+                // `x[r].add(i)` in a row `inputs` long (checked by `Linear::apply_all`).
+                let (lo, hi, a) = unsafe {
+                    let w = panel.add(i * PANEL);
+                    (_mm256_loadu_pd(w), _mm256_loadu_pd(w.add(4)), [*x[0].add(i), *x[1].add(i), *x[2].add(i), *x[3].add(i)])
+                };
+                for r in 0..4 {
+                    let a = _mm256_set1_pd(a[r]);
+                    acc[2 * r] = _mm256_add_pd(acc[2 * r], _mm256_mul_pd(a, lo));
+                    acc[2 * r + 1] = _mm256_add_pd(acc[2 * r + 1], _mm256_mul_pd(a, hi));
+                }
+            }
+            for r in 0..4 {
+                keep(&mut ys[t + r], at, acc[2 * r], acc[2 * r + 1]);
+            }
+            t += 4;
+        }
+        for t in t..rows {
+            let x = xs[t].as_ptr();
+            let (mut lo_acc, mut hi_acc) = (_mm256_setzero_pd(), _mm256_setzero_pd());
+            for i in 0..inputs {
+                // SAFETY: as above.
+                let (lo, hi, a) = unsafe {
+                    let w = panel.add(i * PANEL);
+                    (_mm256_loadu_pd(w), _mm256_loadu_pd(w.add(4)), _mm256_set1_pd(*x.add(i)))
+                };
+                lo_acc = _mm256_add_pd(lo_acc, _mm256_mul_pd(a, lo));
+                hi_acc = _mm256_add_pd(hi_acc, _mm256_mul_pd(a, hi));
+            }
+            keep(&mut ys[t], at, lo_acc, hi_acc);
+        }
     }
 }
 
@@ -205,6 +360,25 @@ fn read_tail(path: &Path, most: u64) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `job(0)` to `job(count - 1)` in order, spread over the machine's cores less two, so a model
+/// answer never takes every core from the lighting and the window.
+fn side_by_side<T: Send>(count: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2)).clamp(1, count.max(1));
+    if workers == 1 {
+        return (0..count).map(job).collect();
+    }
+    let mut parts: Vec<Vec<(usize, T)>> = std::thread::scope(|scope| {
+        let job = &job;
+        let handles: Vec<_> = (0..workers).map(|w| scope.spawn(move || (w..count).step_by(workers).map(|i| (i, job(i))).collect::<Vec<_>>())).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
+    });
+    let mut out: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    for (i, value) in parts.iter_mut().flat_map(std::mem::take) {
+        out[i] = Some(value);
+    }
+    out.into_iter().map(|value| value.expect("every job ran")).collect()
+}
+
 /// A loaded colour model.
 pub struct Learned {
     name: String,
@@ -212,8 +386,9 @@ pub struct Learned {
     weights_sha256: String,
     /// The taste head that chooses among the core's readings, when one sits beside the bundle.
     taste: Option<Taste>,
-    /// The taste of the person picking, from their journal, once it holds enough decided slates.
-    person: Option<Person>,
+    /// The taste of the person picking, from their journal, once it holds enough decided slates,
+    /// and how many it holds. Shared: the picker learns while the model answers.
+    person: RwLock<(Option<Person>, usize)>,
     /// What [`Learned::load`] found beside the core and could not use.
     notes: Vec<String>,
     heads: usize,
@@ -270,14 +445,83 @@ impl Learned {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => model.notes.push(format!("{} not used: {e}", taste::BUNDLE)),
         }
-        if model.taste.is_some() {
-            match read_tail(&folder.join(taste::JOURNAL), JOURNAL_TAIL) {
-                Ok(journal) => model.person = model.taste.as_ref().and_then(|head| head.person(&journal)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => model.notes.push(format!("{} not read: {e}", taste::JOURNAL)),
-            }
+        if let Err(e) = model.relearn(folder) {
+            model.notes.push(e);
         }
         Ok(Some(model))
+    }
+
+    /// The colour model Neuron ships: Luma-T, Luma's core v4.4 with taste head v6 (the stack Luma's
+    /// blind duels measure), from `data/luma-t`.
+    #[must_use]
+    pub fn builtin() -> Learned {
+        let mut model = Learned::parse(BUILTIN.0).expect("the built-in colour model reads");
+        model.attach(Taste::parse(BUILTIN.1).expect("the built-in taste head reads")).expect("the built-in head is bound to the built-in core");
+        model
+    }
+
+    /// The model for a models `folder`: a bundle there when one is ([`Learned::load`]), else the
+    /// built-in one ([`Learned::builtin`]), with the person's journal in `folder` read either way.
+    /// What was there and could not be used is in [`Learned::notes`]; this never fails.
+    #[must_use]
+    pub fn open(folder: &Path) -> Learned {
+        match Learned::load(folder) {
+            Ok(Some(model)) => model,
+            found => {
+                let mut model = Learned::builtin();
+                if let Err(e) = found {
+                    model.notes.push(format!("{e}; using the built-in model"));
+                }
+                if let Err(e) = model.relearn(folder) {
+                    model.notes.push(e);
+                }
+                model
+            }
+        }
+    }
+
+    /// Read the person's taste again from the newest part of the journal in `folder`
+    /// ([`taste::JOURNAL`]). Without a taste head there is no person. A journal not there yet is
+    /// a person not known yet; one that cannot be read leaves the taste as it was.
+    pub fn relearn(&self, folder: &Path) -> Result<(), String> {
+        let Some(head) = self.taste.as_ref() else { return Ok(()) };
+        let journal = match read_tail(&folder.join(taste::JOURNAL), JOURNAL_TAIL) {
+            Ok(journal) => journal,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{} not read: {e}", taste::JOURNAL)),
+        };
+        *self.person.write().unwrap_or_else(PoisonError::into_inner) = head.read(&journal);
+        Ok(())
+    }
+
+    /// How far the model is from knowing the person picking; `None` when it cannot learn one
+    /// (no taste head, or a head without the rules for it).
+    #[must_use]
+    pub fn learning(&self) -> Option<Learning> {
+        let needed = self.taste.as_ref()?.needs()?;
+        let (person, decided) = &*self.person.read().unwrap_or_else(PoisonError::into_inner);
+        Some(Learning { decided: *decided, needed, known: person.is_some() })
+    }
+
+    /// Stop reading the person's taste until [`Learned::relearn`] is asked again.
+    pub fn forget(&self) {
+        *self.person.write().unwrap_or_else(PoisonError::into_inner) = (None, 0);
+    }
+
+    fn known_person(&self) -> Option<Person> {
+        self.person.read().unwrap_or_else(PoisonError::into_inner).0.clone()
+    }
+
+    #[cfg(test)]
+    fn set_person(&self, person: Option<Person>) {
+        self.person.write().unwrap_or_else(PoisonError::into_inner).0 = person;
+    }
+
+    /// Whether this model's answer is the whole answer. A taste head decides between offering and
+    /// keeping, and its "keep" is a judgement: another engine filling the silence would undo it.
+    #[must_use]
+    pub fn answers_alone(&self) -> bool {
+        self.taste.is_some()
     }
 
     /// What loading found beside the core and could not use, in words for a log.
@@ -305,7 +549,7 @@ impl Learned {
     /// Whether the offers read a person's own taste.
     #[must_use]
     pub fn knows_the_person(&self) -> bool {
-        self.person.is_some()
+        self.person.read().unwrap_or_else(PoisonError::into_inner).0.is_some()
     }
 
     /// The answer to a request: the taste head's when there is one, else the core's own slate.
@@ -365,10 +609,10 @@ impl Learned {
         let linear = |name: &str, out: Option<usize>, inp: usize| -> Result<Linear, String> {
             let stated = arrays.get(format!("{name}.weight").as_str()).and_then(|(shape, _)| shape.first().copied());
             let out = out.or(stated).filter(|rows| (1..=4096).contains(rows)).ok_or_else(|| format!("bundle has no array {name}.weight"))?;
-            Ok(Linear { weight: take(&format!("{name}.weight"), &[out, inp])?, bias: take(&format!("{name}.bias"), &[out])? })
+            Ok(Linear::dense(take(&format!("{name}.weight"), &[out, inp])?, take(&format!("{name}.bias"), &[out])?))
         };
         let scale = |name: &str| -> Result<Linear, String> {
-            Ok(Linear { weight: take(&format!("{name}.weight"), &[width])?, bias: take(&format!("{name}.bias"), &[width])? })
+            Ok(Linear::gain(take(&format!("{name}.weight"), &[width])?, take(&format!("{name}.bias"), &[width])?))
         };
         let margins = |task: &str| -> Result<Option<Margins>, String> {
             let entry = &policy[task];
@@ -392,7 +636,7 @@ impl Learned {
             name: doc["name"].as_str().unwrap_or("colour model").to_string(),
             weights_sha256: doc["source"]["weights_sha256"].as_str().unwrap_or("").to_ascii_lowercase(),
             taste: None,
-            person: None,
+            person: RwLock::new((None, 0)),
             notes: Vec::new(),
             heads,
             components,
@@ -548,36 +792,68 @@ impl Learned {
         (tokens, pair)
     }
 
+    /// What the pair geometry adds to attention, per pair `i * n + j` and per block and head: a
+    /// function of where the stops sit and which show a colour, never of the colours.
+    fn pair_bias(&self, pair: &[Vec<[f64; PAIR]>]) -> Vec<Vec<f64>> {
+        let pairs: Vec<Vec<f64>> = pair.iter().flatten().map(|p| p.to_vec()).collect();
+        self.bias[1].apply_all(&self.bias[0].apply_all(&pairs).into_iter().map(gelu).collect::<Vec<_>>())
+    }
+
     /// The network: tokens and pair geometry in, one mixture per stop out.
     fn forward(&self, tokens: &[Vec<f64>], pair: &[Vec<[f64; PAIR]>]) -> Vec<Mixture> {
+        self.forward_with(tokens, &self.pair_bias(pair))
+    }
+
+    /// [`Learned::forward`] with the pair geometry's attention bias already made
+    /// ([`Learned::pair_bias`]).
+    fn forward_with(&self, tokens: &[Vec<f64>], bias: &[Vec<f64>]) -> Vec<Mixture> {
         let k = self.components;
-        let bias: Vec<Vec<Vec<f64>>> = pair.iter().map(|row| row.iter().map(|p| self.bias[1].apply(&gelu(self.bias[0].apply(p)))).collect()).collect();
-        let mut x: Vec<Vec<f64>> = tokens.iter().map(|t| self.embed[1].apply(&gelu(self.embed[0].apply(t)))).collect();
+        let n = tokens.len();
+        // every layer runs over all the tokens at once: see `Linear::apply_all`
+        let mut x: Vec<Vec<f64>> = self.embed[1].apply_all(&self.embed[0].apply_all(tokens).into_iter().map(gelu).collect::<Vec<_>>());
         let width = x.first().map_or(0, Vec::len);
         let part = width / self.heads;
+        let root = (part as f64).sqrt();
+        let mut weight = vec![0.0; n];
         for (b, block) in self.blocks.iter().enumerate() {
             // queries, keys and values, each a third of the row; a head owns `part` of each third
-            let qkv: Vec<Vec<f64>> = x.iter().map(|row| block.qkv.apply(&norm(row, &block.norm1))).collect();
-            for (i, row) in x.iter_mut().enumerate() {
+            let qkv = block.qkv.apply_all(&x.iter().map(|row| norm(row, &block.norm1)).collect::<Vec<_>>());
+            let mixed: Vec<Vec<f64>> = (0..n).map(|i| {
                 let mut mixed = vec![0.0; width];
                 for head in 0..self.heads {
-                    let of = |third: usize| third * width + head * part..third * width + (head + 1) * part;
-                    let lean = |j: usize| if head < self.heads - self.open_heads { bias[i][j][b * self.heads + head] } else { 0.0 };
-                    let score: Vec<f64> = qkv.iter().enumerate().map(|(j, other)| dot(&qkv[i][of(0)], &other[of(1)]) / (part as f64).sqrt() + lean(j)).collect();
-                    for (other, w) in qkv.iter().zip(softmax(&score)) {
-                        for (m, v) in mixed[head * part..(head + 1) * part].iter_mut().zip(&other[of(2)]) {
+                    let (q, kk, v) = (head * part, width + head * part, 2 * width + head * part);
+                    let biased = head < self.heads - self.open_heads;
+                    let query = &qkv[i][q..q + part];
+                    // the softmax of the scores, as `softmax` makes it, in a reused buffer
+                    for (j, (w, other)) in weight.iter_mut().zip(&qkv).enumerate() {
+                        *w = dot(query, &other[kk..kk + part]) / root + if biased { bias[i * n + j][b * self.heads + head] } else { 0.0 };
+                    }
+                    let top = weight.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    for w in &mut weight {
+                        *w = (*w - top).exp();
+                    }
+                    let total: f64 = weight.iter().sum();
+                    let out = &mut mixed[head * part..(head + 1) * part];
+                    for (other, w) in qkv.iter().zip(&weight) {
+                        let w = w / total;
+                        for (m, v) in out.iter_mut().zip(&other[v..v + part]) {
                             *m += w * v;
                         }
                     }
                 }
-                add(row, &block.proj.apply(&mixed));
-                let hidden = block.narrow.apply(&gelu(block.wide.apply(&norm(row, &block.norm2))));
-                add(row, &hidden);
+                mixed
+            }).collect();
+            for (row, change) in x.iter_mut().zip(block.proj.apply_all(&mixed)) {
+                add(row, &change);
+            }
+            let wide = block.wide.apply_all(&x.iter().map(|row| norm(row, &block.norm2)).collect::<Vec<_>>());
+            for (row, change) in x.iter_mut().zip(block.narrow.apply_all(&wide.into_iter().map(gelu).collect::<Vec<_>>())) {
+                add(row, &change);
             }
         }
         let (low, high) = (self.sigma[0].ln(), self.sigma[1].ln());
-        x.iter().zip(tokens).map(|(row, token)| {
-            let out = self.head[1].apply(&gelu(self.head[0].apply(&norm(row, &self.norm))));
+        let outs = self.head[1].apply_all(&self.head[0].apply_all(&x.iter().map(|row| norm(row, &self.norm)).collect::<Vec<_>>()).into_iter().map(gelu).collect::<Vec<_>>());
+        outs.into_iter().zip(tokens).map(|(out, token)| {
             // a stop without a colour starts from what its neighbours imply
             let from = if token[8] > 0.0 { 0 } else { 10 };
             let base: Lab = std::array::from_fn(|d| token[from + d] / SCALE[d] + SHIFT[d]);
@@ -633,16 +909,34 @@ impl Learned {
             let mix = self.run(inp, positions, condition);
             return candidates.iter().map(|c| log_density(&mix[only], c[only])).collect();
         }
-        candidates.iter().map(|candidate| {
-            stops.iter().map(|&s| {
-                let mut scene = inp.clone();
-                for k in stops.iter().copied().filter(|k| *k != s) {
-                    scene.lab[k] = candidate[k];
-                    scene.shown[k] = true;
-                }
-                log_density(&self.run(&scene, positions, condition)[s], candidate[s])
-            }).sum()
-        }).collect()
+        self.rated(inp, positions, condition, candidates, &stops, log_density)
+            .into_iter().map(|row| row.into_iter().sum()).collect()
+    }
+
+    /// `rate` of each candidate's colour at each of `stops`, in a pass with the other `stops` at the
+    /// candidate's colours: one pass per candidate and stop, run side by side.
+    fn rated<T: Send>(&self, inp: &Inputs, positions: &[f64], condition: &Condition, candidates: &[Vec<Lab>], stops: &[usize],
+                      rate: impl Fn(&Mixture, Lab) -> T + Sync) -> Vec<Vec<T>> {
+        // Every pass that rates stop `s` shows the same stops, so its pair geometry, and the
+        // attention bias made from it, is the same for every candidate: made once per stop.
+        let shown = |s: usize| {
+            let mut scene = inp.clone();
+            for k in stops.iter().copied().filter(|k| *k != s) {
+                scene.shown[k] = true;
+            }
+            scene
+        };
+        let biases = side_by_side(stops.len(), |at| self.pair_bias(&self.tokens(&shown(stops[at]), positions, condition).1));
+        let mut flat = side_by_side(candidates.len() * stops.len(), |job| {
+            let (candidate, at) = (&candidates[job / stops.len()], job % stops.len());
+            let s = stops[at];
+            let mut scene = shown(s);
+            for k in stops.iter().copied().filter(|k| *k != s) {
+                scene.lab[k] = candidate[k];
+            }
+            rate(&self.forward_with(&self.tokens(&scene, positions, condition).0, &biases[at])[s], candidate[s])
+        }).into_iter();
+        candidates.iter().map(|_| flat.by_ref().take(stops.len()).collect()).collect()
     }
 
     /// Candidates for the request, scored against the palette as it stands.
@@ -1133,8 +1427,19 @@ impl Engine for Learned {
     }
 }
 
+/// Eight running sums, so the products vectorise; the order differs from one sum by rounding at
+/// the last bit, which is far inside the reference vectors' tolerance.
 fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut acc = [0.0f64; 8];
+    for (x, y) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        for k in 0..8 {
+            acc[k] += x[k] * y[k];
+        }
+    }
+    let tail: f64 = a.chunks_exact(8).remainder().iter().zip(b.chunks_exact(8).remainder()).map(|(x, y)| x * y).sum();
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
 }
 
 fn add(into: &mut [f64], from: &[f64]) {
@@ -1146,9 +1451,19 @@ fn add(into: &mut [f64], from: &[f64]) {
 /// The tanh approximation, which is the one the model was trained with.
 fn gelu(mut x: Vec<f64>) -> Vec<f64> {
     for v in &mut x {
-        *v = 0.5 * *v * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (*v + 0.044715 * v.powi(3))).tanh());
+        *v = 0.5 * *v * (1.0 + tanh((2.0 / std::f64::consts::PI).sqrt() * (*v + 0.044715 * v.powi(3))));
     }
     x
+}
+
+/// `tanh` as `expm1(2z) / (expm1(2z) + 2)`: within an ulp of the library's, and faster, which
+/// matters at the twenty thousand a pass makes. Past |z| = 20 tanh is ±1 to the last bit.
+fn tanh(z: f64) -> f64 {
+    if z.abs() > 20.0 {
+        return z.signum();
+    }
+    let e = (2.0 * z).exp_m1();
+    e / (e + 2.0)
 }
 
 /// Layer normalisation: population variance, epsilon inside the root.
@@ -1485,6 +1800,78 @@ mod tests {
         s.selected = 0;
         s.open = true;
         assert!(model.offers(&s).is_empty(), "a palette of one");
+    }
+
+    #[test]
+    fn the_builtin_model_is_luma_t_with_its_taste_head() {
+        let model = Learned::builtin();
+        assert_eq!(model.name(), "core-v4.4");
+        assert_eq!(model.taste().map(Taste::name), Some("taste-head-v6"));
+        assert!(model.answers_alone(), "its taste head's keep is the answer");
+        assert_eq!(model.learning(), Some(Learning { decided: 0, needed: 3, known: false }));
+        assert!(!Learned::parse(SMALL).unwrap().answers_alone(), "a core alone leaves room for the rules");
+    }
+
+    /// A models folder: its bundle when one is there, else Luma-T, and the person's taste read
+    /// again from the journal as it grows.
+    #[test]
+    fn a_models_folder_picks_the_model_and_its_journal_teaches_it() {
+        let folder = std::env::temp_dir().join(format!("neuron-colour-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let model = Learned::open(&folder);
+        assert!(model.name() == "core-v4.4" && model.notes().is_empty(), "{:?}", model.notes());
+        let journal: serde_json::Value = serde_json::from_str(SMALL_JOURNAL).unwrap();
+        let lines: Vec<&str> = journal["journal"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        std::fs::write(folder.join(taste::JOURNAL), lines[..4].join("\n")).unwrap();
+        model.relearn(&folder).unwrap();
+        let early = model.learning().unwrap();
+        assert!(!early.known && early.decided < early.needed, "{early:?}");
+        std::fs::write(folder.join(taste::JOURNAL), lines.join("\n")).unwrap();
+        model.relearn(&folder).unwrap();
+        assert!(model.knows_the_person() && model.learning().unwrap().decided >= 3);
+        model.forget();
+        assert!(!model.knows_the_person() && model.learning().unwrap().decided == 0);
+        // a bundle in the folder is used instead, with no head unless one sits beside it
+        std::fs::write(folder.join(BUNDLE), SMALL).unwrap();
+        let mine = Learned::open(&folder);
+        assert!(mine.name() != "core-v4.4" && mine.taste().is_none() && mine.notes().is_empty());
+        // one that cannot be read is passed over, and says so
+        std::fs::write(folder.join(BUNDLE), &SMALL[..100]).unwrap();
+        let fallback = Learned::open(&folder);
+        let _ = std::fs::remove_dir_all(&folder);
+        assert_eq!(fallback.name(), "core-v4.4");
+        assert!(fallback.knows_the_person(), "the journal still teaches the built-in model");
+        assert!(fallback.notes().iter().any(|n| n.contains("built-in")), "{:?}", fallback.notes());
+    }
+
+    /// How long Luma-T takes over a whole answer to an edit (fits, follow, tidy, doubts) and a new
+    /// stop, by palette size. Release builds only; the picker asks off the UI thread.
+    #[test]
+    #[ignore = "a timing, for release builds"]
+    fn luma_t_answers_an_edit_in_a_moment() {
+        let model = Learned::builtin();
+        for n in [4usize, 6, 9, 12] {
+            let base: Vec<(u8, u8, u8)> = (0..n).map(|i| {
+                let t = i as f32 / (n - 1) as f32;
+                ((20.0 + 200.0 * t) as u8, (40.0 + 150.0 * t) as u8, (120.0 - 80.0 * t) as u8)
+            }).collect();
+            let mut s = scene(&base);
+            s.before = Some(s.stops.clone());
+            s.selected = n / 2;
+            s.stops[n / 2].col = Rgb::new(200, 60, 160);
+            // the best of several, so a busy machine measures the model rather than itself
+            let best = |s: &Scene| (0..7).map(|_| {
+                let started = std::time::Instant::now();
+                let offers = model.offers(s);
+                (started.elapsed(), offers.len())
+            }).min().unwrap();
+            let (edit, offers) = best(&s);
+            s.open = true;
+            let (open, _) = best(&s);
+            println!("{n} stops: an edit {edit:?} ({offers} offers), a new stop {open:?}");
+            assert!(edit < std::time::Duration::from_millis(600), "{n} stops took {edit:?}");
+        }
     }
 
     /// Every offer the engine makes over a spread of edits keeps to what its kind may touch.
