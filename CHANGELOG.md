@@ -4,6 +4,7 @@
 the colour picker grew a brain: Luma-T, a tiny colour model that edits with you. neuron updates itself now, plus a pile of everyday fixes.
 ![picker v2 with Luma-T's first idea drafted on a stop, contour rings around where it fits](docs/media/picker-v2-suggest.webp)
 ![a fresh roll on show, with the roll drawer open](docs/media/picker-v2-roll.webp)
+![Tidepool, neuron's new shallow-water effect, rendered on a keyboard](docs/media/release-v0.1.8-tidepool.webp)
 
 ### new
 - **Luma-T.** a 663k-parameter colour model that runs on your computer in real time, no GPU or internet. it suggests colours for the stop you're editing, carries a change through the palette, tidies the stops around it and colours new ones.
@@ -21,6 +22,7 @@ the colour picker grew a brain: Luma-T, a tiny colour model that edits with you.
 - **look inside a pocket.** click one to see what it holds and copy its text out.
 - **try a clipboard transform on real text.** paste a clipboard sample and watch each step change it.
 - **effect options show themselves.** each option carries a small live preview.
+- **Tidepool.** sunlit shallow water on your keys, rippling where you type.
 - **Fn keys survive driver mode.** keyboards held for their macro keys keep their Fn combos and media keys, and there's a new `game-mode` action.
 
 ### better
