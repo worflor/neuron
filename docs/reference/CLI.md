@@ -285,6 +285,20 @@ accents, phoenix, start_minimized, the CONNECTIONS settings, ...; values are typ
 secrets such as the OBS password are never read or written here). `status` gives version, run root,
 whether the app runs, the active profile and counts. `reload` signals the app.
 
+### update
+
+The running app owns its updater; these drive it through livesync and read what it shows from
+`update/live.json`. `update status` prints this version, whether this copy updates itself (and
+why not), the newest release, when it was last checked, and the app's update phase and download
+progress (`--json`: `version`, `updates_itself`, `why_not`, `app_running`, `latest_release`,
+`last_check`, `phase`, `offered`, `progress`, `error`, `preview`, `status`). `update check` asks
+for a newer release now, through the app when it runs and from the CLI when it does not.
+`update install` has the app download, verify, install and restart; it needs the app running.
+`update preview <phase>` shows the update UI in `available`, `downloading`, `ready`,
+`installing`, `updated`, `rolled-back` or `error` with this build's own notes, fetching and
+installing nothing; the pill's buttons then walk the states. `update preview off` ends it. It
+works in any build.
+
 ### report
 
 `report bug [--what TEXT]` writes `reports/bug-<date>-<time>/` under the run root (`report.md` from the

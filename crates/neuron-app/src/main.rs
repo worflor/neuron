@@ -890,6 +890,9 @@ fn main() {
                                 use slint::Model;
                                 (device.clone(), st.get_dpi().round() as i32, st.get_dpi_stage_nums().iter().collect())
                             }),
+                            update: Some(st.get_update_phase().to_string())
+                                .filter(|p| !p.is_empty())
+                                .map(|p| (p, st.get_update_version().to_string(), (st.get_update_progress().clamp(0.0, 1.0) * 10.0).floor() as u8)),
                         }
                     };
                     poll_tray.sync(&snap, acted);
@@ -1078,6 +1081,7 @@ fn show_window(resident: &Rc<RefCell<Resident>>) {
         app.window().set_minimized(false);
         app.global::<State>().set_window_shown(true); // on screen now → page animation timers may run
     }
+    updater::window_opened();
     // RAISE over whatever owns the foreground. A bare `show()` lands BEHIND a borderless-fullscreen
     // game, so "Open Neuron" reads as "nothing happened". Force it forward like a summon does.
     #[cfg(windows)]
@@ -1156,6 +1160,7 @@ fn apply_live_commands(
                     flight::trace("live", "pocket request could not be served", 0);
                 }
             }
+            (Command::Update { op }, _, _) => updater::command(op),
         }
     }
 }
@@ -1224,6 +1229,17 @@ fn handle_tray(resident: &Rc<RefCell<Resident>>, action: TrayAction) {
         }
         TrayAction::SetBrightness(v) => set_brightness(resident, v),
         TrayAction::SetDpi(v) => set_dpi(resident, v),
+        TrayAction::UpdateInstall => {
+            if let Some(app) = resident.borrow().window.as_ref() {
+                app.global::<State>().invoke_update_install();
+            }
+        }
+        TrayAction::UpdateNotes => {
+            show_window(resident);
+            if let Some(app) = resident.borrow().window.as_ref() {
+                app.global::<State>().set_update_notes_open(true);
+            }
+        }
         TrayAction::ReportBug => {
             if let Some(app) = resident.borrow().window.as_ref() {
                 bugreport::start(app, String::new(), false);

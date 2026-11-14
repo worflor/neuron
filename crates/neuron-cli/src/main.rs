@@ -18,6 +18,7 @@ mod out;
 mod profile_cmd;
 mod setup_cmd;
 mod spec;
+mod update_cmd;
 
 use anyhow::{bail, Context, Result};
 use cast_cmd::{CastCmd, GestureCmd};
@@ -91,6 +92,11 @@ enum Cmd {
     Report {
         #[command(subcommand)]
         action: ReportCmd,
+    },
+    /// Check for, install or preview an update; the app does the work
+    Update {
+        #[command(subcommand)]
+        action: update_cmd::UpdateCmd,
     },
     /// List connected, recognized Razer devices
     ///
@@ -990,7 +996,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Feel", &["feel"]),
     ("Input", &["bind", "control", "action", "trigger", "cast", "gesture", "radial", "macro", "pocket", "run", "watch", "pads", "rumble", "audio", "twin"]),
     ("Lighting", &["lighting"]),
-    ("Setup", &["profile", "config", "dump", "apply", "reload", "status", "catalog", "import", "report"]),
+    ("Setup", &["profile", "config", "dump", "apply", "reload", "status", "catalog", "import", "report", "update"]),
 ];
 
 /// Exit for a command line clap rejected: help and version as clap prints them, anything else as
@@ -1120,6 +1126,8 @@ fn run() -> Result<()> {
         Cmd::Compat { action } => return compat_cmd::run(action),
         // a bug report must work however broken the config is, and must not migrate it
         Cmd::Report { action } => return report_cmd(action),
+        // updating must work however broken the config is
+        Cmd::Update { action } => return update_cmd::run(action),
         command => command,
     };
     neuron::screenshot::install_completion_sink(|message| eprintln!("[screenshot] {message}"));
@@ -1137,6 +1145,7 @@ fn run() -> Result<()> {
     match command {
         Cmd::Compat { action } => compat_cmd::run(action)?,
         Cmd::Report { action } => report_cmd(action)?,
+        Cmd::Update { action } => update_cmd::run(action)?,
         Cmd::List => list(&reg)?,
         Cmd::Discover { emit } => discover_cmd(emit),
         Cmd::Adopt { dry_run } => adopt_cmd(&reg, dry_run)?,

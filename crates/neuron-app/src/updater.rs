@@ -3,15 +3,19 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 //! The in-app updater: one worker that sleeps on a condvar between checks (shortly after launch,
-//! then every ~12 h, or when asked), downloads and verifies in the background, and hands installs
-//! to the copy's own lifecycle (`neuron::update::install`). The UI thread only flips request
-//! flags and receives finished views; it never touches the network or the disk here.
+//! then every ~12 h, when the window opens on a stale check, or when asked), downloads and
+//! verifies in the background, and hands installs to the copy's own lifecycle
+//! (`neuron::update::install`). The UI thread only flips request flags and receives finished
+//! views; it never touches the network or the disk here. Every view is also written to
+//! `update/live.json` for `neuron update`, which drives the same requests through livesync.
+//! A preview (`neuron update preview`) walks the pill through its states with this build's own
+//! notes, touching no network and installing nothing; it works in any build.
 
 use crate::ui::{AppWindow, NoteMedia, NoteRow, State};
 use neuron::update::{self, client, install, notes, policy, state::State as Record, version::Version, Engine, Offer};
 use slint::ComponentHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -24,6 +28,13 @@ const REPORT: &str = "https://github.com/worflor/neuron/issues/new";
 const MAX_NAP: Duration = Duration::from_secs(15 * 60);
 /// Notes images are drawn at most ~420 px wide; decode to twice that for high-DPI glass.
 const MEDIA_MAX_WIDTH: u32 = 840;
+/// Opening the window checks again when the last check is older than this.
+const STALE: u64 = 3600;
+
+/// A preview is running: the pill's requests go to it, not to the real worker.
+static PREVIEW: AtomicBool = AtomicBool::new(false);
+/// Bumped per preview, so a superseded preview thread stops.
+static PREVIEW_RUN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct Requests {
@@ -32,6 +43,8 @@ struct Requests {
     install: bool,
     dismiss: bool,
     poke: bool,
+    /// Check, unless the last check is recent (the window just opened).
+    stale: bool,
 }
 
 struct Ctl {
@@ -177,6 +190,20 @@ fn apply(app: &AppWindow, v: View) {
 }
 
 fn post(v: &View) {
+    let live = update::state::Live {
+        phase: v.phase.to_string(),
+        version: v.version.clone(),
+        progress: v.progress,
+        error: v.error.clone(),
+        status: v.status.clone(),
+        checking: v.checking,
+        enabled: v.enabled,
+        preview: PREVIEW.load(Ordering::SeqCst),
+        at: now_unix(),
+    };
+    if let Err(e) = live.save(&neuron::runroot::run_root()) {
+        eprintln!("neuron: update status not written: {e}");
+    }
     let Some(weak) = UI.get().cloned() else { return };
     let v = v.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -227,6 +254,159 @@ pub fn install(app: &AppWindow) {
         let url = RELEASE_URL.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         crate::glue::open_external(if url.is_empty() { RELEASES } else { &url });
     });
+}
+
+/// The window opened: check again if the last check is old. Cheap: the release API answers a
+/// repeat question with "not modified".
+pub fn window_opened() {
+    request(|r| r.stale = true);
+}
+
+/// A request from `neuron update`, through livesync.
+pub fn command(op: neuron::livesync::UpdateOp) {
+    use neuron::livesync::UpdateOp;
+    match op {
+        UpdateOp::Check => request(|r| r.check = true),
+        UpdateOp::Install => request(|r| r.install = true),
+        UpdateOp::Preview { phase } => preview(&phase),
+        UpdateOp::EndPreview => end_preview(),
+    }
+}
+
+/// The phases a preview can open on.
+pub const PREVIEW_PHASES: [&str; 7] = ["available", "downloading", "ready", "installing", "updated", "rolled-back", "error"];
+
+/// Show the pill in `phase` with this build's own notes. Its buttons then walk the states as a
+/// real update would: download fills the bar, install restarts into "updated". Nothing is fetched
+/// or installed; "not now" or `neuron update preview off` ends it.
+fn preview(phase: &str) {
+    if !PREVIEW_PHASES.contains(&phase) {
+        return;
+    }
+    let run = PREVIEW_RUN.fetch_add(1, Ordering::SeqCst) + 1;
+    PREVIEW.store(true, Ordering::SeqCst);
+    let phase = phase.to_string();
+    crate::worker::spawn_detached("neuron-update-preview", move || run_preview(run, &phase));
+}
+
+fn end_preview() {
+    PREVIEW_RUN.fetch_add(1, Ordering::SeqCst);
+    if PREVIEW.swap(false, Ordering::SeqCst) {
+        post(&View { enabled: environment_allows(), status: format!("v{}", Version::current()), ..View::default() });
+    }
+}
+
+fn environment_allows() -> bool {
+    policy::availability(&environment()).is_ok()
+}
+
+/// The notes a preview shows: this version's section, else the newest in the bundled changelog.
+fn preview_release() -> Option<notes::Release> {
+    notes::find(CHANGELOG, &Version::current()).or_else(|| notes::parse(CHANGELOG).into_iter().next())
+}
+
+fn run_preview(run: u64, phase: &str) {
+    let live = || PREVIEW_RUN.load(Ordering::SeqCst) == run;
+    let current = Version::current();
+    let next = Version { patch: current.patch + 1, pre: Vec::new(), ..current.clone() };
+    let release = preview_release();
+    let mut view = View {
+        phase: "",
+        version: next.to_string(),
+        status: format!("v{next} available · preview"),
+        enabled: true,
+        notes: Some(release.as_ref().map(rows).unwrap_or_default()),
+        media: Some(release.as_ref().map(|r| local_media(r, &exe_dir())).unwrap_or_default()),
+        ..View::default()
+    };
+    let show = |view: &mut View, phase: &'static str| {
+        view.phase = phase;
+        post(view);
+        view.notes = None;
+        view.media = None;
+    };
+    // walk a download, then (when asked) an install that "restarts" into the updated card
+    let download = |view: &mut View, then_install: bool| -> bool {
+        view.queued = then_install;
+        for step in 0..=40 {
+            if !live() {
+                return false;
+            }
+            view.progress = step as f32 / 40.0;
+            show(view, "downloading");
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        view.queued = false;
+        show(view, "ready");
+        true
+    };
+    let install = |view: &mut View| {
+        show(view, "installing");
+        std::thread::sleep(Duration::from_millis(1600));
+        if !live() {
+            return;
+        }
+        view.status = format!("v{} · preview of the first launch after an update", view.version);
+        view.notes = Some(release.as_ref().map(rows).unwrap_or_default());
+        view.media = Some(release.as_ref().map(|r| local_media(r, &exe_dir())).unwrap_or_default());
+        show(view, "updated");
+    };
+    match phase {
+        "available" => show(&mut view, "available"),
+        "downloading" => {
+            if download(&mut view, false) {
+                view.progress = 0.0;
+                show(&mut view, "available");
+            }
+        }
+        "ready" => {
+            view.progress = 1.0;
+            show(&mut view, "ready");
+        }
+        "installing" => install(&mut view),
+        "updated" => show(&mut view, "updated"),
+        "rolled-back" => {
+            view.status = format!("{next} rolled back · preview");
+            show(&mut view, "rolled-back");
+        }
+        _ => {
+            view.error = "hash mismatch · retry".into();
+            show(&mut view, "error");
+        }
+    }
+    // the pill's own buttons, until the preview ends
+    while live() {
+        let c = ctl();
+        let req = {
+            let mut g = c.req.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !(g.download || g.install || g.dismiss || g.check) {
+                g = c.cv.wait_timeout(g, Duration::from_millis(250)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            }
+            if !live() {
+                return;
+            }
+            Requests { download: std::mem::take(&mut g.download), install: std::mem::take(&mut g.install), dismiss: std::mem::take(&mut g.dismiss), check: std::mem::take(&mut g.check), ..Requests::default() }
+        };
+        if req.dismiss {
+            end_preview();
+            return;
+        }
+        if req.check {
+            view.checking = true;
+            let phase = view.phase;
+            show(&mut view, phase);
+            std::thread::sleep(Duration::from_millis(700));
+            view.checking = false;
+            show(&mut view, "available");
+        }
+        if req.install {
+            if view.phase == "ready" || download(&mut view, true) {
+                install(&mut view);
+            }
+        } else if req.download {
+            download(&mut view, false);
+        }
+    }
 }
 
 /// The running version's own notes images, decoded off the UI thread.
@@ -395,7 +575,8 @@ impl Worker {
                 self.dismiss();
             }
             let timed = crate::prefs::update_auto() && now_unix() >= due;
-            if req.check || timed || ((req.download || req.install) && self.offer.is_none()) {
+            let stale = req.stale && crate::prefs::update_auto() && self.rec.last_check.is_none_or(|t| now_unix().saturating_sub(t) >= STALE);
+            if req.check || timed || stale || ((req.download || req.install) && self.offer.is_none()) {
                 self.check(req.check);
             }
             if req.download || req.install {
@@ -413,7 +594,7 @@ impl Worker {
         let c = ctl();
         let mut g = c.req.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
-            if g.check || g.download || g.install || g.dismiss || g.poke {
+            if !PREVIEW.load(Ordering::SeqCst) && (g.check || g.download || g.install || g.dismiss || g.poke || g.stale) {
                 return std::mem::take(&mut *g);
             }
             let now = now_unix();

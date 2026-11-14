@@ -38,6 +38,10 @@ pub enum TrayAction {
     SetBrightness(f32),
     SetDpi(f32),
     ReportBug,
+    /// Download the offered release if needed, install it and restart.
+    UpdateInstall,
+    /// Open the window on the update's notes.
+    UpdateNotes,
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -78,6 +82,22 @@ pub struct TraySnapshot {
     pub light: Option<(String, i32)>,
     /// the selected device, its DPI and its stages, when it has DPI
     pub dpi: Option<(String, i32, Vec<i32>)>,
+    /// the updater's phase, the version it concerns, and download progress in tenths
+    pub update: Option<(String, String, u8)>,
+}
+
+/// The tray's update line for the updater's `phase`, and what clicking it does (`None`: a status
+/// line, not a button).
+pub(crate) fn update_line(phase: &str, version: &str, tenths: u8) -> Option<(String, Option<TrayAction>)> {
+    Some(match phase {
+        "available" | "ready" => (format!("Install v{version} and restart"), Some(TrayAction::UpdateInstall)),
+        "downloading" => (format!("Downloading v{version} · {}%", u32::from(tenths) * 10), None),
+        "installing" => (format!("Installing v{version}…"), None),
+        "error" => (format!("Update to v{version} stopped · try again"), Some(TrayAction::UpdateInstall)),
+        "updated" => (format!("Updated to v{version} · what's new"), Some(TrayAction::UpdateNotes)),
+        "rolled-back" => (format!("v{version} rolled back · details"), Some(TrayAction::UpdateNotes)),
+        _ => return None,
+    })
 }
 
 
@@ -293,6 +313,10 @@ fn build_menu(snap: &TraySnapshot) -> (Menu, HashMap<String, TrayAction>) {
         let _ = menu.append(&it);
     };
     item(&status_line(snap), false, None, None);
+    if let Some((text, act)) = snap.update.as_ref().and_then(|(phase, version, tenths)| update_line(phase, version, *tenths)) {
+        let on = act.is_some();
+        item(&text, on, None, act);
+    }
     item("Open Neuron", true, key("Ctrl+Alt+N"), Some(TrayAction::Open));
     let _ = menu.append(&PredefinedMenuItem::separator());
 
@@ -398,4 +422,25 @@ fn register_hotkeys(map: &mut HashMap<String, TrayAction>) -> Option<GlobalHotKe
 #[cfg(any(windows, target_os = "linux"))]
 fn load_icon() -> anyhow::Result<tray_icon::Icon> {
     Ok(tray_icon::Icon::from_rgba(crate::mark::rgba(32), 32, 32)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_status_line_says_what_neuron_is_doing() {
+        let snap = |paused, armed| TraySnapshot { paused, armed, active: "work".into(), ..TraySnapshot::default() };
+        assert_eq!(status_line(&snap(false, true)), "Neuron · live · work");
+        assert_eq!(status_line(&snap(true, true)), "Neuron · device writes paused · work");
+        assert_eq!(status_line(&snap(false, false)), "Neuron · input off (safe mode) · work");
+    }
+
+    #[test]
+    fn the_update_line_offers_the_next_step_or_reports_progress() {
+        assert!(matches!(update_line("ready", "0.1.8", 10), Some((t, Some(TrayAction::UpdateInstall))) if t == "Install v0.1.8 and restart"));
+        assert!(matches!(update_line("downloading", "0.1.8", 4), Some((t, None)) if t == "Downloading v0.1.8 · 40%"));
+        assert!(matches!(update_line("updated", "0.1.8", 0), Some((_, Some(TrayAction::UpdateNotes)))));
+        assert!(update_line("", "0.1.8", 0).is_none());
+    }
 }

@@ -17,9 +17,21 @@ updater does not touch user config.
 
 Release builds also update themselves from inside the app: a header pill offers a newer signed
 release, and its `& install` drives the same lifecycle this script does (Windows Setup for an
-installed copy, this script for a portable one). If the user is in the app, that is the shorter
-path. It is off for source builds, Steam copies and when `NEURON_NO_UPDATE` is set. Its state is
-in the run root's `update/` folder. A version that failed to start after an in-app update was
+installed copy, this script for a portable one). It is off for source builds, Steam copies and
+when `NEURON_NO_UPDATE` is set. Its state is in the run root's `update/` folder.
+
+When neuron is running, drive that updater with the CLI rather than this script. It is the
+shorter path, and it goes through the same signature and hash checks the pill does:
+
+| ask | command |
+|---|---|
+| what's installed, the newest release, what the updater is doing | `neuron update status` (`--json` for fields) |
+| look for a newer release now | `neuron update check` |
+| download, install and restart | `neuron update install` (ask the user first: it restarts neuron) |
+
+`status` and `check` work with the app closed too (`check` then asks the release API itself);
+`install` needs the app running, because the app owns its install. A copy that does not update
+itself says why (`updates_itself: false`, `why_not`); use this script for those. A version that failed to start after an in-app update was
 rolled back automatically and is recorded as `skip` in `update/state.json`; the failed version's
 crash log is kept beside it as `failed-<version>-crash.log`.
 

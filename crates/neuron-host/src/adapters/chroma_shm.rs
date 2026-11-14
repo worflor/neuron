@@ -2174,12 +2174,16 @@ pub mod server {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::{ReleaseMutex, WaitForSingleObject};
 
+        /// A name no other test in this run can be holding: the clock alone repeats when two
+        /// tests start in the same 100 ns tick, and the second then meets the first's object.
         fn seed_test_name() -> String {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
                 .as_nanos();
-            format!(r"Local\neuron-chroma-seed-{}-{stamp}", std::process::id())
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!(r"Local\neuron-chroma-seed-{}-{stamp}-{n}", std::process::id())
         }
 
         #[test]

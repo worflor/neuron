@@ -85,6 +85,47 @@ pub fn dir(run_root: &Path) -> PathBuf {
     run_root.join("update")
 }
 
+/// What the running app's updater shows right now, `update/live.json`: written by the app on every
+/// change so `neuron update` can read it without asking.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Live {
+    /// "" · "available" · "downloading" · "ready" · "installing" · "error" · "updated" · "rolled-back"
+    pub phase: String,
+    /// The incoming (or just-installed) version, without the "v".
+    pub version: String,
+    /// 0..1 while downloading.
+    pub progress: f32,
+    pub error: String,
+    /// The SYSTEM line: "v0.1.8 available", "v0.1.7 · up to date", or why this copy does not update.
+    pub status: String,
+    pub checking: bool,
+    /// This copy updates itself at all.
+    pub enabled: bool,
+    /// The state shown is a preview (`neuron update preview`), not a real release.
+    pub preview: bool,
+    /// When this was written, unix seconds.
+    pub at: u64,
+}
+
+impl Live {
+    pub fn path(run_root: &Path) -> PathBuf {
+        dir(run_root).join("live.json")
+    }
+
+    pub fn load(run_root: &Path) -> Option<Self> {
+        std::fs::read(Self::path(run_root)).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    pub fn save(&self, run_root: &Path) -> std::io::Result<()> {
+        let path = Self::path(run_root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        crate::salvage::atomic_write(&path, &body)
+    }
+}
+
 impl State {
     pub fn path(run_root: &Path) -> PathBuf {
         dir(run_root).join("state.json")
@@ -119,6 +160,10 @@ mod tests {
         assert_eq!(State::load(&root), s);
         std::fs::write(State::path(&root), b"{not json").unwrap();
         assert_eq!(State::load(&root), State::default());
+        assert_eq!(Live::load(&root), None);
+        let live = Live { phase: "downloading".into(), version: "0.1.8".into(), progress: 0.5, enabled: true, at: 9, ..Live::default() };
+        live.save(&root).unwrap();
+        assert_eq!(Live::load(&root), Some(live));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

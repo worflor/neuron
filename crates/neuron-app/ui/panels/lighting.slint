@@ -149,15 +149,18 @@ component EffectTileCard inherits Rectangle {
         mouse-cursor: root.dimmed ? MouseCursor.default : MouseCursor.pointer;
         clicked => { if (!root.dimmed) { root.picked(); } }
     }
+    // add this effect as a new layer: a chip in the art's top-left corner that grows rightward into
+    // "above this │ below this". The choices fade in once it has room and take a click only once
+    // it has finished growing, so the icon's spot never fires a choice.
     layer-add := Rectangle {
         property <bool> open: add-ta.has-hover;
-        property <length> choice-w: (root.width - 42px) / 2;
-        // the choices take a click only once the chip has grown to full width: mid-growth the
-        // icon still sits where "above this" will be
+        property <length> icon-w: 20px;
+        property <length> choice-w: (root.width - 20px - self.icon-w) / 2;
         property <bool> settled: self.open && self.width >= root.width - 20.5px;
-        x: root.width - 10px - self.width;
-        y: (root.deletable || root.tile.source != "") ? 32px : 10px;
-        width: self.open ? root.width - 20px : 18px;
+        property <length> at: add-ta.mouse-x - self.icon-w;
+        x: 10px;
+        y: 10px;
+        width: self.open ? root.width - 20px : self.icon-w;
         height: 20px;
         visible: root.card-hovered && !root.dimmed;
         background: Theme.bg.with-alpha(0.88);
@@ -166,29 +169,33 @@ component EffectTileCard inherits Rectangle {
         border-color: self.open ? Theme.text-faint : Theme.line;
         clip: true;
         animate width { duration: 200ms; easing: ease-out; }
+        Path {
+            x: 3px; y: 2px; width: 14px; height: 16px;
+            viewbox-width: 16; viewbox-height: 16;
+            fill: transparent;
+            stroke: layer-add.open ? Theme.text : Theme.text-mid;
+            stroke-width: 1.2px;
+            commands: "M1 6 L6 3 L11 6 L6 9 Z M1 10 L6 13 L11 10 M12 1 V5 M10 3 H14";
+        }
         Rectangle {
-            x: 0px; width: layer-add.choice-w; height: 100%;
-            background: layer-add.settled && add-ta.mouse-x >= 0px && add-ta.mouse-x < layer-add.choice-w ? Theme.well-hi : transparent;
+            x: layer-add.icon-w; width: layer-add.choice-w; height: 100%;
+            opacity: layer-add.open ? 1 : 0;
+            animate opacity { duration: Theme.quick; }
+            background: layer-add.settled && layer-add.at >= 0px && layer-add.at < layer-add.choice-w ? Theme.well-hi : transparent;
             Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "above this"; font-size: Theme.fs-small; color: Theme.text-mid; }
         }
         Rectangle {
-            x: layer-add.choice-w; width: layer-add.choice-w; height: 100%;
-            background: layer-add.settled && add-ta.mouse-x >= self.x && add-ta.mouse-x < layer-add.choice-w * 2 ? Theme.well-hi : transparent;
+            x: layer-add.icon-w + layer-add.choice-w; width: layer-add.choice-w; height: 100%;
+            opacity: layer-add.open ? 1 : 0;
+            animate opacity { duration: Theme.quick; }
+            background: layer-add.settled && layer-add.at >= layer-add.choice-w && layer-add.at < layer-add.choice-w * 2 ? Theme.well-hi : transparent;
             Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "below this"; font-size: Theme.fs-small; color: Theme.text-mid; }
-        }
-        Path {
-            x: parent.width - 16px; y: 2px; width: 14px; height: 16px;
-            viewbox-width: 16; viewbox-height: 16;
-            fill: transparent;
-            stroke: Theme.text-mid;
-            stroke-width: 1.2px;
-            commands: "M1 6 L6 3 L11 6 L6 9 Z M1 10 L6 13 L11 10 M12 1 V5 M10 3 H14";
         }
         add-ta := TouchArea {
             mouse-cursor: MouseCursor.pointer;
             clicked => {
-                if (layer-add.settled && self.mouse-x < layer-add.choice-w * 2) {
-                    root.layer-added(self.mouse-x < layer-add.choice-w);
+                if (layer-add.settled && layer-add.at >= 0px && layer-add.at < layer-add.choice-w * 2) {
+                    root.layer-added(layer-add.at < layer-add.choice-w);
                 }
             }
         }

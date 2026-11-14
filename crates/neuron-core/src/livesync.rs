@@ -37,6 +37,23 @@ pub enum Command {
     ApplyProfile { name: String },
     /// Handle one bounded pocket-management request stored beneath the run root.
     PocketRequest { request_id: String },
+    /// Drive the app's updater, as its own pill and SYSTEM controls do.
+    Update { op: UpdateOp },
+}
+
+/// What `neuron update` asks the running app's updater to do.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "kebab-case")]
+pub enum UpdateOp {
+    /// Check for a newer release now.
+    Check,
+    /// Download the offered release if needed, then install it and restart.
+    Install,
+    /// Show the pill in `phase` with this build's own notes, touching no network and installing
+    /// nothing; its buttons walk the states as a real update would.
+    Preview { phase: String },
+    /// Leave a preview.
+    EndPreview,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,8 +413,13 @@ mod tests {
         assert!(take().is_empty());
         send(&Command::Reload).unwrap();
         send(&Command::ApplyProfile { name: "game".into() }).unwrap();
+        send(&Command::Update { op: UpdateOp::Preview { phase: "ready".into() } }).unwrap();
         assert!(pending());
-        assert_eq!(take(), vec![Command::Reload, Command::ApplyProfile { name: "game".into() }]);
+        assert_eq!(take(), vec![
+            Command::Reload,
+            Command::ApplyProfile { name: "game".into() },
+            Command::Update { op: UpdateOp::Preview { phase: "ready".into() } },
+        ]);
         assert!(!pending(), "claiming removes the queue: that is the acknowledgement");
         assert!(take().is_empty());
     }

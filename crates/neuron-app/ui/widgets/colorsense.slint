@@ -744,7 +744,7 @@ component RollBank inherits Rectangle {
 }
 
 // What a roll starts from and how far it strays, in a drawer that opens under the roll button.
-// Choosing where to start rolls one straight away; the wildness applies to the next roll.
+// Both apply to the next roll; only the roll button rolls.
 export component RollDrawer inherits Rectangle {
     in property <bool> open;
     height: root.open ? lay.preferred-height : 0px;
@@ -759,11 +759,7 @@ export component RollDrawer inherits Rectangle {
             options: State.roll-modes;
             index: State.roll-mode;
             base: 0;
-            picked(i) => {
-                State.roll-choose(i, State.roll-wild);
-                State.roll();
-                State.picker-focus += 1;
-            }
+            picked(i) => { State.roll-choose(i, State.roll-wild); }
         }
         RollBank {
             options: State.roll-wilds;
