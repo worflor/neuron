@@ -346,18 +346,31 @@ export struct OrganRow {
 }
 
 // One row of release notes, drawn as plain styled text: kind "head" (the headline), "group" (a
-// subsection title), "item" (a bullet with an optional bold lead), "thanks".
+// section title, `body` its opening line), "item" (a bullet with an optional bold lead), "sub" (a
+// part of the item above), "thanks". A lead that opens with a name neuron draws in its own colours
+// carries it in `letters`: `ink` "luma" for Luma-T's ink, "palette" for an effect's palette (one
+// colour per letter in `colours`); `rest` is the lead after the name.
 export struct NoteRow {
     kind: string,
     title: string,
     body: string,
+    ink: string,
+    letters: [string],
+    colours: [color],
+    rest: string,
 }
 
-// A notes image, decoded off the UI thread; `ratio` is height / width.
+// A notes picture, decoded off the UI thread. `ratio` is its height / width, `stage` the tallest
+// ratio in its set. An animated one shows `img` (its first frame) until State.media-play(id)
+// streams its frames into State.media-frame; one pass takes `pass-ms`.
 export struct NoteMedia {
     img: image,
     alt: string,
     ratio: float,
+    stage: float,
+    id: string,
+    animated: bool,
+    pass-ms: int,
 }
 
 // One sector of the radial preview.

@@ -447,11 +447,10 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
             }
             let offered = |scope: Scope| slate.offers.iter().enumerate().filter(move |(_, offer)| offer.scope == scope);
             // rolls lead the row, newest first; then the engines' palettes, the way back, the dots
-            // a roll that would move a stop held since it was made is no longer one to offer
+            // a roll that leaves out a colour held since it was made is no longer one to offer
             sense.rolls.retain(|(at, offer)| {
                 *at == home
-                    && (offer.stops.len() != palette.stops.len()
-                        || offer.stops.iter().zip(&palette.stops).enumerate().all(|(i, (new, old))| !pins.get(i).copied().unwrap_or(false) || new.col == old.col))
+                    && palette.stops.iter().zip(&pins).filter(|(_, pin)| **pin).all(|(held, _)| offer.stops.iter().any(|new| new.col == held.col))
             });
             // the row holds PILLS capsules beside the ask capsule; older rolls give way to the
             // engines' palettes and the way back, the newest roll is always shown
@@ -662,6 +661,16 @@ fn accept(app: &AppWindow, sh: &SharedRt, index: i32) {
                     None => journal.undo(&offer.stops),
                 });
             }
+        }
+        // a held colour stays held wherever the kept palette put it, even at a new stop count
+        if let Some((_, pins)) = sense.pins.as_mut().filter(|(at, _)| *at == home) {
+            let mut kept = vec![false; offer.stops.len()];
+            for held in was_stops.iter().zip(pins.iter()).filter(|(_, pin)| **pin).map(|(stop, _)| stop.col) {
+                if let Some(slot) = (0..kept.len()).find(|&j| !kept[j] && offer.stops[j].col == held) {
+                    kept[slot] = true;
+                }
+            }
+            *pins = kept;
         }
         sense.undo = (place.is_some() || rolled).then(|| (home, was_stops, was_interp, offer.stops.clone()));
         sense.base = None;

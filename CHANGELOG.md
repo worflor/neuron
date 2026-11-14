@@ -1,50 +1,49 @@
 # changelog
 
 ## 0.1.8 · 2026-11-14
-the colour picker grew a brain: Luma-T, a tiny colour model that edits with you. neuron updates itself now, plus a pile of everyday fixes.
+the colour picker grew a brain: Luma-T, a real-time colour model that edits with you. neuron updates itself now, plus a pile of everyday fixes.
 ![picker v2 with Luma-T's first idea drafted on a stop, contour rings around where it fits](docs/media/picker-v2-suggest.webp)
 ![a fresh roll on show, with the roll drawer open](docs/media/picker-v2-roll.webp)
 ![Tidepool, neuron's new shallow-water effect, rendered on a keyboard](docs/media/release-v0.1.8-tidepool.webp)
 
 ### new
-- **Luma-T.** a 663k-parameter colour model that runs on your computer in real time, no GPU or internet. it suggests colours for the stop you're editing, carries a change through the palette, tidies the stops around it and colours new ones.
-- **picker v2, now the default.** lightness and vividness on a plane, hue on a rail, in an even colour space, so turning the hue keeps the colour as light as it was. suggestions sit where you'd pick: dots in the square, pills underneath. hover to try one, click to keep it. `v1` in the spectrum header brings the old one back.
-- **ask and roll.** ask gets ideas even when Luma-T would leave your palette alone (drawn faint: they're a stretch). roll makes a whole palette: around the stops you're holding, from scratch, like your other palettes, or pure chance.
-- **drive it from the keyboard.** arrows nudge a stop. Tab shows the first idea and Tab again keeps it, Tab with a number picks another, `R` rolls, `Ctrl+Z` takes it back.
-- **it learns your taste.** what you keep and pass over shapes what it suggests next, on your machine only. `picker_journal = false` turns it off.
-- **see what it's thinking.** an amber squiggle marks a stop it would change; contour rings in the square and hills on the hue rail show where a colour would fit.
-- **updates, in the app.** a pill in the header and a line in the tray say when a new signed release is out. click the version for what's new; `& install` does the rest. `neuron update` does it from a terminal, for you or your agent. off for source builds, Steam copies and `NEURON_NO_UPDATE`.
-- **it won't brick you.** the previous version stays on disk until the new one has run for a minute. if it crashes twice first, the next start puts the old one back and skips that version.
-- **report a bug.** say what happened on the system page and neuron writes a report (version, devices, crash log, your name and paths scrubbed) and opens an issue for it. **for your agent** copies a prompt instead. also `neuron report bug`.
-- **neuron has a face.** a lowercase `n.`, in the tray, the taskbar and on the exe.
-- **a tray menu that tells you things.** whether neuron's live, what everything is set to, and the hotkeys beside what they do. brightness and dpi jump straight to a value.
-- **a status bar you can click.** undo the last profile, lighting or audio change, jump from what fired to the rule behind it, or make an app rule from the app in front.
-- **look inside a pocket.** click one to see what it holds and copy its text out.
-- **try a clipboard transform on real text.** paste a clipboard sample and watch each step change it.
-- **effect options show themselves.** each option carries a small live preview.
+- **Luma-T, in the colour picker.** 663k parameters, running on your computer in real time, with no GPU or internet.
+  - **suggestions.** colours for the stop you're editing, a change carried through the palette, new stops coloured in. hover to try one, click to keep it.
+  - **ask and roll.** ask for the ideas it would keep to itself, or roll a whole palette around the stops you hold.
+  - **its thinking, drawn.** a squiggle on a stop it would change, rings and hills where a colour would fit.
+  - **your taste.** it learns from what you keep and pass over, on your machine only.
+- **picker v2, now the default.** lightness and vividness on a plane, hue on a rail, in an even colour space. arrows nudge a stop, Tab takes an idea, `R` rolls. `v1` in the spectrum header brings the old one back.
 - **Tidepool.** sunlit shallow water on your keys, rippling where you type.
+- **neuron updates itself.** a pill in the header says when a signed release is out: click it for what's new, `& install` for the rest. the old version stays until the new one runs cleanly. also from the tray, and `neuron update` in a terminal.
 - **Fn keys survive driver mode.** keyboards held for their macro keys keep their Fn combos and media keys, and there's a new `game-mode` action.
+- **a tray and status bar that talk back.**
+  - **the tray** says whether neuron's live and what everything is set to, with the hotkeys beside what they do.
+  - **the status bar** undoes the last change, jumps to the rule that fired, and makes an app rule from the app in front.
+- **report a bug** from the system page: neuron writes a report with your name and paths scrubbed and opens an issue for it, or copies a prompt for your agent.
+- **see inside pockets and transforms.** click a pocket to read and copy it; paste a sample to watch a clipboard transform work step by step.
+- **effect options preview themselves.**
+- **neuron has a face.** a lowercase `n.`, in the tray, the taskbar and on the exe.
 
 ### better
-- **system, sorted.** one page, grouped in the order you reach for things, with an index to jump around. diagnostics take a line each.
-- **the roll drawer shows its choices.** each option draws what it does. hold shows on the strip what it'll keep, and an x dismisses a roll or an idea you asked for.
-- **macros know where they're bound.** a macro's card binds it in one click, or shows what fires it.
+- **system, sorted.** one page in the order you reach for things, with an index to jump around.
+- **macros know where they're bound.** a macro's card shows what fires it, or binds it in one click.
 - **add a layer above or below** the one you're on, straight from an effect's tile.
-- **Luma-T answers fast.** 10 to 60 ms per edit, down from up to a second.
-- **devices update live.** adopt or edit a device and the whole app sees it, no restart.
-- **crisper UI.** pages sit on whole pixels so thin lines stay sharp, the stop keys shrank to `− │ +` and preview what they'll do, and long names fade at the edge.
+- **devices update live** when you adopt or edit one.
+- **crisper UI.** thin lines stay sharp, and long names fade at the edge.
 - **longer timeline holds.** `stay` goes to 30 s and `fade in` to 10 s.
 
 ### fixed
+mostly input, found living with it every day.
 - **binds on keys a device can't remap itself** fire again, and a key shared by several keyboards goes to the one you typed on.
-- **HyperShift** keys type normally unless you're holding the HyperShift key.
-- **quitting with a sleeping wireless Naga** is quick again.
+- **HyperShift** keys type normally unless you're holding HyperShift.
 - **a device asleep at startup** gets retried, and input arms once it wakes.
 - **macros on a busy machine** get the time they need to arm.
-- **two stops on the same spot** get suggestions too.
-- **a damaged colour model** you drop in is set aside with a note, and Luma-T takes over.
-- **the window flickered** when you hovered the roll button, and a closing guide card ate your next click. both gone.
+- **quitting with a sleeping wireless Naga** is quick again.
+- **closing a guide card** leaves your next click for what's under it.
 - **shared device files** can't attach commands to keys a built-in definition doesn't have.
+
+### p.s.
+- **Tidepool** gets an honourable second mention, just cuz. use it, try it, it's cool. pls <3
 
 ## 0.1.7 · 2026-11-08
 a hardening pass. i went through neuron trying to break it and fixed what fell out: macros and shared setups locked down, and the keyboards you reported now light up properly.

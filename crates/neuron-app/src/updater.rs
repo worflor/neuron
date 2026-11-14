@@ -16,7 +16,7 @@ use neuron::update::{self, client, install, notes, policy, state::State as Recor
 use slint::ComponentHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The changelog this build shipped with; SYSTEM shows the running version's section from it.
@@ -68,11 +68,18 @@ fn request(f: impl FnOnce(&mut Requests)) {
 
 /// A decoded notes image, ready to become a Slint image on the UI thread.
 #[derive(Clone)]
-struct Pixels {
+pub(crate) struct Pixels {
     rgba: Vec<u8>,
     w: u32,
     h: u32,
     alt: String,
+    /// The file's path in the notes, which names it to the player.
+    id: String,
+    /// An animation keeps its encoded file (at most `MAX_MEDIA_BYTES`) and is played frame by
+    /// frame while on show; `rgba` is its first frame.
+    anim: Option<Arc<[u8]>>,
+    /// One pass of the animation, in ms.
+    pass_ms: u32,
 }
 
 /// What the worker shows; `notes`/`media` replace the models only when they change.
@@ -91,17 +98,21 @@ struct View {
 }
 
 /// Rows for a release, in reading order.
-fn rows(r: &notes::Release) -> Vec<(String, String, String)> {
+pub(crate) fn rows(r: &notes::Release) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     if !r.headline.is_empty() {
-        out.push(("head".into(), String::new(), r.headline.clone()));
+        // the tagline leads; the rest of the headline sits under it
+        let head = r.headline.trim();
+        let tag = r.tagline();
+        let rest = head.strip_prefix(tag).map_or("", |s| s.trim_start_matches(['.', ':']).trim());
+        out.push(("head".into(), tag.to_string(), rest.to_string()));
     }
     for s in &r.sections {
         if !s.title.is_empty() {
-            out.push(("group".into(), s.title.clone(), String::new()));
+            out.push(("group".into(), s.title.clone(), s.intro.clone()));
         }
         for i in &s.items {
-            out.push(("item".into(), i.title.clone(), i.body.clone()));
+            out.push((if i.sub { "sub" } else { "item" }.into(), i.title.clone(), i.body.clone()));
         }
     }
     if !r.thanks.is_empty() {
@@ -110,25 +121,80 @@ fn rows(r: &notes::Release) -> Vec<(String, String, String)> {
     out
 }
 
-fn note_rows(rows: &[(String, String, String)]) -> slint::ModelRc<NoteRow> {
-    slint::ModelRc::new(slint::VecModel::from(
-        rows.iter().map(|(k, t, b)| NoteRow { kind: k.as_str().into(), title: t.as_str().into(), body: b.as_str().into() }).collect::<Vec<_>>(),
-    ))
+/// The name a lead opens with that neuron draws in its own colours: Luma-T in its ink, or an
+/// effect in its palette (one colour per letter, lifted so a dark palette still reads on the
+/// drawer). Returns the ink, the name, and the letters' colours.
+fn name_ink(title: &str) -> Option<(&'static str, &str, Vec<slint::Color>)> {
+    // exact case: leads are lowercase and names are not, so "static" stays a word
+    let opens = |name: &str| title.starts_with(name) && !title[name.len()..].starts_with(|c: char| c.is_alphanumeric());
+    if opens("Luma-T") {
+        return Some(("luma", &title[..6], Vec::new()));
+    }
+    let p = neuron::pattern::presets().into_iter().find(|p| opens(p.label))?;
+    let name = &title[..p.label.len()];
+    let spectrum = (p.spectrum)();
+    let n = name.chars().count().max(1);
+    let colours = (0..n)
+        .map(|i| {
+            let c = spectrum.at(0.0, (i as f32 + 0.5) / n as f32);
+            let (r, g, b) = (f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0);
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let lift = if y < 0.55 { (0.55 - y) / (1.0 - y) } else { 0.0 };
+            let up = |v: f32| ((v + (1.0 - v) * lift) * 255.0).round() as u8;
+            slint::Color::from_rgb_u8(up(r), up(g), up(b))
+        })
+        .collect();
+    Some(("palette", name, colours))
 }
 
-fn note_media(px: &[Pixels]) -> slint::ModelRc<NoteMedia> {
+pub(crate) fn note_rows(rows: &[(String, String, String)]) -> slint::ModelRc<NoteRow> {
+    let row = |(k, t, b): &(String, String, String)| {
+        let mut row = NoteRow { kind: k.as_str().into(), title: t.as_str().into(), body: b.as_str().into(), ..Default::default() };
+        if let ("item" | "sub", Some((ink, name, colours))) = (k.as_str(), name_ink(t)) {
+            row.ink = ink.into();
+            row.letters = slint::ModelRc::new(slint::VecModel::from(name.chars().map(|c| slint::SharedString::from(c.to_string())).collect::<Vec<_>>()));
+            row.colours = slint::ModelRc::new(slint::VecModel::from(colours));
+            row.rest = t[name.len()..].into();
+        }
+        row
+    };
+    slint::ModelRc::new(slint::VecModel::from(rows.iter().map(row).collect::<Vec<_>>()))
+}
+
+/// The stage a set of pictures shares: as tall as the tallest, so stepping between them moves
+/// nothing below it.
+fn stage_ratio(px: &[Pixels]) -> f32 {
+    px.iter().map(|p| p.h as f32 / p.w.max(1) as f32).fold(0.0, f32::max)
+}
+
+pub(crate) fn note_media(px: &[Pixels]) -> slint::ModelRc<NoteMedia> {
+    let stage = stage_ratio(px);
+    for p in px {
+        if let Some(a) = &p.anim {
+            player::register(&p.id, a.clone());
+        }
+    }
     slint::ModelRc::new(slint::VecModel::from(
         px.iter()
             .map(|p| {
                 let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&p.rgba, p.w, p.h);
-                NoteMedia { img: slint::Image::from_rgba8(buf), alt: p.alt.as_str().into(), ratio: p.h as f32 / p.w.max(1) as f32 }
+                NoteMedia {
+                    img: slint::Image::from_rgba8(buf),
+                    alt: p.alt.as_str().into(),
+                    ratio: p.h as f32 / p.w.max(1) as f32,
+                    stage,
+                    id: p.id.as_str().into(),
+                    animated: p.anim.is_some(),
+                    pass_ms: i32::try_from(p.pass_ms).unwrap_or(i32::MAX),
+                }
             })
             .collect::<Vec<_>>(),
     ))
 }
 
-/// Decode one image, bounded in bytes and pixels. Off the UI thread.
-fn decode(bytes: &[u8], alt: &str) -> Option<Pixels> {
+/// Decode one image, bounded in bytes and pixels. Off the UI thread. An animated WebP or GIF is
+/// read through once here, so the player is only ever handed one that decodes to the end.
+fn decode(bytes: &[u8], alt: &str, id: &str) -> Option<Pixels> {
     if bytes.len() as u64 > update::manifest::MAX_MEDIA_BYTES {
         return None;
     }
@@ -138,30 +204,194 @@ fn decode(bytes: &[u8], alt: &str) -> Option<Pixels> {
     limits.max_image_height = Some(8192);
     limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    let mut img = reader.decode().ok()?;
+    let rgba = fit(reader.decode().ok()?);
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let pass = player::pass_ms(bytes);
+    Some(Pixels {
+        rgba: rgba.into_raw(),
+        w,
+        h,
+        alt: alt.to_string(),
+        id: id.to_string(),
+        anim: pass.map(|_| Arc::from(bytes)),
+        pass_ms: pass.unwrap_or(0),
+    })
+}
+
+/// Scale down to the width the drawer draws at.
+fn fit(img: image::DynamicImage) -> image::RgbaImage {
     if img.width() > MEDIA_MAX_WIDTH {
         let h = (u64::from(img.height()) * u64::from(MEDIA_MAX_WIDTH) / u64::from(img.width().max(1))).max(1) as u32;
-        img = img.resize_exact(MEDIA_MAX_WIDTH, h, image::imageops::FilterType::Triangle);
+        return img.resize_exact(MEDIA_MAX_WIDTH, h, image::imageops::FilterType::Triangle).to_rgba8();
     }
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    (w > 0 && h > 0).then(|| Pixels { rgba: rgba.into_raw(), w, h, alt: alt.to_string() })
+    img.to_rgba8()
 }
 
 /// Media for the running version's own notes, from the `docs/` the package installs beside it.
-fn local_media(r: &notes::Release, exe_dir: &Path) -> Vec<Pixels> {
+/// A source build has none beside it and reads them from the tree it was built from.
+pub(crate) fn local_media(r: &notes::Release, exe_dir: &Path) -> Vec<Pixels> {
+    let tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     r.media
         .iter()
         .take(update::manifest::MAX_MEDIA)
         .filter_map(|m| {
-            let path = exe_dir.join(&m.path);
+            let path = [exe_dir, tree.as_path()].iter().map(|d| d.join(&m.path)).find(|p| p.is_file())?;
             let len = std::fs::metadata(&path).ok()?.len();
             if len > update::manifest::MAX_MEDIA_BYTES {
                 return None;
             }
-            decode(&std::fs::read(path).ok()?, &m.alt)
+            decode(&std::fs::read(path).ok()?, &m.alt, &m.path)
         })
         .collect()
+}
+
+/// Plays an animated notes picture while it is on show: one thread decodes its frames from the
+/// encoded file as they fall due and hands each to the UI, so a long loop is never held decoded.
+/// The last picture asked for plays; asking for another, or stopping, ends the one before.
+pub(crate) mod player {
+    use super::{fit, State, UI};
+    use image::AnimationDecoder;
+    use slint::ComponentHandle;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    /// Frames read at most to time one pass, and the longest pass the slideshow waits out.
+    const MAX_FRAMES: u32 = 2000;
+    const MAX_PASS_MS: u128 = 60_000;
+
+    static FILES: Mutex<Vec<(String, Arc<[u8]>)>> = Mutex::new(Vec::new());
+    static PLAYING: Mutex<String> = Mutex::new(String::new());
+    /// Bumped by every play and stop; a playing thread holding an older ticket ends.
+    static TICKET: AtomicU64 = AtomicU64::new(0);
+
+    fn frames(bytes: &[u8]) -> Option<image::Frames<'_>> {
+        let cur = std::io::Cursor::new(bytes);
+        match image::guess_format(bytes).ok()? {
+            image::ImageFormat::WebP => {
+                let d = image::codecs::webp::WebPDecoder::new(cur).ok()?;
+                d.has_animation().then(|| d.into_frames())
+            }
+            image::ImageFormat::Gif => Some(image::codecs::gif::GifDecoder::new(cur).ok()?.into_frames()),
+            _ => None,
+        }
+    }
+
+    /// How long a frame stays up. As in browsers, a delay of 10 ms or less means 100 ms.
+    fn hold(f: &image::Frame) -> Duration {
+        let (n, d) = f.delay().numer_denom_ms();
+        let ms = u64::from(n) / u64::from(d.max(1));
+        Duration::from_millis(if ms <= 10 { 100 } else { ms })
+    }
+
+    /// One pass's length, when `bytes` is an animation of two or more frames that all decode.
+    pub(super) fn pass_ms(bytes: &[u8]) -> Option<u32> {
+        let mut total = Duration::ZERO;
+        let mut n = 0u32;
+        for f in frames(bytes)? {
+            total += hold(&f.ok()?);
+            n += 1;
+            if n >= MAX_FRAMES {
+                break;
+            }
+        }
+        (n > 1).then(|| total.as_millis().min(MAX_PASS_MS) as u32)
+    }
+
+    pub(super) fn register(id: &str, bytes: Arc<[u8]>) {
+        let mut files = FILES.lock().unwrap_or_else(PoisonError::into_inner);
+        files.retain(|(k, _)| k != id);
+        files.push((id.to_string(), bytes));
+        // two releases' pictures at most are on hand: the running version's and the offer's
+        let excess = files.len().saturating_sub(2 * neuron::update::manifest::MAX_MEDIA);
+        files.drain(..excess);
+    }
+
+    /// Play `id` on a loop until it is stopped or another is played.
+    pub fn play(id: &str) {
+        let ticket = TICKET.fetch_add(1, Ordering::SeqCst) + 1;
+        *PLAYING.lock().unwrap_or_else(PoisonError::into_inner) = id.to_string();
+        let bytes = FILES.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(k, _)| k == id).map(|(_, b)| b.clone());
+        let (Some(bytes), Some(ui)) = (bytes, UI.get().cloned()) else { return };
+        let id = id.to_string();
+        crate::worker::spawn_detached("neuron-notes-player", move || {
+            let current = || TICKET.load(Ordering::SeqCst) == ticket;
+            let mut due = Instant::now();
+            while current() {
+                let Some(pass) = frames(&bytes) else { return };
+                for f in pass {
+                    let Ok(f) = f else { return };
+                    let wait = hold(&f);
+                    let px = fit(image::DynamicImage::ImageRgba8(f.into_buffer()));
+                    let (w, h) = px.dimensions();
+                    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(px.as_raw(), w, h);
+                    match due.checked_duration_since(Instant::now()) {
+                        Some(early) => std::thread::sleep(early),
+                        // fell behind (the machine was busy): carry on from now, never race to catch up
+                        None => due = Instant::now(),
+                    }
+                    if !current() {
+                        return;
+                    }
+                    let (ui, id) = (ui.clone(), id.clone());
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if TICKET.load(Ordering::SeqCst) != ticket {
+                            return;
+                        }
+                        if let Some(app) = ui.upgrade() {
+                            let st = app.global::<State>();
+                            st.set_media_frame(slint::Image::from_rgba8(buf));
+                            st.set_media_frame_of(id.as_str().into());
+                        }
+                    });
+                    due += wait;
+                }
+            }
+        });
+    }
+
+    /// Stop `id` if it is the one playing (any, for ""); it falls back to its first frame.
+    pub fn stop(id: &str) {
+        let mut playing = PLAYING.lock().unwrap_or_else(PoisonError::into_inner);
+        if !id.is_empty() && *playing != id {
+            return;
+        }
+        playing.clear();
+        TICKET.fetch_add(1, Ordering::SeqCst);
+        if let Some(ui) = UI.get().cloned() {
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = ui.upgrade() {
+                    app.global::<State>().set_media_frame_of("".into());
+                }
+            });
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn an_animation_is_timed_and_a_still_is_not() {
+            use image::codecs::gif::GifEncoder;
+            let mut gif = Vec::new();
+            {
+                let mut enc = GifEncoder::new(&mut gif);
+                for c in [0u8, 255] {
+                    let buf = image::RgbaImage::from_pixel(4, 4, image::Rgba([c, c, c, 255]));
+                    enc.encode_frame(image::Frame::from_parts(buf, 0, 0, image::Delay::from_numer_denom_ms(250, 1))).unwrap();
+                }
+            }
+            assert_eq!(super::pass_ms(&gif), Some(500));
+            let px = super::super::decode(&gif, "loop", "a.gif").unwrap();
+            assert!(px.anim.is_some());
+            assert_eq!(px.pass_ms, 500);
+            let mut png = Vec::new();
+            image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+            assert_eq!(super::pass_ms(&png), None);
+        }
+    }
 }
 
 fn exe_dir() -> PathBuf {
@@ -182,6 +412,7 @@ fn apply(app: &AppWindow, v: View) {
         st.set_update_notes(note_rows(rows));
     }
     if let Some(px) = &v.media {
+        player::stop("");
         st.set_update_media(note_media(px));
     }
     if v.phase.is_empty() && st.get_update_notes_open() {
@@ -239,6 +470,8 @@ pub fn install(app: &AppWindow) {
     st.on_update_dismiss(|| request(|r| r.dismiss = true));
     st.on_update_check_now(|| request(|r| r.check = true));
     st.on_update_restart(restart);
+    st.on_media_play(|id| player::play(&id));
+    st.on_media_stop(|id| player::stop(&id));
     st.on_update_set_auto({
         let w = app.as_weak();
         move |v| {
@@ -764,7 +997,7 @@ impl Worker {
                 .into_iter()
                 .filter_map(|(m, bytes)| {
                     let alt = offer.manifest.release_notes().and_then(|r| r.media.into_iter().find(|x| x.path == m.path)).map(|x| x.alt).unwrap_or_default();
-                    decode(&bytes, &alt)
+                    decode(&bytes, &alt, &m.path)
                 })
                 .collect();
             self.view.media = Some(px);
@@ -903,11 +1136,13 @@ mod tests {
         let r = notes::parse_section("## 0.1.8 · 2026-11-20\nthe updater.\n### new\n- **luma-t.** learns.\n### thanks\n@a").unwrap();
         let kinds: Vec<_> = rows(&r).into_iter().map(|(k, t, _)| (k, t)).collect();
         assert_eq!(kinds, vec![
-            ("head".to_string(), String::new()),
+            ("head".to_string(), "the updater".to_string()),
             ("group".to_string(), "new".to_string()),
             ("item".to_string(), "luma-t.".to_string()),
             ("thanks".to_string(), String::new()),
         ]);
+        let r = notes::parse_section("## 0.1.8 · 2026-11-20\nthe picker grew a brain: Luma-T. and fixes.").unwrap();
+        assert_eq!(&rows(&r)[0], &("head".to_string(), "the picker grew a brain".to_string(), "Luma-T. and fixes.".to_string()));
     }
 
     #[test]
@@ -916,9 +1151,21 @@ mod tests {
         image::RgbaImage::from_pixel(1680, 10, image::Rgba([1, 2, 3, 255]))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        let px = decode(&png, "a").unwrap();
+        let px = decode(&png, "a", "a.png").unwrap();
         assert_eq!((px.w, px.h), (840, 5));
-        assert!(decode(b"not an image", "b").is_none());
+        assert!(decode(b"not an image", "b", "b.png").is_none());
+    }
+
+    #[test]
+    fn named_leads_wear_their_colours() {
+        let (ink, name, colours) = name_ink("Luma-T, in the colour picker.").unwrap();
+        assert_eq!((ink, name, colours.len()), ("luma", "Luma-T", 0));
+        let (ink, name, colours) = name_ink("Tidepool.").unwrap();
+        assert_eq!((ink, name, colours.len()), ("palette", "Tidepool", 8));
+        let lit = |c: &slint::Color| 0.2126 * f32::from(c.red()) + 0.7152 * f32::from(c.green()) + 0.0722 * f32::from(c.blue());
+        assert!(colours.iter().all(|c| lit(c) >= 0.5 * 255.0), "a palette is lifted to read on the drawer");
+        assert!(name_ink("static colours.").is_none(), "a lowercase word is not a name");
+        assert!(name_ink("Tidepools.").is_none() && name_ink("Luma-Tea.").is_none(), "a name ends at its last letter");
     }
 
     #[test]

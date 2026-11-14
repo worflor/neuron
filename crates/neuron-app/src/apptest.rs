@@ -1720,6 +1720,19 @@ fn second_picker_offers_preview_accept_and_undo() {
         assert!(st.get_assist_offers().iter().any(|o| o.back), "and the way back is there");
         st.invoke_assist_accept(st.invoke_assist_option(0));
         assert_eq!(stops(), resting);
+        // a fresh roll keeps the held colour too, and keeping it, or going back, keeps the hold
+        st.invoke_roll_choose(1, 1);
+        st.invoke_roll();
+        let at = stops().iter().position(|s| s.col == resting[held].col).expect("a fresh roll keeps the held colour");
+        st.invoke_assist_accept(0);
+        snap(&app).unwrap();
+        assert_eq!(st.get_light_pins().iter().nth(at), Some(true), "the kept roll still holds it");
+        st.invoke_assist_accept(st.invoke_assist_option(0));
+        snap(&app).unwrap();
+        assert_eq!(stops(), resting);
+        assert_eq!(st.get_light_pins().iter().nth(held), Some(true), "and so does the way back");
+        st.set_light_sel_stop(held as i32);
+        st.invoke_picker_sync();
         st.invoke_toggle_pin();
         st.invoke_roll_choose(1, 2);
         assert_eq!(crate::prefs::roll_choice(), ("fresh".to_string(), "wild".to_string()), "the choice is saved");
@@ -2063,7 +2076,7 @@ fn update_pill_drawer_and_system_notes_draw_and_fit() {
     std::env::set_var("SLINT_SCALE_FACTOR", "1");
     let Some(app) = try_window() else { return };
     let st = app.global::<State>();
-    let row = |kind: &str, title: &str, body: &str| NoteRow { kind: kind.into(), title: title.into(), body: body.into() };
+    let row = |kind: &str, title: &str, body: &str| NoteRow { kind: kind.into(), title: title.into(), body: body.into(), ..Default::default() };
     let notes = ModelRc::new(VecModel::from(vec![
         row("head", "", "the in-app updater, and patch notes you can read before you install."),
         row("group", "new", ""),
@@ -2077,7 +2090,7 @@ fn update_pill_drawer_and_system_notes_draw_and_fit() {
     for (i, p) in px.make_mut_slice().iter_mut().enumerate() {
         *p = slint::Rgba8Pixel { r: (i % 320) as u8, g: 80, b: 160, a: 255 };
     }
-    let media = ModelRc::new(VecModel::from(vec![NoteMedia { img: slint::Image::from_rgba8(px), alt: "the pill".into(), ratio: 120.0 / 320.0 }]));
+    let media = ModelRc::new(VecModel::from(vec![NoteMedia { img: slint::Image::from_rgba8(px), alt: "the pill".into(), ratio: 120.0 / 320.0, stage: 120.0 / 320.0, ..Default::default() }]));
     st.set_app_version("0.1.7".into());
     st.set_update_version("0.1.8".into());
     st.set_update_notes(notes.clone());
@@ -2085,9 +2098,12 @@ fn update_pill_drawer_and_system_notes_draw_and_fit() {
     st.set_window_shown(true);
     app.window().set_size(slint::LogicalSize::new(1240.0, 800.0));
     app.show().expect("show the window");
+    // past the pill's width ease, so each frame shows where a step lands
     let settle = |app: &AppWindow| {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        slint::platform::update_timers_and_animations();
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            slint::platform::update_timers_and_animations();
+        }
         snap(app).expect("a frame is drawn")
     };
     let shots = std::env::var_os("NEURON_INSPECTOR_SHOTS").map(std::path::PathBuf::from);
@@ -2147,6 +2163,57 @@ fn update_pill_drawer_and_system_notes_draw_and_fit() {
     app.window().dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(600.0, 700.0), delta_x: 0.0, delta_y: -4000.0 });
     let bottom = settle(&app);
     save("system-bottom", &bottom);
+}
+
+/// The what's-new drawer with this release's real notes and images, as an offer of it would show
+/// them: every image and every line has to be reachable, by the wheel when they overflow.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn the_real_release_notes_draw_in_the_update_drawer() {
+    use slint::platform::WindowEvent;
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let _shared = glue::install(&app);
+    let st = app.global::<State>();
+    let changelog = include_str!("../../../CHANGELOG.md");
+    let release = neuron::update::notes::parse(changelog).into_iter().next().expect("the changelog has a release");
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let media = crate::updater::local_media(&release, &repo);
+    assert_eq!(media.len(), release.media.len(), "every image in the notes decodes");
+    st.set_update_notes(crate::updater::note_rows(&crate::updater::rows(&release)));
+    st.set_update_media(crate::updater::note_media(&media));
+    st.set_update_version(release.version.to_string().into());
+    st.set_update_phase("available".into());
+    st.set_update_enabled(true);
+    st.set_update_notes_open(true);
+    st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(1240.0, 900.0));
+    app.show().expect("show the window");
+    let frame = |name: &str| {
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            slint::platform::update_timers_and_animations();
+        }
+        let f = snap(&app).expect("the drawer draws");
+        if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            image::save_buffer(dir.join(format!("{name}.png")), f.as_bytes(), f.width(), f.height(), image::ColorType::Rgba8).unwrap();
+        }
+        f
+    };
+    let top = frame("update-real-notes");
+    // the drawer hangs under the pill at the window's right
+    let at = slint::LogicalPosition::new(1000.0, 400.0);
+    for _ in 0..40 {
+        app.window().dispatch_event(WindowEvent::PointerScrolled { position: at, delta_x: 0.0, delta_y: -120.0 });
+    }
+    let bottom = frame("update-real-notes-scrolled");
+    assert_ne!(top.as_bytes(), bottom.as_bytes(), "the wheel scrolls the notes");
+    // a short window: the notes give way before the footer does
+    app.window().set_size(slint::LogicalSize::new(1240.0, 520.0));
+    frame("update-real-notes-short");
 }
 
 /// Every SYSTEM group, jumped to from the page's index and drawn with long data, at the window's

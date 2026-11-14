@@ -913,6 +913,7 @@ export component SettingsPanel inherits VerticalLayout {
                             height: self.preferred-height;
                             rows: State.installed-notes;
                             media: State.installed-media;
+                            live: State.installed-notes-open && State.page == 3 && State.window-shown;
                         }
                     }
                     }

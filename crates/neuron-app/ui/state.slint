@@ -1046,4 +1046,9 @@ export global State {
     callback update-restart();      // start the version Setup just installed under this one
     callback update-set-auto(bool);
     callback update-open-release();
+    // the animated notes picture on show: its current frame, and which picture it belongs to
+    in-out property <image> media-frame;
+    in-out property <string> media-frame-of: "";
+    callback media-play(string);
+    callback media-stop(string);
 }

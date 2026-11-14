@@ -250,7 +250,7 @@ export component AppWindow inherits Window {
                             // profile pill, which never moves.
                             upd-slot := HorizontalLayout {
                                 horizontal-stretch: 0;
-                                if State.update-phase != "" : UpdatePill {}
+                                UpdatePill {}
                             }
                             // PROFILE — opens the profiles sheet (save/apply/rules from anywhere).
                             Pill {
@@ -678,6 +678,11 @@ export component AppWindow inherits Window {
             property <length> grab-x;
             property <length> grab-y;
             property <bool> tb-down: false;
+            // whether a band of the guide's body is in view, so its Luma-T ink animates only then
+            // and the window rests while it is scrolled away
+            pure function shows(top: length, h: length) -> bool {
+                State.guide-open && top + h > self.absolute-position.y + 35px && top < self.absolute-position.y + self.height
+            }
             // BASE swallow — a click anywhere ON the card is absorbed here (declared FIRST, so the
             // title-bar drag + the X, declared after, still win their own regions) so a click inside
             // the tooltip never reaches the click-away catcher behind it. The scroll-event swallow
@@ -812,14 +817,14 @@ export component AppWindow inherits Window {
                                         letter-spacing: Theme.track-1;
                                         wrap: word-wrap;
                                     }
-                                    if s.shine.length > 0 : LumaInk { letters: s.shine; }
+                                    if s.shine.length > 0 : LumaInk { letters: s.shine; live: gcard.shows(self.absolute-position.y, self.height); }
                                     // each block is PROSE (quiet sans, the exception in a mono UI) or a
                                     // CODE CELL (mono on a well, hairline-framed — the same surface as the
                                     // macro editor, so a snippet here looks like where it'll be pasted). The
                                     // code cell is selectable and carries a floating copy button (top-right).
                                     for b in s.blocks : VerticalLayout {
                                         // a name that carries its own mark, on the line above its words
-                                        if b.lead.length > 0 : LumaInk { letters: b.lead; split: b.lead-split > 0 ? b.lead-split : 0.5; }
+                                        if b.lead.length > 0 : LumaInk { letters: b.lead; split: b.lead-split > 0 ? b.lead-split : 0.5; live: gcard.shows(self.absolute-position.y, self.height); }
                                         if !b.code : Label {
                                             text: b.text;
                                             color: Theme.text-mid;

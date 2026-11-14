@@ -22,11 +22,15 @@ pub struct Item {
     /// The bold lead (`**Title.**`), without its markers; empty for an item that has none.
     pub title: String,
     pub body: String,
+    /// An indented bullet: a part of the item above it.
+    pub sub: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Section {
     pub title: String,
+    /// Prose between the heading and its first bullet.
+    pub intro: String,
     pub items: Vec<Item>,
 }
 
@@ -144,7 +148,7 @@ pub fn parse_section(raw: &str) -> Option<Release> {
             if h.eq_ignore_ascii_case("thanks") {
                 at = At::Thanks;
             } else {
-                rel.sections.push(Section { title: h.to_string(), items: Vec::new() });
+                rel.sections.push(Section { title: h.to_string(), intro: String::new(), items: Vec::new() });
                 at = At::Group;
             }
             continue;
@@ -167,14 +171,19 @@ pub fn parse_section(raw: &str) -> Option<Release> {
             At::Head | At::Group => {
                 if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
                     if rel.sections.is_empty() {
-                        rel.sections.push(Section { title: String::new(), items: Vec::new() });
+                        rel.sections.push(Section { title: String::new(), intro: String::new(), items: Vec::new() });
                     }
                     at = At::Group;
                     if let Some(sec) = rel.sections.last_mut() {
-                        sec.items.push(split_item(item));
+                        let mut item = split_item(item);
+                        // indented under an item, it is a part of that item
+                        item.sub = line.starts_with([' ', '\t']) && !sec.items.is_empty();
+                        sec.items.push(item);
                     }
                 } else if let Some(last) = rel.sections.last_mut().and_then(|s| s.items.last_mut()) {
                     last.body = join(&last.body, &plain(t));
+                } else if let (At::Group, Some(sec)) = (&at, rel.sections.last_mut()) {
+                    sec.intro = join(&sec.intro, &plain(t));
                 } else if matches!(at, At::Head) {
                     rel.headline = join(&rel.headline, &plain(t));
                 }
@@ -197,10 +206,10 @@ fn split_item(item: &str) -> Item {
     let item = item.trim();
     if let Some(rest) = item.strip_prefix("**") {
         if let Some(end) = rest.find("**") {
-            return Item { title: plain(&rest[..end]), body: plain(rest[end + 2..].trim()) };
+            return Item { title: plain(&rest[..end]), body: plain(rest[end + 2..].trim()), sub: false };
         }
     }
-    Item { title: String::new(), body: plain(item) }
+    Item { title: String::new(), body: plain(item), sub: false }
 }
 
 fn media_line(t: &str) -> Option<Media> {
@@ -310,11 +319,22 @@ The in-app updater.
         assert_eq!(r.sections[0].title, "New");
         assert_eq!(r.sections[0].items[0].title, "Updates.");
         assert_eq!(r.sections[0].items[0].body, "Neuron checks for releases and installs them in one click. (thanks @someone, #123)");
-        assert_eq!(r.sections[1].items[0], Item { title: String::new(), body: "A plain item with code and a link.".into() });
+        assert_eq!(r.sections[1].items[0], Item { title: String::new(), body: "A plain item with code and a link.".into(), sub: false });
         assert_eq!(r.thanks, vec!["@someone, @another".to_string()]);
         assert!(r.raw.starts_with("## 0.1.8") && r.raw.ends_with("@someone, @another"));
         assert_eq!(all[1].version.to_string(), "0.1.7");
         assert_eq!(all[1].sections[0].title, "Security");
+    }
+
+    #[test]
+    fn an_indented_bullet_is_a_part_of_the_item_above() {
+        let r = parse_section("## 0.1.8\nhead.\n### new\n- **luma-t.** a model.\n  - **ask.** more ideas\n    that wrap.\n- **tidepool.** water.").unwrap();
+        let items: Vec<_> = r.sections[0].items.iter().map(|i| (i.title.as_str(), i.body.as_str(), i.sub)).collect();
+        assert_eq!(items, vec![("luma-t.", "a model.", false), ("ask.", "more ideas that wrap.", true), ("tidepool.", "water.", false)]);
+        let first = parse_section("## 0.1.8\n### new\n  - **alone.** an indented first item").unwrap();
+        assert!(!first.sections[0].items[0].sub, "an indented first item has nothing to belong to");
+        let intro = parse_section("## 0.1.8\nhead.\n### fixed\nmostly input.\n- **binds** fire.").unwrap();
+        assert_eq!((intro.headline.as_str(), intro.sections[0].intro.as_str()), ("head.", "mostly input."));
     }
 
     #[test]

@@ -16,11 +16,12 @@ pub enum Mode {
     /// The palette as it is: held stops stay, the rest are rolled to suit them. With none held,
     /// the selected stop is the anchor.
     Around,
-    /// A new palette around a random anchor, with a new number of stops.
+    /// A new palette with a new number of stops, around the held colours or, with none held, a
+    /// random anchor.
     Fresh,
     /// As fresh, anchored on a colour from the person's other palettes and in their style.
     Mine,
-    /// Every colour by chance, the model aside.
+    /// Every colour but the held ones by chance, the model aside.
     Wildcard,
 }
 
@@ -83,7 +84,7 @@ impl Wild {
 pub struct Roll<'a> {
     /// The palette as it is.
     pub stops: &'a [Stop],
-    /// Stops a roll around this palette keeps. Shorter than `stops` means the rest are free.
+    /// Stops every roll keeps. Shorter than `stops` means the rest are free.
     pub held: &'a [bool],
     pub selected: usize,
     /// The person's other palettes: the anchor and style of [`Mode::Mine`], the style of
@@ -178,8 +179,8 @@ fn sketch(stops: &mut [Stop], known: &[bool], dice: &mut Dice, wild: Wild) {
 }
 
 /// Roll a palette. Positions are kept for [`Mode::Around`]; the other modes space a new number of
-/// stops evenly. Held stops come back exactly in [`Mode::Around`]. Without a model the sketch is
-/// the roll.
+/// stops evenly. Held stops come back exactly in [`Mode::Around`]; the other modes keep their
+/// colours, in order, at the stops nearest where they sat. Without a model the sketch is the roll.
 #[must_use]
 pub fn roll(model: Option<&Learned>, r: &Roll) -> Vec<Stop> {
     let mut dice = Dice(r.seed ^ 0xA076_1D64_78BD_642F);
@@ -190,14 +191,26 @@ pub fn roll(model: Option<&Learned>, r: &Roll) -> Vec<Stop> {
             (r.stops.to_vec(), known)
         }
         _ => {
-            let n = FRESH_COUNTS[dice.pick(&FRESH_COUNTS.map(|(_, w)| w))].0;
-            let stops: Vec<Stop> = (0..n).map(|i| Stop::new(Rgb::new(0, 0, 0), i as f32 / (n - 1) as f32)).collect();
-            (stops, vec![false; n])
+            // held colours come along, in their order: each takes the stop nearest where it sat
+            // that still leaves room for the ones after it
+            let held: Vec<&Stop> = r.stops.iter().enumerate().filter(|(i, _)| r.held.get(*i).copied().unwrap_or(false)).map(|(_, s)| s).collect();
+            let n = FRESH_COUNTS[dice.pick(&FRESH_COUNTS.map(|(_, w)| w))].0.max(held.len()).max(2);
+            let mut stops: Vec<Stop> = (0..n).map(|i| Stop::new(Rgb::new(0, 0, 0), i as f32 / (n - 1) as f32)).collect();
+            let mut known = vec![false; n];
+            let mut from = 0;
+            for (k, h) in held.iter().enumerate() {
+                let last = n - (held.len() - k);
+                let slot = (from..=last).min_by(|&a, &b| (stops[a].at - h.at).abs().total_cmp(&(stops[b].at - h.at).abs())).unwrap_or(from);
+                stops[slot].col = h.col;
+                known[slot] = true;
+                from = slot + 1;
+            }
+            (stops, known)
         }
     };
     let n = stops.len();
     if r.mode == Mode::Wildcard {
-        for stop in &mut stops {
+        for (stop, _) in stops.iter_mut().zip(&known).filter(|(_, held)| !**held) {
             let (l, h) = (dice.range(0.25, 0.9), dice.unit());
             stop.col = Lch { l, c: Lch::max_chroma(l, h) * dice.range(0.2, 1.0), h }.rgb();
         }
@@ -283,6 +296,28 @@ mod tests {
                 assert_eq!(out.len(), stops.len());
                 assert!(out.iter().zip(&stops).all(|(a, b)| a.at == b.at));
                 assert!(out[0].col == stops[0].col && out[3].col == stops[3].col, "held stops move: {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_roll_keeps_the_held_colours() {
+        let stops = palette();
+        let model = Learned::parse(include_bytes!("../../data/colour-model.golden.lumacore")).unwrap();
+        for held in [[false, true, false, false], [true, false, false, true], [true, true, true, true]] {
+            for mode in Mode::ALL {
+                for seed in 0..10 {
+                    let out = roll(Some(&model), &ask(&stops, &held, mode, Wild::Wild, seed));
+                    let mut taken = vec![false; out.len()];
+                    for kept in stops.iter().zip(held).filter(|(_, h)| *h).map(|(s, _)| s.col) {
+                        let slot = (0..out.len()).find(|&j| !taken[j] && out[j].col == kept);
+                        assert!(slot.is_some(), "{mode:?} lost held {kept:?}: {out:?}");
+                        taken[slot.unwrap()] = true;
+                    }
+                    // a held colour keeps its place in the order of the palette
+                    let order: Vec<usize> = (0..out.len()).filter(|&j| taken[j]).collect();
+                    assert!(order.windows(2).all(|w| w[0] < w[1]));
+                }
             }
         }
     }

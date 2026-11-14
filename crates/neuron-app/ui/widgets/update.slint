@@ -8,49 +8,127 @@
 import { Theme, Signal } from "../theme.slint";
 import { State } from "../state.slint";
 import { NoteRow, NoteMedia } from "../models.slint";
-import { LoadingRim, Mono } from "controls.slint";
+import { LoadingRim, LumaInk, Mono } from "controls.slint";
 
-// Release notes: the images first, then the headline, the groups and their items, the thanks.
+// A release's pictures, one at a time on a stage sized for the tallest, so stepping between them
+// moves nothing below. They cross-fade and step on by themselves while `live` until one is
+// picked; an animated one plays while it is on show and stays up for a whole pass.
+export component MediaStage inherits VerticalLayout {
+    in property <[NoteMedia]> media;
+    in property <bool> live;
+    property <int> count: root.media.length;
+    property <int> at: 0;
+    property <bool> picked: false;
+    property <NoteMedia> shown: root.media[min(root.at, max(0, root.count - 1))];
+    // the animated picture this stage wants playing, and the one it last asked for
+    property <string> want: root.live && root.shown.animated ? root.shown.id : "";
+    property <string> asked: "";
+    spacing: 8px;
+    changed count => { root.at = 0; root.picked = false; }
+    changed want => {
+        if (root.asked != "") { State.media-stop(root.asked); }
+        root.asked = root.want;
+        if (root.want != "") { State.media-play(root.want); }
+    }
+    Timer {
+        interval: root.shown.animated ? max(6s, root.shown.pass-ms * 1ms) : 6s;
+        running: root.live && !root.picked && root.count > 1;
+        triggered => { root.at = mod(root.at + 1, root.count); }
+    }
+    Rectangle {
+        height: min(self.width * (root.count > 0 ? root.media[0].stage : 0), 320px);
+        border-radius: Theme.radius-sm;
+        background: Theme.well;
+        clip: true;
+        for m[i] in root.media : Image {
+            width: parent.width;
+            height: parent.height;
+            source: m.animated && State.media-frame-of == m.id ? State.media-frame : m.img;
+            image-fit: contain;
+            accessible-label: m.alt;
+            opacity: i == root.at ? 1 : 0;
+            animate opacity { duration: 420ms; easing: ease-in-out; }
+        }
+    }
+    // where in the set, and the way to the others
+    if root.count > 1 : HorizontalLayout {
+        alignment: center;
+        spacing: 2px;
+        for m[i] in root.media : Rectangle {
+            width: 22px;
+            height: 12px;
+            Rectangle {
+                width: i == root.at ? 16px : 6px;
+                height: 4px;
+                border-radius: 2px;
+                background: i == root.at ? Theme.accent : dta.has-hover ? Theme.text-mid : Theme.line;
+                animate width, background { duration: Theme.settle; easing: ease-out; }
+            }
+            dta := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => { root.at = i; root.picked = true; }
+            }
+        }
+    }
+}
+
+// Release notes: the tagline and the rest of the headline, the pictures, then the groups and
+// their items, and the thanks.
 export component NotesView inherits VerticalLayout {
     in property <[NoteRow]> rows;
     in property <[NoteMedia]> media;
+    // on show: the pictures step on and play only then
+    in property <bool> live;
     spacing: 7px;
-    for m in root.media : Rectangle {
-        height: self.width * m.ratio;
-        border-radius: Theme.radius-sm;
-        clip: true;
-        background: Theme.well;
-        Image {
-            width: parent.width;
-            height: parent.height;
-            source: m.img;
-            image-fit: contain;
-            accessible-label: m.alt;
-        }
-    }
     for r in root.rows : VerticalLayout {
-        padding-top: r.kind == "group" ? 5px : 0px;
-        if r.kind == "head" : Text {
-            text: r.body;
-            color: Theme.text;
-            font-size: Theme.fs-body;
-            font-family: Theme.mono;
-            wrap: word-wrap;
+        padding-top: r.kind == "group" ? 8px : 0px;
+        spacing: 10px;
+        if r.kind == "head" : VerticalLayout {
+            spacing: 3px;
+            if r.title != "" : Text {
+                text: r.title;
+                color: Theme.text;
+                font-size: Theme.fs-title;
+                font-family: Theme.mono;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+            if r.body != "" : Text {
+                text: r.body;
+                color: Theme.text-mid;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                wrap: word-wrap;
+            }
         }
-        if r.kind == "group" : Text {
-            text: r.title;
-            color: Theme.accent-dim;
-            font-size: Theme.fs-small;
-            font-family: Theme.mono;
-            font-weight: 700;
-            letter-spacing: Theme.track-2;
-            overflow: elide;
+        if r.kind == "head" && root.media.length > 0 : MediaStage { media: root.media; live: root.live; }
+        // a group's name, and the line that opens it when it has one
+        if r.kind == "group" : VerticalLayout {
+            spacing: 3px;
+            Text {
+                text: r.title;
+                color: Theme.accent-dim;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                font-weight: 700;
+                letter-spacing: Theme.track-2;
+                overflow: elide;
+            }
+            if r.body != "" : Text {
+                text: r.body;
+                color: Theme.text-mid;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                wrap: word-wrap;
+            }
         }
-        if r.kind == "item" : HorizontalLayout {
+        // a part of the item above sits under its words, marked quieter
+        if r.kind == "item" || r.kind == "sub" : HorizontalLayout {
+            padding-left: r.kind == "sub" ? 14px : 0px;
             spacing: 7px;
             Text {
-                text: "·";
-                color: Theme.accent-dim;
+                text: r.kind == "sub" ? "–" : "·";
+                color: r.kind == "sub" ? Theme.text-faint : Theme.accent-dim;
                 font-size: Theme.fs-body;
                 font-family: Theme.mono;
                 vertical-alignment: top;
@@ -58,13 +136,42 @@ export component NotesView inherits VerticalLayout {
             VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 1px;
-                if r.title != "" : Text {
+                if r.title != "" && r.ink == "" : Text {
                     text: r.title;
                     color: Theme.text;
                     font-size: Theme.fs-small;
                     font-family: Theme.mono;
                     font-weight: 700;
                     wrap: word-wrap;
+                }
+                // a lead that names Luma-T or an effect wears its colours: Luma-T's ink, or the
+                // effect's palette across its letters
+                if r.title != "" && r.ink != "" : HorizontalLayout {
+                    if r.ink == "luma" : LumaInk {
+                        letters: r.letters;
+                        size: Theme.fs-small;
+                        track: 0px;
+                        live: root.live;
+                    }
+                    if r.ink == "palette" : HorizontalLayout {
+                        for ch[i] in r.letters : Text {
+                            text: ch;
+                            color: r.colours[i];
+                            font-size: Theme.fs-small;
+                            font-family: Theme.mono;
+                            font-weight: 700;
+                        }
+                    }
+                    if r.rest != "" : Text {
+                        horizontal-stretch: 1;
+                        text: r.rest;
+                        color: Theme.text;
+                        font-size: Theme.fs-small;
+                        font-family: Theme.mono;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                    if r.rest == "" : Rectangle { horizontal-stretch: 1; }
                 }
                 if r.body != "" : Text {
                     text: r.body;
@@ -109,6 +216,7 @@ component PillSeg inherits Rectangle {
         horizontal-alignment: center;
         y: ta.pressed && root.enabled ? 1px : 0px;
         animate y { duration: Theme.press-throw; }
+        animate color { duration: Theme.settle; }
     }
     ta := TouchArea {
         enabled: root.enabled;
@@ -118,11 +226,21 @@ component PillSeg inherits Rectangle {
 }
 
 // The header pill: the version (opens what's new), the next step, and "& install" for the
-// one-click path. While downloading, a thin fill runs along its foot.
+// one-click path. It opens out from beside the profile pill when a release arrives, eases to
+// each step's width and folds away when there is nothing to show; while downloading, a thin
+// fill runs along its foot.
 export component UpdatePill inherits Rectangle {
     property <string> phase: State.update-phase;
     property <bool> offering: root.phase == "available" || root.phase == "downloading";
+    // false until the first frame, so a pill that arrives with the window opens out too
+    property <bool> settled: false;
+    property <bool> out: root.settled && root.phase != "";
+    init => { root.settled = true; }
     horizontal-stretch: 0;
+    width: root.out ? lay.preferred-width : 0px;
+    animate width { duration: 280ms; easing: ease-out; }
+    opacity: root.out ? 1 : 0;
+    animate opacity { duration: Theme.settle; }
     height: Theme.row-h-sm - 4px;
     border-radius: Theme.radius-sm;
     border-width: Theme.hair;
@@ -130,7 +248,11 @@ export component UpdatePill inherits Rectangle {
     background: State.update-notes-open ? Theme.accent-glow : transparent;
     clip: true;
     animate background, border-color { duration: Theme.settle; }
-    HorizontalLayout {
+    // anchored right, so it unrolls leftward from the profile pill
+    lay := HorizontalLayout {
+        x: parent.width - self.width;
+        width: self.preferred-width;
+        height: parent.height;
         spacing: 0;
         if root.phase == "rolled-back" : PillSeg {
             text: State.update-version + " didn't start, so you're back on " + State.app-version;
@@ -165,13 +287,15 @@ export component UpdatePill inherits Rectangle {
             strong: true;
             clicked => { State.update-install(); }
         }
+        // sized from its label alone: the pill's width is read from these segments
         if root.phase == "installing" : Rectangle {
+            property <length> w: busy.preferred-width + 18px;
             horizontal-stretch: 0;
-            min-width: busy.preferred-width + 18px;
-            LoadingRim { width: parent.width; height: parent.height; tint: Theme.accent-dim; }
+            width: self.w;
+            LoadingRim { width: parent.w; height: root.height; tint: Theme.accent-dim; }
             busy := Text {
-                width: parent.width;
-                height: parent.height;
+                width: parent.w;
+                height: root.height;
                 text: "restarting";
                 color: Theme.accent-dim;
                 font-size: Theme.fs-small;
@@ -200,21 +324,94 @@ export component UpdatePill inherits Rectangle {
             clicked => { State.update-install(); }
         }
     }
-    if root.phase == "downloading" : Rectangle {
+    // the download along the foot; it runs to the end and fades as the pill moves on
+    Rectangle {
         x: 0;
         y: parent.height - 2px;
-        width: parent.width * clamp(State.update-progress, 0, 1);
+        width: parent.width * clamp(root.phase == "downloading" ? State.update-progress : root.phase == "ready" ? 1 : 0, 0, 1);
         height: 2px;
         background: Theme.accent;
+        opacity: root.phase == "downloading" ? 1 : 0;
         animate width { duration: Theme.settle; }
+        animate opacity { duration: 600ms; }
     }
 }
 
-// The what's-new drawer: drops from the pill, holds the notes and two quiet verbs.
+// The drawer's one primary key: the release's next step, as the pill offers it. The download
+// fills the key itself.
+component NextStep inherits Rectangle {
+    in property <bool> enabled;
+    property <string> phase: State.update-phase;
+    property <bool> waiting: root.phase == "installing" || (root.phase == "downloading" && State.update-install-queued);
+    horizontal-stretch: 0;
+    height: Theme.row-h-sm;
+    min-width: max(150px, lbl.preferred-width + 28px);
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    border-color: root.phase == "error" ? Theme.danger.with-alpha(0.5) : root.phase == "rolled-back" ? Theme.line : Theme.accent-line;
+    background: root.waiting ? Theme.accent-glow
+        : ta.pressed ? Theme.accent.with-alpha(0.24)
+        : ta.has-hover ? Theme.accent.with-alpha(0.16)
+        : Theme.accent-glow;
+    animate background, border-color { duration: Theme.settle; }
+    clip: true;
+    Rectangle {
+        x: 0;
+        width: parent.width * (root.phase == "downloading" ? clamp(State.update-progress, 0, 1) : root.phase == "ready" ? 1 : 0);
+        height: parent.height;
+        background: Theme.accent.with-alpha(0.14);
+        animate width { duration: Theme.settle; easing: ease-out; }
+    }
+    if root.phase == "installing" : LoadingRim { width: root.width; height: root.height; tint: Theme.accent-dim; }
+    lbl := Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.phase == "available" ? "download & install"
+            : root.phase == "downloading" ? (State.update-install-queued ? "installs at 100%" : "downloading · " + round(State.update-progress * 100) + "%")
+            : root.phase == "ready" ? "install & restart"
+            : root.phase == "installing" ? "restarting"
+            : root.phase == "installed" ? "restart to finish"
+            : root.phase == "error" ? "try again"
+            : root.phase == "rolled-back" ? "report it"
+            : "got it";
+        color: root.phase == "error" ? Theme.danger : root.phase == "rolled-back" ? Theme.warn : Theme.accent;
+        font-size: Theme.fs-small;
+        font-family: Theme.mono;
+        font-weight: 700;
+        letter-spacing: Theme.track-1;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        y: ta.pressed ? 1px : 0px;
+        animate y { duration: Theme.press-throw; }
+        animate color { duration: Theme.settle; }
+    }
+    ta := TouchArea {
+        enabled: root.enabled && !root.waiting;
+        mouse-cursor: self.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            if (root.phase == "available" || root.phase == "downloading" || root.phase == "ready") {
+                State.update-install();
+            } else if (root.phase == "installed") {
+                State.update-restart();
+            } else if (root.phase == "error") {
+                State.update-download();
+            } else if (root.phase == "rolled-back") {
+                State.update-open-release();
+            } else {
+                State.update-notes-open = false;
+                State.update-dismiss();
+            }
+        }
+    }
+}
+
+// The what's-new drawer: drops from the pill with the release's tagline, pictures and notes,
+// and its next step. The notes scroll inside once they outgrow the window, fading at the foot
+// while there is more below.
 export component UpdateDrawer inherits Rectangle {
-    // takes presses only while it is there to see, not while fading in or out
     in property <bool> open;
-    property <bool> live: root.open && root.opacity > 0.5;
+    // takes presses and plays pictures only while it is there to see, not while fading
+    property <bool> live: root.open && root.opacity > 0.5 && State.window-shown;
     background: Theme.bg-2;
     border-radius: Theme.radius;
     border-width: Theme.hair;
@@ -223,12 +420,15 @@ export component UpdateDrawer inherits Rectangle {
     TouchArea { enabled: root.live; }
     VerticalLayout {
         padding: 14px;
+        padding-top: 12px;
         spacing: 10px;
         HorizontalLayout {
             spacing: 8px;
             Text {
-                text: (State.update-phase == "updated" ? "now on v" : "v") + State.update-version;
-                color: Theme.accent;
+                text: State.update-phase == "updated" ? "now on v" + State.update-version
+                    : State.update-phase == "rolled-back" ? "v" + State.update-version + " was rolled back"
+                    : "v" + State.update-version;
+                color: State.update-phase == "rolled-back" ? Theme.warn : Theme.accent;
                 font-size: Theme.fs-small;
                 font-family: Theme.mono;
                 font-weight: 700;
@@ -243,32 +443,58 @@ export component UpdateDrawer inherits Rectangle {
             }
             Rectangle { horizontal-stretch: 1; }
         }
-        notes-scroll := Flickable {
-            interactive: false;
-            height: min(notes.preferred-height, 380px);
-            viewport-width: self.width;
-            viewport-height: notes.preferred-height;
-            notes := NotesView {
-                width: parent.viewport-width;
-                rows: State.update-notes;
-                media: State.update-media;
+        Rectangle {
+            vertical-stretch: 1;
+            min-height: 96px;
+            preferred-height: notes.preferred-height;
+            scroll := Flickable {
+                width: parent.width;
+                height: parent.height;
+                viewport-width: self.width;
+                viewport-height: notes.preferred-height;
+                notes := NotesView {
+                    width: parent.viewport-width;
+                    height: self.preferred-height;
+                    rows: State.update-notes;
+                    media: State.update-media;
+                    live: root.live;
+                }
+            }
+            // scrolled: the notes pass under the header softly
+            Rectangle {
+                y: 0;
+                width: parent.width;
+                height: 18px;
+                background: @linear-gradient(180deg, Theme.bg-2 0%, Theme.bg-2.with-alpha(0) 100%);
+                opacity: scroll.viewport-y < -2px ? 1 : 0;
+                animate opacity { duration: Theme.settle; }
+            }
+            // more below: the notes fade into the drawer
+            Rectangle {
+                y: parent.height - self.height;
+                width: parent.width;
+                height: 32px;
+                background: @linear-gradient(180deg, Theme.bg-2.with-alpha(0) 0%, Theme.bg-2 100%);
+                opacity: scroll.viewport-height + scroll.viewport-y > scroll.height + 2px ? 1 : 0;
+                animate opacity { duration: Theme.settle; }
             }
         }
         HorizontalLayout {
-            spacing: 6px;
+            spacing: 4px;
             PillSeg {
                 text: "release page";
                 ink: Theme.text-dim;
                 enabled: root.live;
                 clicked => { State.update-open-release(); }
             }
-            Rectangle { horizontal-stretch: 1; }
-            PillSeg {
-                text: State.update-phase == "updated" ? "got it" : "not now";
+            if State.update-phase == "available" || State.update-phase == "ready" || State.update-phase == "error" : PillSeg {
+                text: "not now";
                 ink: Theme.text-dim;
                 enabled: root.live;
                 clicked => { State.update-notes-open = false; State.update-dismiss(); }
             }
+            Rectangle { horizontal-stretch: 1; }
+            NextStep { enabled: root.live; }
         }
     }
 }

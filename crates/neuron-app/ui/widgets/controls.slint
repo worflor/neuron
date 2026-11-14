@@ -122,10 +122,9 @@ export component LumaInk inherits HorizontalLayout {
         property <float> fill: self.reach * self.reach * (3 - 2 * self.reach) * (1 - root.drain);
         // purple, turning to yellow just past the split
         property <color> hue: #a56ef0.mix(#f5c542, 1 - clamp((self.at - root.split) * 6, 0, 1));
-        // the yellow's front burns white as it passes, and a filled yellow letter glints now and then
+        // the yellow's front burns white as it passes
         property <float> flare: self.light && root.race < 1 ? max(0, 1 - abs(root.front - self.at) / 0.08) * 0.7 : 0;
-        property <float> glint: self.light && root.live ? 0.18 * max(0, Math.sin((root.tick * 0.006 + i * 2.3) * 1rad)) : 0;
-        property <color> lit: self.hue.mix(#ffffff, 1 - max(self.flare, self.glint));
+        property <color> lit: self.hue.mix(#ffffff, 1 - self.flare);
         text: ch;
         color: root.ink.mix(self.lit, 1 - self.fill);
         font-family: Theme.mono;
