@@ -8,9 +8,9 @@
 //! (`follow`)? Which stops look out of place (`repair`)? Every answer is weighed against leaving
 //! the palette alone, and the bundle's margins decide what is worth offering.
 //!
-//! This is a port of Luma's core v4.1 to v4.4 (layout 5, the revision 3 runtime) from its bridge
-//! specification, for stops on a line. The network is data. Neuron ships Luma-T, Luma's core v4.4
-//! with taste head v6 ([`Learned::builtin`]); a `.lumacore` bundle in the models folder replaces
+//! This is a port of Luma's core v4.1 to v4.6 (layout 5, the revision 3 runtime) from its bridge
+//! specification, for stops on a line. The network is data. Neuron ships Luma-T, Luma's core v4.6
+//! with taste head v7 ([`Learned::builtin`]); a `.lumacore` bundle in the models folder replaces
 //! it ([`Learned::open`]), for trying another checkpoint. Each stop becomes one token (its
 //! colour, position, flags, the colour its neighbours imply and what it was before the edit) and
 //! each pair of stops a few numbers about how far apart they sit, which bias attention. A request
@@ -457,8 +457,8 @@ impl Learned {
         Ok(Some(model))
     }
 
-    /// The colour model Neuron ships: Luma-T, Luma's core v4.4 with taste head v6 (the stack Luma's
-    /// blind duels measure), from `data/luma-t`.
+    /// The colour model Neuron ships: Luma-T, Luma's core v4.6 with taste head v7 (Luma's flagship
+    /// bundle), from `data/luma-t`.
     #[must_use]
     pub fn builtin() -> Learned {
         let mut model = Learned::parse(BUILTIN.0).expect("the built-in colour model reads");
@@ -1693,12 +1693,12 @@ mod tests {
 
     /// The same check for a trained bundle against the vectors Luma publishes with it. Point
     /// `NEURON_LUMA_BRIDGE` at the folder holding `<core>.lumacore` and `golden-<version>.jsonl`
-    /// (`NEURON_LUMA_CORE` names the core, `core-v4.4` by default).
+    /// (`NEURON_LUMA_CORE` names the core, `core-v4.6` by default).
     #[test]
     #[ignore = "needs a Luma bridge folder in NEURON_LUMA_BRIDGE"]
     fn matches_luma_vectors() {
         let folder = std::path::PathBuf::from(std::env::var_os("NEURON_LUMA_BRIDGE").expect("NEURON_LUMA_BRIDGE"));
-        let core = std::env::var("NEURON_LUMA_CORE").unwrap_or_else(|_| "core-v4.4".into());
+        let core = std::env::var("NEURON_LUMA_CORE").unwrap_or_else(|_| "core-v4.6".into());
         let model = Learned::parse(&std::fs::read(folder.join(format!("{core}.lumacore"))).unwrap()).unwrap();
         let started = std::time::Instant::now();
         let seen = check(&model, &std::fs::read_to_string(folder.join(format!("golden-{}.jsonl", core.trim_start_matches("core-")))).unwrap());
@@ -1791,14 +1791,14 @@ mod tests {
 
     /// The taste head against the vectors Luma publishes with it: every reading, both token groups,
     /// the scores, a person's term and the decision. `NEURON_LUMA_BRIDGE` holds the core and the head
-    /// (`NEURON_LUMA_TASTE` names the head, `taste-head-v6` by default, and `NEURON_LUMA_CORE` its core,
-    /// `core-v4.4`) with their vectors.
+    /// (`NEURON_LUMA_TASTE` names the head, `taste-head-v7` by default, and `NEURON_LUMA_CORE` its core,
+    /// `core-v4.6`) with their vectors.
     #[test]
     #[ignore = "needs a Luma bridge folder in NEURON_LUMA_BRIDGE"]
     fn matches_luma_taste_vectors() {
         let folder = std::path::PathBuf::from(std::env::var_os("NEURON_LUMA_BRIDGE").expect("NEURON_LUMA_BRIDGE"));
-        let head = std::env::var("NEURON_LUMA_TASTE").unwrap_or_else(|_| "taste-head-v6".into());
-        let core = std::env::var("NEURON_LUMA_CORE").unwrap_or_else(|_| "core-v4.4".into());
+        let head = std::env::var("NEURON_LUMA_TASTE").unwrap_or_else(|_| "taste-head-v7".into());
+        let core = std::env::var("NEURON_LUMA_CORE").unwrap_or_else(|_| "core-v4.6".into());
         let mut model = Learned::parse(&std::fs::read(folder.join(format!("{core}.lumacore"))).unwrap()).unwrap();
         model.attach(Taste::parse(&std::fs::read(folder.join(format!("{head}.lumataste"))).unwrap()).unwrap()).unwrap();
         let taste = model.taste.take().unwrap();
@@ -1900,8 +1900,8 @@ mod tests {
     #[test]
     fn the_builtin_model_is_luma_t_with_its_taste_head() {
         let model = Learned::builtin();
-        assert_eq!(model.name(), "core-v4.4");
-        assert_eq!(model.taste().map(Taste::name), Some("taste-head-v6"));
+        assert_eq!(model.name(), "core-v4.6");
+        assert_eq!(model.taste().map(Taste::name), Some("taste-head-v7"));
         assert!(model.answers_alone(), "its taste head's keep is the answer");
         assert_eq!(model.learning(), Some(Learning { decided: 0, needed: 3, known: false }));
         assert!(!Learned::parse(SMALL).unwrap().answers_alone(), "a core alone leaves room for the rules");
@@ -1915,7 +1915,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
         let model = Learned::open(&folder);
-        assert!(model.name() == "core-v4.4" && model.notes().is_empty(), "{:?}", model.notes());
+        assert!(model.name() == "core-v4.6" && model.notes().is_empty(), "{:?}", model.notes());
         let journal: serde_json::Value = serde_json::from_str(SMALL_JOURNAL).unwrap();
         let lines: Vec<&str> = journal["journal"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
         std::fs::write(folder.join(taste::JOURNAL), lines[..4].join("\n")).unwrap();
@@ -1930,12 +1930,12 @@ mod tests {
         // a bundle in the folder is used instead, with no head unless one sits beside it
         std::fs::write(folder.join(BUNDLE), SMALL).unwrap();
         let mine = Learned::open(&folder);
-        assert!(mine.name() != "core-v4.4" && mine.taste().is_none() && mine.notes().is_empty());
+        assert!(mine.name() != "core-v4.6" && mine.taste().is_none() && mine.notes().is_empty());
         // one that cannot be read is passed over, and says so
         std::fs::write(folder.join(BUNDLE), &SMALL[..100]).unwrap();
         let fallback = Learned::open(&folder);
         let _ = std::fs::remove_dir_all(&folder);
-        assert_eq!(fallback.name(), "core-v4.4");
+        assert_eq!(fallback.name(), "core-v4.6");
         assert!(fallback.knows_the_person(), "the journal still teaches the built-in model");
         assert!(fallback.notes().iter().any(|n| n.contains("built-in")), "{:?}", fallback.notes());
     }
