@@ -2149,25 +2149,65 @@ fn update_pill_drawer_and_system_notes_draw_and_fit() {
     save("system-bottom", &bottom);
 }
 
-/// SYSTEM's report-a-bug row, with a long status line, at the window's minimum width.
+/// Every SYSTEM group, jumped to from the page's index and drawn with long data, at the window's
+/// minimum width and a wide one.
 #[test]
 #[ignore = "run by gui_tests_in_fresh_processes"]
-fn bug_report_row_draws_and_fits() {
+fn system_page_groups_draw_and_fit() {
+    use crate::ui::{BeaconMacro, DiagRow, OrganRow};
+    use slint::{ModelRc, VecModel};
     std::env::set_var("SLINT_BACKEND", "winit-software");
     std::env::set_var("SLINT_SCALE_FACTOR", "1");
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
     let st = app.global::<State>();
-    st.set_page(3);
+    let diag = |name: &str, state: &str, detail: &str| DiagRow { name: name.into(), state: state.into(), detail: detail.into() };
+    st.set_diagnostics(ModelRc::new(VecModel::from(vec![
+        diag("transport enumerate", "pass", "4 HID interfaces"),
+        diag("registry load", "pass", "61 definitions"),
+        diag("device round-trip", "fail", "no reply from the BlackWidow Chroma V2 after three attempts on pipe 2"),
+        diag("lighting test pattern", "pass", "frame built"),
+        diag("effect engine", "pass", "ok"),
+        diag("spine engine", "pass", "ok"),
+        diag("macro runtime", "skip", "python not installed"),
+        diag("gesture vault", "pass", "12 glyphs"),
+        diag("mic endpoint", "pass", "default capture"),
+    ])));
+    st.set_diag_pass(7);
+    st.set_diag_fail(1);
+    st.set_diag_skip(1);
+    let organ = |name: &str, state: &str| OrganRow { name: name.into(), state: state.into(), detail: "silent for 41 s while a device write was in flight".into() };
+    st.set_organs(ModelRc::new(VecModel::from(vec![
+        organ("input", "beat"), organ("live dispatch", "beat"), organ("lighting", "stall"), organ("hidwatch", "beat"),
+        organ("macro host", "rest"), organ("weave", "rest"), organ("audio", "beat"),
+    ])));
+    st.set_organ_stall(true);
+    st.set_beacon_macros(ModelRc::new(VecModel::from(vec![
+        BeaconMacro { name: "stream_starting_soon_scene_switcher".into(), asks: "switch to the starting soon scene and mute the mic?".into() },
+        BeaconMacro { name: "dim".into(), asks: "".into() },
+    ])));
+    st.set_host_enabled(true);
+    st.set_host_obs(true);
     st.set_status_line("report written to C:/Users/someone/AppData/Roaming/neuron/reports/bug-2026-11-13-235959 · the clipboard was busy, so point your agent at that folder".into());
+    st.set_page(3);
     st.set_window_shown(true);
-    app.window().set_size(slint::LogicalSize::new(900.0, 1100.0));
     app.show().expect("show the window");
-    let frame = snap(&app).expect("SYSTEM draws with the bug-report row");
-    if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
-        let dir = std::path::PathBuf::from(dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        image::save_buffer(dir.join("system-bug-report.png"), frame.as_bytes(), frame.width(), frame.height(), image::ColorType::Rgba8).unwrap();
+    let shots = std::env::var_os("NEURON_INSPECTOR_SHOTS").map(std::path::PathBuf::from);
+    for width in [900.0, 1400.0] {
+        app.window().set_size(slint::LogicalSize::new(width, 1000.0));
+        for group in ["startup", "updates", "appearance", "notifications", "connections", "beacons", "files", "health"] {
+            st.set_system_jump_target(group.into());
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                slint::platform::update_timers_and_animations();
+            }
+            assert_eq!(st.get_system_jump_target(), "", "the jump to {group} lands");
+            let frame = snap(&app).expect("SYSTEM draws");
+            if let Some(dir) = &shots {
+                std::fs::create_dir_all(dir).unwrap();
+                image::save_buffer(dir.join(format!("system-{width}-{group}.png")), frame.as_bytes(), frame.width(), frame.height(), image::ColorType::Rgba8).unwrap();
+            }
+        }
     }
 }
 

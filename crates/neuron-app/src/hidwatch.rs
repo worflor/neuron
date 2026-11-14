@@ -72,8 +72,10 @@ const BATCH_SETTLE: Duration = Duration::from_millis(220);
 /// [`BATCH_SETTLE`]. A batch holding a plate waits this long instead.
 #[cfg(not(test))]
 const PLATE_SETTLE: Duration = Duration::from_millis(700);
+// The tests seat a partial code for longer than BATCH_SETTLE and must stay well inside this on
+// a loaded machine, so the gap between the two windows is generous.
 #[cfg(test)]
-const PLATE_SETTLE: Duration = Duration::from_millis(260);
+const PLATE_SETTLE: Duration = Duration::from_millis(600);
 /// The "a human physically couldn't" threshold. A person cannot change two DISTINCT states within this
 /// span — DPI and scroll are separate buttons, and a plate swap is a multi-second physical act — but
 /// the firmware emits its whole wake-announce within a few ms. So a batch holding ≥2 DISTINCT kinds
@@ -1930,7 +1932,7 @@ mod tests {
     fn lone_plate_report_settles_and_reaches_confirm() {
         // a single 05 0e <strap_id> is ONE kind alone — never a sync burst — so after the settle
         // window it reaches `confirm` and updates the readout.
-        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         plate_report(0x03); // 12-button
         settle();
         assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("12-button"));
@@ -1941,7 +1943,7 @@ mod tests {
     /// seated plate, named for it.
     #[test]
     fn recorded_plate_swaps_card_each_plate_by_name() {
-        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = std::sync::mpsc::channel();
         neuron::confirm::set_sink(Some(tx));
         settle();
@@ -1971,7 +1973,7 @@ mod tests {
     /// pattern later. Only the plate that stays is believed.
     #[test]
     fn a_partial_contact_while_seating_never_names_the_wrong_plate() {
-        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = std::sync::mpsc::channel();
         neuron::confirm::set_sink(Some(tx));
         neuron::confirm::prime_side_plate(NAGA_PID, 4, &plate_label(NAGA_PID, 4));
@@ -1996,7 +1998,7 @@ mod tests {
 
     #[test]
     fn a_wake_burst_claiming_no_plate_keeps_the_seated_one() {
-        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         neuron::confirm::prime_side_plate(NAGA_PID, 4, &plate_label(NAGA_PID, 4));
         let t0 = Instant::now();
         batch_push_at(NAGA_PID, Push::Dpi(800), t0);
@@ -2011,7 +2013,7 @@ mod tests {
         // a seating bounce: the strap flickers detached↔seated before it settles. Same-kind reports
         // overwrite the pending value (keeping first-seen), so only the FINAL stable code reaches
         // `confirm` — the flicker never does, and one kind alone is never mistaken for a sync.
-        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         plate_report(0); // detached
         plate_report(1); // 2-button
         plate_report(0); // detached
@@ -2025,7 +2027,7 @@ mod tests {
         // THE FIX: a wake/reconnect re-announces dpi + scroll + plate in one tight burst (these decode
         // calls land within microseconds — far inside BURST_SPAN). That's a STATE SYNC: zero cards,
         // but the state is still LEARNED (the readout reflects the synced plate).
-        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = std::sync::mpsc::channel();
         neuron::confirm::set_sink(Some(tx));
         // A wake re-announces the plate that is already on; a different plate in a burst is a swap
@@ -2075,7 +2077,7 @@ mod tests {
     fn a_plate_swap_burst_cards_the_new_plate() {
         // The Naga announces a new plate only inside a full state burst (dpi + scroll + plate), so a
         // burst whose plate differs from the seated one is a swap and cards that plate once.
-        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = std::sync::mpsc::channel();
         neuron::confirm::set_sink(Some(tx));
         neuron::confirm::prime_side_plate(NAGA_PID, 1, &plate_label(NAGA_PID, 1));
@@ -2096,7 +2098,7 @@ mod tests {
         // the other half of foolproof: a single change is a USER action and must still card. Establish
         // a known baseline first (plate 1), then a DIFFERENT lone plate must produce a card — proving
         // the burst guard never over-suppresses genuine input.
-        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         plate_report(1); // 2-button — set the baseline (no sink yet)
         settle();
         let (tx, rx) = std::sync::mpsc::channel();

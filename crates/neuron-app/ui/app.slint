@@ -342,13 +342,7 @@ export component AppWindow inherits Window {
                             interval: 16ms;
                             running: State.system-jump-target != "" && State.page == 3;
                             triggered => {
-                                if (State.system-jump-target == "beacons") {
-                                    system_page.viewport-y = -max(0px, min(sp.beacons-y, system_page.viewport-height - system_page.height));
-                                } else if (State.system-jump-target == "connections") {
-                                    system_page.viewport-y = -max(0px, min(sp.connections-y, system_page.viewport-height - system_page.height));
-                                } else if (State.system-jump-target == "reliability") {
-                                    system_page.viewport-y = -max(0px, min(sp.reliability-y, system_page.viewport-height - system_page.height));
-                                }
+                                system_page.viewport-y = -max(0px, min(sp.anchor-y(State.system-jump-target), system_page.viewport-height - system_page.height));
                                 State.system-jump-target = "";
                             }
                         }
