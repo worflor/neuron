@@ -1698,6 +1698,23 @@ fn second_picker_offers_preview_accept_and_undo() {
         snap(&app).unwrap();
         assert!(st.get_assist_offers().iter().take_while(|o| o.rolled).count() == 2, "rolls stack, newest first");
         st.invoke_assist_accept(0);
+        // the x at a pointed-at roll's right end waves it off
+        {
+            use slint::platform::{PointerEventButton, WindowEvent};
+            let (ox, oy, _, _) = crate::uifit::rect_of(app.window(), "SenseOffers").expect("the row is drawn");
+            let end = ox + if st.get_assist_prime() == 0 { 54.0 } else { 40.0 } - 8.0;
+            let p = slint::LogicalPosition::new(end, oy + 13.0);
+            app.window().dispatch_event(WindowEvent::PointerMoved { position: p });
+            capture("picker-v2-wave");
+            app.window().dispatch_event(WindowEvent::PointerPressed { position: p, button: PointerEventButton::Left });
+            app.window().dispatch_event(WindowEvent::PointerReleased { position: p, button: PointerEventButton::Left });
+            app.window().dispatch_event(WindowEvent::PointerExited);
+            snap(&app).unwrap();
+            assert_eq!(st.get_assist_offers().iter().take_while(|o| o.rolled).count(), 1, "the x waves the newest roll off");
+            assert!(!st.get_assist_showing() && stops() == resting, "and leaves the palette as it was");
+            st.invoke_roll();
+            snap(&app).unwrap();
+        }
         assert!(!st.get_assist_showing() && stops() != resting, "a click keeps a roll");
         assert!(st.get_assist_offers().iter().any(|o| o.back), "and the way back is there");
         st.invoke_assist_accept(st.invoke_assist_option(0));
@@ -1732,6 +1749,36 @@ fn second_picker_offers_preview_accept_and_undo() {
             }
         }
         app.window().dispatch_event(WindowEvent::PointerExited);
+        // pointing at hold marks the selected stop as held before the click
+        let (sx, sy, sw, sh) = crate::uifit::rect_of(app.window(), "stop-deck").expect("the stop keys are drawn");
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(sx + sw + 24.0, sy + sh / 2.0) });
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        slint::platform::update_timers_and_animations();
+        capture("picker-v2-hold-hover");
+        // the drawer's settings draw a picture of each choice that stirs under the pointer
+        let arrow = slint::LogicalPosition::new(rx + rw - 8.0, ry + rh / 2.0);
+        let click = |p| {
+            app.window().dispatch_event(WindowEvent::PointerPressed { position: p, button: slint::platform::PointerEventButton::Left });
+            app.window().dispatch_event(WindowEvent::PointerReleased { position: p, button: slint::platform::PointerEventButton::Left });
+        };
+        click(arrow);
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            slint::platform::update_timers_and_animations();
+        }
+        let (bx, by, bw, bh) = crate::uifit::rect_of(app.window(), "RollBank").expect("the roll drawer opens");
+        for (row, cells) in [(0.0, 4.0), (bh + 6.0, 3.0)] {
+            for c in 0..cells as usize {
+                let p = slint::LogicalPosition::new(bx + bw * (c as f32 + 0.5) / cells, by + row + bh / 2.0);
+                app.window().dispatch_event(WindowEvent::PointerMoved { position: p });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                slint::platform::update_timers_and_animations();
+                snap(&app).unwrap();
+            }
+        }
+        capture("picker-v2-roll-drawer");
+        app.window().dispatch_event(WindowEvent::PointerExited);
+        click(arrow);
 
         // spamming roll and ask never grows the row past its column or leaves a draft stuck
         for i in 0..12 {
@@ -2099,4 +2146,26 @@ fn update_pill_drawer_and_system_notes_draw_and_fit() {
     app.window().dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(600.0, 700.0), delta_x: 0.0, delta_y: -4000.0 });
     let bottom = settle(&app);
     save("system-bottom", &bottom);
+}
+
+/// SYSTEM's report-a-bug row, with a long status line, at the window's minimum width.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn bug_report_row_draws_and_fits() {
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let _shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_page(3);
+    st.set_status_line("report written to C:/Users/someone/AppData/Roaming/neuron/reports/bug-2026-11-13-235959 · the clipboard was busy, so point your agent at that folder".into());
+    st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(900.0, 1100.0));
+    app.show().expect("show the window");
+    let frame = snap(&app).expect("SYSTEM draws with the bug-report row");
+    if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        image::save_buffer(dir.join("system-bug-report.png"), frame.as_bytes(), frame.width(), frame.height(), image::ColorType::Rgba8).unwrap();
+    }
 }

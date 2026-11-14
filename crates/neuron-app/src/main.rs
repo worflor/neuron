@@ -26,6 +26,7 @@
 
 mod autostart;
 mod beacon;
+mod bugreport;
 mod binding_list;
 mod buttonfw;
 mod capture;
@@ -46,6 +47,7 @@ mod hidwatch;
 mod host;
 mod knockback;
 mod macrokeys;
+mod mark;
 mod mic;
 mod migrate;
 mod notifs;
@@ -874,12 +876,20 @@ fn main() {
     }
     // Flush any still-debounced lighting save before teardown — a quit must never strand the last
     // edit. Structural edits (stack/remove/tile-pick) already persist immediately; this catches a
+                        let device = st.get_selected_device_name().to_string();
     // knob (speed/stop/timing) tweaked within the 400ms debounce window right before quitting.
     glue::flush_lighting_save();
     light_render::shutdown();
     light_metadata::shutdown();
+                            effect: usize::try_from(st.get_applied_effect()).ok(),
     // ── DEVICE-MODE RESTORE (the DPI-16000 trap) ──────────────────────────
+                            armed: neuron::action::input_armed(),
     // Driver mode is a scoped LEASE (streams/writes), never a permanent state: while a device is held
+                            light: st.get_sel_can_light().then(|| (device.clone(), st.get_brightness().round() as i32)),
+                            dpi: st.get_sel_can_dpi().then(|| {
+                                use slint::Model;
+                                (device.clone(), st.get_dpi().round() as i32, st.get_dpi_stage_nums().iter().collect())
+                            }),
     // in it, its onboard buttons/FN defer to software and it wakes with a stale factory volatile plane
     // unless something re-asserts config. On exit neuron is that "something" no longer, so hand every
     // device back to firmware ownership. Stop the live streams FIRST (each board's own teardown
@@ -1175,34 +1185,35 @@ fn handle_tray(resident: &Rc<RefCell<Resident>>, action: TrayAction) {
                 }
             }
         }
-        TrayAction::BrightnessUp => nudge_brightness(resident, 10.0),
-        TrayAction::BrightnessDown => nudge_brightness(resident, -10.0),
-        TrayAction::DpiUp => nudge_dpi(resident, 200.0),
-        TrayAction::DpiDown => nudge_dpi(resident, -200.0),
+        TrayAction::SetBrightness(v) => set_brightness(resident, v),
+        TrayAction::SetDpi(v) => set_dpi(resident, v),
+        TrayAction::ReportBug => {
+            if let Some(app) = resident.borrow().window.as_ref() {
+                bugreport::start(app, String::new(), false);
+            }
+        }
     }
 }
 
-fn nudge_brightness(resident: &Rc<RefCell<Resident>>, delta: f32) {
+fn set_brightness(resident: &Rc<RefCell<Resident>>, v: f32) {
     if let Some(app) = resident.borrow().window.as_ref() {
         let st = app.global::<State>();
         if st.get_writes_paused() {
             st.set_status_line("writes paused — brightness unchanged".into());
             return; // don't move the slider to a value the device never received
         }
-        let v = (st.get_brightness() + delta).clamp(0.0, 100.0);
         st.set_brightness(v);
         st.invoke_apply_brightness(v);
     }
 }
 
-fn nudge_dpi(resident: &Rc<RefCell<Resident>>, delta: f32) {
+fn set_dpi(resident: &Rc<RefCell<Resident>>, v: f32) {
     if let Some(app) = resident.borrow().window.as_ref() {
         let st = app.global::<State>();
         if st.get_writes_paused() {
             st.set_status_line("writes paused — DPI unchanged".into());
             return;
         }
-        let v = (st.get_dpi() + delta).clamp(100.0, 30000.0);
         st.set_dpi(v);
         st.invoke_apply_dpi(v);
     }

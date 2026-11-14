@@ -139,6 +139,18 @@ jobs:
           CARGO_TARGET_DIR: target
         run: ./packaging/package-windows.ps1 -Version '${{ needs.preflight.outputs.version }}'
 
+      # The release's title and words come from its CHANGELOG.md section, the same section the
+      # in-app updater shows; a tag without one fails here.
+      - name: Release notes from the changelog
+        shell: pwsh
+        run: |
+          & target/release/neuron-release.exe notes --version '${{ needs.preflight.outputs.version }}' --repo-root . --out dist
+          if ($LASTEXITCODE -ne 0) {
+            if ('${{ github.event_name }}' -eq 'push') { throw 'CHANGELOG.md has no section for this release' }
+            Write-Output '::warning::CHANGELOG.md has no section for this version; this test build gets generated notes'
+            exit 0
+          }
+
       # The in-app updater acts only on a manifest signed with the key compiled into Neuron. The
       # package step built the signing tool alongside the CLI; the key reaches this step only.
       - name: Sign the update manifest
@@ -163,6 +175,8 @@ jobs:
             dist/*-setup.exe
             dist/*.zip
             dist/neuron-update.json*
+            dist/release-notes.md
+            dist/release-title.txt
           if-no-files-found: error
 
   publish:
@@ -171,8 +185,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7 # for .github/releases/<tag>.md
-
       # Flatten the package artifact so SHA256SUMS.txt lists the downloaded filename.
       - uses: actions/download-artifact@v8
         with:
@@ -212,19 +224,25 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          # Hand-written notes in .github/releases/<tag>.md win; otherwise GitHub generates them.
-          notes=".github/releases/${VERSION}.md"
-          if [ -f "$notes" ]; then notes_args=(--notes-file "$notes"); else notes_args=(--generate-notes); fi
+          # The windows job wrote the title and notes from CHANGELOG.md; only a test build lacks them.
+          if [ -f dist/release-notes.md ]; then
+            notes_args=(--notes-file dist/release-notes.md)
+            title="$(cat dist/release-title.txt)"
+          else
+            notes_args=(--generate-notes)
+            title="neuron $VERSION"
+          fi
           assets=(dist/*-setup.exe dist/*.zip dist/SHA256SUMS.txt)
           for manifest in dist/neuron-update.json dist/neuron-update.json.sig; do
             if [ -f "$manifest" ]; then assets+=("$manifest"); fi
           done
           if ! gh release create "$VERSION" "${assets[@]}" \
             --draft \
-            --title "neuron $VERSION" \
+            --title "$title" \
             "${notes_args[@]}"; then
             if [ "$(gh release view "$VERSION" --json isDraft --jq '.isDraft')" != true ]; then
               echo "::error::refusing to replace assets on a published release"

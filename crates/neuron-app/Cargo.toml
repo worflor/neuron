@@ -104,6 +104,9 @@ windows-sys = { version = "0.59", features = [
 [build-dependencies]
 slint-build = "1.16"
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1" # Embed neuron's mark as the executable's icon.
+
 [features]
 default = []
 # A Steam build: Steam updates the app, so the self-updater stays off.

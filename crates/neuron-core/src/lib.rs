@@ -98,6 +98,7 @@ pub mod profile;
 pub mod protocol;
 pub mod radial;
 pub mod registry;
+pub mod report;
 pub mod rhythm;
 pub mod runroot;
 pub mod salvage;

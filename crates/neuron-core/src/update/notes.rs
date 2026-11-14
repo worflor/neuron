@@ -42,6 +42,33 @@ pub struct Release {
     pub raw: String,
 }
 
+impl Release {
+    /// The release's tagline: its headline up to the first full stop or colon. The GitHub release
+    /// is titled `neuron vX.Y.Z — <tagline>`.
+    #[must_use]
+    pub fn tagline(&self) -> &str {
+        let h = self.headline.trim();
+        let end = [". ", ": "].iter().filter_map(|stop| h.find(stop)).min().unwrap_or(h.len());
+        h[..end].trim_end_matches('.').trim()
+    }
+
+    /// The section as a GitHub release body: everything under its `##` line, with each image's
+    /// repo path pointed at `tag`'s copy of the file so it shows on the release page.
+    #[must_use]
+    pub fn body(&self, repo: &str, tag: &str) -> String {
+        let mut out = String::new();
+        for line in self.raw.lines().skip(1) {
+            let t = line.trim();
+            match media_line(t) {
+                Some(m) => out.push_str(&format!("![{}](https://raw.githubusercontent.com/{repo}/{tag}/{})", m.alt, m.path)),
+                None => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        out.trim().to_string()
+    }
+}
+
 /// Every versioned release section in `md`, in file order.
 pub fn parse(md: &str) -> Vec<Release> {
     split_sections(md).into_iter().filter_map(|raw| parse_section(&raw)).collect()
@@ -227,6 +254,21 @@ pub fn plain(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_release_page_is_its_changelog_section() {
+        let md = "## 0.1.9 · 2026-11-20\nthe colour picker grew a brain: a model. plus fixes.\n![a roll](docs/media/roll.webp)\n\n### new\n- **Luma.** it edits with you.\n";
+        let rel = parse(md).remove(0);
+        assert_eq!(rel.tagline(), "the colour picker grew a brain");
+        let body = rel.body("worflor/neuron", "v0.1.9");
+        assert!(body.starts_with("the colour picker grew a brain: a model."), "{body}");
+        assert!(body.contains("![a roll](https://raw.githubusercontent.com/worflor/neuron/v0.1.9/docs/media/roll.webp)"), "{body}");
+        assert!(body.contains("### new\n- **Luma.** it edits with you."), "{body}");
+        let short = parse("## 0.1.7\na hardening pass. i went through it.\n").remove(0);
+        assert_eq!(short.tagline(), "a hardening pass");
+        let whole = parse("## 0.1.0\nbeta mk1.\n").remove(0);
+        assert_eq!(whole.tagline(), "beta mk1");
+    }
+
     use super::*;
 
     const SAMPLE: &str = "# Changelog

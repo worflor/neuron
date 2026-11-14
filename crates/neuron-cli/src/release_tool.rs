@@ -8,6 +8,11 @@
 //!   neuron-release manifest --version vX.Y.Z --dist DIR [--changelog FILE] [--repo-root DIR]
 //!                           (--key-env VAR | --key-file FILE) [--out DIR]
 //!   neuron-release verify --dir DIR
+//!   neuron-release notes --version vX.Y.Z [--repo-root DIR] [--out DIR]
+//!
+//! `notes` writes the GitHub release's title and body from the version's `CHANGELOG.md` section
+//! inside `packaging/release-notes.md`, the page around it. The changelog is the only place a
+//! release's words live: a version without a section fails.
 //!
 //! `manifest` signs only with the key whose public half is compiled into this build, so a
 //! release can never ship a manifest the app would refuse.
@@ -22,7 +27,8 @@ fn main() {
         Some("keygen") => keygen(&args[1..]),
         Some("manifest") => build_manifest(&args[1..]),
         Some("verify") => verify(&args[1..]),
-        _ => Err("usage: neuron-release keygen | manifest | verify (see the source header)".to_string()),
+        Some("notes") => release_notes(&args[1..]),
+        _ => Err("usage: neuron-release keygen | manifest | verify | notes (see the source header)".to_string()),
     };
     if let Err(e) = result {
         eprintln!("neuron-release: {e}");
@@ -139,6 +145,31 @@ fn build_manifest(args: &[String]) -> Result<(), String> {
     std::fs::write(out.join(manifest::MANIFEST_NAME), &body).map_err(|e| e.to_string())?;
     std::fs::write(out.join(manifest::SIGNATURE_NAME), sig).map_err(|e| e.to_string())?;
     println!("signed {} for {} with {} asset(s) and {} media", manifest::MANIFEST_NAME, doc.tag, doc.assets.len(), doc.media.len());
+    Ok(())
+}
+
+fn release_notes(args: &[String]) -> Result<(), String> {
+    let tag = opt(args, "--version").ok_or("--version is required")?;
+    let version = Version::parse(&tag).ok_or("--version is not a version")?;
+    let repo_root = PathBuf::from(opt(args, "--repo-root").unwrap_or_else(|| ".".into()));
+    let out = PathBuf::from(opt(args, "--out").unwrap_or_else(|| "dist".into()));
+    let read = |path: PathBuf| std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()));
+    let md = read(repo_root.join("CHANGELOG.md"))?;
+    let release = notes::find(&md, &version).ok_or_else(|| format!("CHANGELOG.md has no section for {version}; write it before tagging"))?;
+    let tagline = release.tagline();
+    if tagline.is_empty() {
+        return Err(format!("the {version} section has no headline to take a tagline from"));
+    }
+    let page = read(repo_root.join("packaging").join("release-notes.md"))?;
+    if !page.contains("{notes}") {
+        return Err("packaging/release-notes.md has no {notes} placeholder".into());
+    }
+    let tag = version.tag();
+    let body = page.replace("{tag}", &tag).replace("{notes}", &release.body(neuron::update::REPO, &tag));
+    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    std::fs::write(out.join("release-title.txt"), format!("neuron {tag} \u{2014} {tagline}")).map_err(|e| e.to_string())?;
+    std::fs::write(out.join("release-notes.md"), body).map_err(|e| e.to_string())?;
+    println!("neuron {tag} \u{2014} {tagline}");
     Ok(())
 }
 

@@ -84,6 +84,14 @@ enum Cmd {
         #[command(subcommand)]
         action: compat_cmd::CompatCmd,
     },
+    /// Write a bug report for an issue or a coding agent; sends nothing
+    ///
+    /// report.md from the bug template, the crash log's tail, a pre-filled issue link and a
+    /// prompt for your coding agent, with your home folder, user and PC names scrubbed.
+    Report {
+        #[command(subcommand)]
+        action: ReportCmd,
+    },
     /// List connected, recognized Razer devices
     ///
     /// A device no definition covers yet is reported as `new device ...`; `neuron adopt` learns
@@ -982,7 +990,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Feel", &["feel"]),
     ("Input", &["bind", "control", "action", "trigger", "cast", "gesture", "radial", "macro", "pocket", "run", "watch", "pads", "rumble", "audio", "twin"]),
     ("Lighting", &["lighting"]),
-    ("Setup", &["profile", "config", "dump", "apply", "reload", "status", "catalog", "import"]),
+    ("Setup", &["profile", "config", "dump", "apply", "reload", "status", "catalog", "import", "report"]),
 ];
 
 /// Exit for a command line clap rejected: help and version as clap prints them, anything else as
@@ -1110,6 +1118,8 @@ fn run() -> Result<()> {
     // Compatibility export/replay must work even with broken app config and must never migrate it.
     let command = match cli.cmd {
         Cmd::Compat { action } => return compat_cmd::run(action),
+        // a bug report must work however broken the config is, and must not migrate it
+        Cmd::Report { action } => return report_cmd(action),
         command => command,
     };
     neuron::screenshot::install_completion_sink(|message| eprintln!("[screenshot] {message}"));
@@ -1126,6 +1136,7 @@ fn run() -> Result<()> {
     // the bus and comes up short. See `adopt_and_reload`.
     match command {
         Cmd::Compat { action } => compat_cmd::run(action)?,
+        Cmd::Report { action } => report_cmd(action)?,
         Cmd::List => list(&reg)?,
         Cmd::Discover { emit } => discover_cmd(emit),
         Cmd::Adopt { dry_run } => adopt_cmd(&reg, dry_run)?,
@@ -4258,6 +4269,40 @@ fn unknown_devices(reg: &Registry) -> Vec<(u16, String)> {
             (pid, name)
         })
         .collect()
+}
+
+#[derive(Subcommand)]
+enum ReportCmd {
+    /// Write a bug report under the run root's `reports` folder
+    Bug {
+        /// what happened, in your own words (the issue's title is its first line)
+        #[arg(long, default_value = "")]
+        what: String,
+    },
+}
+
+fn report_cmd(action: ReportCmd) -> Result<()> {
+    let ReportCmd::Bug { what } = action;
+    let root = neuron::runroot::run_root();
+    let devices = Registry::load().map(|reg| neuron::report::connected_devices(&reg)).unwrap_or_default();
+    let input = neuron::report::Input {
+        what,
+        version: env!("CARGO_PKG_VERSION").into(),
+        devices,
+        crash_log: std::fs::read_to_string(root.join("neuron-crash.log")).ok(),
+        flight: None,
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let report = neuron::report::build(&input, &root, &neuron::report::Private::current(), now, &neuron::report::skill_location())?;
+    out::done(
+        serde_json::json!({ "dir": report.dir, "zip": report.zip, "issue_url": report.issue_url, "agent_prompt": report.agent_prompt }),
+        format!("Report written to {}
+Attach {} to a new issue: {}
+Or give your coding agent this prompt:
+{}",
+            report.dir.display(), report.zip.display(), report.issue_url, report.agent_prompt),
+    );
+    Ok(())
 }
 
 fn list(reg: &Registry) -> Result<()> {

@@ -352,6 +352,8 @@ export component Button inherits Rectangle {
     in property <bool> busy: false;        // an async op is in flight — lamp on, contact open
     property <color> hue: Theme.hue(root.signal);
     property <bool> signalled: root.signal != Signal.idle;
+    // the pointer is on a usable button, for a caller that shows what pressing it would do
+    out property <bool> hovered: touch.has-hover && root.usable;
     callback clicked();
     height: Theme.row-h;
     clip: true;

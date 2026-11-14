@@ -478,12 +478,11 @@ pub fn code_it_adds(doc: &Setup) -> Vec<String> {
         if crate::macros::macro_host::load_macro(id).as_deref() == Some(src.as_str()) {
             continue;
         }
-        let raw = crate::macros::policy::mode_from_source(src)
-            .is_ok_and(|m| m == crate::macros::policy::MacroMode::Raw);
-        found.push(if raw {
-            format!("macro `{id}` is RAW: unsandboxed Python with your account's access")
-        } else {
-            format!("macro `{id}` is BOUND: Python under a policy wall, which is containment for honest code and not an isolation boundary")
+        use crate::macros::policy::{mode_from_source, MacroMode};
+        found.push(match mode_from_source(src) {
+            Ok(MacroMode::Raw) => format!("macro `{id}` is RAW: unsandboxed Python with your account's access"),
+            Ok(MacroMode::Bound) => format!("macro `{id}` is BOUND: Python under a policy wall, which is containment for honest code and not an isolation boundary"),
+            Err(e) => format!("macro `{id}` is Python neuron cannot run as either mode: {e}"),
         });
     }
     for b in doc.profiles.iter().flatten() {

@@ -71,18 +71,17 @@ impl Engine for Asked<'_> {
 impl Learned {
     /// The colours the model would give stop `at` of `stops` if it had none, best first: a masked
     /// request with no edit budget, reading the other stops as they are. `library` sets the style,
-    /// as [`Scene::library`] does. Empty for a palette of one, a stop out of range, or positions
-    /// that do not rise.
+    /// as [`Scene::library`] does. Empty for a palette of one, a stop out of range, or a position
+    /// that is not a number or out of order; stops that share a spot are read a hair apart.
     #[must_use]
     pub fn fill(&self, stops: &[Stop], at: usize, library: &[Vec<Rgb>]) -> Vec<Rgb> {
         let n = stops.len();
-        if n < 2 || at >= n || stops.windows(2).any(|pair| pair[1].at <= pair[0].at) {
+        let Some(positions) = super::positions(stops).filter(|_| n >= 2 && at < n) else {
             return Vec::new();
-        }
+        };
         let unit = |c: Rgb| [f64::from(c.r) / 255.0, f64::from(c.g) / 255.0, f64::from(c.b) / 255.0];
         let byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
         let rgb: Vec<Srgb> = stops.iter().map(|s| unit(s.col)).collect();
-        let positions: Vec<f64> = stops.iter().map(|s| 2.0 * f64::from(s.at) - 1.0).collect();
         let support: Vec<Vec<Lab>> = library.iter().map(|palette| palette.iter().map(|c| oklab(unit(*c))).collect()).collect();
         let style = self.style_vector(&support);
         // as in a one-stop request: the palette's ends hold, unless one is the stop asked about

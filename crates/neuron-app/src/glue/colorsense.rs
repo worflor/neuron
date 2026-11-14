@@ -88,6 +88,8 @@ struct Sense {
     /// Palettes rolled for a palette, newest first, and how many rolls there have been.
     rolls: Vec<(Home, Offer)>,
     rolled: u64,
+    /// Options asked for that the person waved off, for the palette they were asked about.
+    waved: Option<(Home, Vec<Stop>, Vec<Vec<Stop>>)>,
 }
 
 /// How long a slate must stay on screen before replacing it counts as passing it over. A slate
@@ -459,6 +461,12 @@ pub(super) fn refresh(app: &AppWindow, sh: &SharedRt) {
                 let lch = Lch::of(offer.stops.get(chosen)?.col);
                 Some(Row { offer: offer.clone(), slate: Some(i), dot: Some((vividness(lch), lch.l.clamp(0.0, 1.0))), roll: false })
             }));
+            if sense.waved.as_ref().is_some_and(|(at, then, _)| *at != home || *then != palette.stops) {
+                sense.waved = None;
+            }
+            if let Some((_, _, waved)) = &sense.waved {
+                rows.retain(|row| !row.offer.reach || !waved.contains(&row.offer.stops));
+            }
             st.set_assist_asking(sense.asking.is_some());
             record(sense, home, &palette, chosen, &rows);
             sense.slate = Some((scene, slate));
@@ -590,6 +598,30 @@ fn preview(app: &AppWindow, sh: &SharedRt, index: i32) {
         }
         // nothing was on show: an answer that arrived meanwhile may now be
         None => refresh(app, sh),
+    }
+}
+
+/// Take row `index` off the row: a roll is forgotten, and an option the model was asked for is
+/// not offered again for this palette. Other rows are the engines' own and stay.
+fn dismiss(app: &AppWindow, sh: &SharedRt, index: i32) {
+    preview(app, sh, -1);
+    let Some((home, palette)) = active(sh) else { return };
+    let changed = SENSE.with(|sense| {
+        let mut sense = sense.borrow_mut();
+        let Some(row) = usize::try_from(index).ok().and_then(|i| sense.rows.get(i).cloned()) else { return false };
+        if row.roll {
+            sense.rolls.retain(|(_, offer)| *offer != row.offer);
+            true
+        } else if row.offer.reach {
+            let waved = sense.waved.get_or_insert_with(|| (home, palette.stops.clone(), Vec::new()));
+            waved.2.push(row.offer.stops);
+            true
+        } else {
+            false
+        }
+    });
+    if changed {
+        refresh(app, sh);
     }
 }
 
@@ -1020,6 +1052,7 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
     };
     st.on_assist_preview(offer(preview));
     st.on_assist_accept(offer(accept));
+    st.on_assist_dismiss(offer(dismiss));
     st.on_assist_at(dot_at);
     st.on_assist_option(option_row);
     let (w, sh2) = (app.as_weak(), sh.clone());

@@ -17,6 +17,7 @@ for the relevant commands, release workflow, and product evidence.
 | change a setting, read a device, or run any `neuron` command | [cli.md](cli.md) |
 | know how something works, or whether it's supported | [answers.md](answers.md) |
 | says something didn't work, or asks why something is the way it is | [issues.md](issues.md) |
+| hands you a `reports/bug-…` folder or a prompt from neuron's bug-report button | [issues.md](issues.md#starting-from-a-bug-report) |
 | author or revise a Python macro, beacon, or action-specific macro | [neuron-macros](../neuron-macros/SKILL.md) |
 | author bindings, cast, lighting, profiles, or a complete CLI setup | [neuron-cli](../neuron-cli/SKILL.md) |
 

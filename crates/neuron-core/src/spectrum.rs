@@ -476,6 +476,9 @@ impl Palette {
         if idx >= self.stops.len() {
             return idx;
         }
+        if !at.is_finite() {
+            return idx;
+        }
         let mut s = self.stops.remove(idx);
         s.at = at.clamp(0.0, 1.0);
         let pos = self.stops.partition_point(|x| x.at <= s.at);
@@ -1101,7 +1104,8 @@ fn motion_parts(m: &Motion) -> (Option<String>, Option<f32>, Option<f32>, Option
 }
 
 /// Parse wire stops into sorted [`Stop`]s. All-hex (no positions) -> evenly distributed; any explicit
-/// position -> use it (a missing one defaults to 0.0). Clamped to 0..1 and sorted ascending.
+/// position -> use it (a missing one defaults to 0.0). Clamped to 0..1 and sorted ascending; a
+/// position that is not a number is refused.
 fn parse_stops(reprs: Vec<StopRepr>) -> Result<Vec<Stop>, String> {
     let mut tmp: Vec<(Option<f32>, Rgb)> = Vec::with_capacity(reprs.len());
     for r in reprs {
@@ -1112,6 +1116,9 @@ fn parse_stops(reprs: Vec<StopRepr>) -> Result<Vec<Stop>, String> {
             }
             StopRepr::Full { col, at } => {
                 let c = Rgb::parse(&col).ok_or_else(|| format!("invalid stop hex '{col}'"))?;
+                if !at.is_finite() {
+                    return Err(format!("stop '{col}' has a position that is not a number"));
+                }
                 tmp.push((Some(at), c));
             }
         }
@@ -1354,6 +1361,24 @@ mod tests {
             "the Breathe motion (a breathing layer's only animation) must survive the recolour"
         );
         assert!(!red.is_solid(), "a recoloured breathing spectrum must NOT collapse to a static solid");
+    }
+
+    /// A hand-edited `at = nan` is refused where the palette is read, not carried into the picker.
+    #[test]
+    fn a_stop_position_that_is_not_a_number_is_refused() {
+        #[derive(Deserialize)]
+        struct Holder {
+            #[allow(dead_code)]
+            spectrum: Spectrum,
+        }
+        let read = |at: &str| toml::from_str::<Holder>(&format!("spectrum = {{ stops = [{{ col = \"ff0000\", at = 0.0 }}, {{ col = \"0000ff\", at = {at} }}] }}"));
+        assert!(read("1.0").is_ok());
+        for bad in ["nan", "inf", "-inf"] {
+            assert!(read(bad).is_err(), "at = {bad}");
+        }
+        let mut palette = Palette::new(vec![Stop::new(Rgb::new(255, 0, 0), 0.0), Stop::new(Rgb::new(0, 0, 255), 1.0)], Motion::Hold);
+        palette.move_stop(1, f32::NAN);
+        assert_eq!(palette.stops[1].at, 1.0, "a move to nowhere leaves the stop where it was");
     }
 
     // REPRO: a stacked layer with a TABLE-tier spectrum (motion / sequence) inside a TOML

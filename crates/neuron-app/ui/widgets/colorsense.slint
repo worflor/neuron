@@ -391,6 +391,11 @@ export component SenseOffers inherits Rectangle {
     property <int> shown: -1;
     property <int> lit: root.hov >= 0 ? root.hov : State.assist-keyed < root.n ? State.assist-keyed : -1;
     property <bool> hint: root.lit < 0 && State.assist-keys && State.assist-prime >= 0 && State.assist-prime < root.n;
+    // a roll or an option asked for can be waved off: its right end is an x while it is pointed at
+    property <bool> can-wave: root.hov >= 0 && root.hov < State.assist-offers.length
+        && (State.assist-offers[root.hov].rolled || State.assist-offers[root.hov].reach);
+    property <length> hov-end: root.hov == 0 ? root.hw : root.hw + root.gap + root.hov * (root.cw + root.gap) - root.gap;
+    property <bool> on-wave: root.can-wave && ta.mouse-x >= root.hov-end - 16px;
     changed hov => {
         State.assist-keyed = -1;
         if (root.hov < 0 || root.shown >= 0) {
@@ -443,6 +448,24 @@ export component SenseOffers inherits Rectangle {
         if State.assist-tab-held && offer.num > 0 : Keycap {
             ground: true;
             key: offer.num;
+        }
+        if i == root.hov && root.can-wave : Rectangle {
+            x: parent.width - 16px;
+            y: 7px;
+            width: 12px;
+            height: 12px;
+            border-radius: 6px;
+            background: #000000b8;
+            Path {
+                x: 3px; y: 3px;
+                width: 6px; height: 6px;
+                viewbox-width: 6; viewbox-height: 6;
+                fill: transparent;
+                stroke: root.on-wave ? Theme.danger : Theme.text-mid;
+                stroke-width: 1.3px;
+                commands: "M0 0 L6 6 M6 0 L0 6";
+                animate stroke { duration: Theme.quick; }
+            }
         }
     }
     // ask the model outright: "ask" while it has nothing to say, "more" once asked
@@ -510,7 +533,11 @@ export component SenseOffers inherits Rectangle {
         height: 26px;
         mouse-cursor: MouseCursor.pointer;
         clicked => {
-            if (root.hov >= 0) {
+            if (root.on-wave) {
+                // whatever slides under the pointer next shows once the beat has passed
+                State.assist-dismiss(root.hov);
+                root.shown = -1;
+            } else if (root.hov >= 0) {
                 State.assist-accept(root.hov);
                 State.picker-focus += 1;
             }
@@ -589,6 +616,133 @@ export component RollButton inherits Rectangle {
     }
 }
 
+// A colour dot centred on (cx, cy), for the roll glyphs.
+component RollDot inherits Rectangle {
+    in property <length> cx;
+    in property <length> cy;
+    in property <length> d: 4px;
+    in property <bool> hollow;
+    in property <color> tint;
+    x: self.cx - self.d / 2;
+    y: self.cy - self.d / 2;
+    width: self.d;
+    height: self.d;
+    border-radius: self.d / 2;
+    background: self.hollow ? transparent : self.tint;
+    border-width: self.hollow ? 1.2px : 0px;
+    border-color: self.tint;
+    animate x, y { duration: 160ms; easing: ease-out; }
+}
+
+// A roll setting drawn as a picture of what it does, under its name. `stir` is the pointer on it:
+// the picture moves the way that setting moves a palette.
+component RollGlyph inherits Rectangle {
+    in property <int> kind;     // 0..3 the start (around, fresh, mine, wildcard); 10..12 the wildness
+    in property <bool> stir;
+    width: 48px;
+    height: 10px;
+    // around: the held stop, ringed, with near hues drawing in to it
+    if root.kind == 0 : Rectangle {
+        RollDot { cx: 24px; cy: 5px; d: 7px; hollow: true; tint: #4af2b0; }
+        RollDot { cx: root.stir ? 15px : 11px; cy: 5px; d: 4px; tint: #38c99a; }
+        RollDot { cx: root.stir ? 33px : 37px; cy: 5px; d: 4px; tint: #7ff5c8; }
+        RollDot { cx: root.stir ? 9px : 3px; cy: 5px; d: 3px; tint: #2fa883; }
+        RollDot { cx: root.stir ? 39px : 45px; cy: 5px; d: 3px; tint: #a8f8db; }
+    }
+    // fresh: new, evenly spread hues from nothing
+    if root.kind == 1 : Rectangle {
+        RollDot { cx: root.stir ? 3px : 9px; cy: 5px; tint: #ff6f91; }
+        RollDot { cx: root.stir ? 18px : 19px; cy: 5px; tint: #ffd166; }
+        RollDot { cx: root.stir ? 30px : 29px; cy: 5px; tint: #4af2b0; }
+        RollDot { cx: root.stir ? 45px : 39px; cy: 5px; tint: #5aa7e0; }
+    }
+    // mine: a palette off your own pile
+    if root.kind == 2 : Rectangle {
+        Rectangle {
+            x: root.stir ? 13px : 11px; y: root.stir ? 0px : 1px;
+            width: 26px; height: 4px; border-radius: 2px;
+            background: @linear-gradient(90deg, #6b5bd6 0%, #c86bb0 100%);
+            opacity: 0.45;
+            animate x, y { duration: 160ms; easing: ease-out; }
+        }
+        Rectangle {
+            x: root.stir ? 9px : 11px; y: root.stir ? 6px : 5px;
+            width: 26px; height: 4px; border-radius: 2px;
+            background: @linear-gradient(90deg, #e07a5f 0%, #f2cc8f 100%);
+            animate x, y { duration: 160ms; easing: ease-out; }
+        }
+    }
+    // wildcard: anything, anywhere
+    if root.kind == 3 : Rectangle {
+        RollDot { cx: 6px; cy: root.stir ? 7px : 2px; d: 3px; tint: #5aa7e0; }
+        RollDot { cx: 17px; cy: root.stir ? 2px : 7px; d: 5px; tint: #ff6f91; }
+        RollDot { cx: 28px; cy: root.stir ? 8px : 4px; d: 3px; tint: #ffd166; }
+        RollDot { cx: 40px; cy: root.stir ? 3px : 7px; d: 4px; tint: #4af2b0; }
+    }
+    // the wildness: how far the line wanders, stirred up under the pointer
+    if root.kind >= 10 : Path {
+        x: 2px;
+        width: 44px;
+        height: root.stir && root.kind > 10 ? 10px : 7px;
+        y: (root.height - self.height) / 2;
+        viewbox-width: 44;
+        viewbox-height: 8;
+        fill: transparent;
+        stroke: root.kind == 10 ? #5aa7e0 : root.kind == 11 ? #4af2b0 : #ff6f91;
+        stroke-width: 1.4px;
+        commands: root.kind == 10 ? "M 0 4 L 44 4"
+            : root.kind == 11 ? "M 0 4 Q 5.5 0.5 11 4 T 22 4 T 33 4 T 44 4"
+            : "M 0 4 L 4 1 L 8 7 L 12 1.5 L 16 7.5 L 20 0.5 L 24 6.5 L 28 2 L 32 7.5 L 36 0.5 L 40 5.5 L 44 3";
+        animate height { duration: 160ms; easing: ease-out; }
+    }
+}
+
+// A row of roll settings, each a name over a picture of it. `base` picks the pictures
+// (0 the starts, 10 the wildness).
+component RollBank inherits Rectangle {
+    in property <[string]> options;
+    in property <int> index;
+    in property <int> base;
+    callback picked(int);
+    height: 36px;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    border-color: Theme.line;
+    clip: true;
+    HorizontalLayout {
+        spacing: 0;
+        for opt[i] in root.options : seg := Rectangle {
+            property <bool> on: i == root.index;
+            min-width: max(56px, txt.preferred-width + 20px);
+            horizontal-stretch: 1;
+            background: seg.on ? Theme.accent-glow : sta.pressed ? Theme.well-hi : sta.has-hover ? Theme.well : transparent;
+            animate background { duration: sta.has-hover ? Theme.hover-in : Theme.hover-out; }
+            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+            txt := Text {
+                y: 3px;
+                height: 18px;
+                text: opt;
+                vertical-alignment: center; horizontal-alignment: center;
+                color: seg.on ? Theme.accent : (sta.has-hover ? Theme.text-mid : Theme.text-dim);
+                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                letter-spacing: Theme.track-2;
+            }
+            RollGlyph {
+                x: (seg.width - self.width) / 2;
+                y: 22px;
+                kind: root.base + i;
+                stir: sta.has-hover;
+                opacity: seg.on ? 1 : sta.has-hover ? 0.85 : 0.4;
+                animate opacity { duration: sta.has-hover ? Theme.hover-in : Theme.hover-out; }
+            }
+            sta := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => { root.picked(i); }
+            }
+        }
+    }
+}
+
 // What a roll starts from and how far it strays, in a drawer that opens under the roll button.
 // Choosing where to start rolls one straight away; the wildness applies to the next roll.
 export component RollDrawer inherits Rectangle {
@@ -601,18 +755,20 @@ export component RollDrawer inherits Rectangle {
         width: root.width;
         height: self.preferred-height;
         spacing: 6px;
-        SplitToggle {
+        RollBank {
             options: State.roll-modes;
             index: State.roll-mode;
+            base: 0;
             picked(i) => {
                 State.roll-choose(i, State.roll-wild);
                 State.roll();
                 State.picker-focus += 1;
             }
         }
-        SplitToggle {
+        RollBank {
             options: State.roll-wilds;
             index: State.roll-wild;
+            base: 10;
             picked(i) => { State.roll-choose(State.roll-mode, i); }
         }
     }

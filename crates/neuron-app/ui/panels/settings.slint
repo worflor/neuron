@@ -1463,6 +1463,28 @@ export component SettingsPanel inherits VerticalLayout {
                             property <int> total: max(1, State.diag-pass + State.diag-fail + State.diag-skip);
                             // absolute segments (no inner layout — it would feed back into this width)
                             property <length> w-pass: self.width * State.diag-pass / self.total;
+                    // report a bug: writes a scrubbed report folder + zip, then opens a pre-filled
+                    // issue, or copies a prompt for the person's coding agent. Nothing is sent.
+                    VerticalLayout {
+                        spacing: 4px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            bug-what := Field {
+                                placeholder: "what happened?";
+                                field-width: 320px;
+                                accepted(v) => { State.report-bug(v, false); }
+                            }
+                            SplitButton {
+                                horizontal-stretch: 0;
+                                left-text: "report a bug";
+                                right-text: "for your agent";
+                                left-clicked => { State.report-bug(bug-what.text, false); }
+                                right-clicked => { State.report-bug(bug-what.text, true); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        Mono { text: "home folder, user and pc names are scrubbed. you attach the zip yourself."; color: Theme.text-faint; wrap: word-wrap; }
+                    }
                             property <length> w-fail: self.width * State.diag-fail / self.total;
                             Rectangle {
                                 x: 0; width: parent.w-pass; height: parent.height;

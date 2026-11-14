@@ -104,6 +104,8 @@ impl Linear {
     fn dense(weight: Vec<f64>, bias: Vec<f64>) -> Linear {
         let out = bias.len();
         let inputs = weight.len().checked_div(out).unwrap_or(0);
+        // the parser takes every array at its exact shape, so a weight is a whole number of rows
+        debug_assert_eq!(weight.len(), out * inputs, "a dense layer's weight is out rows of its inputs");
         let mut panels = vec![0.0; out.div_ceil(PANEL) * PANEL * inputs];
         if inputs > 0 {
             for (r, row) in weight.chunks_exact(inputs).enumerate() {
@@ -130,6 +132,8 @@ impl Linear {
     /// sum over the inputs that the one-row product makes.
     fn apply_all(&self, xs: &[Vec<f64>]) -> Vec<Vec<f64>> {
         let out = self.bias.len();
+        // every caller hands rows the layer's own width; a mismatch is a wiring bug, not data
+        debug_assert!(self.inputs == 0 || xs.iter().all(|x| x.len() == self.inputs), "rows of another width");
         if self.inputs == 0 || xs.iter().any(|x| x.len() != self.inputs) {
             return xs.iter().map(|x| self.apply(x)).collect();
         }
@@ -582,7 +586,9 @@ impl Learned {
             return Err("bundle payload does not match its header".into());
         }
         let config = &doc["config"];
-        let number = |v: &serde_json::Value, what: &str| v.as_f64().ok_or_else(|| format!("bundle config: {what}"));
+        // Numbers are finite, and a rule that is present but not a number is refused, not defaulted.
+        let number = |v: &serde_json::Value, what: &str| v.as_f64().filter(|v| v.is_finite()).ok_or_else(|| format!("bundle config: {what}"));
+        let at_least = |v: f64, floor: f64, what: &str| if v >= floor { Ok(v) } else { Err(format!("bundle config: {what}")) };
         let size = |what: &str| config[what].as_u64().map(|v| v as usize).filter(|v| (1..=4096).contains(v)).ok_or_else(|| format!("bundle config: {what}"));
         let (width, heads, blocks, components, style) = (size("width")?, size("heads")?, size("blocks")?, size("components")?, size("style")?);
         let policy = &config["policy"];
@@ -592,24 +598,40 @@ impl Learned {
         {
             return Err("unsupported colour model layout, revision or policy".into());
         }
-        let mut arrays: HashMap<&str, (Vec<usize>, usize)> = HashMap::new();
+        // Every array lies inside the payload, apart from every other, and is as long as its shape.
+        let mut arrays: HashMap<&str, (Vec<usize>, usize, usize)> = HashMap::new();
+        let mut spans = Vec::new();
         for a in doc["arrays"].as_array().ok_or("bundle header: arrays")? {
-            let shape: Option<Vec<usize>> = a["shape"].as_array().map(|s| s.iter().filter_map(|v| v.as_u64().map(|v| v as usize)).collect());
+            let shape: Option<Vec<usize>> = a["shape"].as_array().and_then(|s| s.iter().map(|v| v.as_u64().and_then(|v| usize::try_from(v).ok())).collect());
             let (Some(name), Some(shape), Some(offset), "<f4") = (a["name"].as_str(), shape, a["offset"].as_u64(), a["dtype"].as_str().unwrap_or("")) else {
                 return Err("bundle header: array entry".into());
             };
-            arrays.insert(name, (shape, offset as usize));
+            let offset = usize::try_from(offset).map_err(|_| "bundle header: array entry")?;
+            let end = shape.iter().try_fold(4usize, |total, side| total.checked_mul(*side)).and_then(|bytes| offset.checked_add(bytes));
+            let end = end.filter(|end| *end <= payload.len()).ok_or_else(|| format!("bundle array {name} lies outside the payload"))?;
+            spans.push((offset, end));
+            if arrays.insert(name, (shape, offset, end)).is_some() {
+                return Err(format!("bundle lists array {name} twice"));
+            }
+        }
+        spans.sort_unstable();
+        if spans.windows(2).any(|w| w[1].0 < w[0].1) {
+            return Err("bundle arrays overlap".into());
         }
         let take = |name: &str, shape: &[usize]| -> Result<Vec<f64>, String> {
-            let (found, offset) = arrays.get(name).ok_or_else(|| format!("bundle has no array {name}"))?;
-            let bytes = shape.iter().try_fold(4usize, |total, side| total.checked_mul(*side));
-            let raw = bytes.and_then(|bytes| offset.checked_add(bytes)).and_then(|end| payload.get(*offset..end)).filter(|_| found == shape);
-            let raw = raw.ok_or_else(|| format!("bundle array {name} has the wrong shape"))?;
-            Ok(raw.chunks_exact(4).map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))).collect())
+            let (found, offset, end) = arrays.get(name).ok_or_else(|| format!("bundle has no array {name}"))?;
+            if found != shape {
+                return Err(format!("bundle array {name} has the wrong shape"));
+            }
+            let values: Vec<f64> = payload[*offset..*end].chunks_exact(4).map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))).collect();
+            if values.iter().any(|v| !v.is_finite()) {
+                return Err(format!("bundle array {name} holds a value that is not a number"));
+            }
+            Ok(values)
         };
         // `out` of `None` takes the row count the bundle states; the next layer's input checks it.
         let linear = |name: &str, out: Option<usize>, inp: usize| -> Result<Linear, String> {
-            let stated = arrays.get(format!("{name}.weight").as_str()).and_then(|(shape, _)| shape.first().copied());
+            let stated = arrays.get(format!("{name}.weight").as_str()).and_then(|(shape, ..)| shape.first().copied());
             let out = out.or(stated).filter(|rows| (1..=4096).contains(rows)).ok_or_else(|| format!("bundle has no array {name}.weight"))?;
             Ok(Linear::dense(take(&format!("{name}.weight"), &[out, inp])?, take(&format!("{name}.bias"), &[out])?))
         };
@@ -627,7 +649,12 @@ impl Learned {
         };
         let optional = |v: &serde_json::Value, what: &str, otherwise: f64| if v.is_null() { Ok(otherwise) } else { number(v, what) };
         let features = SPACE + INTENT + style + 1;
-        let merge = number(&config["merge"], "merge")?;
+        let merge = at_least(number(&config["merge"], "merge")?, 0.0, "merge")?;
+        // the spread of a colour is drawn between these two, on a log scale: both above zero
+        let sigma = [number(&config["sigma"][0], "sigma")?, number(&config["sigma"][1], "sigma")?];
+        if sigma.iter().any(|s| *s <= 0.0) {
+            return Err("bundle config: sigma".into());
+        }
         let bias = linear("bias.0", None, PAIR)?;
         let lanes = bias.bias.len();
         let token = linear("style.token.0", None, 4)?;
@@ -645,11 +672,11 @@ impl Learned {
             style,
             features,
             open_heads: config["open_heads"].as_u64().unwrap_or(0).min(heads as u64) as usize,
-            cone: optional(&config["cone"], "cone", 0.5)?,
-            sigma: [number(&config["sigma"][0], "sigma")?, number(&config["sigma"][1], "sigma")?],
+            cone: at_least(optional(&config["cone"], "cone", 0.5)?, 0.0, "cone")?,
+            sigma,
             merge,
             favour: optional(&config["favour"], "favour", 0.0)?,
-            duplicate: optional(&policy["duplicate"], "policy.duplicate", merge)?,
+            duplicate: at_least(optional(&policy["duplicate"], "policy.duplicate", merge)?, 0.0, "policy.duplicate")?,
             masked: margins("masked")?,
             refine: margins("refine")?,
             follow: margins("follow")?,
@@ -1299,11 +1326,32 @@ impl Terrain {
     }
 }
 
+/// Stop positions as the model reads them, on its -1..1 scale: strictly rising, so stops dragged
+/// onto one spot still get suggestions. `None` when a position is not a number or out of order.
+pub(crate) fn positions(stops: &[crate::spectrum::Stop]) -> Option<Vec<f64>> {
+    let mut out: Vec<f64> = Vec::with_capacity(stops.len());
+    for stop in stops {
+        let at = 2.0 * f64::from(stop.at) - 1.0;
+        let at = match out.last() {
+            _ if !at.is_finite() => return None,
+            Some(&prev) if at < prev => return None,
+            Some(&prev) if at - prev < SAME_SPOT => prev + SAME_SPOT,
+            _ => at,
+        };
+        out.push(at);
+    }
+    Some(out)
+}
+
+/// How far apart [`positions`] holds two stops that share a spot.
+const SAME_SPOT: f64 = 2e-4;
+
 impl Learned {
     fn frame(&self, scene: &Scene) -> Option<Frame> {
         let n = scene.stops.len();
         let active = scene.selected;
-        if n < 2 || active >= n || scene.stops.windows(2).any(|pair| pair[1].at <= pair[0].at) {
+        let positions = positions(&scene.stops)?;
+        if n < 2 || active >= n {
             return None;
         }
         let unit = |c: Rgb| [f64::from(c.r) / 255.0, f64::from(c.g) / 255.0, f64::from(c.b) / 255.0];
@@ -1313,7 +1361,7 @@ impl Learned {
         Some(Frame {
             rgb: scene.stops.iter().map(|s| unit(s.col)).collect(),
             was: edited.map(|before| before.iter().map(|s| unit(s.col)).collect()),
-            positions: scene.stops.iter().map(|s| 2.0 * f64::from(s.at) - 1.0).collect(),
+            positions,
             style: self.style_vector(&support),
             ends: (0..n).map(|i| i != active && (pins[i] || i == 0 || i == n - 1)).collect(),
             pins,
@@ -1788,6 +1836,51 @@ mod tests {
         let last = (colours.len() - 1).max(1) as f32;
         let stops = colours.iter().enumerate().map(|(i, c)| Stop::new(Rgb::new(c.0, c.1, c.2), i as f32 / last)).collect();
         Scene { stops, interp: Interp::Oklab, before: None, selected: 1, pins: Vec::new(), open: false, library: Vec::new() }
+    }
+
+    /// A core bundle whose numbers are bad is refused even when its hash is right, as a taste
+    /// head is: the picker would otherwise go quiet with nothing saying why.
+    #[test]
+    fn a_core_with_bad_numbers_is_refused() {
+        let rehash = |change: &dyn Fn(&mut [u8], &mut String)| -> Vec<u8> {
+            let mut bundle = SMALL.to_vec();
+            let len = u32::from_le_bytes(bundle[12..16].try_into().unwrap()) as usize;
+            let start = (16 + len).div_ceil(64) * 64;
+            let mut header = String::from_utf8(bundle[16..16 + len].to_vec()).unwrap();
+            let old: String = Sha256::digest(&bundle[start..]).iter().map(|b| format!("{b:02x}")).collect();
+            change(&mut bundle[start..], &mut header);
+            let new: String = Sha256::digest(&bundle[start..]).iter().map(|b| format!("{b:02x}")).collect();
+            let header = header.replace(&old, &new);
+            assert_eq!(header.len(), len);
+            bundle[16..16 + len].copy_from_slice(header.as_bytes());
+            bundle
+        };
+        assert!(Learned::parse(&rehash(&|_, _| {})).is_ok(), "rehashing alone changes nothing");
+        for (what, bad) in [
+            ("a weight that is not a number", rehash(&|payload, _| payload[..4].copy_from_slice(&f32::NAN.to_le_bytes()))),
+            ("an infinite weight", rehash(&|payload, _| payload[4..8].copy_from_slice(&f32::INFINITY.to_le_bytes()))),
+            ("arrays that overlap", rehash(&|_, header| *header = header.replacen("\"offset\":0,", "\"offset\":4,", 1))),
+            ("a spread of zero", rehash(&|_, header| *header = header.replacen("\"sigma\":[0.008,", "\"sigma\":[0.000,", 1))),
+            ("a shape entry that is not a size", rehash(&|_, header| *header = header.replacen("\"shape\":[16]", "\"shape\":[-1]", 1))),
+        ] {
+            assert!(Learned::parse(&bad).is_err(), "{what}");
+        }
+    }
+
+    /// Stops dragged onto one spot are read a hair apart and still get colours; a position that
+    /// is not a number gets none.
+    #[test]
+    fn stops_on_one_spot_are_read_apart_and_a_position_that_is_not_a_number_is_not() {
+        let model = Learned::parse(SMALL).unwrap();
+        let stop = |c: (u8, u8, u8), at: f32| Stop::new(Rgb::new(c.0, c.1, c.2), at);
+        let mut stops = vec![stop((12, 45, 34), 0.0), stop((200, 40, 190), 0.5), stop((67, 190, 116), 0.5), stop((206, 229, 128), 1.0)];
+        let read = positions(&stops).unwrap();
+        assert!(read.windows(2).all(|pair| pair[1] > pair[0]), "{read:?}");
+        assert!(!model.fill(&stops, 2, &[]).is_empty(), "two stops on one spot");
+        stops[1].at = f32::NAN;
+        assert!(positions(&stops).is_none() && model.fill(&stops, 2, &[]).is_empty());
+        stops[1].at = 0.9;
+        assert!(positions(&stops).is_none(), "out of order");
     }
 
     #[test]

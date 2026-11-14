@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! The system tray — the 90% surface. A resident `TrayIcon` with a menu (active profile +
-//! quick-switch, `HyperShift` toggle, brightness/DPI quick controls, effects quick-pick, Open,
-//! Settings sub-toggles, Quit). Events arrive on tray-icon's + global-hotkey's static channels;
-//! we drain them from the Slint event loop via a `Timer` (the loop stays alive with no window).
+//! The system tray — the 90% surface. A resident `TrayIcon` whose menu reads as neuron's state:
+//! a status line, then profile, lighting, brightness and DPI each labelled with what they are now,
+//! HyperShift, the write gate, and the way out. The rows keep one order whatever is plugged in, so
+//! the menu is learnable; a row with nothing to act on stays in place, disabled, saying why. The
+//! global hotkeys are shown beside the rows they trigger. Events arrive on tray-icon's and
+//! global-hotkey's static channels; we drain them from the Slint event loop via a `Timer`.
 //!
-//! The menu is NOT a boot-time snapshot: `sync` rebuilds it whenever the live truth (profiles /
-//! effects / active / paused / hypershift) changes, so the quick-switch list, the active-profile
-//! checkmark, and the Pause-writes check track reality. Hotkeys are registered once and survive
-//! every menu rebuild (their ids live in a separate map).
+//! `sync` rebuilds the menu whenever the state it shows changes. Hotkeys are registered once and
+//! survive every rebuild (their ids live in a separate map).
 
 #[cfg(any(windows, target_os = "linux"))]
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
@@ -35,10 +35,9 @@ pub enum TrayAction {
     ToggleWritesPaused,
     ApplyProfile(String),
     SetEffect(String),
-    BrightnessUp,
-    BrightnessDown,
-    DpiUp,
-    DpiDown,
+    SetBrightness(f32),
+    SetDpi(f32),
+    ReportBug,
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -70,8 +69,15 @@ pub struct TraySnapshot {
     pub profiles: Vec<String>,
     pub effects: Vec<String>,
     pub active: String,
+    /// the effect the device is running, by index into `effects`
+    pub effect: Option<usize>,
     pub paused: bool,
+    pub armed: bool,
     pub hyper: bool,
+    /// the selected device and its brightness (percent), when it has lighting
+    pub light: Option<(String, i32)>,
+    /// the selected device, its DPI and its stages, when it has DPI
+    pub dpi: Option<(String, i32, Vec<i32>)>,
 }
 
 
@@ -134,6 +140,7 @@ impl Tray {
             active: active.to_string(),
             paused,
             hyper,
+            ..TraySnapshot::default()
         };
         let (menu, map) = build_menu(&snap);
 
@@ -261,73 +268,102 @@ impl Tray {
     }
 }
 
+/// The menu's first line: what neuron is doing right now.
+pub(crate) fn status_line(snap: &TraySnapshot) -> String {
+    let state = if snap.paused {
+        "device writes paused"
+    } else if !snap.armed {
+        "input off (safe mode)"
+    } else {
+        "live"
+    };
+    if snap.active.is_empty() { format!("Neuron · {state}") } else { format!("Neuron · {state} · {}", snap.active) }
+}
+
 /// Construct the menu + its id->action map from a snapshot (shared by build and sync).
 #[cfg(any(windows, target_os = "linux"))]
 fn build_menu(snap: &TraySnapshot) -> (Menu, HashMap<String, TrayAction>) {
+    use tray_icon::menu::accelerator::Accelerator;
+    let key = |s: &str| s.parse::<Accelerator>().ok();
     let mut map = HashMap::new();
     let menu = Menu::new();
-
-    let open = MenuItem::new("Open Neuron", true, None);
-    map.insert(open.id().0.clone(), TrayAction::Open);
-    let _ = menu.append(&open);
+    let mut item = |text: &str, enabled: bool, accel: Option<Accelerator>, act: Option<TrayAction>| {
+        let it = MenuItem::new(text, enabled, accel);
+        if let Some(a) = act { map.insert(it.id().0.clone(), a); }
+        let _ = menu.append(&it);
+    };
+    item(&status_line(snap), false, None, None);
+    item("Open Neuron", true, key("Ctrl+Alt+N"), Some(TrayAction::Open));
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // profile quick-switch submenu
-    let prof_sub = Submenu::new("Profile", true);
+    let pick = |sub: &Submenu, map: &mut HashMap<String, TrayAction>, text: &str, on: bool, act: TrayAction| {
+        let it = CheckMenuItem::new(text, true, on, None);
+        map.insert(it.id().0.clone(), act);
+        let _ = sub.append(&it);
+    };
+    let note = |sub: &Submenu, text: &str| { let _ = sub.append(&MenuItem::new(text, false, None)); };
+
+    let label = if snap.active.is_empty() { "Profile".to_string() } else { format!("Profile: {}", snap.active) };
+    let prof = Submenu::new(label, !snap.profiles.is_empty());
     for p in &snap.profiles {
-        let it = CheckMenuItem::new(p, true, *p == snap.active, None);
-        map.insert(it.id().0.clone(), TrayAction::ApplyProfile(p.clone()));
-        let _ = prof_sub.append(&it);
+        pick(&prof, &mut map, p, *p == snap.active, TrayAction::ApplyProfile(p.clone()));
     }
-    if snap.profiles.is_empty() {
-        let _ = prof_sub.append(&MenuItem::new("(none saved)", false, None));
-    }
-    let _ = menu.append(&prof_sub);
+    let _ = menu.append(&prof);
 
-    // effects quick-pick submenu
-    let fx_sub = Submenu::new("Effect", true);
-    for e in &snap.effects {
-        let it = MenuItem::new(e, true, None);
-        map.insert(it.id().0.clone(), TrayAction::SetEffect(e.clone()));
-        let _ = fx_sub.append(&it);
+    let running = snap.effect.and_then(|i| snap.effects.get(i));
+    let label = match running {
+        Some(e) => format!("Lighting: {e}"),
+        None if snap.effects.is_empty() => "Lighting: no device".into(),
+        None => "Lighting".into(),
+    };
+    let fx = Submenu::new(label, !snap.effects.is_empty());
+    for (i, e) in snap.effects.iter().enumerate() {
+        pick(&fx, &mut map, e, snap.effect == Some(i), TrayAction::SetEffect(e.clone()));
     }
-    if snap.effects.is_empty() {
-        let _ = fx_sub.append(&MenuItem::new("(no device)", false, None));
-    }
-    let _ = menu.append(&fx_sub);
+    let _ = menu.append(&fx);
 
-    // HyperShift toggle
-    let hs = CheckMenuItem::new("HyperShift", true, snap.hyper, None);
+    match &snap.light {
+        Some((device, now)) => {
+            let sub = Submenu::new(format!("Brightness: {now}%"), true);
+            note(&sub, device);
+            for v in [100, 75, 50, 25, 0] {
+                let text = if v == 0 { "Off".to_string() } else { format!("{v}%") };
+                pick(&sub, &mut map, &text, *now == v, TrayAction::SetBrightness(v as f32));
+            }
+            let _ = menu.append(&sub);
+        }
+        None => { let _ = menu.append(&Submenu::new("Brightness: no lighting selected", false)); }
+    }
+    match &snap.dpi {
+        Some((device, now, stages)) => {
+            let sub = Submenu::new(format!("DPI: {now}"), true);
+            note(&sub, device);
+            for &v in stages {
+                pick(&sub, &mut map, &v.to_string(), *now == v, TrayAction::SetDpi(v as f32));
+            }
+            let _ = menu.append(&sub);
+        }
+        None => { let _ = menu.append(&Submenu::new("DPI: no mouse selected", false)); }
+    }
+
+    let hs = CheckMenuItem::new("HyperShift", true, snap.hyper, key("Ctrl+Alt+H"));
     map.insert(hs.id().0.clone(), TrayAction::ToggleHyperShift);
     let _ = menu.append(&hs);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // brightness + DPI quick controls
-    let b_up = MenuItem::new("Brightness +", true, None);
-    let b_dn = MenuItem::new("Brightness −", true, None);
-    let d_up = MenuItem::new("DPI +", true, None);
-    let d_dn = MenuItem::new("DPI −", true, None);
-    map.insert(b_up.id().0.clone(), TrayAction::BrightnessUp);
-    map.insert(b_dn.id().0.clone(), TrayAction::BrightnessDown);
-    map.insert(d_up.id().0.clone(), TrayAction::DpiUp);
-    map.insert(d_dn.id().0.clone(), TrayAction::DpiDown);
-    let _ = menu.append(&b_up);
-    let _ = menu.append(&b_dn);
-    let _ = menu.append(&d_up);
-    let _ = menu.append(&d_dn);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    // settings (pause-writes), open settings page, quit
-    let pause = CheckMenuItem::new("Pause writes", true, snap.paused, None);
+    let pause = CheckMenuItem::new("Pause device writes", true, snap.paused, key("Ctrl+Alt+P"));
     map.insert(pause.id().0.clone(), TrayAction::ToggleWritesPaused);
     let _ = menu.append(&pause);
-    let settings = MenuItem::new("Settings…", true, None);
-    map.insert(settings.id().0.clone(), TrayAction::GotoSettings);
-    let _ = menu.append(&settings);
     let _ = menu.append(&PredefinedMenuItem::separator());
-    let quit = MenuItem::new("Quit", true, None);
-    map.insert(quit.id().0.clone(), TrayAction::Quit);
-    let _ = menu.append(&quit);
+
+    let mut item = |text: &str, act: TrayAction| {
+        let it = MenuItem::new(text, true, None);
+        map.insert(it.id().0.clone(), act);
+        let _ = menu.append(&it);
+    };
+    item("Report a bug…", TrayAction::ReportBug);
+    item("Settings", TrayAction::GotoSettings);
+    item("Quit Neuron", TrayAction::Quit);
 
     (menu, map)
 }
@@ -358,32 +394,8 @@ fn register_hotkeys(map: &mut HashMap<String, TrayAction>) -> Option<GlobalHotKe
     Some(mgr)
 }
 
-/// The tray icon bitmap — a small generated neuron mark (no asset file needed). A 32×32 RGBA: a true
-/// near-black tile carrying a single phosphor diamond, matching the instrument accent (#4af2b0).
+/// The tray icon: neuron's mark (see `mark.rs`).
 #[cfg(any(windows, target_os = "linux"))]
 fn load_icon() -> anyhow::Result<tray_icon::Icon> {
-    const W: u32 = 32;
-    let mut rgba = vec![0u8; (W * W * 4) as usize];
-    let cx = (W as f32 - 1.0) / 2.0;
-    for y in 0..W {
-        for x in 0..W {
-            let i = ((y * W + x) * 4) as usize;
-            // rounded-square void ground
-            let inside = (2..W - 2).contains(&x) && (2..W - 2).contains(&y);
-            // diamond distance (Manhattan) from center -> the phosphor accent mark
-            let d = (x as f32 - cx).abs() + (y as f32 - cx).abs();
-            if d < 9.0 {
-                rgba[i] = 0x4a;
-                rgba[i + 1] = 0xf2;
-                rgba[i + 2] = 0xb0;
-                rgba[i + 3] = 0xff;
-            } else if inside {
-                rgba[i] = 0x07;
-                rgba[i + 1] = 0x08;
-                rgba[i + 2] = 0x09;
-                rgba[i + 3] = 0xff;
-            }
-        }
-    }
-    Ok(tray_icon::Icon::from_rgba(rgba, W, W)?)
+    Ok(tray_icon::Icon::from_rgba(crate::mark::rgba(32), 32, 32)?)
 }

@@ -551,7 +551,10 @@ pub fn shared_with_generation() -> (std::sync::Arc<Registry>, u64) {
 type EventIdentities = std::sync::Arc<(std::collections::HashMap<u16, u16>, std::collections::HashSet<u16>)>;
 static EVENT_IDENTITIES: std::sync::Mutex<Option<EventIdentities>> = std::sync::Mutex::new(None);
 
-/// Learn newly adopted event PIDs without changing identities already owned this session.
+/// Learn newly adopted event PIDs without changing identities already owned this session. A PID
+/// whose definition goes away keeps its identity until restart, so a held key or a capture in
+/// flight never changes identity under it; nothing can be bound through it, since the registry
+/// no longer lists the device.
 pub fn refresh_event_identities(registry: &Registry) {
     let mut cache = EVENT_IDENTITIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fresh = event_identities(registry);

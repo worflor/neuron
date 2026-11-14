@@ -456,7 +456,7 @@ pub fn restore_history(index: usize) -> String {
         ClipState::Busy => return "clipboard history: clipboard is busy; nothing changed".into(),
         ClipState::Uncarryable => return "clipboard history: current clipboard format cannot be preserved".into(),
     };
-    match set_clipboard_if_sequence(&snapshot, sequence, &original) {
+    match set_clipboard_if_sequence(&snapshot, sequence, &original, !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst)) {
         Ok(()) => {},
         Err(ClipboardWriteError::Changed) => return "clipboard history: clipboard changed; nothing restored".into(),
         Err(ClipboardWriteError::Busy) => return "clipboard history: clipboard is busy; nothing changed".into(),
@@ -575,7 +575,7 @@ fn transform_snapshot_compute_commit_from_snapshot(
         return "clipboard transform [disarmed]".into();
     }
     let replacement = text_pocket(&output);
-    match set_clipboard_if_sequence(&replacement, sequence, &original) {
+    match set_clipboard_if_sequence(&replacement, sequence, &original, !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst)) {
         Ok(()) => {
             remember_history(&original);
             format!("clipboard transformed ({} chars)", output.chars().count())
@@ -650,7 +650,7 @@ pub fn activate(slot: &str, persist: bool) -> String {
     }
     if !changed && !becoming_durable { return format!("pocket{tag}: clipboard and pocket already match"); }
     if changed {
-        match set_clipboard_if_sequence(&entry.pocket, sequence, &new_pocket) {
+        match set_clipboard_if_sequence(&entry.pocket, sequence, &new_pocket, !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst)) {
             Ok(()) => {},
             Err(ClipboardWriteError::Changed) => return format!("pocket{tag}: clipboard changed; nothing moved"),
             Err(ClipboardWriteError::Busy) => return format!("pocket{tag}: clipboard is held by another app \u{2014} nothing moved"),
@@ -1155,9 +1155,18 @@ pub(crate) fn macro_clipboard_get() -> Option<String> {
 }
 
 pub(crate) fn macro_clipboard_set(text: &str) -> bool {
-    if !crate::action::input_armed() {
-        return false;
-    }
+    crate::action::input_armed() && write_text(text, true)
+}
+
+/// Put `text` on the clipboard for a copy the person asked for in neuron's own UI. It is not
+/// synthesized input, so it skips the arm gate; the previous contents join pocket history.
+pub fn copy_text(text: &str) -> bool {
+    write_text(text, false)
+}
+
+/// Replace the clipboard with `text`. With `require_armed`, the arm gate is checked again inside
+/// the clipboard transaction and a disarm mid-write rolls the old contents back.
+fn write_text(text: &str, require_armed: bool) -> bool {
     let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
     bytes.extend_from_slice(&[0, 0]);
     let (state, sequence) = read_clip_snapshot();
@@ -1173,13 +1182,13 @@ pub(crate) fn macro_clipboard_set(text: &str) -> bool {
         }],
     };
     if replacement == previous { return true; }
-    if set_clipboard_if_sequence(&replacement, sequence, &previous).is_ok() {
+    if set_clipboard_if_sequence(&replacement, sequence, &previous, require_armed).is_ok() {
         remember_history(&previous);
         true
     } else { false }
 }
 
-fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket) -> Result<(), ClipboardWriteError> {
+fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket, require_armed: bool) -> Result<(), ClipboardWriteError> {
     let mut g = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(fake) = g.as_ref() {
         if FAKE_SEQUENCE.load(Ordering::SeqCst) != expected { return Err(ClipboardWriteError::Changed); }
@@ -1189,8 +1198,8 @@ fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket) -> Re
         return Ok(());
     }
     drop(g);
-    if !crate::action::input_armed() { return Err(ClipboardWriteError::Disarmed); }
-    imp::set_clipboard_if_sequence(p, expected, rollback).map_err(|error| match error {
+    if require_armed && !crate::action::input_armed() { return Err(ClipboardWriteError::Disarmed); }
+    imp::set_clipboard_if_sequence(p, expected, rollback, require_armed).map_err(|error| match error {
         ImpWriteError::Changed => ClipboardWriteError::Changed,
         ImpWriteError::Busy => ClipboardWriteError::Busy,
         ImpWriteError::Disarmed => ClipboardWriteError::Disarmed,
@@ -1202,9 +1211,10 @@ fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket) -> Re
 /// Replace the clipboard only if its system sequence still equals the captured version.
 pub(crate) fn replace_at_sequence(replacement: &Pocket, original: &Pocket, sequence: u64) -> Result<(), &'static str> {
     if pocket_size(replacement) > MAX_POCKET_BYTES || pocket_size(original) > MAX_POCKET_BYTES { return Err("payload exceeds 128 MiB"); }
-    if !crate::action::input_armed() && !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst) { return Err("disarmed"); }
+    let require_armed = !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst);
+    if require_armed && !crate::action::input_armed() { return Err("disarmed"); }
     let changed = replacement != original;
-    match set_clipboard_if_sequence(replacement, sequence, original) {
+    match set_clipboard_if_sequence(replacement, sequence, original, require_armed) {
         Ok(()) => { if changed { remember_history(original); } Ok(()) }
         Err(ClipboardWriteError::Changed) => Err("changed"),
         Err(ClipboardWriteError::Busy) => Err("busy"),
@@ -1447,7 +1457,7 @@ mod imp {
     }
 
     /// Compare the clipboard sequence inside the open transaction immediately before replacing it.
-    pub fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket) -> Result<(), ImpWriteError> {
+    pub fn set_clipboard_if_sequence(p: &Pocket, expected: u64, rollback: &Pocket, require_armed: bool) -> Result<(), ImpWriteError> {
         let _guard = crate::clipboard::clipboard_guard();
         let Some(mut output) = prepare(p) else { return Err(ImpWriteError::WriteFailed); };
         let Some(mut backup) = prepare(rollback) else { return Err(ImpWriteError::WriteFailed); };
@@ -1460,7 +1470,7 @@ mod imp {
                 CloseClipboard();
                 return Err(ImpWriteError::Changed);
             }
-            if !crate::action::input_armed() {
+            if require_armed && !crate::action::input_armed() {
                 CloseClipboard();
                 return Err(ImpWriteError::Disarmed);
             }
@@ -1468,7 +1478,7 @@ mod imp {
                 CloseClipboard();
                 return Err(ImpWriteError::WriteFailed);
             }
-            if !crate::action::input_armed() {
+            if require_armed && !crate::action::input_armed() {
                 let rolled_back = EmptyClipboard() != 0 && install(&mut backup);
                 CloseClipboard();
                 return if rolled_back { Err(ImpWriteError::Disarmed) } else { Err(ImpWriteError::RollbackFailed) };
@@ -1534,7 +1544,7 @@ mod imp {
     pub fn read_clip_snapshot() -> (ClipState, u64) {
         (ClipState::Empty, 0)
     }
-    pub fn set_clipboard_if_sequence(_p: &Pocket, _expected: u64, _rollback: &Pocket) -> Result<(), super::ImpWriteError> {
+    pub fn set_clipboard_if_sequence(_p: &Pocket, _expected: u64, _rollback: &Pocket, _require_armed: bool) -> Result<(), super::ImpWriteError> {
         Err(super::ImpWriteError::Busy)
     }
 }

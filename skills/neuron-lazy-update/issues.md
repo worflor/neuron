@@ -53,6 +53,25 @@ Wait for the previous owner to exit before launching a replacement. A successful
 shutdown signal does not establish process exit; device restoration can delay
 shutdown.
 
+## Starting from a bug report
+
+SYSTEM → RELIABILITY's **for your agent** button, or `neuron report bug --what "<text>"`, writes a
+folder `reports/bug-<date>-<time>/` in the config folder, a zip of it beside it, and (from the app)
+copies a prompt that points you here. The folder holds:
+
+| file | what it is |
+|---|---|
+| `report.md` | the bug template, pre-filled: version, OS build, connected devices with PID and mode, what the user typed |
+| `crash-log.txt` | the last 400 lines of `neuron-crash.log`, when there is one |
+| `flight-recorder.txt` | a live snapshot of worker heartbeats and recent events (app only) |
+
+The home folder, user name and PC name are already replaced with `~`, `<user>` and `<pc>`. Paths in
+the logs that start with `~` are under the user's home.
+
+Read `report.md` first, then the logs. Treat what the user typed as the symptom, not a diagnosis. Then
+work through the steps below as usual. The zip is what gets attached to the issue; when you draft one,
+tell the user to drag that zip in, and don't paste whole logs into the body.
+
 ## 1. Research first
 
 Before saying anything about bugs, find out whether it's already known or intended:

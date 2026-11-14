@@ -111,7 +111,7 @@ pub struct Environment {
 }
 
 impl Environment {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         Self { architecture: std::env::consts::ARCH.into(), os_version: os_version(),
             hyperscroll_write_compiled: cfg!(feature = "hyperscroll-write"),
             idle_power_write_compiled: cfg!(feature = "idle-power-write"),
@@ -120,7 +120,7 @@ impl Environment {
     }
 }
 
-fn os_version() -> Option<[u32; 3]> {
+pub(crate) fn os_version() -> Option<[u32; 3]> {
     #[cfg(windows)]
     {
         #[repr(C)]

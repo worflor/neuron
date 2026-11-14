@@ -584,6 +584,8 @@ component SpectrumEditor inherits VerticalLayout {
                 ramp: State.light-name-ramp;
                 prefix: "– ";
             }
+    // the pointer is on hold: the strip shows what holding (or letting go) would do
+    property <bool> hold-hover: false;
             Rectangle {}
             // no stop-count here: "stop N of M" under the strip already carries the total —
             // the same number twice in 75px, in two grammars, read as unconsidered.
@@ -595,7 +597,7 @@ component SpectrumEditor inherits VerticalLayout {
                     width: 84px;
                     options: ["v1", "v2"];
                     index: State.picker-v2 ? 1 : 0;
-                    picked(i) => { State.set-picker-v2(i == 1); }
+                    picked(i) => { root.hold-hover = false; State.set-picker-v2(i == 1); }
                 }
             }
         }
@@ -665,13 +667,16 @@ component SpectrumEditor inherits VerticalLayout {
                 border-width: handle.on ? Theme.hair : 0px;
                 border-color: handle.doomed ? Theme.danger-line : Theme.accent-line;
                 animate background, border-color { duration: Theme.quick; }
-                opacity: handle.doomed ? 0.55 : 1;
+                opacity: handle.doomed ? 0.55 : handle.holding && !handle.on && !handle.pinned ? 0.4 : 1;
                 animate opacity { duration: Theme.quick; }
                 border-radius: 2px;
                 // the colour chip — a grounded, ringed marker (bigger than the old 9px speck) so it reads
                 // as a handle you grab, not a dot floating on the gradient. The selected one is larger with
                 // a crisp white ring; the rest carry a subtle ring that keeps them legible on any colour.
                 Rectangle {
+                // pointing at hold: the selected stop stays put, the rest stay free to change
+                property <bool> holding: State.picker-v2 && root.hold-hover;
+                property <bool> pinned: State.light-pins.length > i && State.light-pins[i];
                     width: handle.on ? 14px : 11px; height: self.width; border-radius: self.width / 2;
                     y: 4px; x: (parent.width - self.width) / 2;
                     background: s.col;
@@ -700,10 +705,13 @@ component SpectrumEditor inherits VerticalLayout {
                     }
                 }
                 // a held stop wears a bar across its foot: suggestions leave it where it is
-                if State.picker-v2 && State.light-pins.length > i && State.light-pins[i] : Rectangle {
-                    width: 8px; height: 2px;
+                // (pointing at hold shows it coming on the selected stop, or going)
+                if State.picker-v2 && (handle.pinned || (handle.holding && handle.on)) : Rectangle {
+                    width: 10px; height: 2px;
                     y: parent.height - 4px; x: (parent.width - self.width) / 2;
-                    background: Theme.text;
+                    background: handle.holding && handle.on ? Theme.accent : Theme.text;
+                    opacity: handle.holding && handle.on && handle.pinned ? 0.3 : 1;
+                    animate opacity, background { duration: Theme.quick; }
                 }
                 // the stem — ONLY the SELECTED stop drops a cursor line down the strip, marking the column
                 // it controls. Unselected stops are just their chip, so the gradient stays clean instead of
@@ -780,6 +788,7 @@ component SpectrumEditor inherits VerticalLayout {
         if State.light-stops.length > 0 && !State.picker-v2 : ColorPicker {
             current: State.light-stops[root.stop-idx].col;
             value: State.light-stops[root.stop-idx].hex;
+                changed hovered => { root.hold-hover = self.hovered; }
             swatches: Palette.accent;
             lead: State.default-chip-key != "" && State.default-chip-solid;
             lead-col: State.default-chip-col;

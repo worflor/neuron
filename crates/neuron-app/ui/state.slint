@@ -429,6 +429,7 @@ export global State {
     in-out property <[string]> roll-wilds;              // how far it can stray, by name
     in-out property <int> roll-mode;
     in-out property <int> roll-wild;
+    callback assist-dismiss(int);                       // wave off offer i (a roll, or an option asked for)
     callback roll();                                    // roll a palette and put it on show
     callback roll-choose(int, int);                     // (mode, wildness) for the next rolls
     in-out property <int> picker-focus;                 // bumped to hand the picker the keyboard
@@ -976,6 +977,7 @@ export global State {
     callback apply-import();
 
     // Diagnostics = the in-app test bench ("prove it works to me"): fire each capability live.
+    callback report-bug(string, bool);                    // write a bug report of what happened; true = copy a coding-agent prompt instead of opening the issue
     in-out property <[DiagRow]> diagnostics;
     in-out property <bool> diag-running: false;
     in-out property <int> diag-pass: 0;               // the segmented verdict bar's three widths

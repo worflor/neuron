@@ -285,6 +285,14 @@ accents, phoenix, start_minimized, the CONNECTIONS settings, ...; values are typ
 secrets such as the OBS password are never read or written here). `status` gives version, run root,
 whether the app runs, the active profile and counts. `reload` signals the app.
 
+### report
+
+`report bug [--what TEXT]` writes `reports/bug-<date>-<time>/` under the run root (`report.md` from the
+bug template, with version, OS build and connected devices, plus the tail of `neuron-crash.log`) and a
+zip beside it. The home folder, user name and PC name are scrubbed. It prints the folder, the zip, a
+pre-filled new-issue URL and a prompt for a coding agent (`--json` gives `dir`, `zip`, `issue_url`,
+`agent_prompt`). Nothing is sent anywhere.
+
 ### dump, apply: the whole setup
 
 `neuron dump [--only rules,cast,...] [--vault] [--out F]` writes TOML (JSON with `--json`). Sections:

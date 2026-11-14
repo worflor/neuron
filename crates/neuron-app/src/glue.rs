@@ -1541,6 +1541,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 "lines-unique" => Some(neuron::clipboard_transform::TransformOp::LinesUnique),
                 "json-pretty" => Some(neuron::clipboard_transform::TransformOp::JsonPretty),
                 "json-compact" => Some(neuron::clipboard_transform::TransformOp::JsonCompact),
+    app.set_mark(slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(&crate::mark::rgba(64), 64, 64)));
                 "csv-to-json" => Some(neuron::clipboard_transform::TransformOp::CsvToJson),
                 "json-to-csv" => Some(neuron::clipboard_transform::TransformOp::JsonToCsv),
                 "base64-encode" => Some(neuron::clipboard_transform::TransformOp::Base64Encode),
@@ -6191,6 +6192,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             crate::dispatch::request_reload();
                             st.set_status_line(
                                 format!(
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_report_bug(move |what, for_agent| {
+            if let Some(app) = w.upgrade() {
+                crate::bugreport::start(&app, what.to_string(), for_agent);
+            }
+        });
+    });
                                     "feel timing -> hold {}ms · gap {}ms · coyote {}ms",
                                     cfg.hold_ms, cfg.gap_ms, cfg.coyote_ms
                                 )

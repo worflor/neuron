@@ -128,6 +128,9 @@ export component AppWindow inherits Window {
     default-font-family: Theme.mono;
     forward-focus: keys;
 
+    // neuron's mark, drawn by `mark.rs`
+    in property <image> mark;
+    icon: root.mark;
     // The four warranted sections — user INTENTS, not feature taxonomy: make it feel right /
     // make it look right / make input do things / set it up + prove it works. PROFILES is a
     // global affordance (the header sheet), not a seat. Index == State.page.
