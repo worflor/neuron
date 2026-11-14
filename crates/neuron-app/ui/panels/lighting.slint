@@ -152,7 +152,11 @@ component EffectTileCard inherits Rectangle {
     layer-add := Rectangle {
         property <bool> open: add-ta.has-hover;
         property <length> choice-w: (root.width - 42px) / 2;
-        x: 10px; y: 10px;
+        // the choices take a click only once the chip has grown to full width: mid-growth the
+        // icon still sits where "above this" will be
+        property <bool> settled: self.open && self.width >= root.width - 20.5px;
+        x: root.width - 10px - self.width;
+        y: (root.deletable || root.tile.source != "") ? 32px : 10px;
         width: self.open ? root.width - 20px : 18px;
         height: 20px;
         visible: root.card-hovered && !root.dimmed;
@@ -162,29 +166,29 @@ component EffectTileCard inherits Rectangle {
         border-color: self.open ? Theme.text-faint : Theme.line;
         clip: true;
         animate width { duration: 200ms; easing: ease-out; }
+        Rectangle {
+            x: 0px; width: layer-add.choice-w; height: 100%;
+            background: layer-add.settled && add-ta.mouse-x >= 0px && add-ta.mouse-x < layer-add.choice-w ? Theme.well-hi : transparent;
+            Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "above this"; font-size: Theme.fs-small; color: Theme.text-mid; }
+        }
+        Rectangle {
+            x: layer-add.choice-w; width: layer-add.choice-w; height: 100%;
+            background: layer-add.settled && add-ta.mouse-x >= self.x && add-ta.mouse-x < layer-add.choice-w * 2 ? Theme.well-hi : transparent;
+            Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "below this"; font-size: Theme.fs-small; color: Theme.text-mid; }
+        }
         Path {
-            x: 2px; y: 2px; width: 14px; height: 16px;
+            x: parent.width - 16px; y: 2px; width: 14px; height: 16px;
             viewbox-width: 16; viewbox-height: 16;
             fill: transparent;
             stroke: Theme.text-mid;
             stroke-width: 1.2px;
             commands: "M1 6 L6 3 L11 6 L6 9 Z M1 10 L6 13 L11 10 M12 1 V5 M10 3 H14";
         }
-        Rectangle {
-            x: 22px; width: layer-add.choice-w; height: 100%;
-            background: layer-add.open && add-ta.mouse-x >= 22px && add-ta.mouse-x < 22px + layer-add.choice-w ? Theme.well-hi : transparent;
-            Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "above this"; font-size: Theme.fs-small; color: Theme.text-mid; }
-        }
-        Rectangle {
-            x: 22px + layer-add.choice-w; width: layer-add.choice-w; height: 100%;
-            background: layer-add.open && add-ta.mouse-x >= self.x ? Theme.well-hi : transparent;
-            Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "below this"; font-size: Theme.fs-small; color: Theme.text-mid; }
-        }
         add-ta := TouchArea {
             mouse-cursor: MouseCursor.pointer;
             clicked => {
-                if (self.mouse-x >= 22px) {
-                    root.layer-added(self.mouse-x < 22px + layer-add.choice-w);
+                if (layer-add.settled && self.mouse-x < layer-add.choice-w * 2) {
+                    root.layer-added(self.mouse-x < layer-add.choice-w);
                 }
             }
         }
@@ -306,11 +310,16 @@ component TileShelf inherits VerticalLayout {
     in property <int> shelf;
     in property <length> viewport-top;
     in property <length> viewport-bottom;
+    in property <bool> active: true;
+    changed active => {
+        if (root.active) { root.sample-demand(); }
+        else { State.tile-demand(root.shelf, 0, 0, 0, 0); }
+    }
     property <length> previous-top: 0px;
     property <bool> forward: true;
     Timer {
         interval: 16ms;
-        running: State.window-shown && State.page == 1;
+        running: root.active && State.window-shown && State.page == 1;
         triggered => { root.sample-demand(); }
     }
     callback sample-demand();
@@ -427,8 +436,10 @@ component SpecSlider inherits FaderRow {
 component EditorChoice inherits HorizontalLayout {
     in property <string> label;
     in property <[string]> options;
+    in property <[image]> previews: [];
     in property <int> index;
     callback changed(int);
+    callback preview-active-changed(bool);
     spacing: 9px;
     VerticalLayout {
         width: 78px; alignment: center;
@@ -436,8 +447,11 @@ component EditorChoice inherits HorizontalLayout {
     }
     Picker {
         horizontal-stretch: 1;
-        options: root.options; index: root.index;
+        options: root.options;
+        previews: root.previews;
+        index: root.index;
         changed(index) => { root.changed(index); }
+        preview-active-changed(active) => { root.preview-active-changed(active); }
     }
     @children
 }
@@ -460,8 +474,9 @@ component ParamControl inherits VerticalLayout {
         changed(v) => { State.set-param-range(root.p.key, v); }
     }
     if root.p.kind == "enum" : EditorChoice {
-        label: root.p.label; options: root.p.options; index: root.p.ival;
+        label: root.p.label; options: root.p.options; previews: root.p.previews; index: root.p.ival;
         changed(i) => { State.set-param-enum(root.p.key, i); }
+        preview-active-changed(active) => { State.boost-param-preview(root.p.key, active); }
         if root.p.key == "direction" && root.p.options.length == 4 : Button {
             text: "reverse";
             clicked => { State.set-param-enum(root.p.key, root.p.ival == 0 ? 1 : root.p.ival == 1 ? 0 : root.p.ival == 2 ? 3 : 2); }
@@ -569,6 +584,8 @@ component SpectrumEditor inherits VerticalLayout {
     property <bool> tl-open: false;
     // the roll button's drawer: what a roll starts from and how far it strays
     property <bool> roll-open: false;
+    // the pointer is on hold: the strip shows what holding (or letting go) would do
+    property <bool> hold-hover: false;
 
     // ── GRADIENT STRIP — the active palette's stops ──────────────────────
     VerticalLayout {
@@ -584,8 +601,6 @@ component SpectrumEditor inherits VerticalLayout {
                 ramp: State.light-name-ramp;
                 prefix: "– ";
             }
-    // the pointer is on hold: the strip shows what holding (or letting go) would do
-    property <bool> hold-hover: false;
             Rectangle {}
             // no stop-count here: "stop N of M" under the strip already carries the total —
             // the same number twice in 75px, in two grammars, read as unconsidered.
@@ -659,6 +674,9 @@ component SpectrumEditor inherits VerticalLayout {
                 property <bool> on: i == root.stop-idx;
                 // pointing at − marks the stop it would remove
                 property <bool> doomed: handle.on && stop-deck.left-hovered;
+                // pointing at hold: the selected stop stays put, the rest stay free to change
+                property <bool> holding: State.picker-v2 && root.hold-hover;
+                property <bool> pinned: State.light-pins.length > i && State.light-pins[i];
                 width: 16px;
                 height: parent.height;
                 // on a whole pixel, so the stem under the chip draws sharp
@@ -674,9 +692,6 @@ component SpectrumEditor inherits VerticalLayout {
                 // as a handle you grab, not a dot floating on the gradient. The selected one is larger with
                 // a crisp white ring; the rest carry a subtle ring that keeps them legible on any colour.
                 Rectangle {
-                // pointing at hold: the selected stop stays put, the rest stay free to change
-                property <bool> holding: State.picker-v2 && root.hold-hover;
-                property <bool> pinned: State.light-pins.length > i && State.light-pins[i];
                     width: handle.on ? 14px : 11px; height: self.width; border-radius: self.width / 2;
                     y: 4px; x: (parent.width - self.width) / 2;
                     background: s.col;
@@ -773,6 +788,7 @@ component SpectrumEditor inherits VerticalLayout {
                 height: Theme.row-h-sm;
                 text: State.light-sel-pinned ? "held" : "hold";
                 primary: State.light-sel-pinned;
+                changed hovered => { root.hold-hover = self.hovered; }
                 clicked => { State.toggle-pin(); }
             }
             Rectangle { horizontal-stretch: 1; }
@@ -788,7 +804,6 @@ component SpectrumEditor inherits VerticalLayout {
         if State.light-stops.length > 0 && !State.picker-v2 : ColorPicker {
             current: State.light-stops[root.stop-idx].col;
             value: State.light-stops[root.stop-idx].hex;
-                changed hovered => { root.hold-hover = self.hovered; }
             swatches: Palette.accent;
             lead: State.default-chip-key != "" && State.default-chip-solid;
             lead-col: State.default-chip-col;
@@ -999,6 +1014,13 @@ component SpectrumEditor inherits VerticalLayout {
 export component LightingPanel inherits VerticalLayout {
     in property <length> viewport-top;
     in property <length> viewport-bottom;
+    property <string> catalog-scope: "all";
+    changed catalog-scope => {
+        if (root.catalog-scope != "all" && root.catalog-scope != "motion") { State.tile-demand(0, 0, 0, 0, 0); }
+        if (root.catalog-scope != "all" && root.catalog-scope != "keys") { State.tile-demand(1, 0, 0, 0, 0); }
+        if (root.catalog-scope != "all" && root.catalog-scope != "data") { State.tile-demand(2, 0, 0, 0, 0); }
+        if (root.catalog-scope != "all" && root.catalog-scope != "saved") { State.tile-demand(3, 0, 0, 0, 0); }
+    }
     property <bool> render-hero: false;
     changed render-hero => { State.light-hero-visible = root.render-hero; State.preview-tick(); }
     property <bool> render-active: State.window-shown && State.page == 1;
@@ -1187,40 +1209,53 @@ export component LightingPanel inherits VerticalLayout {
                     }
                     Button { text: "import .ChromaEffects"; clicked => { State.import-light-file(); } }
                 }
-                TileShelf {
+                HorizontalLayout {
+                    spacing: 6px;
+                    Pill { text: "all"; live: root.catalog-scope == "all"; clickable: true; clicked => { root.catalog-scope = "all"; } }
+                    Pill { text: "motion"; live: root.catalog-scope == "motion"; clickable: true; clicked => { root.catalog-scope = "motion"; } }
+                    Pill { text: "keys"; live: root.catalog-scope == "keys"; clickable: true; clicked => { root.catalog-scope = "keys"; } }
+                    Pill { text: "data"; live: root.catalog-scope == "data"; clickable: true; clicked => { root.catalog-scope = "data"; } }
+                    Pill { text: "saved (" + State.light-user-tiles.length + ")"; live: root.catalog-scope == "saved"; clickable: true; clicked => { root.catalog-scope = "saved"; } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                if root.catalog-scope == "all" || root.catalog-scope == "motion" : TileShelf {
                     title: "EFFECTS";
                     caption: "pure light shows, running on a clock";
                     tiles: State.light-tiles;
                     swatches: State.light-swatches;
                     shelf: 0;
+                    active: root.catalog-scope == "all" || root.catalog-scope == "motion";
                     viewport-top: root.viewport-top;
                     viewport-bottom: root.viewport-bottom;
                 }
-                TileShelf {
+                if root.catalog-scope == "all" || root.catalog-scope == "keys" : TileShelf {
                     title: "REACTS TO KEYS";
                     caption: "driven by your live typing · tiles loop a demo";
                     tiles: State.light-input-tiles;
                     swatches: State.light-input-swatches;
                     shelf: 1;
+                    active: root.catalog-scope == "all" || root.catalog-scope == "keys";
                     viewport-top: root.viewport-top;
                     viewport-bottom: root.viewport-bottom;
                 }
-                TileShelf {
+                if root.catalog-scope == "all" || root.catalog-scope == "data" : TileShelf {
                     title: "LIVE DATA";
                     caption: "each one reads a real feed, named on the chip · tiles loop a demo";
                     tiles: State.light-data-tiles;
                     swatches: State.light-data-swatches;
                     shelf: 2;
+                    active: root.catalog-scope == "all" || root.catalog-scope == "data";
                     viewport-top: root.viewport-top;
                     viewport-bottom: root.viewport-bottom;
                 }
-                TileShelf {
+                if root.catalog-scope == "all" || root.catalog-scope == "saved" : TileShelf {
                     title: "YOUR EFFECTS";
                     caption: State.light-user-tiles.length == 0 ? "save a look above to keep it here"
                         : "saved by you · click to load, \u{00d7} to delete";
                     tiles: State.light-user-tiles;
                     swatches: State.light-user-swatches;
                     shelf: 3;
+                    active: root.catalog-scope == "all" || root.catalog-scope == "saved";
                     viewport-top: root.viewport-top;
                     viewport-bottom: root.viewport-bottom;
                     selected-extra: State.light-user-effect == "" ? "" : "user:" + State.light-user-effect;

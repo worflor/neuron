@@ -187,7 +187,13 @@ export component ProfilesMenu inherits VerticalLayout {
     // yet the button still reads "capture" (the check saw only the empty field). So re-answer it on
     // init, whenever effective-name changes (typing OR a fresh suggestion), and after every save (the
     // profiles list just changed under us). One source of truth: always check effective-name.
-    init => { State.profile-name-edited(root.effective-name); }
+    init => {
+        State.profile-name-edited(root.effective-name);
+        if (State.profile-sheet-open && State.app-rule-prefill != "") {
+            root.rule-app = State.app-rule-prefill;
+            State.app-rule-prefill = "";
+        }
+    }
     changed effective-name => { State.profile-name-edited(root.effective-name); }
     property <string> rule-app;
     property <int> rule-profile-idx: 0;
@@ -201,6 +207,10 @@ export component ProfilesMenu inherits VerticalLayout {
     property <bool> sheet-open: State.profile-sheet-open;
     changed sheet-open => {
         if (!self.sheet-open) { root.renaming = ""; root.armed-delete = ""; }
+        if (self.sheet-open && State.app-rule-prefill != "") {
+            root.rule-app = State.app-rule-prefill;
+            State.app-rule-prefill = "";
+        }
     }
     Timer {
         interval: Theme.confirm-window;

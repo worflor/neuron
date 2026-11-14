@@ -6,7 +6,7 @@
 
 use neuron::lighting::Rgb;
 use neuron::pattern::{Compositor, LayerDef, LayerInstanceId, LightingSession, ProcessInputHub, ProviderPolicy, SceneLayerSpec};
-use slint::{Rgb8Pixel, SharedPixelBuffer};
+use slint::{Rgb8Pixel, Rgba8Pixel, SharedPixelBuffer};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -14,11 +14,14 @@ use std::time::{Duration, Instant};
 
 const HERO_INTERVAL: Duration = Duration::from_millis(50);
 const TILE_INTERVAL: Duration = Duration::from_millis(120);
+const PARAM_ACTIVE_INTERVAL: Duration = Duration::from_millis(55);
+const PARAM_WARM_INTERVAL: Duration = Duration::from_millis(220);
+pub const PARAM_PREVIEW_DIMS: (u8, u8) = (6, 40);
 const CACHE_LIMIT: usize = 128;
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum SurfaceId { Hero, Preset(String), Saved(String) }
+pub enum SurfaceId { Hero, Preset(String), Saved(String), ParamOption(String, usize) }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Target {
@@ -48,6 +51,15 @@ pub struct Tile {
     pub layers: Arc<[LayerDef]>,
 }
 
+#[derive(Clone, PartialEq)]
+pub struct ParamPreview {
+    pub id: SurfaceId,
+    pub layers: Arc<[LayerDef]>,
+    pub dims: (u8, u8),
+    pub active: bool,
+    pub boosted: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct DesiredSurfaceState {
     pub target: Target,
@@ -57,6 +69,7 @@ pub struct DesiredSurfaceState {
     pub layout_generation: u64,
     pub layers: Arc<[LayerDef]>,
     pub tiles: Arc<[Tile]>,
+    pub param_previews: Arc<[ParamPreview]>,
     pub demand: [DemandRange; 4],
     pub active: bool,
     pub hero: bool,
@@ -72,6 +85,7 @@ pub struct CompletedFrame {
     pub layout_generation: u64,
     pub rgb: Arc<[Rgb]>,
     pub swatch: Option<SharedPixelBuffer<Rgb8Pixel>>,
+    pub overlay: Option<SharedPixelBuffer<Rgba8Pixel>>,
     pub requested: Instant,
     pub render_time: Duration,
 }
@@ -195,6 +209,7 @@ fn same_request(a: &DesiredSurfaceState, b: &DesiredSurfaceState) -> bool {
     a.target == b.target && a.dims == b.dims && a.content_rev == b.content_rev
         && a.structure_generation == b.structure_generation && a.layout_generation == b.layout_generation
         && Arc::ptr_eq(&a.layers, &b.layers) && Arc::ptr_eq(&a.tiles, &b.tiles)
+        && Arc::ptr_eq(&a.param_previews, &b.param_previews)
         && a.demand == b.demand && a.active == b.active && a.hero == b.hero
         && a.selected == b.selected && a.fps == b.fps
 }
@@ -251,6 +266,7 @@ struct Cached {
     input_attached: bool,
     rgb: Arc<[Rgb]>,
     swatch: Option<SharedPixelBuffer<Rgb8Pixel>>,
+    overlay: Option<SharedPixelBuffer<Rgba8Pixel>>,
 }
 
 impl Cached {
@@ -263,7 +279,7 @@ impl Cached {
     fn pending(layers: Arc<[LayerDef]>, dims: (u8, u8), structure_generation: u64, now: Instant) -> Self {
         Self { producer: Producer::Pending, rebase_clocks: Vec::new(), layers, dims, structure_generation, due: now, last_used: now,
             visible: false, warm: false, scratch: neuron::pattern::RenderScratch::default(), prewarmed: false,
-            input_cursor: 0, input_attached: false, rgb: Arc::from([]), swatch: None }
+            input_cursor: 0, input_attached: false, rgb: Arc::from([]), swatch: None, overlay: None }
     }
 
     fn prepare(&mut self, now: Instant) {
@@ -366,6 +382,7 @@ impl Cached {
         if self.rgb.as_ref() != self.scratch.output.as_slice() {
             self.rgb = Arc::from(self.scratch.output.as_slice());
             self.swatch = None;
+            self.overlay = None;
         }
         self.rgb.clone()
     }
@@ -376,14 +393,25 @@ impl Cached {
             + self.scratch.retained_bytes() + self.rgb.len() * std::mem::size_of::<Rgb>()
             + self.layers.iter().map(|layer| layer.frame.len() * 6).sum::<usize>()
             + self.swatch.as_ref().map_or(0, |image| std::mem::size_of_val(image.as_slice()))
+            + self.overlay.as_ref().map_or(0, |image| std::mem::size_of_val(image.as_slice()))
     }
 
     fn thumbnail(&mut self, rgb: &Arc<[Rgb]>) -> SharedPixelBuffer<Rgb8Pixel> {
         if self.rgb.as_ref() != rgb.as_ref() {
             self.rgb = rgb.clone();
             self.swatch = None;
+            self.overlay = None;
         }
         self.swatch.get_or_insert_with(|| rasterize(rgb, self.dims)).clone()
+    }
+
+    fn overlay_thumbnail(&mut self, rgb: &Arc<[Rgb]>) -> SharedPixelBuffer<Rgba8Pixel> {
+        if self.rgb.as_ref() != rgb.as_ref() {
+            self.rgb = rgb.clone();
+            self.swatch = None;
+            self.overlay = None;
+        }
+        self.overlay.get_or_insert_with(|| rasterize_overlay(rgb, self.dims)).clone()
     }
 }
 
@@ -485,6 +513,21 @@ fn select_job(desired: &DesiredSurfaceState, cache: &mut HashMap<SurfaceId, Cach
                     } else { (visible && !chosen_visible) || (visible == *chosen_visible && entry.due < *due) }
                 }) { selected = Some((tile.id.clone(), tile.layers.clone(), visible, entry.due)); }
             }
+            for preview in desired.param_previews.iter() {
+                if preview.dims.0 == 0 || preview.dims.1 == 0 { continue; }
+                let visible = preview.active || preview.boosted;
+                let entry = cache.entry(preview.id.clone()).or_insert_with(|| Cached::pending(preview.layers.clone(), preview.dims, 0, now));
+                entry.reconcile(preview.layers.clone(), preview.dims, 0, now);
+                if visible && !entry.visible { entry.due = now; }
+                entry.visible = visible;
+                entry.warm = true;
+                next_due = next_due.min(entry.due);
+                if entry.due <= now && selected.as_ref().is_none_or(|(id, _, chosen_visible, due)| {
+                    if *id == SurfaceId::Hero {
+                        visible && now.saturating_duration_since(entry.due) >= Duration::from_millis(250)
+                    } else { (visible && !chosen_visible) || (visible == *chosen_visible && entry.due < *due) }
+                }) { selected = Some((preview.id.clone(), preview.layers.clone(), visible, entry.due)); }
+            }
         }
     (selected, next_due)
 }
@@ -515,6 +558,7 @@ fn run(shared: Arc<(Mutex<Shared>, Condvar)>) { run_lane(shared, None, false); }
 fn run_lane(shared: Arc<(Mutex<Shared>, Condvar)>, seed: Option<HeroSeed>, hero_only: bool) {
     let mut cache: HashMap<SurfaceId, Cached> = HashMap::new();
     let mut previous_tiles: Arc<[Tile]> = Arc::from([]);
+    let mut previous_param_previews: Arc<[ParamPreview]> = Arc::from([]);
     let (hero, mut hub, mut last_target, mut last_input) = seed.unwrap_or_else(||
         (None, ProcessInputHub::new(), Target::default(), Instant::now()));
     if let Some(hero) = hero { cache.insert(SurfaceId::Hero, hero); }
@@ -530,12 +574,18 @@ fn run_lane(shared: Arc<(Mutex<Shared>, Condvar)>, seed: Option<HeroSeed>, hero_
             if !hero_only { for id in state.invalidated.drain() { cache.remove(&id); } }
             (state.desired.clone(), state.request_generation, state.requested_at)
         };
-        if hero_only { desired.tiles = Arc::from([]); }
-        else if hero_lane.is_some() { desired.hero = false; }
-        if !hero_only && !Arc::ptr_eq(&previous_tiles, &desired.tiles) {
-            let present: std::collections::HashSet<_> = desired.tiles.iter().map(|tile| &tile.id).collect();
-            cache.retain(|id, _| *id == SurfaceId::Hero || present.contains(id));
+        if hero_only {
+            desired.tiles = Arc::from([]);
+            desired.param_previews = Arc::from([]);
+        } else if hero_lane.is_some() { desired.hero = false; }
+        if !hero_only && (!Arc::ptr_eq(&previous_tiles, &desired.tiles) || !Arc::ptr_eq(&previous_param_previews, &desired.param_previews)) {
+            cache.retain(|id, _| {
+                *id == SurfaceId::Hero
+                    || desired.tiles.iter().any(|tile| tile.id == *id)
+                    || desired.param_previews.iter().any(|preview| preview.id == *id)
+            });
             previous_tiles = desired.tiles.clone();
+            previous_param_previews = desired.param_previews.clone();
         }
         if desired.target != last_target {
             cache.clear();
@@ -592,7 +642,8 @@ fn run_lane(shared: Arc<(Mutex<Shared>, Condvar)>, seed: Option<HeroSeed>, hero_
         let elapsed = neuron::pattern::render_epoch().elapsed();
         sample_representative_keys(&mut empty_hub, &mut demo_step, elapsed);
         let hero = id == SurfaceId::Hero;
-        let selected_catalog = !hero && desired.selected.as_ref() == Some(&id)
+        let param_preview = desired.param_previews.iter().find(|preview| preview.id == id);
+        let selected_catalog = !hero && param_preview.is_none() && desired.selected.as_ref() == Some(&id)
             && desired.tiles.iter().find(|tile| tile.id == id).is_some_and(|tile| same_configuration(&tile.layers, &desired.layers));
         let shared_rgb = if selected_catalog {
             let state = shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -601,10 +652,12 @@ fn run_lane(shared: Arc<(Mutex<Shared>, Condvar)>, seed: Option<HeroSeed>, hero_
                 && snapshot.content_rev == desired.content_rev).map(|snapshot| snapshot.rgb.clone())
         } else { None };
         let entry = match cache.get_mut(&id) { Some(entry) => entry, None => continue };
+        let entry_dims = entry.dims;
         let started = now;
         let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let policy = if hero { hero_policy() } else if selected_catalog { ProviderPolicy::SharedSnapshotNoStart } else { ProviderPolicy::Representative };
             let _policy = policy.enter();
+            let _demo_t = (param_preview.is_some()).then(|| neuron::pattern::enter_representative_time(elapsed.as_secs_f32()));
             let _no_keys = (!hero || cfg!(test)).then(neuron::capture::suppress_key_reads);
             let rgb = if let Some(rgb) = shared_rgb { rgb }
                 else if selected_catalog { entry.render(&hub, now, elapsed, policy) }
@@ -612,17 +665,22 @@ fn run_lane(shared: Arc<(Mutex<Shared>, Condvar)>, seed: Option<HeroSeed>, hero_
                     SurfaceId::Preset(slug) => representative(slug, entry, &empty_hub, now, elapsed),
                     _ => entry.render(if hero { &hub } else { &empty_hub }, now, elapsed, policy),
                 } };
-            let swatch = (!hero).then(|| entry.thumbnail(&rgb));
-            (rgb, swatch)
+            let swatch = (!hero && param_preview.is_none()).then(|| entry.thumbnail(&rgb));
+            let overlay = param_preview.is_some().then(|| entry.overlay_thumbnail(&rgb));
+            (rgb, swatch, overlay)
         }));
-        if let Ok((rgb, swatch)) = rendered {
+        if let Ok((rgb, swatch, overlay)) = rendered {
                 entry.last_used = now;
                 entry.prewarmed = true;
-                entry.due = Instant::now() + if hero { HERO_INTERVAL.max(Duration::from_secs_f64(1.0 / f64::from(desired.fps.max(1)))) } else { TILE_INTERVAL };
+                entry.due = Instant::now() + if hero {
+                    HERO_INTERVAL.max(Duration::from_secs_f64(1.0 / f64::from(desired.fps.max(1))))
+                } else if let Some(preview) = param_preview {
+                    if preview.active || preview.boosted { PARAM_ACTIVE_INTERVAL } else { PARAM_WARM_INTERVAL }
+                } else { TILE_INTERVAL };
                 let frame = CompletedFrame {
-                    id: id.clone(), target: desired.target.clone(), dims: desired.dims,
+                    id: id.clone(), target: desired.target.clone(), dims: entry_dims,
                     content_rev: desired.content_rev, layout_generation: desired.layout_generation,
-                    rgb, swatch, requested: requested_at, render_time: started.elapsed(),
+                    rgb, swatch, overlay, requested: requested_at, render_time: started.elapsed(),
                 };
                 let mut frames = vec![frame];
                 if hero {
@@ -639,7 +697,7 @@ fn run_lane(shared: Arc<(Mutex<Shared>, Condvar)>, seed: Option<HeroSeed>, hero_
                         tile_entry.due = Instant::now() + TILE_INTERVAL;
                         frames.push(CompletedFrame { id: tile.id.clone(), target: desired.target.clone(), dims: desired.dims,
                             content_rev: desired.content_rev, layout_generation: desired.layout_generation,
-                            rgb, swatch: Some(swatch), requested: requested_at, render_time: started.elapsed() });
+                            rgb, swatch: Some(swatch), overlay: None, requested: requested_at, render_time: started.elapsed() });
                     }
                 }
                 let notify = {
@@ -690,7 +748,9 @@ fn sample_representative_keys(hub: &mut ProcessInputHub, previous: &mut Option<u
     let step = elapsed.as_millis() / 400;
     if *previous == Some(step) { return; }
     *previous = Some(step);
-    let key = neuron::pattern::ControlId::Key(neuron::pattern::KeyId(0x1b));
+    const KEYS: [u16; 8] = [0x1b, 0x57, 0x45, 0x52, 0x44, 0x46, 0x4a, 0x4b];
+    let vk = KEYS[(step as usize) % KEYS.len()];
+    let key = neuron::pattern::ControlId::Key(neuron::pattern::KeyId(vk));
     hub.enqueue_event(key, true, elapsed);
     hub.enqueue_event(key, false, elapsed);
     let _ = hub.publish_tick();
@@ -792,6 +852,30 @@ pub fn rasterize(frame: &[Rgb], (rows, cols): (u8, u8)) -> SharedPixelBuffer<Rgb
             for y in pad + row * (cell + gap)..pad + row * (cell + gap) + cell {
                 let start = y * width + pad + col * (cell + gap);
                 pixels[start..start + cell].fill(Rgb8Pixel { r: color.r, g: color.g, b: color.b });
+            }
+        }
+    }
+    buffer
+}
+
+/// Premultiplied RGBA LED grid with transparent gaps and off-cells so picker backgrounds show through.
+pub fn rasterize_overlay(frame: &[Rgb], (rows, cols): (u8, u8)) -> SharedPixelBuffer<Rgba8Pixel> {
+    let (rows, cols) = (rows as usize, cols as usize);
+    let (cell, gap, pad) = (4, 1, 1);
+    let width = (pad * 2 + cols * cell + cols.saturating_sub(1) * gap).max(1);
+    let height = (pad * 2 + rows * cell + rows.saturating_sub(1) * gap).max(1);
+    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width as u32, height as u32);
+    let pixels = buffer.make_mut_slice();
+    pixels.fill(Rgba8Pixel { r: 0, g: 0, b: 0, a: 0 });
+    for row in 0..rows {
+        for col in 0..cols {
+            let color = frame.get(row * cols + col).copied().unwrap_or(Rgb::BLACK);
+            let a = color.r.max(color.g).max(color.b);
+            if a == 0 { continue; }
+            let px = Rgba8Pixel { r: color.r, g: color.g, b: color.b, a };
+            for y in pad + row * (cell + gap)..pad + row * (cell + gap) + cell {
+                let start = y * width + pad + col * (cell + gap);
+                pixels[start..start + cell].fill(px);
             }
         }
     }
@@ -1022,7 +1106,7 @@ mod tests {
                 for revision in 1..=10000 {
                     let frame = CompletedFrame { id: SurfaceId::Hero, target: Target::default(), dims: (1, 2),
                         content_rev: revision, layout_generation: 0, rgb: vec![Rgb::new(revision as u8, 2, 3); 2].into(),
-                        swatch: None, requested: now, render_time: Duration::ZERO };
+                        swatch: None, overlay: None, requested: now, render_time: Duration::ZERO };
                     if writer_mailbox.lock().unwrap().publish([frame]) { send.send(()).unwrap(); }
                     if revision % 7 == 0 { std::thread::yield_now(); }
                 }
@@ -1171,5 +1255,118 @@ mod tests {
         let a = Target { pid: 0x0226, unit: "first".into(), epoch: 1 };
         assert_ne!(a, Target { unit: "second".into(), ..a.clone() });
         assert_ne!(a, Target { epoch: 2, ..a.clone() });
+    }
+
+    #[test]
+    fn param_previews_render_procedurally_across_effect_kinds_with_representative_signals() {
+        use neuron::effects::ParamKind;
+        assert!(
+            neuron::pattern::representative_time().is_none(),
+            "representative_time must stay None outside explicit demo scope"
+        );
+        {
+            let _live = ProviderPolicy::AuthoritativeLive.enter();
+            let _demo = neuron::pattern::enter_representative_time(1.5);
+            assert!(
+                neuron::pattern::representative_time().is_none(),
+                "AuthoritativeLive renders must never read synthetic demo time"
+            );
+        }
+
+        let start = Instant::now();
+        for slug in ["cascade", "wave", "audiometer", "signal"] {
+            let base = neuron::pattern::preset_layer(slug).expect(slug);
+            let mut hub = ProcessInputHub::new();
+            let mut demo_step = None;
+            let enum_params: Vec<_> = neuron::pattern::pattern_params(&base.pattern)
+                .into_iter()
+                .filter_map(|p| match p.kind {
+                    ParamKind::Enum { options, .. } => Some((p.key, options)),
+                    _ => None,
+                })
+                .collect();
+            assert!(!enum_params.is_empty(), "{slug} should expose at least one enum param");
+
+            for (key, options) in enum_params {
+                let mut per_option_frames: Vec<Vec<Arc<[Rgb]>>> = Vec::with_capacity(options.len());
+                for (opt_idx, _) in options.iter().enumerate() {
+                    let mut variant = base.clone();
+                    variant.id = Some(LayerInstanceId(10_000 + opt_idx as u64));
+                    variant.params.set(key, opt_idx as f32);
+                    let mut cached = Cached::new(vec![variant].into(), PARAM_PREVIEW_DIMS, 0, start);
+                    let mut snapshots = Vec::new();
+                    for step in 1..=10 {
+                        let elapsed = Duration::from_millis(step * 220);
+                        let now = start + elapsed;
+                        sample_representative_keys(&mut hub, &mut demo_step, elapsed);
+                        let _policy = ProviderPolicy::Representative.enter();
+                        let _demo = neuron::pattern::enter_representative_time(elapsed.as_secs_f32());
+                        let _quiet = neuron::capture::suppress_key_reads();
+                        let rgb = cached.render(&hub, now, elapsed, ProviderPolicy::Representative);
+                        let overlay = cached.overlay_thumbnail(&rgb);
+                        assert_eq!(overlay.width(), u32::from(PARAM_PREVIEW_DIMS.1) * 5 + 1);
+                        assert_eq!(overlay.height(), u32::from(PARAM_PREVIEW_DIMS.0) * 5 + 1);
+                        snapshots.push(rgb);
+                    }
+                    assert!(
+                        snapshots.iter().any(|rgb| rgb.iter().any(|c| *c != Rgb::BLACK)),
+                        "{slug}.{key}[{opt_idx}] must produce visible procedural pixels"
+                    );
+                    per_option_frames.push(snapshots);
+                }
+                if per_option_frames.len() >= 2 {
+                    assert_ne!(
+                        per_option_frames[0], per_option_frames[1],
+                        "{slug}.{key} options 0 and 1 must produce distinct simulations"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn param_preview_scheduling_prioritizes_active_and_snaps_on_boost() {
+        let now = Instant::now();
+        let base = neuron::pattern::preset_layer("cascade").unwrap();
+        let mut alt = base.clone();
+        alt.params.set("mode", 1.0);
+        let opt0 = SurfaceId::ParamOption("mode".into(), 0);
+        let opt1 = SurfaceId::ParamOption("mode".into(), 1);
+        let mut desired = DesiredSurfaceState {
+            active: true,
+            dims: (6, 22),
+            param_previews: vec![
+                ParamPreview {
+                    id: opt0.clone(),
+                    layers: vec![base].into(),
+                    dims: PARAM_PREVIEW_DIMS,
+                    active: true,
+                    boosted: false,
+                },
+                ParamPreview {
+                    id: opt1.clone(),
+                    layers: vec![alt].into(),
+                    dims: PARAM_PREVIEW_DIMS,
+                    active: false,
+                    boosted: false,
+                },
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut cache = HashMap::new();
+        let first = select_job(&desired, &mut cache, now).0.unwrap();
+        assert_eq!(first.0, opt0, "active collapsed option schedules as visible first");
+        assert!(first.2);
+        cache.get_mut(&opt0).unwrap().due = now + PARAM_ACTIVE_INTERVAL;
+        let second = select_job(&desired, &mut cache, now).0.unwrap();
+        assert_eq!(second.0, opt1, "dormant option still prewarms");
+        assert!(!second.2);
+        cache.get_mut(&opt1).unwrap().due = now + PARAM_WARM_INTERVAL;
+
+        Arc::make_mut(&mut desired.param_previews)[1].boosted = true;
+        let boosted = select_job(&desired, &mut cache, now + Duration::from_millis(10)).0.unwrap();
+        assert_eq!(boosted.0, opt1, "hover/open boost must wake dormant options immediately");
+        assert!(boosted.2);
     }
 }

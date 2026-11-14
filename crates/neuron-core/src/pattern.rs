@@ -3300,15 +3300,31 @@ impl Pattern for Meter {
         let spd = self.speed.clamp(0.1, 6.0);
         match self.source {
             0 | 1 => {
-                let src = if self.source == 1 { "mic" } else { "speakers" };
-                crate::audio_spectrum::ensure(src);
-                let region = (self.focus as usize).min(crate::audio_spectrum::REGIONS - 1);
-                let (level, tone) = crate::audio_spectrum::signal().map_or_else(|| {
+                let (level, tone) = if let Some(rt) = representative_time() {
+                    let (mut beat, mut tone) = match self.focus {
+                        1 => ((rt * 2.2 * std::f32::consts::PI * 0.55).sin().abs().powf(2.2), 0.14 + 0.10 * (rt * 0.7).sin()), // bass
+                        2 => ((rt * 3.4 + 0.7).sin().abs().powf(1.3), 0.48 + 0.16 * (rt * 1.1).sin()),                        // mids
+                        3 => (0.28 + 0.72 * (rt * 7.8).sin().abs().powf(1.6), 0.82 + 0.12 * (rt * 1.6).sin()),               // highs
+                        _ => (0.18 + 0.82 * (rt * std::f32::consts::PI * 1.1).sin().abs().powf(1.4), 0.5 + 0.45 * (rt * 0.55).sin()),
+                    };
+                    if self.source == 1 {
+                        // mic: conversational cadence gating whichever register `focus` targets
+                        let gate = 0.25 + 0.75 * (rt * 2.3).sin().max(0.0);
+                        beat = (beat * gate).clamp(0.0, 1.0);
+                        tone = (tone * 0.8 + 0.1).clamp(0.0, 1.0);
+                    }
+                    (beat, tone)
+                } else {
+                    let src = if self.source == 1 { "mic" } else { "speakers" };
+                    crate::audio_spectrum::ensure(src);
+                    let region = (self.focus as usize).min(crate::audio_spectrum::REGIONS - 1);
+                    crate::audio_spectrum::signal().map_or_else(|| {
                         // no PCM stream (off-platform / exotic endpoint) — the honest OS peak
                         // instead, with the colour parked mid-gradient (no tone data to hear).
                         crate::audio_level::ensure(src);
                         (crate::audio_level::level(), 0.5)
-                    }, |s| (s.levels[region], s.tone));
+                    }, |s| (s.levels[region], s.tone))
+                };
                 // dt from the shared render clock (0.25 cap absorbs pauses; covers a 6fps board's 167ms)
                 let dt = (t - self.last_t).clamp(0.0, 0.25);
                 self.last_t = t;
@@ -3316,9 +3332,15 @@ impl Pattern for Meter {
                 Field::Scalar(paint_audio_tint(tone, self.bar, n))
             }
             _ => {
-                crate::sys_stats::ensure();
-                let cpu = crate::sys_stats::cpu();
-                let ram = crate::sys_stats::ram();
+                let (cpu, ram) = if let Some(rt) = representative_time() {
+                    (
+                        0.28 + 0.62 * (0.5 + 0.5 * (rt * 0.95).sin()),
+                        0.38 + 0.42 * (0.5 + 0.5 * (rt * 0.48 + 1.4).sin()),
+                    )
+                } else {
+                    crate::sys_stats::ensure();
+                    (crate::sys_stats::cpu(), crate::sys_stats::ram())
+                };
                 // breathe: the rate rises with CPU, so we INTEGRATE rate·dt into a wrapped phase (never
                 // `t * rate`, which would slew the whole accrued phase on every load change). dt from the
                 // shared render clock (0.25 cap absorbs pauses / a 6fps board's 167ms frame).
@@ -3428,8 +3450,22 @@ impl Pattern for Screen {
         if n == 0 {
             return Field::Color(Vec::new());
         }
-        crate::screen_ambient::ensure();
-        let (gc, gr, grid) = crate::screen_ambient::grid();
+        let (gc, gr, grid) = if let Some(rt) = representative_time() {
+            let (gc, gr) = (8usize, 4usize);
+            let drift = (rt * 24.0).rem_euclid(360.0);
+            let mut demo = Vec::with_capacity(gc * gr);
+            for y in 0..gr {
+                let v = 0.55 + 0.35 * (1.0 - y as f32 / gr.max(1) as f32);
+                for x in 0..gc {
+                    let hue = (x as f32 / (gc - 1) as f32 * 300.0 + drift).rem_euclid(360.0);
+                    demo.push(Rgb::from_hsv(hue, 0.82, v.clamp(0.0, 1.0)));
+                }
+            }
+            (gc, gr, demo)
+        } else {
+            crate::screen_ambient::ensure();
+            crate::screen_ambient::grid()
+        };
         let ease = (0.25 * self.speed).clamp(0.04, 1.0);
         // frame-rate-independent ease: `ease` is the fraction closed per 60Hz frame — fold the real
         // elapsed dt in so a slow renderer still catches the screen at the same chase speed.
@@ -3554,9 +3590,20 @@ impl Pattern for Vitals {
         // the audio meter, which idles at its spectrum's LOW colour — that's a Scalar field; vitals is a
         // Color field of black.) When this layer is OVERLAID its preset defaults to `Blend::Cut`, for
         // which black falls THROUGH to the effect beneath (and lit cells replace at true colour).
-        let v = match may_read_provider().then(crate::lighting::latest_vitals).flatten() {
-            Some(v) => v,
-            None => return Field::Color(vec![Rgb::BLACK; n]),
+        let v = if let Some(rt) = representative_time() {
+            let p = (rt / 14.0).fract();
+            let (pct, charging) = if p < 0.5 { (90.0 - 140.0 * p, false) } else { (20.0 + 140.0 * (p - 0.5), true) };
+            crate::lighting::Vitals {
+                battery_pct: pct.round().clamp(0.0, 100.0) as u8,
+                charging,
+                active_stage: 1,
+                stage_count: 3,
+            }
+        } else {
+            match may_read_provider().then(crate::lighting::latest_vitals).flatten() {
+                Some(v) => v,
+                None => return Field::Color(vec![Rgb::BLACK; n]),
+            }
         };
         let bounds = self.bounds.unwrap_or_else(|| Bounds::board(rows, cols));
         // CREST_RATE: charging-crest sweeps per second — a calm travelling highlight along the lit run.
@@ -3647,7 +3694,15 @@ impl Pattern for OnAir {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        let b = may_read_provider().then(crate::lighting::latest_broadcast).flatten();
+        let b = if let Some(rt) = representative_time() {
+            Some(crate::lighting::Broadcast {
+                connected: true,
+                streaming: (rt / 3.4).fract() < 0.55,
+                recording: ((rt + 1.5) / 4.2).fract() < 0.50,
+            })
+        } else {
+            may_read_provider().then(crate::lighting::latest_broadcast).flatten()
+        };
         let connected = b.is_some_and(|b| b.connected);
         let live = b.is_some_and(|b| {
             b.connected
@@ -3714,8 +3769,13 @@ impl Pattern for MicLight {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        crate::mic_state::ensure();
-        let lit = match crate::mic_state::muted() {
+        let muted = if let Some(rt) = representative_time() {
+            Some((rt / 2.8).fract() < 0.5)
+        } else {
+            crate::mic_state::ensure();
+            crate::mic_state::muted()
+        };
+        let lit = match muted {
             Some(muted) => {
                 if self.show_hot {
                     !muted
@@ -3752,7 +3812,15 @@ impl Pattern for ModeHeld {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        let lit = may_read_provider().then(crate::lighting::latest_hold).flatten().is_some_and(|h| match self.signal {
+        let hold = if let Some(rt) = representative_time() {
+            Some(crate::lighting::HoldState {
+                layer: (rt / 2.8).fract() < 0.50,
+                sniper: ((rt + 1.3) / 3.6).fract() < 0.45,
+            })
+        } else {
+            may_read_provider().then(crate::lighting::latest_hold).flatten()
+        };
+        let lit = hold.is_some_and(|h| match self.signal {
             1 => h.sniper,
             2 => h.layer || h.sniper,
             _ => h.layer,
@@ -3808,7 +3876,14 @@ impl Pattern for GameLightLayer {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        let feed = may_read_provider().then(crate::lighting::latest_game_feed).flatten();
+        let feed = if let Some(rt) = representative_time() {
+            let ambient = Rgb::from_hsv((rt * 18.0).rem_euclid(360.0), 0.72, 0.34);
+            let burst = (rt * 1.4).sin().max(0.0).powf(2.0);
+            let effect = (burst > 0.02).then_some((Rgb::from_hsv(((rt * 18.0) + 150.0).rem_euclid(360.0), 0.9, 0.9), burst));
+            Some(crate::lighting::GameFeed { ambient: Some(ambient), effect })
+        } else {
+            may_read_provider().then(crate::lighting::latest_game_feed).flatten()
+        };
         let c = game_light_color(feed, self.show, self.level);
         let (br, bc) = (rows as usize, cols as usize);
         let b = self.bounds.unwrap_or_else(|| Bounds::board(rows, cols));
@@ -3854,7 +3929,13 @@ impl Pattern for SignalLight {
     }
 
     fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
-        let v = if may_read_provider() { crate::lighting::signal(self.channel) } else { 0.0 };
+        let v = if let Some(rt) = representative_time() {
+            0.08 + 0.92 * ((rt / 4.5) + self.channel as f32 * 0.23).fract()
+        } else if may_read_provider() {
+            crate::lighting::signal(self.channel)
+        } else {
+            0.0
+        };
         if v <= 0.0 {
             return placement_field(self.bounds, rows, cols, 0.0);
         }

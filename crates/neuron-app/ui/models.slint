@@ -261,8 +261,9 @@ export struct EffectParam {
     fval: float,
     fmin: float,
     fmax: float,
-    // enum (segment) — the option labels; ival = chosen index
+    // enum (segment) — the option labels + live procedural simulation previews; ival = chosen index
     options: [string],
+    previews: [image],
     ival: int,
     // color
     hex: string,

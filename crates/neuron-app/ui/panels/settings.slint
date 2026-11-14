@@ -168,16 +168,24 @@ component ChromaStream inherits HorizontalLayout {
 
 component DiagCell inherits Rectangle {
     in property <DiagRow> d;
+    in property <bool> jumpable: false;
+    callback clicked();
     border-radius: Theme.radius;
     // the frame + ground make a verdict scannable at a glance, not just the tiny lamp
     background: d.state == "pass" ? Theme.accent-glow
-        : d.state == "fail" ? Theme.danger-glow
-        : Theme.bg-2;
+        : d.state == "fail" ? (root.jumpable && dta.has-hover ? Theme.danger.with-alpha(0.18) : Theme.danger-glow)
+        : (root.jumpable && dta.has-hover ? Theme.well : Theme.bg-2);
     border-width: Theme.hair;
-    border-color: d.state == "fail" ? Theme.danger-line
+    border-color: d.state == "fail" ? (root.jumpable && dta.has-hover ? Theme.danger : Theme.danger-line)
         : d.state == "pass" ? Theme.accent-line
-        : d.state == "skip" ? Theme.warn-line
+        : d.state == "skip" ? (root.jumpable && dta.has-hover ? Theme.warn : Theme.warn-line)
         : Theme.line;
+    animate background, border-color { duration: Theme.quick; }
+    dta := TouchArea {
+        enabled: root.jumpable;
+        mouse-cursor: root.jumpable ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
     VerticalLayout {
         padding: 12px;
         spacing: 6px;
@@ -209,9 +217,10 @@ component DiagCell inherits Rectangle {
             Rectangle {}
             Mono {
                 // the VERDICT, tracked-out caps — the thing the eye hunts reads as a verdict
-                text: root.d.state == "pass" ? "PASS"
+                text: (root.d.state == "pass" ? "PASS"
                     : root.d.state == "fail" ? "FAIL"
-                    : root.d.state == "skip" ? "SKIP" : "—";
+                    : root.d.state == "skip" ? "SKIP" : "—")
+                    + (root.jumpable && dta.has-hover ? " \u{203a}" : "");
                 // PASS inks the FULL accent — the confident verdict shouldn't be the quietest thing in
                 // the cell. FAIL/SKIP already get full-strength danger/warn; a dimmed pass broke that
                 // scale (the good outcome read fainter than the bad ones).
@@ -673,6 +682,9 @@ component PingGrid inherits VerticalLayout {
 export component SettingsPanel inherits VerticalLayout {
     in property <length> viewport-top;
     in property <length> viewport-bottom;
+    out property <length> beacons-y: beacons_anchor.absolute-position.y - root.absolute-position.y;
+    out property <length> connections-y: conn_anchor.absolute-position.y - root.absolute-position.y;
+    out property <length> reliability-y: rel_anchor.absolute-position.y - root.absolute-position.y;
     spacing: 0;
     // Is the RIGHT COLUMN too narrow to seat the notification placer (348px) beside a workable
     // 4-card ping row? Measured HERE, at the panel root — its width is imposed by the page
@@ -775,7 +787,7 @@ export component SettingsPanel inherits VerticalLayout {
                     // BEACONS header: the section title plus a right-aligned quick-jump to the macro
                     // authoring area (INPUT → DIRECT, where MACRO · PYTHON lives) so the registry and
                     // the place you write/edit these macros are one click apart.
-                    HorizontalLayout {
+                    beacons_anchor := HorizontalLayout {
                         alignment: space-between;
                         SectionTitle { text: "BEACONS"; }
                         VerticalLayout {
@@ -845,13 +857,35 @@ export component SettingsPanel inherits VerticalLayout {
                     // APPEARANCE — make it yours. The accent isn't decoration; it's the live signal the
                     // whole instrument reads by, so this is a real instrument setting, not chrome.
                     SectionTitle { text: "APPEARANCE"; }
-                    ColorPicker {
-                        label: "INTERFACE";
-                        hint: "the app's accent. anything live lights up in this.";
-                        current: Theme.accent;
-                        value: State.ui-accent;
-                        swatches: Palette.accent;
-                        pick(h) => { State.set-ui-accent(h); }
+                    VerticalLayout {
+                        spacing: 6px;
+                        ColorPicker {
+                            label: "INTERFACE";
+                            hint: "the app's accent. anything live lights up in this.";
+                            current: Theme.accent;
+                            value: State.ui-accent;
+                            swatches: Palette.accent;
+                            pick(h) => { State.set-ui-accent(h); }
+                        }
+                        contrast-row := HorizontalLayout {
+                            spacing: 8px;
+                            property <int> contrast-tenths: round(State.ui-accent-contrast * 10);
+                            VerticalLayout {
+                                alignment: center;
+                                Mono {
+                                    text: floor(contrast-row.contrast-tenths / 10) + "." + mod(contrast-row.contrast-tenths, 10) + ":1 vs bg"
+                                        + (State.ui-accent-contrast-low ? " \u{00b7} low contrast (<4.5:1)" : "");
+                                    color: State.ui-accent-contrast-low ? Theme.warn : Theme.text-faint;
+                                    font-size: Theme.fs-small;
+                                    overflow: elide;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            if State.ui-accent.to-lowercase() != "4af2b0" && State.ui-accent.to-lowercase() != "#4af2b0" : Button {
+                                text: "reset #4af2b0";
+                                clicked => { State.set-ui-accent("4af2b0"); }
+                            }
+                        }
                     }
                     // WEAVE and its MATERIAL are one substance — same colour, same cast — so they live as
                     // a single block on the picker's own 9px rhythm. The old colour-hint is gone; MATERIAL's
@@ -1241,7 +1275,7 @@ export component SettingsPanel inherits VerticalLayout {
                     // as layers ABOVE the configured lighting, which returns the instant they
                     // release. Off by default (opening ports is a conscious opt-in); the status
                     // lines carry port truth — a socket held by real Synapse never reads green.
-                    VerticalLayout {
+                    conn_anchor := VerticalLayout {
                         spacing: 3px;
                         SectionTitle { text: "CONNECTIONS"; }
                     }
@@ -1252,7 +1286,7 @@ export component SettingsPanel inherits VerticalLayout {
                             checked: State.host-enabled;
                             toggled(v) => { State.set-host-enabled(v); }
                         }
-                        Mono { text: "your lighting stays underneath and comes back when they stop."; color: Theme.text-faint; }
+                        Mono { text: "your lighting stays underneath and comes back when they stop."; color: Theme.text-faint; wrap: word-wrap; }
                     }
                     if State.host-enabled : VerticalLayout {
                         spacing: 7px;
@@ -1348,11 +1382,11 @@ export component SettingsPanel inherits VerticalLayout {
                     // ── RELIABILITY — the flight recorder, surfaced ───────────
                     // Always-on, crash-surviving: uptime, every worker's live heartbeat, the on-disk
                     // crash record, and the phoenix auto-restart. The machine showing its own vitals.
-                    HorizontalLayout {
+                    rel_anchor := HorizontalLayout {
                         VerticalLayout {
                             spacing: 3px;
                             SectionTitle { text: "RELIABILITY"; }
-                            Mono { text: "the flight recorder. always on, survives crashes."; color: Theme.text-faint; }
+                            Mono { text: "the flight recorder. always on, survives crashes."; color: Theme.text-faint; wrap: word-wrap; }
                         }
                         Rectangle {}
                         VerticalLayout {
@@ -1413,7 +1447,7 @@ export component SettingsPanel inherits VerticalLayout {
                             toggled(v) => { State.set-phoenix(v); }
                         }
                         // no "phoenix." lead — an internal codename floating as a sentence fragment.
-                        Mono { text: "windows relaunches neuron if it crashes or hangs"; color: Theme.text-faint; }
+                        Mono { text: "windows relaunches neuron if it crashes or hangs"; color: Theme.text-faint; wrap: word-wrap; }
                     }
                     HorizontalLayout {
                         // the two flight-recorder verbs fuse into one deck. stretch: 0 is what makes
@@ -1429,40 +1463,6 @@ export component SettingsPanel inherits VerticalLayout {
                         }
                         Rectangle { horizontal-stretch: 1; }
                     }
-
-                    Divider {}
-
-                    // ── DIAGNOSTICS — the in-app test bench ───────────────────
-                    HorizontalLayout {
-                        spacing: 10px;
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 3px;
-                            SectionTitle { text: "DIAGNOSTICS"; }
-                            Mono { text: "a live run of every capability."; color: Theme.text-faint; }
-                        }
-                        Rectangle {}
-                        // the run trigger sizes to its own label (no fixed-width slot floating in space)
-                        VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: "run diagnostics";
-                                busy: State.diag-running;
-                                clicked => { State.run-diagnostics(); }
-                            }
-                        }
-                    }
-                    // segmented verdict bar — pass/fail/skip as proportional widths, settling mechanically.
-                    // The bar shows once a run lands; the summary line is ALWAYS present (rendered once).
-                    VerticalLayout {
-                        spacing: 5px;
-                        if State.diag-pass + State.diag-fail + State.diag-skip > 0 : Rectangle {
-                            height: 6px;
-                            border-radius: 1px;
-                            clip: true;
-                            property <int> total: max(1, State.diag-pass + State.diag-fail + State.diag-skip);
-                            // absolute segments (no inner layout — it would feed back into this width)
-                            property <length> w-pass: self.width * State.diag-pass / self.total;
                     // report a bug: writes a scrubbed report folder + zip, then opens a pre-filled
                     // issue, or copies a prompt for the person's coding agent. Nothing is sent.
                     VerticalLayout {
@@ -1485,6 +1485,48 @@ export component SettingsPanel inherits VerticalLayout {
                         }
                         Mono { text: "home folder, user and pc names are scrubbed. you attach the zip yourself."; color: Theme.text-faint; wrap: word-wrap; }
                     }
+
+                    Divider {}
+
+                    // ── DIAGNOSTICS — the in-app test bench ───────────────────
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            SectionTitle { text: "DIAGNOSTICS"; }
+                            Mono { text: "a live run of every capability."; color: Theme.text-faint; wrap: word-wrap; }
+                        }
+                        Rectangle {}
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "copy summary";
+                                enabled: (State.diag-pass + State.diag-fail + State.diag-skip > 0) && !State.diag-running;
+                                clicked => { State.copy-diagnostics(); }
+                            }
+                        }
+                        // the run trigger sizes to its own label (no fixed-width slot floating in space)
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "run diagnostics";
+                                busy: State.diag-running;
+                                clicked => { State.run-diagnostics(); }
+                            }
+                        }
+                    }
+                    // segmented verdict bar — pass/fail/skip as proportional widths, settling mechanically.
+                    // The bar shows once a run lands; the summary line is ALWAYS present (rendered once).
+                    VerticalLayout {
+                        spacing: 5px;
+                        if State.diag-pass + State.diag-fail + State.diag-skip > 0 : Rectangle {
+                            height: 6px;
+                            border-radius: 1px;
+                            clip: true;
+                            property <int> total: max(1, State.diag-pass + State.diag-fail + State.diag-skip);
+                            // absolute segments (no inner layout — it would feed back into this width)
+                            property <length> w-pass: self.width * State.diag-pass / self.total;
                             property <length> w-fail: self.width * State.diag-fail / self.total;
                             Rectangle {
                                 x: 0; width: parent.w-pass; height: parent.height;
@@ -1505,7 +1547,7 @@ export component SettingsPanel inherits VerticalLayout {
                                 animate width { duration: Theme.settle; }
                             }
                         }
-                        Mono { text: State.diag-summary; color: Theme.text-mid; }
+                        Mono { text: State.diag-summary; color: Theme.text-mid; wrap: word-wrap; }
                     }
                     // the bench grid — 3 stations per row, arithmetic placement (no lazy list). It
                     // STRETCHES to absorb the column's slack (so config packs tight at the top and the
@@ -1523,11 +1565,25 @@ export component SettingsPanel inherits VerticalLayout {
                             y: floor(i / 3) * 96px;
                             width: bench.cw;
                             height: 86px;
+                            jumpable: d.state == "fail" || d.state == "skip";
+                            clicked => {
+                                if (d.name == "lighting test pattern" || d.name == "effect engine") {
+                                    State.page = 1;
+                                } else if (d.name == "spine engine" || d.name == "macro runtime" || d.name == "mic endpoint") {
+                                    State.input-view = 0;
+                                    State.page = 2;
+                                } else if (d.name == "gesture vault") {
+                                    State.input-view = 1;
+                                    State.page = 2;
+                                } else {
+                                    State.page = 0;
+                                }
+                            }
                         }
                         if State.diagnostics.length == 0 : VerticalLayout {
                             alignment: center; spacing: 5px;
                             Mono { text: "no probes have run"; color: Theme.text-dim; horizontal-alignment: center; }
-                            Mono { text: "press run diagnostics to fire every capability live"; color: Theme.text-faint; horizontal-alignment: center; }
+                            Mono { text: "press run diagnostics to fire every capability live"; color: Theme.text-faint; wrap: word-wrap; horizontal-alignment: center; }
                         }
                     }
                 }

@@ -32,14 +32,16 @@
 //! The walk needs the element debug info that the build emits for debug builds (see `build.rs`);
 //! without it every element reads as an unnamed non-layout and nothing is checked.
 
-use slint::private_unstable_api::re_exports::WindowInner;
+use slint::private_unstable_api::re_exports::{ItemRc, WindowInner};
 
 /// Rounding in layout maths, in logical pixels.
 const SLACK: f32 = 0.5;
 
 /// What breaks the rules in the window as last laid out, one line each.
 pub(crate) fn misfits(window: &slint::Window) -> Vec<String> {
-    let Some(root) = WindowInner::from_pub(window).window_item_rc() else { return Vec::new() };
+    let inner = WindowInner::from_pub(window);
+    let Some(root) = inner.window_item_rc() else { return Vec::new() };
+    let adapter = inner.window_adapter();
     let mut found = Vec::new();
     let mut stack = vec![(root, String::new())];
     while let Some((item, path)) = stack.pop() {
@@ -68,8 +70,14 @@ pub(crate) fn misfits(window: &slint::Window) -> Vec<String> {
                 || g.max_x() > bounds.size.width + SLACK
                 || g.max_y() > bounds.size.height + SLACK;
             if checked && outside && g.size.width > 0.0 && g.size.height > 0.0 {
+                // a child pushed wide is usually held there by one line of text that cannot shrink
+                let culprit = (g.max_x() > bounds.size.width + SLACK)
+                    .then(|| widest_rigid_text(&c, &adapter))
+                    .flatten()
+                    .map(|(needs, text)| format!("; the widest text inside that cannot wrap needs {needs:.0} px: \"{}\"", text.chars().take(60).collect::<String>()))
+                    .unwrap_or_default();
                 found.push(format!(
-                    "{path}: a {} child at ({:.1}, {:.1}) size {:.1}×{:.1} is outside its {:.1}×{:.1} box",
+                    "{path}: a {} child at ({:.1}, {:.1}) size {:.1}×{:.1} is outside its {:.1}×{:.1} box{culprit}",
                     layout.as_deref().unwrap_or("layout"),
                     g.origin.x, g.origin.y, g.size.width, g.size.height, bounds.size.width, bounds.size.height,
                 ));
@@ -79,6 +87,34 @@ pub(crate) fn misfits(window: &slint::Window) -> Vec<String> {
         }
     }
     found
+}
+
+/// The widest text under `item` that neither wraps nor elides, and the width it needs: what most
+/// often holds a layout child wider than its parent.
+fn widest_rigid_text(item: &ItemRc, adapter: &std::rc::Rc<dyn slint::platform::WindowAdapter>) -> Option<(f32, String)> {
+    use slint::private_unstable_api::re_exports::{ComplexText, Orientation, SimpleText, TextOverflow, TextWrap};
+    let mut best: Option<(f32, String)> = None;
+    let mut stack = vec![item.clone()];
+    while let Some(it) = stack.pop() {
+        let text = if let Some(t) = it.downcast::<ComplexText>() {
+            let t = t.as_pin_ref();
+            (t.wrap() == TextWrap::NoWrap && t.overflow() != TextOverflow::Elide).then(|| t.text().to_string())
+        } else {
+            it.downcast::<SimpleText>().map(|t| t.as_pin_ref().text().to_string())
+        };
+        if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
+            let needs = it.borrow().as_ref().layout_info(Orientation::Horizontal, it.geometry().size.height, adapter, &it).min;
+            if best.as_ref().is_none_or(|(w, _)| needs > *w) {
+                best = Some((needs, text));
+            }
+        }
+        let mut child = it.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            stack.push(c);
+        }
+    }
+    best
 }
 
 /// A button's label sits in room it does not use: more than twice the side padding buttons of its

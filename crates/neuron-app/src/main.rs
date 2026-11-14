@@ -126,8 +126,34 @@ fn initial_runtime_mode(safe: bool) -> neuron::safety::RuntimeMode {
 /// only authority for `status-kind`: "err" (consequence: a real failure), "listen" (neuron is
 /// waiting on the user), "note" (provisional: paused, unsaved, a nudge), else "info".
 fn status_kind(text: &str) -> &'static str {
-    let t = text.to_lowercase();
-    let has = |needles: &[&str]| needles.iter().any(|n| t.contains(n));
+    // ASCII lowering keeps byte offsets, so `orig` still says where a CamelCase word starts
+    let t = text.to_ascii_lowercase();
+    let orig = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    // a word starts or ends at byte `i`: not inside a name like `my_error_app.exe`, but at the
+    // seam of a Debug-printed `WriteFailed` / `HidError`
+    let seam = |i: usize| i == 0 || i == orig.len() || !is_ident(orig[i - 1]) || !is_ident(orig[i])
+        || (orig[i - 1].is_ascii_lowercase() && orig[i].is_ascii_uppercase());
+    let has_phrase = |needle: &str| {
+        let nb = needle.as_bytes();
+        let check_left = nb.first().is_some_and(|b| b.is_ascii_alphanumeric());
+        let check_right = nb.last().is_some_and(|b| b.is_ascii_alphanumeric());
+        let mut from = 0;
+        while let Some(rel) = t[from..].find(needle) {
+            let start = from + rel;
+            let end = start + nb.len();
+            let left_ok = !check_left || seam(start);
+            // "errors", "declined" and friends: a plural or past ending still ends the word
+            let right_ok = !check_right || seam(end)
+                || ["s", "es", "ed", "d"].iter().any(|s| t[end..].starts_with(s) && seam(end + s.len()));
+            if left_ok && right_ok {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    };
+    let has = |needles: &[&str]| needles.iter().any(|n| has_phrase(n));
     if has(&[
         "failed",
         "invalid",
@@ -709,6 +735,11 @@ fn main() {
                 if slow_due {
                     flight::follow_stall_probe();
                     let stalls = flight::stalls(20_000);
+                    let stalled = !stalls.is_empty();
+                    if st.get_organ_stall() != stalled {
+                        st.set_organ_stall(stalled);
+                    }
+                    crate::glue::refresh_undo_state(app);
                     if let Some((name, age)) = stalls.first() {
                         let mut last = stall_name.borrow_mut();
                         if last.as_deref() != Some(name) {
@@ -749,6 +780,12 @@ fn main() {
                         *seen = Instant::now();
                         if st.get_window_shown() && st.get_page() == 3 {
                             crate::glue::refresh_reliability(app);
+                        }
+                        if st.get_window_shown() && st.get_page() == 2 && st.get_input_view() == 1 {
+                            let connected = !neuron::haptics::devices().is_empty();
+                            if st.get_pad_haptics_connected() != connected {
+                                st.set_pad_haptics_connected(connected);
+                            }
                         }
                         // HOST BASE RECOVERY: if the protocol-host kernel took a contained fault and
                         // was reborn, every lease was swept — including the app's own animated base
@@ -839,12 +876,20 @@ fn main() {
                 if tray_due {
                     let snap = {
                         let s = shared.borrow();
+                        let device = st.get_selected_device_name().to_string();
                         TraySnapshot {
                             profiles: s.rt.profiles.iter().map(|p| p.name.clone()).collect(),
                             effects: effect_names(&st),
                             active: s.rt.active_profile.clone(),
+                            effect: usize::try_from(st.get_applied_effect()).ok(),
                             paused: neuron::writes::writes_paused(),
+                            armed: neuron::action::input_armed(),
                             hyper: st.get_hypershift_on(),
+                            light: st.get_sel_can_light().then(|| (device.clone(), st.get_brightness().round() as i32)),
+                            dpi: st.get_sel_can_dpi().then(|| {
+                                use slint::Model;
+                                (device.clone(), st.get_dpi().round() as i32, st.get_dpi_stage_nums().iter().collect())
+                            }),
                         }
                     };
                     poll_tray.sync(&snap, acted);
@@ -876,20 +921,12 @@ fn main() {
     }
     // Flush any still-debounced lighting save before teardown — a quit must never strand the last
     // edit. Structural edits (stack/remove/tile-pick) already persist immediately; this catches a
-                        let device = st.get_selected_device_name().to_string();
     // knob (speed/stop/timing) tweaked within the 400ms debounce window right before quitting.
     glue::flush_lighting_save();
     light_render::shutdown();
     light_metadata::shutdown();
-                            effect: usize::try_from(st.get_applied_effect()).ok(),
     // ── DEVICE-MODE RESTORE (the DPI-16000 trap) ──────────────────────────
-                            armed: neuron::action::input_armed(),
     // Driver mode is a scoped LEASE (streams/writes), never a permanent state: while a device is held
-                            light: st.get_sel_can_light().then(|| (device.clone(), st.get_brightness().round() as i32)),
-                            dpi: st.get_sel_can_dpi().then(|| {
-                                use slint::Model;
-                                (device.clone(), st.get_dpi().round() as i32, st.get_dpi_stage_nums().iter().collect())
-                            }),
     // in it, its onboard buttons/FN defer to software and it wakes with a stale factory volatile plane
     // unless something re-asserts config. On exit neuron is that "something" no longer, so hand every
     // device back to firmware ownership. Stop the live streams FIRST (each board's own teardown
@@ -1248,5 +1285,11 @@ mod startup_policy_tests {
         assert_eq!(status_kind("python installed"), "info");
         assert_eq!(status_kind("capture cancelled"), "info");
         assert_eq!(status_kind("ready"), "info");
+        assert_eq!(status_kind("focused my_error_app.exe"), "info");
+        assert_eq!(status_kind("saved unfailed_test profile"), "info");
+        assert_eq!(status_kind("bound invalid-app.exe"), "info");
+        assert_eq!(status_kind("3 errors in the setup file"), "err");
+        assert_eq!(status_kind("lighting write: WriteFailed"), "err");
+        assert_eq!(status_kind("device read: HidError(Timeout)"), "err");
     }
 }

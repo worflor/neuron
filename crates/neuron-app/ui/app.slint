@@ -44,6 +44,7 @@ component NavEntry inherits Rectangle {
     in property <string> label;
     in property <int> index;
     in property <bool> active;
+    in property <bool> warn-dot: false;
     callback clicked();
     horizontal-stretch: 0;
     height: Theme.seg-h;
@@ -73,6 +74,15 @@ component NavEntry inherits Rectangle {
             font-weight: root.active ? 700 : 500;
             letter-spacing: Theme.track-4;
             vertical-alignment: center;
+        }
+        if root.warn-dot && !root.active : VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: Theme.dot;
+                height: Theme.dot;
+                border-radius: Theme.dot / 2;
+                background: Theme.warn;
+            }
         }
     }
     ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
@@ -118,6 +128,9 @@ export component AppWindow inherits Window {
     sample-light-demand => { lighting_panel.sample-demand(); }
 
     title: "Neuron";
+    // neuron's mark, drawn by `mark.rs`
+    in property <image> mark;
+    icon: root.mark;
     // Pages scroll (see PanelPage), so the minimum is "still comfortable", not "fits everything".
     min-width: 900px;
     min-height: 560px;
@@ -128,9 +141,6 @@ export component AppWindow inherits Window {
     default-font-family: Theme.mono;
     forward-focus: keys;
 
-    // neuron's mark, drawn by `mark.rs`
-    in property <image> mark;
-    icon: root.mark;
     // The four warranted sections — user INTENTS, not feature taxonomy: make it feel right /
     // make it look right / make input do things / set it up + prove it works. PROFILES is a
     // global affordance (the header sheet), not a seat. Index == State.page.
@@ -138,6 +148,8 @@ export component AppWindow inherits Window {
     // ARMING REAL INPUT deserves friction: first click on the SAFE pill arms the question,
     // a second click within 2.5s commits. Disarming (ARMED -> SAFE) is always one click.
     property <bool> arm-confirm: false;
+    property <bool> wire-jump-pending: false;
+    property <bool> rules-jump-pending: false;
     Timer {
         interval: Theme.confirm-window;
         running: root.arm-confirm;
@@ -163,6 +175,10 @@ export component AppWindow inherits Window {
                 return reject;
             }
             if (!State.import-open && !State.capture-active && !State.profile-sheet-open) {
+                if (e.modifiers.control && !e.modifiers.shift && (e.text == "z" || e.text == "Z" || e.text == "\u{001a}")) {
+                    State.undo-last();
+                    return accept;
+                }
                 if (e.text == "1") { State.page = 0; return accept; }
                 if (e.text == "2") { State.page = 1; return accept; }
                 if (e.text == "3") { State.page = 2; return accept; }
@@ -175,15 +191,16 @@ export component AppWindow inherits Window {
             padding: 0;
 
             // ── instrument fascia: section selector + live signal cluster ─────
-            Rectangle {
-                height: 56px;
+            fascia := Rectangle {
+                height: max(fascia-row.preferred-height, section-selector.preferred-height) + Theme.gap;
                 background: Theme.bg;
-                HorizontalLayout {
+                fascia-row := HorizontalLayout {
                     padding-left: Theme.pad-page;
                     padding-right: Theme.pad-page;
                     spacing: 0;
                     // wordmark — quiet, mono, the instrument's name plate
                     VerticalLayout {
+                        horizontal-stretch: 0;
                         alignment: center;
                         HorizontalLayout {
                             spacing: 8px;
@@ -199,24 +216,13 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    Rectangle { width: 26px; }
-                    // the section selector
-                    HorizontalLayout {
-                        alignment: start;
-                        spacing: 4px;
-                        for s[i] in root.sections : NavEntry {
-                            label: s;
-                            index: i;
-                            active: State.page == i;
-                            clicked => { State.page = i; }
-                        }
-                    }
                     Rectangle {}  // push the right cluster over
                     // The right cluster is ONE affordance, not a row of tags: the PROFILE sheet
                     // trigger (plus a quiet "shift" word while a layer is held — a state, not a
                     // badge). The link lamp is the wordmark dot; gate/paused/beacon live on the
                     // scope strip below, where modes belong.
                     VerticalLayout {
+                        horizontal-stretch: 0;
                         alignment: center;
                         HorizontalLayout {
                             alignment: end;
@@ -255,6 +261,23 @@ export component AppWindow inherits Window {
                                 clickable: true;
                                 clicked => { State.refresh-profile-suggestion(); State.profile-sheet-open = true; }
                             }
+                        }
+                    }
+                }
+                // Center on the window, independently of the two side clusters.
+                section-selector := VerticalLayout {
+                    width: parent.width;
+                    height: parent.height;
+                    alignment: center;
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        for s[i] in root.sections : NavEntry {
+                            label: s;
+                            index: i;
+                            active: State.page == i;
+                            warn-dot: i == 3 && State.organ-stall;
+                            clicked => { State.page = i; }
                         }
                     }
                 }
@@ -297,7 +320,7 @@ export component AppWindow inherits Window {
                         PanelSlot { active: State.page == 2 && State.input-view == 0; bp_page := PanelPage { bp := BindingsPanel {} } }
                         PanelSlot { active: State.page == 2 && State.input-view == 1; PanelPage { SpellweavingPanel {} } }
                         PanelSlot { active: State.page == 3; system_page := PanelPage {
-                            SettingsPanel {
+                            sp := SettingsPanel {
                                 viewport-top: system_page.absolute-position.y;
                                 viewport-bottom: system_page.absolute-position.y + system_page.height;
                             }
@@ -313,6 +336,52 @@ export component AppWindow inherits Window {
                             triggered => {
                                 bp_page.viewport-y = -max(0px, min(bp.macro-y, bp_page.viewport-height - bp_page.height));
                                 State.macro-jump-pending = false;
+                            }
+                        }
+                        Timer {
+                            interval: 16ms;
+                            running: State.system-jump-target != "" && State.page == 3;
+                            triggered => {
+                                if (State.system-jump-target == "beacons") {
+                                    system_page.viewport-y = -max(0px, min(sp.beacons-y, system_page.viewport-height - system_page.height));
+                                } else if (State.system-jump-target == "connections") {
+                                    system_page.viewport-y = -max(0px, min(sp.connections-y, system_page.viewport-height - system_page.height));
+                                } else if (State.system-jump-target == "reliability") {
+                                    system_page.viewport-y = -max(0px, min(sp.reliability-y, system_page.viewport-height - system_page.height));
+                                }
+                                State.system-jump-target = "";
+                            }
+                        }
+                        Timer {
+                            interval: 16ms;
+                            running: State.input-layer-request >= 0 && State.macro-bind-request == "" && State.page == 2 && State.input-view == 0;
+                            triggered => {
+                                bp.apply-layer-request();
+                                root.rules-jump-pending = true;
+                            }
+                        }
+                        Timer {
+                            interval: 16ms;
+                            running: root.rules-jump-pending && State.page == 2 && State.input-view == 0;
+                            triggered => {
+                                bp_page.viewport-y = -max(0px, min(bp.rules-y - 16px, bp_page.viewport-height - bp_page.height));
+                                root.rules-jump-pending = false;
+                            }
+                        }
+                        Timer {
+                            interval: 16ms;
+                            running: State.macro-bind-request != "" && State.page == 2 && State.input-view == 0;
+                            triggered => {
+                                bp.apply-macro-bind();
+                                root.wire-jump-pending = true;
+                            }
+                        }
+                        Timer {
+                            interval: 16ms;
+                            running: root.wire-jump-pending && State.page == 2 && State.input-view == 0;
+                            triggered => {
+                                bp_page.viewport-y = -max(0px, min(bp.wire-y - 24px, bp_page.viewport-height - bp_page.height));
+                                root.wire-jump-pending = false;
                             }
                         }
                         }
@@ -364,7 +433,7 @@ export component AppWindow inherits Window {
 
                     // ── ZONE R — the mode readouts, packed right, split by hairline DIVIDERS (visible
                     // structure) instead of blind spacer gaps. Gates + live states belong on the scope
-                    // line. Order: beacon | writes-paused | gate | fired | focus. Each group LEADS with
+                    // line. Order: beacon | writes-paused | undo | gate | fired | focus. Each group LEADS with
                     // its own divider, so whichever renders first is cleanly parted from the message.
                     //
                     // SANCTIONED REFLOW EXCEPTION (audit-ruled): the transient chips (beacon, writes-
@@ -384,6 +453,8 @@ export component AppWindow inherits Window {
                                 text: State.beacon-count > 1 ? "beacon ×" + State.beacon-count : "beacon";
                                 lit: true;
                                 signal: Signal.listening;   // a macro is waiting on the user's answer
+                                clickable: true;
+                                clicked => { State.system-jump-target = "beacons"; State.page = 3; }
                             }
                         }
 
@@ -399,6 +470,18 @@ export component AppWindow inherits Window {
                                 signal: Signal.provisional;
                                 clickable: true;
                                 clicked => { State.page = 3; }
+                            }
+                        }
+
+                        if State.undo-available : HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            StatusLamp {
+                                text: "undo " + State.undo-label;
+                                lit: false;
+                                signal: Signal.provisional;
+                                clickable: true;
+                                clicked => { State.undo-last(); }
                             }
                         }
 
@@ -432,13 +515,22 @@ export component AppWindow inherits Window {
                         if State.live-fired > 0 : HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
-                            Mono {
-                                text: "fired " + State.live-fired + " · " + State.live-last-trigger
-                                    + " → " + State.live-last-action;
-                                color: Theme.accent-dim;
-                                font-size: Theme.fs-mono;
-                                overflow: elide;
-                                max-width: 340px;
+                            Rectangle {
+                                HorizontalLayout {
+                                    Mono {
+                                        text: "fired " + State.live-fired + " · " + State.live-last-trigger
+                                            + " → " + State.live-last-action;
+                                        color: fired-ta.has-hover ? Theme.accent : Theme.accent-dim;
+                                        font-size: Theme.fs-mono;
+                                        overflow: elide;
+                                        max-width: 340px;
+                                        animate color { duration: Theme.quick; }
+                                    }
+                                }
+                                fired-ta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { State.jump-to-fired-rule(); }
+                                }
                             }
                         }
 
@@ -446,12 +538,26 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
-                            Mono {
-                                text: "focus " + State.focused-app;
-                                color: Theme.text-faint;
-                                font-size: Theme.fs-mono;
-                                overflow: elide;
-                                max-width: 260px;
+                            Rectangle {
+                                HorizontalLayout {
+                                    Mono {
+                                        text: "focus " + State.focused-app;
+                                        color: focus-ta.enabled && focus-ta.has-hover ? Theme.text-mid : Theme.text-faint;
+                                        font-size: Theme.fs-mono;
+                                        overflow: elide;
+                                        max-width: 260px;
+                                        animate color { duration: Theme.quick; }
+                                    }
+                                }
+                                focus-ta := TouchArea {
+                                    enabled: State.focused-app != "" && State.focused-app != "—";
+                                    mouse-cursor: self.enabled ? MouseCursor.pointer : MouseCursor.default;
+                                    clicked => {
+                                        State.app-rule-prefill = State.focused-app;
+                                        State.refresh-profile-suggestion();
+                                        State.profile-sheet-open = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -478,7 +584,7 @@ export component AppWindow inherits Window {
             // content-sized but capped to the glass; the menu scrolls inside if it ever outgrows it
             height: min(menu.preferred-height, parent.height - 80px);
             x: parent.width - self.width - Theme.pad-page;     // right-aligned under the header pill
-            y: State.profile-sheet-open ? 50px : 42px;         // a gentle slide-down on open
+            y: fascia.absolute-position.y + fascia.height - (State.profile-sheet-open ? 0px : 8px);         // a gentle slide-down on open
             opacity: State.profile-sheet-open ? 1.0 : 0.0;
             background: Theme.bg-2;
             border-radius: Theme.radius;
@@ -517,7 +623,7 @@ export component AppWindow inherits Window {
             width: min(420px, parent.width - Theme.pad-page * 2);
             height: min(self.preferred-height, parent.height - 80px);
             x: clamp(upd-slot.absolute-position.x + upd-slot.width - self.width, Theme.pad-page, max(Theme.pad-page, parent.width - self.width - Theme.pad-page));
-            y: State.update-notes-open ? 50px : 42px;
+            y: fascia.absolute-position.y + fascia.height - (State.update-notes-open ? 0px : 8px);
             opacity: State.update-notes-open ? 1.0 : 0.0;
             animate opacity, y { duration: Theme.settle; easing: ease-out; }
         }

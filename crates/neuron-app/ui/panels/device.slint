@@ -110,17 +110,30 @@ component CapHead inherits HorizontalLayout {
     in property <string> readout: "";
     in property <color> readout-ink: Theme.text-faint;
     in property <bool> gated: false;
+    in property <bool> dirty: false;
     spacing: 8px;
-    VerticalLayout {
-        alignment: center;
-        Text {
-            text: root.term;
-            color: Theme.text-dim;
-            font-size: Theme.fs-small;
-            font-family: Theme.mono;
-            font-weight: 700;
-            letter-spacing: Theme.track-2;
-            vertical-alignment: center;
+    HorizontalLayout {
+        spacing: 6px;
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.term;
+                color: Theme.text-dim;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                font-weight: 700;
+                letter-spacing: Theme.track-2;
+                vertical-alignment: center;
+            }
+        }
+        if root.dirty : VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 5px;
+                height: 5px;
+                border-radius: 2.5px;
+                background: Theme.warn;
+            }
         }
     }
     Rectangle { horizontal-stretch: 1; min-width: 8px; }
@@ -159,10 +172,12 @@ component FeelTile inherits Rectangle {
     in property <string> term;
     in property <string> readout: "";
     in property <color> readout-ink: Theme.text-faint;
+    in property <bool> dirty: false;
     background: Theme.well.with-alpha(0.5);
     border-radius: Theme.radius-sm;
     border-width: Theme.hair;
-    border-color: Theme.line;
+    border-color: root.dirty ? Theme.warn-line : Theme.line;
+    animate border-color { duration: Theme.quick; }
     VerticalLayout {
         padding: 11px;
         spacing: 9px;
@@ -170,6 +185,7 @@ component FeelTile inherits Rectangle {
             term: root.term;
             readout: root.readout;
             readout-ink: root.readout-ink;
+            dirty: root.dirty;
         }
         @children
     }
@@ -1206,6 +1222,13 @@ export component DevicePanel inherits VerticalLayout {
                             }
                         }
 
+                        if State.sel-can-dpi && State.selected-device >= 0 && State.selected-device < State.devices.length && State.devices[State.selected-device].connected && State.devices[State.selected-device].dpi == "—" : Mono {
+                            text: "device asleep · showing saved draft values until it wakes";
+                            color: Theme.text-faint;
+                            font-size: Theme.fs-small;
+                            wrap: word-wrap;
+                        }
+
                         // ── DPI HERO — the big value + fader (detents = the stage cycle), with the
                         // active-stage cycle (the stages field + i+1:stage active pills) folded in
                         // beneath it as one hero block. No per-control apply: the global apply commits.
@@ -1216,6 +1239,7 @@ export component DevicePanel inherits VerticalLayout {
                                 minimum: 100; maximum: 30000; value: State.dpi;
                                 step: 50;
                                 detents: State.dpi-stage-nums;
+                                dirty: round(State.dpi) != round(State.feel-base-dpi);
                                 changed(v) => { State.dpi = v; }
                             }
                             // the stage cycle, folded under the fader — the list + which stage is active.
@@ -1231,6 +1255,13 @@ export component DevicePanel inherits VerticalLayout {
                                     // it (an immediate apply here would write stages while DPI/rate/etc.
                                     // stay pending, which contradicts the one-apply deck).
                                     accepted(t) => { State.dpi-stages-edited(t); }
+                                }
+                                if State.dpi-stages != State.feel-base-stages : VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 5px; height: 5px; border-radius: 2.5px;
+                                        background: Theme.warn;
+                                    }
                                 }
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1; min-width: 0px;
@@ -1249,6 +1280,13 @@ export component DevicePanel inherits VerticalLayout {
                             HorizontalLayout {
                                 spacing: 6px;
                                 Mono { text: "stage"; color: Theme.text-faint; }
+                                if State.dpi-active-stage != State.feel-base-active-stage : VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 5px; height: 5px; border-radius: 2.5px;
+                                        background: Theme.warn;
+                                    }
+                                }
                                 ContactRow {
                                     options: State.dpi-stage-nums;
                                     ordinal: true;
@@ -1280,6 +1318,7 @@ export component DevicePanel inherits VerticalLayout {
                                     term: "REPORT RATE";
                                     readout: round(State.polling-hz) + " Hz";
                                     readout-ink: Theme.text-mid;
+                                    dirty: round(State.polling-hz) != round(State.feel-base-polling);
                                     ContactRow {
                                         options: [125, 250, 500, 1000];
                                         value: round(State.polling-hz);
@@ -1293,6 +1332,7 @@ export component DevicePanel inherits VerticalLayout {
                                     term: "BRIGHTNESS";
                                     readout: round(State.brightness) + "%";
                                     readout-ink: Theme.text-mid;
+                                    dirty: round(State.brightness) != round(State.feel-base-brightness);
                                     Slider {
                                         compact: true;
                                         minimum: 0; maximum: 100; value: State.brightness;
@@ -1365,6 +1405,12 @@ export component DevicePanel inherits VerticalLayout {
                                     toggled(v) => { State.persist-to-onboard = v; State.set-persist(v); }
                                 }
                                 Mono { text: "kept on the mouse · holds with neuron closed"; color: Theme.text-faint; wrap: word-wrap; }
+                            }
+                            Mono {
+                                text: "SNIPER auto-saves · PERSIST immediate · FEEL drafts wait for apply";
+                                color: Theme.text-faint;
+                                font-size: Theme.fs-small;
+                                wrap: word-wrap;
                             }
                         }
                     }

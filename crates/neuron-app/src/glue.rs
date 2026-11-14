@@ -105,16 +105,36 @@ fn update_param_model(st: &State, mut rows: Vec<EffectParam>, target: Option<(cr
     let same_schema = same_target && existing.row_count() == rows.len() && rows.iter().enumerate().all(|(i, row)| {
         existing.row_data(i).is_some_and(|old| old.key == row.key && old.kind == row.kind)
     });
-    if !same_schema { st.set_light_params(ModelRc::new(VecModel::from(rows))); return; }
+    if !same_schema {
+        forget_param_previews();
+        st.set_light_params(ModelRc::new(VecModel::from(rows)));
+        return;
+    }
+    let mut fresh = false;
     for (i, row) in rows.iter_mut().enumerate() {
-        if let Some(old) = existing.row_data(i) {
-            if old.options.row_count() == row.options.row_count()
-                && (0..old.options.row_count()).all(|j| old.options.row_data(j) == row.options.row_data(j)) {
+        match existing.row_data(i) {
+            Some(old) if old.options.row_count() == row.options.row_count()
+                && (0..old.options.row_count()).all(|j| old.options.row_data(j) == row.options.row_data(j)) => {
                 row.options = old.options;
+                row.previews = old.previews;
             }
+            _ => fresh = true,
         }
     }
+    if fresh {
+        forget_param_previews();
+    }
     update_value_model(existing, rows, |model| st.set_light_params(model));
+}
+
+/// Blank preview images are about to replace the option previews on screen: forget which frames
+/// they last showed, so the next frame of each option is drawn even when it matches the last one.
+fn forget_param_previews() {
+    LIGHT_PREVIEW.with(|p| {
+        if let Ok(mut p) = p.try_borrow_mut() {
+            p.last_rgb.retain(|id, _| !matches!(id, crate::light_render::SurfaceId::ParamOption(..)));
+        }
+    });
 }
 
 /// The app's weak handle, installed ONCE at startup — the reach-back a non-UI subsystem
@@ -653,6 +673,26 @@ fn rgb_to_color(c: Rgb) -> slint::Color {
 fn accent_color(hex: &str) -> slint::Color {
     let clean = crate::prefs::normalize_hex(hex);
     rgb_to_color(Rgb::parse(&clean).unwrap_or(Rgb::new(0x4A, 0xF2, 0xB0)))
+}
+
+fn rel_lum(r: u8, g: u8, b: u8) -> f64 {
+    let lin = |c: u8| {
+        let s = f64::from(c) / 255.0;
+        if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+fn sync_ui_accent_contrast(st: &State, hex: &str) {
+    let clean = crate::prefs::normalize_hex(hex);
+    let c = Rgb::parse(&clean).unwrap_or(Rgb::new(0x4A, 0xF2, 0xB0));
+    let l1 = rel_lum(c.r, c.g, c.b);
+    let l2 = rel_lum(4, 5, 6); // Theme.bg = #040506
+    let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+    let ratio = ((hi + 0.05) / (lo + 0.05)) as f32;
+    let rounded = (ratio * 10.0).round() / 10.0;
+    st.set_ui_accent_contrast(rounded);
+    st.set_ui_accent_contrast_low(rounded < 4.5);
 }
 
 /// Drive the live Directed-Intent material from the saved weave accent. Colour isn't pigment in that
@@ -1400,6 +1440,60 @@ fn refresh_clipboard_operations(state: &State, ops: &[neuron::clipboard_transfor
     }).collect::<Vec<_>>();
     state.set_clipboard_operations(slint::ModelRc::new(slint::VecModel::from(rows.iter().map(|row| row.label.clone()).collect::<Vec<_>>())));
     state.set_clipboard_operation_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+    refresh_clipboard_pipeline_preview(state, ops);
+}
+
+fn refresh_clipboard_pipeline_preview(state: &State, ops: &[neuron::clipboard_transform::TransformOp]) {
+    if current_action(state).0 != "clipboard-transform" || ops.is_empty() {
+        state.set_clipboard_pipeline_preview("".into());
+        state.set_clipboard_pipeline_status("".into());
+        return;
+    }
+    let sample = state.get_clipboard_sample();
+    let mut macro_note = false;
+    match neuron::clipboard_transform::apply_with(sample.as_str(), ops, |id, cur| {
+        macro_note = true;
+        Ok(format!("[macro:{id} · {} chars]", cur.chars().count()))
+    }) {
+        Ok(out) => {
+            let capped = if out.chars().count() > 240 {
+                let s: String = out.chars().take(240).collect();
+                format!("{s}\u{2026}")
+            } else {
+                out
+            };
+            state.set_clipboard_pipeline_preview(capped.into());
+            state.set_clipboard_pipeline_status(
+                if macro_note {
+                    format!("{} steps · macro simulated", ops.len())
+                } else {
+                    format!("{} step{} live", ops.len(), if ops.len() == 1 { "" } else { "s" })
+                }
+                .into(),
+            );
+        }
+        Err(err) => {
+            state.set_clipboard_pipeline_preview("".into());
+            state.set_clipboard_pipeline_status(err.to_string().into());
+        }
+    }
+}
+
+pub fn refresh_undo_state(app: &AppWindow) {
+    let st = app.global::<State>();
+    let label = match neuron::session_undo::peek().map(|r| r.entry) {
+        Some(neuron::session_undo::Entry::Profile { .. }) => "profile",
+        Some(neuron::session_undo::Entry::Lighting { .. }) => "lighting",
+        Some(neuron::session_undo::Entry::Audio { .. }) => "audio",
+        None => "",
+    };
+    let avail = !label.is_empty();
+    if st.get_undo_available() != avail {
+        st.set_undo_available(avail);
+    }
+    if st.get_undo_label() != label {
+        st.set_undo_label(label.into());
+    }
 }
 
 fn clipboard_selections(state: &State) -> Vec<neuron::clipboard_transform::VariableSelection> {
@@ -1416,6 +1510,8 @@ fn clipboard_selections(state: &State) -> Vec<neuron::clipboard_transform::Varia
 }
 
 fn preview_clipboard_example(state: &State, sample: &str, raw_pattern: &str, replacement: &str, raw_mode: bool) {
+    let ops = parse_transform_ops(&state.get_action_param()).unwrap_or_default();
+    refresh_clipboard_pipeline_preview(state, &ops);
     let pattern = if raw_mode {
         raw_pattern.to_string()
     } else {
@@ -1445,6 +1541,7 @@ fn preview_clipboard_example(state: &State, sample: &str, raw_pattern: &str, rep
 /// Install every callback + initial data. Returns the shared runtime so main/tray can reach it.
 pub fn install(app: &AppWindow) -> SharedRt {
     crate::binding_list::install(app);
+    app.set_mark(slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(&crate::mark::rgba(64), 64, 64)));
     let shared: SharedRt = Rc::new(RefCell::new(Shared {
         rt: AppRuntime::load(),
         pending_import: None,
@@ -1541,7 +1638,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 "lines-unique" => Some(neuron::clipboard_transform::TransformOp::LinesUnique),
                 "json-pretty" => Some(neuron::clipboard_transform::TransformOp::JsonPretty),
                 "json-compact" => Some(neuron::clipboard_transform::TransformOp::JsonCompact),
-    app.set_mark(slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(&crate::mark::rgba(64), 64, 64)));
                 "csv-to-json" => Some(neuron::clipboard_transform::TransformOp::CsvToJson),
                 "json-to-csv" => Some(neuron::clipboard_transform::TransformOp::JsonToCsv),
                 "base64-encode" => Some(neuron::clipboard_transform::TransformOp::Base64Encode),
@@ -1742,6 +1838,37 @@ pub fn install(app: &AppWindow) -> SharedRt {
             preview_clipboard_example(&app.global::<State>(), &sample, &raw_pattern, &replacement, raw_mode);
         }
     });
+    st.on_paste_clipboard_sample({
+        let w = app.as_weak();
+        move || {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            match neuron::pocket::clipboard_text() {
+                Some(text) => {
+                    let capped: String = if text.chars().count() > 4000 {
+                        text.chars().take(4000).collect()
+                    } else {
+                        text
+                    };
+                    state.set_clipboard_sample(capped.into());
+                    let sample = state.get_clipboard_sample();
+                    let raw_pattern = state.get_clipboard_pattern_input();
+                    let replacement = state.get_clipboard_replacement_input();
+                    let raw_mode = state.get_clipboard_raw_mode();
+                    preview_clipboard_example(
+                        &state,
+                        sample.as_str(),
+                        raw_pattern.as_str(),
+                        replacement.as_str(),
+                        raw_mode,
+                    );
+                }
+                None => {
+                    state.set_status_line("clipboard has no plain text to sample".into());
+                }
+            }
+        }
+    });
     st.on_forget_pocket({
         let w = app.as_weak();
         move |name| {
@@ -1749,11 +1876,127 @@ pub fn install(app: &AppWindow) -> SharedRt {
             match neuron::pocket::delete(&name) {
                 Ok(true) => {
                     refresh_pockets(&app);
-                    app.global::<State>().set_status_line(format!("forgot pocket {}", if name.is_empty() { "(default)" } else { name.as_str() }).into());
+                    let st = app.global::<State>();
+                    if st.get_pocket_inspect_open() && st.get_pocket_inspect_name() == name {
+                        st.set_pocket_inspect_open(false);
+                    }
+                    st.set_status_line(format!("forgot pocket {}", if name.is_empty() { "(default)" } else { name.as_str() }).into());
                 }
                 Ok(false) => app.global::<State>().set_status_line("pocket already gone".into()),
                 Err(error) => app.global::<State>().set_status_line(format!("pocket not forgotten: {error}").into()),
             }
+        }
+    });
+    st.on_inspect_pocket({
+        let w = app.as_weak();
+        move |name| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            if state.get_pocket_inspect_open() && state.get_pocket_inspect_name() == name {
+                state.set_pocket_inspect_open(false);
+                return;
+            }
+            show_pocket(&state, &name);
+            state.set_pocket_inspect_open(true);
+        }
+    });
+    st.on_copy_pocket_text({
+        let w = app.as_weak();
+        move |name| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            match neuron::pocket::slot_text(&name) {
+                Some(text) if neuron::pocket::copy_text(&text) => {
+                    state.set_status_line(
+                        format!(
+                            "copied text from pocket {}",
+                            if name.is_empty() { "(default)" } else { name.as_str() }
+                        )
+                        .into(),
+                    );
+                }
+                Some(_) => state.set_status_line("could not write to clipboard".into()),
+                None => state.set_status_line("pocket has no text to copy".into()),
+            }
+        }
+    });
+    st.on_bind_macro({
+        let w = app.as_weak();
+        move |name| {
+            let Some(app) = w.upgrade() else { return; };
+            let state = app.global::<State>();
+            state.set_editing_rule(-1);
+            state.set_bind_hypershift(false);
+            state.set_input_layer_request(0);
+            if let Some(idx) = state
+                .get_action_choices()
+                .iter()
+                .position(|c| !c.header && c.id == "macro")
+            {
+                state.set_action_choice(idx as i32);
+            }
+            state.set_action_param(name.clone());
+            refresh_action_editor(&state);
+            state.set_macro_bind_request(name);
+        }
+    });
+    st.on_undo_last({
+        let w = app.as_weak();
+        move || {
+            let Some(app) = w.upgrade() else { return; };
+            let st = app.global::<State>();
+            let Some(record) = neuron::session_undo::peek() else {
+                refresh_undo_state(&app);
+                st.set_status_line("nothing reversible to undo".into());
+                return;
+            };
+            if !neuron::safety::input_armed() {
+                st.set_status_line("undo is disarmed".into());
+                return;
+            }
+            if crate::dispatch::request_undo() {
+                st.set_status_line("undoing\u{2026}".into());
+                return;
+            }
+            let res = match &record.entry {
+                crate::undo::Entry::Audio { .. } => crate::undo::undo_audio(&record.entry),
+                crate::undo::Entry::Lighting { pid, unit, before, applied } => {
+                    restore_selected_lighting(*pid, unit, applied, before.clone())
+                }
+                crate::undo::Entry::Profile { .. } => Err("profile undo requires live dispatch".into()),
+            };
+            match res {
+                Ok(()) => {
+                    neuron::session_undo::complete(record.id);
+                    st.set_status_line("undid last reversible change".into());
+                }
+                Err(e) => st.set_status_line(format!("undo refused: {e}").into()),
+            }
+            refresh_undo_state(&app);
+        }
+    });
+    st.on_jump_to_fired_rule({
+        let w = app.as_weak();
+        move || {
+            let Some(app) = w.upgrade() else { return; };
+            let st = app.global::<State>();
+            let trig = st.get_live_last_trigger().to_string();
+            let needle = if trig == "\u{2014}" || trig.is_empty() { String::new() } else { trig };
+            let needle_lc = needle.to_lowercase();
+            let matches_row = |r: &RuleRow| {
+                !needle_lc.is_empty()
+                    && (r.trigger.to_lowercase().contains(&needle_lc)
+                        || r.control.to_lowercase().contains(&needle_lc))
+            };
+            let hyper = st.get_hypershift_rules().iter().any(|r| matches_row(&r));
+            let base = st.get_rules().iter().any(|r| matches_row(&r));
+            let target_hyper = hyper && !base;
+            st.set_input_layer_request(if target_hyper { 1 } else { 0 });
+            // a rule left open in its editor would make the filter stand down
+            st.set_editing_rule(-1);
+            st.invoke_filter_rules(needle.into(), target_hyper);
+            st.set_input_view(0);
+            st.set_page(2);
         }
     });
 
@@ -2643,6 +2886,21 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         s.layers_rev += 1;
                     }
                     refresh_layers(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_boost_param_preview(move |key, active| {
+                let changed = LIGHT_PREVIEW.with(|p| {
+                    let mut p = p.borrow_mut();
+                    if active { p.boosted_params.insert(key.to_string()) } else { p.boosted_params.remove(key.as_str()) }
+                });
+                if changed {
+                    if let Some(app) = w.upgrade() {
+                        request_light_render(&app, &sh);
+                    }
                 }
             });
         }
@@ -5204,6 +5462,23 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_copy_diagnostics(move || {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                let mut out = format!("Neuron Diagnostics: {}\n", st.get_diag_summary());
+                for row in st.get_diagnostics().iter() {
+                    out.push_str(&format!("- [{}] {}: {}\n", row.state, row.name, row.detail));
+                }
+                if neuron::pocket::copy_text(out.trim_end()) {
+                    st.set_status_line("diagnostics summary copied".into());
+                } else {
+                    st.set_status_line("could not copy diagnostics summary".into());
+                }
+            }
+        });
+    });
 
     // ── Audio ────────────────────────────────────────────────────────────
     bind(app, &shared, |app, _sh| {
@@ -5431,6 +5706,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let saved = crate::prefs::ui_accent();
                 app.global::<Theme>().set_accent(accent_color(&saved));
                 let st = app.global::<State>();
+                sync_ui_accent_contrast(&st, &saved);
                 st.set_ui_accent(saved.into());
                 st.set_status_line(msg.into());
             }
@@ -5916,6 +6192,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_report_bug(move |what, for_agent| {
+            if let Some(app) = w.upgrade() {
+                crate::bugreport::start(&app, what.to_string(), for_agent);
+            }
+        });
+    });
     // SPELLWEAVING MATERIAL — pick the cast's physics; animate the gallery swatches.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
@@ -6192,14 +6476,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             crate::dispatch::request_reload();
                             st.set_status_line(
                                 format!(
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_report_bug(move |what, for_agent| {
-            if let Some(app) = w.upgrade() {
-                crate::bugreport::start(&app, what.to_string(), for_agent);
-            }
-        });
-    });
                                     "feel timing -> hold {}ms · gap {}ms · coyote {}ms",
                                     cfg.hold_ms, cfg.gap_ms, cfg.coyote_ms
                                 )
@@ -6622,7 +6898,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let ui = crate::prefs::ui_accent();
         let weave = crate::prefs::weave_accent();
         app.global::<Theme>().set_accent(accent_color(&ui));
+        sync_ui_accent_contrast(&st, &ui);
         st.set_ui_accent(ui.into());
+        st.set_pad_haptics_connected(!neuron::haptics::devices().is_empty());
+        refresh_undo_state(app);
         apply_weave_accent(&weave); // fold the saved weave colour into the live cast material at boot
         st.set_weave_accent_col(accent_color(&weave));
         st.set_weave_accent(weave.into());
@@ -8774,9 +9053,43 @@ fn sigil_commands(path: &[(f32, f32)]) -> String {
 
 /// Rebuild the POCKETS strip from neuron-core: each portable clipboard with its emergent
 /// content-sigil (drawn from the payload's bytes) + the legible summary + kind/durable flags.
+/// Fill the pocket inspector with what pocket `name` holds now.
+fn show_pocket(state: &State, name: &str) {
+    let info = neuron::pocket::inspect_slot(name);
+    let kind = match info.kind {
+        neuron::pocket::PocketKind::Text => "text",
+        neuron::pocket::PocketKind::Files => "files",
+        neuron::pocket::PocketKind::Image => "image",
+        neuron::pocket::PocketKind::Other => "other",
+        neuron::pocket::PocketKind::Empty => "empty",
+    };
+    let formats = format!(
+        "{} format{} \u{00b7} {}",
+        info.format_count,
+        if info.format_count == 1 { "" } else { "s" },
+        if info.durable { "durable" } else { "ephemeral" }
+    );
+    state.set_pocket_inspect_name(name.into());
+    state.set_pocket_inspect_kind(kind.into());
+    state.set_pocket_inspect_summary(info.summary.into());
+    state.set_pocket_inspect_formats(formats.into());
+    state.set_pocket_inspect_body(info.body.into());
+}
+
 pub fn refresh_pockets(app: &AppWindow) {
     use neuron::pocket::PocketKind;
-    let cards: Vec<PocketCard> = neuron::pocket::views()
+    let views = neuron::pocket::views();
+    // an open inspector follows its pocket: new contents show, a pocket that went away closes it
+    let state = app.global::<State>();
+    if state.get_pocket_inspect_open() {
+        let name = state.get_pocket_inspect_name();
+        if views.iter().any(|(slot, ..)| slot.as_str() == name.as_str()) {
+            show_pocket(&state, &name);
+        } else {
+            state.set_pocket_inspect_open(false);
+        }
+    }
+    let cards: Vec<PocketCard> = views
         .into_iter()
         .map(|(slot, durable, v)| {
             let filled = !v.is_empty();
@@ -10093,12 +10406,58 @@ struct LightPreview {
     live_seen: Option<(neuron::pattern::SurfaceIdentity, u64, u64)>,
     rejected_seen: Option<(u64, u64)>,
     saved_images: HashMap<crate::light_render::SurfaceId, (usize, std::time::Instant)>,
+    boosted_params: std::collections::HashSet<String>,
     last_catalog_check: Option<std::time::Instant>,
     catalog_pending: bool,
 }
 
 thread_local! {
     static LIGHT_PREVIEW: RefCell<LightPreview> = RefCell::new(LightPreview::default());
+}
+
+fn synthetic_param_layer_id(key: &str, option: usize) -> neuron::pattern::LayerInstanceId {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash ^= option as u64;
+    hash = hash.wrapping_mul(0x1000_0000_01b3);
+    neuron::pattern::LayerInstanceId((1u64 << 63) | hash)
+}
+
+fn build_param_previews(
+    active: Option<&neuron::pattern::LayerDef>,
+    boosted: &std::collections::HashSet<String>,
+) -> Vec<crate::light_render::ParamPreview> {
+    use neuron::effects::{Blend, ParamKind};
+    let Some(layer) = active else { return Vec::new(); };
+    let mut out = Vec::new();
+    for p in neuron::pattern::pattern_params(&layer.pattern) {
+        if let Some((gate_key, allowed)) = p.only_when {
+            if !allowed.contains(&layer.params.u8(gate_key, 0)) { continue; }
+        }
+        let ParamKind::Enum { options, default } = p.kind else { continue; };
+        let selected_idx = usize::from(layer.params.u8(p.key, default));
+        let is_boosted = boosted.contains(p.key);
+        for (opt_idx, _) in options.iter().enumerate() {
+            let mut preview_layer = layer.clone();
+            preview_layer.id = Some(synthetic_param_layer_id(p.key, opt_idx));
+            preview_layer.params.set(p.key, opt_idx as f32);
+            preview_layer.region.clear();
+            preview_layer.enabled = true;
+            preview_layer.opacity = 1.0;
+            preview_layer.blend = Blend::Normal;
+            out.push(crate::light_render::ParamPreview {
+                id: crate::light_render::SurfaceId::ParamOption(p.key.to_string(), opt_idx),
+                layers: vec![preview_layer].into(),
+                dims: crate::light_render::PARAM_PREVIEW_DIMS,
+                active: opt_idx == selected_idx,
+                boosted: is_boosted,
+            });
+        }
+    }
+    out
 }
 
 fn init_light_tile_metadata(app: &AppWindow, _sh: &SharedRt) {
@@ -10174,6 +10533,14 @@ fn request_light_render(app: &AppWindow, sh: &SharedRt) {
             for (layer, identity) in shared.light_layers.iter_mut().zip(identified.iter()) { layer.id = identity.id; }
             p.desired.layers = identified;
             p.desired.content_rev = shared.layers_rev;
+        }
+        let active_layer = (!shared.light_layers.is_empty())
+            .then(|| &shared.light_layers[shared.selected_layer.min(shared.light_layers.len() - 1)]);
+        let param_previews = build_param_previews(active_layer, &p.boosted_params);
+        p.boosted_params.retain(|key| param_previews.iter().any(|pv| matches!(&pv.id, crate::light_render::SurfaceId::ParamOption(k, _) if k == key)));
+        if p.desired.param_previews.as_ref() != param_previews.as_slice() {
+            p.last_rgb.retain(|id, _| !matches!(id, crate::light_render::SurfaceId::ParamOption(_, _)));
+            p.desired.param_previews = param_previews.into();
         }
         p.desired.selected = if !st.get_light_user_effect().is_empty() {
             Some(crate::light_render::SurfaceId::Saved(st.get_light_user_effect().to_string()))
@@ -10339,7 +10706,35 @@ fn apply_light_frames(app: &AppWindow, frames: Vec<crate::light_render::Complete
     LIGHT_PREVIEW.with(|p| {
         let mut p = p.borrow_mut();
         for frame in frames {
-            if !p.desired.active || frame.target != p.desired.target || frame.dims != p.desired.dims { continue; }
+            if !p.desired.active || frame.target != p.desired.target { continue; }
+            if let crate::light_render::SurfaceId::ParamOption(ref key, opt_idx) = frame.id {
+                if frame.dims != crate::light_render::PARAM_PREVIEW_DIMS
+                    || frame.content_rev != p.desired.content_rev
+                    || !p.desired.param_previews.iter().any(|pv| pv.id == frame.id) {
+                    continue;
+                }
+                acknowledged = Some(acknowledged.map_or(frame.requested, |old| old.max(frame.requested)));
+                if p.last_rgb.get(&frame.id).is_some_and(|rgb| **rgb == *frame.rgb) { continue; }
+                let params = st.get_light_params();
+                let mut shown = false;
+                if let (Some(row), Some(buffer)) = (
+                    (0..params.row_count()).find_map(|i| params.row_data(i).filter(|r| r.key.as_str() == key.as_str())),
+                    frame.overlay,
+                ) {
+                    if let Some(model) = row.previews.as_any().downcast_ref::<VecModel<Image>>() {
+                        if opt_idx < model.row_count() {
+                            model.set_row_data(opt_idx, Image::from_rgba8_premultiplied(buffer));
+                            shown = true;
+                        }
+                    }
+                }
+                // only a frame that reached the screen counts as shown; any other is drawn next time
+                if shown {
+                    p.last_rgb.insert(frame.id, frame.rgb);
+                }
+                continue;
+            }
+            if frame.dims != p.desired.dims { continue; }
             let hero = frame.id == crate::light_render::SurfaceId::Hero;
             if hero {
                 if live_owner || !p.desired.hero || st.get_light_brush_on() || frame.content_rev != p.desired.content_rev { continue; }
@@ -10455,6 +10850,7 @@ fn params_for(def: &neuron::pattern::LayerDef) -> Vec<EffectParam> {
                 fmin: min,
                 fmax: max,
                 options: no_opts(),
+                previews: ModelRc::default(),
                 ival: 0,
                 hex: "".into(),
                 col: slint::Color::default(),
@@ -10462,6 +10858,7 @@ fn params_for(def: &neuron::pattern::LayerDef) -> Vec<EffectParam> {
             }),
             ParamKind::Enum { options, default } => {
                 let opts: Vec<SharedString> = options.iter().map(|o| (*o).into()).collect();
+                let count = opts.len();
                 out.push(EffectParam {
                     key: p.key.into(),
                     label: p.label.into(),
@@ -10470,6 +10867,7 @@ fn params_for(def: &neuron::pattern::LayerDef) -> Vec<EffectParam> {
                     fmin: 0.0,
                     fmax: 0.0,
                     options: ModelRc::new(VecModel::from(opts)),
+                    previews: ModelRc::new(VecModel::from(vec![Image::default(); count])),
                     ival: i32::from(def.params.u8(p.key, default)),
                     hex: "".into(),
                     col: slint::Color::default(),
@@ -10484,6 +10882,7 @@ fn params_for(def: &neuron::pattern::LayerDef) -> Vec<EffectParam> {
                 fmin: 0.0,
                 fmax: 0.0,
                 options: no_opts(),
+                previews: ModelRc::default(),
                 ival: 0,
                 hex: "".into(),
                 col: slint::Color::default(),

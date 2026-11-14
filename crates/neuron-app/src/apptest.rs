@@ -1095,6 +1095,7 @@ fn lighting_effect_header_draws_painted_name_hovered_and_not() {
         key: "speed".into(), label: "speed".into(), kind: "range".into(),
         fval: 1.0, fmin: 0.0, fmax: 3.0,
         options: ModelRc::new(VecModel::from(Vec::<SharedString>::new())),
+        previews: ModelRc::default(),
         ival: 0, hex: "".into(), col: slint::Color::from_rgb_u8(0, 0, 0), bval: false,
     }])));
     st.set_window_shown(true);
@@ -1241,7 +1242,7 @@ fn hero_publication_rejects_wrong_units_and_preserves_then_releases_paint_drafts
         target: Target { pid: 0x0226, unit: "first".into(), epoch: 5 }, ..Default::default() };
     let frame = |target: Target, content_rev: u64, color: Rgb| CompletedFrame {
         id: SurfaceId::Hero, target, content_rev, dims: (1, 2), layout_generation: 0,
-        rgb: vec![color; 2].into(), swatch: None, requested: std::time::Instant::now(), render_time: std::time::Duration::ZERO,
+        rgb: vec![color; 2].into(), swatch: None, overlay: None, requested: std::time::Instant::now(), render_time: std::time::Duration::ZERO,
     };
     let red = Rgb::new(255, 0, 0);
     let green = Rgb::new(0, 255, 0);
@@ -1697,7 +1698,6 @@ fn second_picker_offers_preview_accept_and_undo() {
         st.invoke_roll();
         snap(&app).unwrap();
         assert!(st.get_assist_offers().iter().take_while(|o| o.rolled).count() == 2, "rolls stack, newest first");
-        st.invoke_assist_accept(0);
         // the x at a pointed-at roll's right end waves it off
         {
             use slint::platform::{PointerEventButton, WindowEvent};
@@ -1715,6 +1715,7 @@ fn second_picker_offers_preview_accept_and_undo() {
             st.invoke_roll();
             snap(&app).unwrap();
         }
+        st.invoke_assist_accept(0);
         assert!(!st.get_assist_showing() && stops() != resting, "a click keeps a roll");
         assert!(st.get_assist_offers().iter().any(|o| o.back), "and the way back is there");
         st.invoke_assist_accept(st.invoke_assist_option(0));
@@ -1748,7 +1749,6 @@ fn second_picker_offers_preview_accept_and_undo() {
                 assert!(blinking < 0.002, "hovering the roll button at x {x:.0} flickers {:.1}% of the window", blinking * 100.0);
             }
         }
-        app.window().dispatch_event(WindowEvent::PointerExited);
         // pointing at hold marks the selected stop as held before the click
         let (sx, sy, sw, sh) = crate::uifit::rect_of(app.window(), "stop-deck").expect("the stop keys are drawn");
         app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(sx + sw + 24.0, sy + sh / 2.0) });
@@ -1779,6 +1779,7 @@ fn second_picker_offers_preview_accept_and_undo() {
         capture("picker-v2-roll-drawer");
         app.window().dispatch_event(WindowEvent::PointerExited);
         click(arrow);
+        app.window().dispatch_event(WindowEvent::PointerExited);
 
         // spamming roll and ask never grows the row past its column or leaves a draft stuck
         for i in 0..12 {
@@ -2169,3 +2170,124 @@ fn bug_report_row_draws_and_fits() {
         image::save_buffer(dir.join("system-bug-report.png"), frame.as_bytes(), frame.width(), frame.height(), image::ColorType::Rgba8).unwrap();
     }
 }
+
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn lighting_enum_picker_simulates_options_collapsed_and_expanded() {
+    use crate::light_render::{CompletedFrame, DesiredSurfaceState, PARAM_PREVIEW_DIMS, ParamPreview, SurfaceId, Target};
+    use neuron::lighting::Rgb;
+    use slint::{Model, Rgba8Pixel, SharedPixelBuffer};
+    let _cwd = crate::testsupport::cwd_guard("lighting_enum_picker");
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    st.set_selected_device(0);
+    st.set_selected_device_name("Fixture".into());
+    st.set_sel_can_light(true);
+    st.set_grid_rows(6);
+    st.set_grid_cols(22);
+    st.set_page(1);
+    st.set_window_shown(true);
+    // the compact v1 colour picker keeps the EFFECT section, and its option picker, in the frame
+    st.set_picker_v2(false);
+    {
+        let mut s = shared.borrow_mut();
+        s.light_layers = vec![neuron::pattern::preset_layer("cascade").unwrap()];
+        s.selected_layer = 0;
+        s.layers_rev += 1;
+    }
+    glue::refresh_layers(&app, &shared);
+
+    let params = st.get_light_params();
+    let mode_row = (0..params.row_count())
+        .find_map(|i| params.row_data(i).filter(|r| r.key == "mode"))
+        .expect("cascade exposes procedural mode enum param");
+    assert_eq!(mode_row.kind, "enum");
+    assert_eq!(mode_row.options.row_count(), 2);
+    assert_eq!(mode_row.previews.row_count(), 2);
+
+    app.window().set_size(slint::LogicalSize::new(1240.0, 1100.0));
+    app.show().expect("show the window");
+
+    let target = Target {
+        pid: shared.borrow().rt.selected_pid,
+        unit: shared.borrow().rt.selected_unit.clone(),
+        epoch: 1,
+    };
+    let content_rev = shared.borrow().layers_rev;
+    let base_layer = shared.borrow().light_layers[0].clone();
+    let desired = DesiredSurfaceState {
+        active: true,
+        target: target.clone(),
+        dims: (6, 22),
+        content_rev,
+        param_previews: vec![
+            ParamPreview {
+                id: SurfaceId::ParamOption("mode".into(), 0),
+                layers: vec![base_layer.clone()].into(),
+                dims: PARAM_PREVIEW_DIMS,
+                active: true,
+                boosted: false,
+            },
+            ParamPreview {
+                id: SurfaceId::ParamOption("mode".into(), 1),
+                layers: vec![base_layer].into(),
+                dims: PARAM_PREVIEW_DIMS,
+                active: false,
+                boosted: false,
+            },
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let make_overlay = |r: u8, g: u8, b: u8| {
+        let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(
+            u32::from(PARAM_PREVIEW_DIMS.1) * 5 + 1,
+            u32::from(PARAM_PREVIEW_DIMS.0) * 5 + 1,
+        );
+        for px in buf.make_mut_slice() {
+            *px = Rgba8Pixel { r, g, b, a: 255 };
+        }
+        buf
+    };
+    let make_frame = |opt_idx: usize, r: u8, g: u8, b: u8| CompletedFrame {
+        id: SurfaceId::ParamOption("mode".into(), opt_idx),
+        target: target.clone(),
+        dims: PARAM_PREVIEW_DIMS,
+        content_rev,
+        layout_generation: 0,
+        rgb: vec![Rgb::new(r, g, b); usize::from(PARAM_PREVIEW_DIMS.0) * usize::from(PARAM_PREVIEW_DIMS.1)].into(),
+        swatch: None,
+        overlay: Some(make_overlay(r, g, b)),
+        requested: std::time::Instant::now(),
+        render_time: std::time::Duration::ZERO,
+    };
+
+    glue::apply_preview_test_frames(&app, &desired, vec![
+        make_frame(0, 10, 120, 255),
+        make_frame(1, 0, 240, 90),
+    ]);
+    assert!(params == st.get_light_params(), "param preview updates must preserve State.light-params model identity");
+    let before = snap(&app).expect("first simulated picker frame draws");
+
+    glue::apply_preview_test_frames(&app, &desired, vec![
+        make_frame(0, 255, 60, 20),
+    ]);
+    assert!(params == st.get_light_params(), "subsequent preview ticks preserve model identity");
+    let after = snap(&app).expect("second simulated picker frame draws");
+    assert_ne!(before.as_bytes(), after.as_bytes(), "collapsed picker simulation must repaint when frames advance");
+
+    st.invoke_boost_param_preview("mode".into(), true);
+    st.invoke_set_param_enum("mode".into(), 1);
+    let updated_mode = (0..params.row_count())
+        .find_map(|i| params.row_data(i).filter(|r| r.key == "mode"))
+        .expect("mode row stays present after option change");
+    assert_eq!(updated_mode.ival, 1);
+    assert_eq!(updated_mode.previews.row_count(), 2);
+    snap(&app).expect("picker remains valid after switching enum option");
+    st.invoke_boost_param_preview("mode".into(), false);
+}
+

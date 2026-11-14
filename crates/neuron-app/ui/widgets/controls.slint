@@ -504,6 +504,7 @@ export component Slider inherits Rectangle {
     in property <bool> has-home: false;
     in property <float> home: 0;
     in property <int> decimals: 0;
+    in property <bool> dirty: false;
     out property <bool> dragging: ta.pressed;
     callback changed(float);
     callback released(float);
@@ -541,13 +542,25 @@ export component Slider inherits Rectangle {
     VerticalLayout {
         spacing: root.compact ? 0px : 9px;
         if !root.compact : HorizontalLayout {
-            Text {
-                text: root.caption;
-                color: Theme.text-dim;
-                font-size: Theme.fs-small;
-                font-family: Theme.mono;
-                letter-spacing: Theme.track-3;
-                vertical-alignment: center;
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.caption;
+                    color: Theme.text-dim;
+                    font-size: Theme.fs-small;
+                    font-family: Theme.mono;
+                    letter-spacing: Theme.track-3;
+                    vertical-alignment: center;
+                }
+                if root.dirty : VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 5px;
+                        height: 5px;
+                        border-radius: 2.5px;
+                        background: Theme.warn;
+                    }
+                }
             }
             Rectangle {}
             // the value is the hero (big mono); the unit is dim chrome subordinate to it. Both are
@@ -1079,11 +1092,31 @@ export component Readout inherits VerticalLayout {
 // closed control still nudges ±1 for the rotary muscle-memory.
 export component Picker inherits Rectangle {
     in property <[string]> options;
+    in property <[image]> previews: [];
     in property <int> index: 0;
     // when false: dimmed ink + inert TouchArea (mirrors SplitToggle's disabled state) so a gated
     // selector never has to be hand-rolled at the call site.
     in property <bool> enabled: true;
     callback changed(int);
+    callback preview-active-changed(bool);
+    property <int> hovered-row: -1;
+    property <bool> preview-boosted: root.enabled && (ta.has-hover || root.hovered-row >= 0);
+    changed preview-boosted => { root.preview-active-changed(self.preview-boosted); }
+    // A popup has no closed event: Escape or a click outside destroys its rows without their hover
+    // ever ending. The open popup beats while a row is pointed at; when the beats stop, the hover
+    // (and the preview boost it holds) lets go.
+    property <int> beat: 0;
+    property <int> beat-seen: 0;
+    Timer {
+        interval: 400ms;
+        running: root.hovered-row >= 0;
+        triggered => {
+            if (root.beat == root.beat-seen) {
+                root.hovered-row = -1;
+            }
+            root.beat-seen = root.beat;
+        }
+    }
     height: Theme.row-h;
     border-radius: Theme.radius-sm;
     background: (root.enabled && ta.has-hover) ? Theme.well : Theme.bg-2;
@@ -1095,6 +1128,11 @@ export component Picker inherits Rectangle {
         x: 0;
         y: root.height + 2px;
         width: max(root.width, 220px);
+        Timer {
+            interval: 150ms;
+            running: root.hovered-row >= 0;
+            triggered => { root.beat += 1; }
+        }
         Rectangle {
             background: Theme.bg-2;
             border-width: Theme.hair;
@@ -1102,11 +1140,49 @@ export component Picker inherits Rectangle {
             border-radius: Theme.radius-sm;
             VerticalLayout {
                 padding: 4px;
+                spacing: root.previews.length > 0 ? 3px : 0px;
                 for opt[i] in root.options : Rectangle {
-                    height: Theme.seg-h;
+                    height: root.previews.length > 0 ? 32px : Theme.seg-h;
                     border-radius: Theme.radius-sm;
                     background: ota.has-hover ? Theme.well : transparent;
-                    ota := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.changed(i); } }
+                    border-width: root.previews.length > 0 ? Theme.hair : 0px;
+                    border-color: i == root.index ? Theme.accent-line
+                        : ota.has-hover ? Theme.line : transparent;
+                    if i < root.previews.length : Rectangle {
+                        x: 1px;
+                        y: 1px;
+                        width: parent.width - 2px;
+                        height: parent.height - 2px;
+                        border-radius: Theme.radius-sm - 1px;
+                        clip: true;
+                        Image {
+                            width: parent.width;
+                            height: parent.height;
+                            source: root.previews[i];
+                            image-fit: cover;
+                            image-rendering: smooth;
+                            opacity: i == root.index ? 0.68 : ota.has-hover ? 0.58 : 0.45;
+                        }
+                        Rectangle {
+                            background: ota.has-hover
+                                ? @linear-gradient(90deg, #0c0d10cc 0%, #0c0d1064 55%, #0c0d10b8 100%)
+                                : @linear-gradient(90deg, #070809cc 0%, #07080964 55%, #070809b8 100%);
+                        }
+                    }
+                    ota := TouchArea {
+                        mouse-cursor: MouseCursor.pointer;
+                        changed has-hover => {
+                            if (self.has-hover) {
+                                root.hovered-row = i;
+                            } else if (root.hovered-row == i) {
+                                root.hovered-row = -1;
+                            }
+                        }
+                        clicked => {
+                            root.hovered-row = -1;
+                            root.changed(i);
+                        }
+                    }
                     HorizontalLayout {
                         padding-left: 9px;
                         padding-right: 9px;
@@ -1135,6 +1211,25 @@ export component Picker inherits Rectangle {
     // shrinks, so a picker sitting beside a button (the app-rule add row) can't push that button
     // off the edge. Caught on screen with a 51-character profile name clipping "+ add rule".
     min-width: 120px;
+    if root.index >= 0 && root.index < root.previews.length : Rectangle {
+        x: 1px;
+        y: 1px;
+        width: parent.width - 2px;
+        height: parent.height - 2px;
+        border-radius: Theme.radius-sm - 1px;
+        clip: true;
+        Image {
+            width: parent.width;
+            height: parent.height;
+            source: root.previews[root.index];
+            image-fit: cover;
+            image-rendering: smooth;
+            opacity: root.enabled ? (ta.has-hover ? 0.65 : 0.55) : 0.25;
+        }
+        Rectangle {
+            background: @linear-gradient(90deg, #070809dc 0%, #07080984 36%, #07080944 74%, #070809c4 100%);
+        }
+    }
     HorizontalLayout {
         padding-left: 11px; padding-right: 9px; spacing: 8px;
         Text {
@@ -1158,7 +1253,11 @@ export component Picker inherits Rectangle {
         enabled: root.enabled && root.options.length > 0;
         mouse-cursor: (root.enabled && root.options.length > 0) ? MouseCursor.pointer : MouseCursor.default;
         // an empty option set has nothing to pick — don't pop a hollow menu (the dead-dropdown bug).
-        clicked => { if (root.options.length > 0) { popup.show(); } }
+        clicked => {
+            if (root.options.length > 0) {
+                popup.show();
+            }
+        }
         // NO scroll-nudge on the closed control: it silently changed the selection (e.g. re-routed
         // an app-rule's profile) just by scrolling the PAGE over it, and trapped the wheel. Click to
         // open the popup and pick — explicit, not incidental.
@@ -1168,7 +1267,6 @@ export component Picker inherits Rectangle {
 // Shared by every ActionPicker: binds, radial sectors, and gesture actions all author the same
 // ordered transform and example-derived regex payload.
 export component ClipboardTransformEditor inherits VerticalLayout {
-    property <string> sample: "order 7391 shipped";
     property <string> capture-name: "id";
     property <string> delimiter: " ";
     property <[string]> kinds: ["literal", "digits", "word", "until-delimiter"];
@@ -1200,6 +1298,12 @@ export component ClipboardTransformEditor inherits VerticalLayout {
         Button { text: "↓"; clicked => { State.move-clipboard-operation(index, 1); } }
         Button { text: "×"; clicked => { State.remove-clipboard-operation(index); } }
     }
+    if State.clipboard-operations.length > 0 : HorizontalLayout {
+        spacing: 6px;
+        Text { text: State.clipboard-pipeline-status; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
+        Text { text: State.clipboard-pipeline-preview; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+        if root.selected-operation-id != "regex" && State.clipboard-editing-index < 0 : Button { text: "clip"; clicked => { State.paste-clipboard-sample(); } }
+    }
     if root.selected-operation-id == "regex" || State.clipboard-editing-index >= 0 : VerticalLayout {
     HorizontalLayout {
         spacing: 5px;
@@ -1209,14 +1313,15 @@ export component ClipboardTransformEditor inherits VerticalLayout {
             border-radius: Theme.radius-sm; background: Theme.well; border-width: Theme.hair;
             border-color: sample-input.has-focus ? Theme.accent.with-alpha(0.7) : Theme.line;
             HorizontalLayout { padding-left: 10px; padding-right: 10px;
-                sample-input := TextInput { text <=> root.sample; color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-small; single-line: true;
-                    edited => { State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); }
+                sample-input := TextInput { text <=> State.clipboard-sample; color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-small; single-line: true;
+                    edited => { State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); }
                 }
             }
         }
+        Button { text: "clip"; clicked => { State.paste-clipboard-sample(); } }
         Field { text <=> root.capture-name; placeholder: "name"; field-width: 84px; }
         Button { text: "mark"; clicked => {
-            State.mark-clipboard-variable(root.sample,
+            State.mark-clipboard-variable(State.clipboard-sample,
                 min(sample-input.cursor-position-byte-offset, sample-input.anchor-position-byte-offset),
                 max(sample-input.cursor-position-byte-offset, sample-input.anchor-position-byte-offset),
                 root.capture-name, root.kinds[root.selected-kind], root.delimiter, State.clipboard-replacement-input, State.clipboard-pattern-input, State.clipboard-raw-mode);
@@ -1228,21 +1333,21 @@ export component ClipboardTransformEditor inherits VerticalLayout {
         Text { text: "${" + variable.name + "}"; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
         Text { text: variable.kind; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
         if variable.kind == "until-delimiter" : Text { text: "before " + variable.delimiter; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
-        Button { text: "${" + variable.name + "}"; clicked => { State.clipboard-replacement-input += "${" + variable.name + "}"; State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
-        Button { text: "×"; clicked => { State.remove-clipboard-variable(index, root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        Button { text: "${" + variable.name + "}"; clicked => { State.clipboard-replacement-input += "${" + variable.name + "}"; State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        Button { text: "×"; clicked => { State.remove-clipboard-variable(index, State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
         Rectangle { height: 1px; horizontal-stretch: 1; background: Theme.line; }
     }
     HorizontalLayout {
         spacing: 4px;
-        Picker { options: root.kinds; index: root.selected-kind; changed(index) => { root.selected-kind = index; State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        Picker { options: root.kinds; index: root.selected-kind; changed(index) => { root.selected-kind = index; State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
         if root.kinds[root.selected-kind] == "until-delimiter" : Field { text <=> root.delimiter; placeholder: "delimiter"; field-width: 74px; }
-        Field { text <=> State.clipboard-replacement-input; placeholder: "${name}"; field-width: 160px; edited(value) => { State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, value, State.clipboard-raw-mode); } }
+        Field { text <=> State.clipboard-replacement-input; placeholder: "${name}"; field-width: 160px; edited(value) => { State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, value, State.clipboard-raw-mode); } }
     }
     HorizontalLayout {
         spacing: 5px;
-        Button { text: State.clipboard-raw-mode ? "raw" : "sample"; clicked => { State.clipboard-raw-mode = !State.clipboard-raw-mode; State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
-        if State.clipboard-raw-mode : Field { text <=> State.clipboard-pattern-input; placeholder: "Rust regex"; field-width: 260px; edited(value) => { State.preview-clipboard-example(root.sample, value, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
-        Button { text: "preview"; clicked => { State.preview-clipboard-example(root.sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        Button { text: State.clipboard-raw-mode ? "raw" : "sample"; clicked => { State.clipboard-raw-mode = !State.clipboard-raw-mode; State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        if State.clipboard-raw-mode : Field { text <=> State.clipboard-pattern-input; placeholder: "Rust regex"; field-width: 260px; edited(value) => { State.preview-clipboard-example(State.clipboard-sample, value, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        Button { text: "preview"; clicked => { State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
         Button { text: State.clipboard-editing-index >= 0 ? "save regex" : "add regex"; clicked => { State.save-clipboard-operation(State.clipboard-editing-index, State.clipboard-pattern, State.clipboard-replacement-input); } }
         Text { text: State.clipboard-pattern; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
     }
@@ -1399,6 +1504,28 @@ export component ActionPicker inherits VerticalLayout {
     property <string> lighting-destination <=> State.lighting-edit-destination;
     property <int> lighting-layer-index <=> State.lighting-edit-stack;
     property <int> lighting-preset-index <=> State.lighting-edit-preset;
+    function sync-lighting-param() {
+        let op = root.lighting-operations[clamp(root.lighting-operation-index, 0, root.lighting-operations.length - 1)];
+        if (op == "toggle" || op == "enable" || op == "disable") {
+            if (root.lighting-index != "") {
+                State.action-param = op + " " + root.lighting-index;
+            }
+        } else if (op == "push") {
+            if (State.lighting-preset-choices.length > 0 && root.lighting-preset-index >= 0 && root.lighting-preset-index < State.lighting-preset-choices.length) {
+                State.action-param = "push " + State.lighting-preset-choices[root.lighting-preset-index].slug;
+            }
+        } else if (op == "pop") {
+            State.action-param = "pop";
+        } else if (op == "replace") {
+            if (root.lighting-index != "" && State.lighting-preset-choices.length > 0 && root.lighting-preset-index >= 0 && root.lighting-preset-index < State.lighting-preset-choices.length) {
+                State.action-param = "replace " + root.lighting-index + " " + State.lighting-preset-choices[root.lighting-preset-index].slug;
+            }
+        } else if (op == "move") {
+            if (root.lighting-index != "" && root.lighting-destination != "") {
+                State.action-param = "move " + root.lighting-index + " " + root.lighting-destination;
+            }
+        }
+    }
     spacing: 8px;
     Rectangle {
         height: Theme.row-h;
@@ -1717,19 +1844,31 @@ export component ActionPicker inherits VerticalLayout {
         Picker {
             options: root.lighting-operations;
             index: root.lighting-operation-index;
-            changed(i) => { root.lighting-operation-index = i; }
+            changed(i) => { root.lighting-operation-index = i; root.sync-lighting-param(); }
         }
         if root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable"
             || root.lighting-op == "replace" || root.lighting-op == "move" : HorizontalLayout {
             spacing: 6px;
             Mono { text: "layer"; }
-            Field { text <=> root.lighting-index; placeholder: "0"; field-width: 76px; }
+            Field {
+                text <=> root.lighting-index;
+                placeholder: "0";
+                field-width: 76px;
+                edited(t) => { root.lighting-index = t; root.sync-lighting-param(); }
+                accepted(t) => { root.lighting-index = t; root.sync-lighting-param(); }
+            }
             Mono { text: "0 = bottom"; }
         }
         if root.lighting-op == "move" : HorizontalLayout {
             spacing: 6px;
             Mono { text: "to"; }
-            Field { text <=> root.lighting-destination; placeholder: "0"; field-width: 76px; }
+            Field {
+                text <=> root.lighting-destination;
+                placeholder: "0";
+                field-width: 76px;
+                edited(t) => { root.lighting-destination = t; root.sync-lighting-param(); }
+                accepted(t) => { root.lighting-destination = t; root.sync-lighting-param(); }
+            }
         }
         if State.lighting-layer-choices.length > 0
             && (root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable"
@@ -1742,6 +1881,7 @@ export component ActionPicker inherits VerticalLayout {
                 changed(i) => {
                     root.lighting-layer-index = i;
                     root.lighting-index = State.lighting-layer-choices[i].index-text;
+                    root.sync-lighting-param();
                 }
             }
         }
@@ -1751,31 +1891,7 @@ export component ActionPicker inherits VerticalLayout {
             Picker {
                 options: State.lighting-preset-labels;
                 index: root.lighting-preset-index;
-                changed(i) => { root.lighting-preset-index = i; }
-            }
-        }
-        if root.lighting-op != "spec" : HorizontalLayout {
-            alignment: end;
-            Rectangle {}
-            Button {
-                text: "use edit";
-                primary: true;
-                enabled: root.lighting-op == "pop"
-                    || ((root.lighting-op == "push" || root.lighting-op == "replace") && State.lighting-preset-choices.length > 0)
-                    || ((root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable" || root.lighting-op == "move") && root.lighting-index != "");
-                clicked => {
-                    if (root.lighting-op == "toggle" || root.lighting-op == "enable" || root.lighting-op == "disable") {
-                        State.action-param = root.lighting-op + " " + root.lighting-index;
-                    } else if (root.lighting-op == "push") {
-                        State.action-param = "push " + State.lighting-preset-choices[root.lighting-preset-index].slug;
-                    } else if (root.lighting-op == "pop") {
-                        State.action-param = "pop";
-                    } else if (root.lighting-op == "replace") {
-                        State.action-param = "replace " + root.lighting-index + " " + State.lighting-preset-choices[root.lighting-preset-index].slug;
-                    } else if (root.lighting-op == "move") {
-                        State.action-param = "move " + root.lighting-index + " " + root.lighting-destination;
-                    }
-                }
+                changed(i) => { root.lighting-preset-index = i; root.sync-lighting-param(); }
             }
         }
     }
@@ -2292,6 +2408,7 @@ export component ColorPicker inherits VerticalLayout {
     // active picker — only one field holds focus. On focus-in, prime the preview from the current text
     // so the swatch starts truthful instead of showing a stale value from a prior edit.
     property <bool> editing: fld.has-focus;
+    property <bool> prism-open: false;
     changed editing => { if (root.editing) { State.preview-hex(fld.text); } }
     spacing: 9px;
     HorizontalLayout {
@@ -2300,9 +2417,17 @@ export component ColorPicker inherits VerticalLayout {
         // to that value the instant it's a complete, valid colour (Rust parses; nothing commits yet).
         Rectangle {
             width: 26px; height: 26px; border-radius: Theme.radius-sm;
-            border-width: Theme.hair; border-color: Theme.line;
-            background: root.editing && State.hex-preview-ok ? State.hex-preview-col : root.current;
-            animate background { duration: Theme.quick; }
+            border-width: Theme.hair;
+            border-color: (swatch-ta.has-hover || root.prism-open) ? Theme.accent-line : Theme.line;
+            background: (root.editing || root.prism-open) && State.hex-preview-ok ? State.hex-preview-col : root.current;
+            animate background, border-color { duration: Theme.quick; }
+            swatch-ta := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    root.prism-open = !root.prism-open;
+                    if (root.prism-open) { State.preview-hex(fld.text); }
+                }
+            }
         }
         if root.label != "" : VerticalLayout {
             alignment: center;
@@ -2322,16 +2447,17 @@ export component ColorPicker inherits VerticalLayout {
             placeholder: "4af2b0";
             text: root.value;
             // danger hairline ONLY when it's genuinely wrong (bad char / overlong) — a half-typed value stays neutral
-            invalid: root.editing && State.hex-preview-bad;
+            invalid: (root.editing || root.prism-open) && State.hex-preview-bad;
             edited(t) => { State.preview-hex(t); root.preview(t); }   // live preview as you type
-            accepted(t) => { root.pick(t); }                          // Enter commits: recolours + persists
+            accepted(t) => { root.prism-open = false; root.pick(t); } // Enter commits: recolours + persists
         }
         if root.label == "" : Rectangle {}
     }
-    // the PRISM — appears while the field holds focus: drag across for hue, down for brightness;
-    // release commits. The HSV→hex math is State.preview-hue → State.hue-pick-hex (the shared helper),
-    // so the picker and the cast's colour come out of the SAME prism maths.
-    if root.editing : Rectangle {
+    // the PRISM — appears while the field holds focus OR when toggled from the preview swatch: drag
+    // across for hue, down for brightness; release commits. The HSV→hex math is State.preview-hue →
+    // State.hue-pick-hex (the shared helper), so the picker and the cast's colour come out of the SAME
+    // prism maths.
+    if root.editing || root.prism-open : Rectangle {
         height: 54px;
         border-radius: Theme.radius-sm;
         border-width: Theme.hair;
@@ -2355,6 +2481,7 @@ export component ColorPicker inherits VerticalLayout {
                     root.preview(State.hue-pick-hex);
                 }
                 if (e.kind == PointerEventKind.up) {
+                    root.prism-open = false;
                     root.pick(State.hue-pick-hex);
                 }
             }
@@ -2367,8 +2494,8 @@ export component ColorPicker inherits VerticalLayout {
         value: root.value;
         lead: root.lead;
         lead-col: root.lead-col;
-        lead-pick => { root.lead-pick(); }
-        pick(h) => { root.pick(h); State.preview-hex(h); }
+        lead-pick => { root.prism-open = false; root.lead-pick(); }
+        pick(h) => { root.prism-open = false; root.pick(h); State.preview-hex(h); }
     }
     // the hint wraps within the column (a Mono ran off the edge before)
     if root.hint != "" : Text {

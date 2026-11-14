@@ -38,6 +38,8 @@ the honest map, graded by how much groundwork is already done.
 
 [AGENTS.md](AGENTS.md#the-tree) has the crate map, and [where each kind of change goes](AGENTS.md#where-a-change-goes). the rule everywhere: semantics live in `neuron-core` as typed, tested code; device wiring lives in data.
 
+for doc changes (or a **Docs & onboarding** pass), [keeping the docs true](AGENTS.md#keeping-the-docs-true) lists which doc owns each topic, and [`worflor/agentic-toolkit`](https://github.com/worflor/agentic-toolkit) holds the skills used for periodic doc health (`project-shaping`, `anti-slop`).
+
 ## the gates
 
 every change runs the same suite i do. green before you open the PR:

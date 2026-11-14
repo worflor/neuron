@@ -1,7 +1,7 @@
 # changelog
 
 ## unreleased
-the colour picker grew a brain: Luma-T, a tiny colour model that edits with you. plus a pile of fixes from living with neuron every day.
+the colour picker grew a brain: Luma-T, a tiny colour model that edits with you. neuron updates itself now too, and there's a pile of fixes from living with it every day.
 ![picker v2 with Luma-T's first idea drafted on a stop, contour rings around where it fits](docs/media/picker-v2-suggest.webp)
 ![a fresh roll on show, with the roll drawer open](docs/media/picker-v2-roll.webp)
 
@@ -12,21 +12,34 @@ the colour picker grew a brain: Luma-T, a tiny colour model that edits with you.
 - **drive it from the keyboard.** grab a stop and the arrows nudge it. Tab shows the first idea and Tab again keeps it, Tab with a number picks another, `R` rolls, `Ctrl+Z` takes it back.
 - **it learns your taste.** what you keep and pass over shapes what it suggests next, on your machine and nowhere else. `picker_journal = false` turns it off.
 - **see what it's thinking.** an amber squiggle marks a stop it would change. contour rings in the colour square and hills on the hue rail show where a colour would fit.
+- **updates, in the app.** release builds check for a newer signed release and show a small pill in the header. click the version to read what's new, images and all; `& install` downloads, installs and restarts in one go. off for source builds, Steam copies and `NEURON_NO_UPDATE`.
+- **it won't brick you.** i keep the previous program files until a new version has run for a minute. if it crashes twice before that, the next start puts the old one back, keeps the crash log and skips that version.
+- **report a bug.** type what happened on the system page and neuron writes a report with your version, devices and crash log, with your name and paths scrubbed out, then opens an issue to drop it into. **for your agent** copies a prompt for a coding agent to dig in instead. `neuron report bug` does the same from a terminal.
+- **neuron has a face.** a lowercase `n.` in the tray, the taskbar and on the exe. the stroke is the trigger, the full stop is what it fires.
+- **a tray menu that tells you things.** it says whether neuron's live, and every row shows what it's set to now. brightness and dpi jump straight to a value, the hotkeys are written next to what they do, and report a bug is in there too.
+- **a status bar you can click.** the footer offers an undo for the last profile, lighting or audio change, jumps from what fired to the rule that did it, and turns the app in front into a new app rule.
+- **look inside a pocket.** click one to see what it holds and copy its text out.
+- **try a clipboard transform on real text.** paste a sample from your clipboard and watch each step change it.
+- **effect options show themselves.** an effect's option list draws a small live preview of each choice.
 - **Fn keys survive driver mode.** keyboards neuron holds for their macro keys keep their Fn combos and media keys. the BlackWidow Chroma V2's Fn row comes from its definition, and there's a new `game-mode` action.
 
 ### better
+- **macros know where they're bound.** a macro's card binds it in one click, or shows the rules that fire it.
+- **add a layer above or below** the one you're looking at, straight from an effect's tile.
 - **Luma-T answers fast.** 10 to 60 ms per edit, down from up to a second.
 - **devices update live.** adopt or edit a device and every part of the app sees it, no restart.
-- **crisper UI.** pages sit on whole pixels so thin lines stop smearing, the stop keys shrank to `− │ +` and show on the strip what they're about to do, and long names fade out instead of stopping mid-letter.
+- **crisper UI.** pages sit on whole pixels so thin lines stop smearing, the stop keys shrank to `− │ +` and show on the strip what they're about to do, and long names fade out at the edge.
 - **longer timeline holds.** `stay` goes to 30 s and `fade in` to 10 s.
 - **UI bugs get caught before you see them.** every frame the GUI tests draw is checked for cut-off text, dead buttons, flicker and layout that doesn't fit, and any Slint warning fails the build.
 
 ### fixed
 - **binds on keys a device can't remap itself** fire again, and a key that several keyboards share goes to the one you actually typed on.
 - **HyperShift** keys type normally unless you're holding the HyperShift key.
-- **quitting with a sleeping wireless Naga** used to hang for up to a minute. it doesn't now.
-- **a sleeping device at startup** no longer leaves input in safe mode all session; neuron retries and arms once it's back.
-- **macros on a busy machine** no longer get killed for arming slowly.
+- **quitting with a sleeping wireless Naga** is quick, where it could hang for a minute.
+- **a sleeping device at startup**: neuron retries and arms input once it's back.
+- **macros on a busy machine** get the time they need to arm.
+- **two stops on the same spot** get suggestions too. Luma-T reads them a hair apart.
+- **a damaged colour model** you drop in gets set aside with a note saying why, and Luma-T takes over. a hand-edited palette with a position that isn't a number won't load.
 - **the window flickered** when you hovered the roll button, and a closing guide card ate your next click. both gone.
 - **shared device files** can't attach commands to keys a built-in definition doesn't have.
 

@@ -183,7 +183,8 @@ export component SpellweavingPanel inherits VerticalLayout {
                 // trailing slot. `two-line` holds the taller control-row height (the folded rhythm-row-h).
                 SelectableRow {
                     lead: rb.label;
-                    label: rb.bound ? rb.desc : "unbound · click to bind";
+                    label: rb.bound ? (rbrow.shadowed ? rb.desc + " · masked by weave" : rb.desc)
+                        : (rbrow.shadowed ? "unbound · masked by weave" : "unbound · click to bind");
                     selected: State.rhythm-bind-target == rb.taps;
                     enabled: !rbrow.shadowed;
                     two-line: true;
@@ -327,6 +328,15 @@ export component SpellweavingPanel inherits VerticalLayout {
                     signal: Signal.listening;
                     tint: Theme.listen;
                     live: true;
+                }
+                if !State.capturing-gesture && !root.rich-live : Mono {
+                    x: 12px;
+                    y: parent.height - self.height - 10px;
+                    width: parent.width - 24px;
+                    overflow: elide;
+                    text: "shift + record \u{2192} rich stroke to file";
+                    color: Theme.text-faint;
+                    font-size: Theme.fs-small;
                 }
                 // floating RECORD — a compact pill in the canvas's top-right (a Button inherits
                 // Rectangle, which fills its parent unless sized, so it MUST hug its own content via
@@ -585,36 +595,46 @@ export component SpellweavingPanel inherits VerticalLayout {
             }
             // PAD FEEL — how strongly a pad aiming the wheel feels its detents, clicks and fire; the
             // button plays that phrase on the pad in hand, so the setting is judged by touch.
-            HorizontalLayout {
-                spacing: 9px;
-                VerticalLayout {
-                    alignment: center;
-                    Mono { text: "PAD FEEL"; color: Theme.text-dim; }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 1;
-                    Slider {
-                        compact: true;
-                        minimum: 0;
-                        maximum: 150;
-                        step: 5;
-                        value: State.pad-feel;
-                        has-home: true;
-                        home: 100;
-                        wheel: false;
-                        changed(v) => { State.pad-feel = v; }
-                        released(v) => { State.set-pad-feel(v); }
+            VerticalLayout {
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 9px;
+                    opacity: State.pad-haptics-connected ? 1.0 : Theme.dim-gated;
+                    VerticalLayout {
+                        alignment: center;
+                        Mono { text: "PAD FEEL"; color: Theme.text-dim; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Slider {
+                            compact: true;
+                            minimum: 0;
+                            maximum: 150;
+                            step: 5;
+                            value: State.pad-feel;
+                            has-home: true;
+                            home: 100;
+                            wheel: false;
+                            changed(v) => { State.pad-feel = v; }
+                            released(v) => { State.set-pad-feel(v); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        min-width: 46px;
+                        Mono { text: State.pad-feel == 0 ? "off" : State.pad-feel + "%"; color: Theme.text; horizontal-alignment: right; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Button { text: "feel it"; enabled: State.pad-haptics-connected && State.pad-feel > 0; clicked => { State.feel-pad(); } }
                     }
                 }
-                VerticalLayout {
-                    alignment: center;
-                    min-width: 46px;
-                    Mono { text: State.pad-feel == 0 ? "off" : State.pad-feel + "%"; color: Theme.text; horizontal-alignment: right; }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    Button { text: "feel it"; enabled: State.pad-feel > 0; clicked => { State.feel-pad(); } }
+                if !State.pad-haptics-connected : Mono {
+                    text: "no haptic pad connected \u{00b7} test disabled";
+                    color: Theme.text-faint;
+                    font-size: Theme.fs-small;
+                    wrap: word-wrap;
                 }
             }
             // HYPERSHIFT RADIAL toggle + the live test button, side by side above the wheel. HyperShift

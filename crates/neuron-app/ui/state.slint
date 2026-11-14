@@ -42,6 +42,11 @@ export global State {
     in-out property <string> status-kind: "info";    // "info" | "listen" | "note" (provisional) | "err" (consequence)
     in-out property <bool> status-stale: false;      // message has aged out (dim it — freshness is honest)
     in-out property <string> focused-app: "—";       // app-aware switch input
+    in-out property <bool> undo-available: false;    // session_undo has a reversible entry
+    in-out property <string> undo-label: "";         // short kind label ("profile" / "lighting" / "audio")
+    in-out property <bool> organ-stall: false;       // any watched worker stalled — lights quiet SYSTEM nav dot
+    callback undo-last();
+    callback jump-to-fired-rule();
 
     // ── LIVE DISPATCH readouts (pushed from the worker thread) ───────────
     in-out property <string> live-last-trigger: "—"; // last trigger the engine fired
@@ -75,6 +80,13 @@ export global State {
     // a cross-panel "jump to the macro editor" request: set by the SYSTEM→BEACONS "author a macro"
     // link, consumed ONCE by the INPUT→DIRECT page Flickable (app.slint), which scrolls to MACRO.
     in-out property <bool> macro-jump-pending: false;
+    // cross-panel jump target on SYSTEM ("beacons" | "connections" | "reliability"), consumed once by app.slint
+    in-out property <string> system-jump-target: "";
+    // pre-fill needle for ProfilesMenu's AUTO-SWITCH BY APP composer (e.g., clicking `focus <app>`)
+    in-out property <string> app-rule-prefill: "";
+    // pending request from BindingsPanel / fired-rule jump to filter or switch layer on INPUT→DIRECT
+    in-out property <int> input-layer-request: -1;
+    in-out property <string> macro-bind-request: "";
     in-out property <string> gesture-predict: "";    // live "what the stroke is becoming" (chip highlight)
     callback try-teleport();                         // prime teleport on a plain hold (no rhythm needed)
     callback try-whiteboard();                       // open a whiteboard session right now
@@ -330,6 +342,7 @@ export global State {
     callback set-param-range(string, float);          // (param key, value) — a slider edit
     callback set-param-enum(string, int);             // (param key, index) — a segment edit
     callback set-param-toggle(string, bool);          // (param key, on) — a switch edit
+    callback boost-param-preview(string, bool);       // (param key, active) — promote picker options to live rate while hovered/open
     // Stack callbacks use authored bottom-to-top indices; the inspector lists the topmost row first.
     in-out property <int> light-stack-count: 0;
     callback stack-current();                          // add the active effect as another layer on top
@@ -416,6 +429,7 @@ export global State {
     pure callback assist-at(float, float, float, float) -> int; // the single-colour offer under plane point (x, y) of (w, h) px, or -1
     callback assist-preview(int);                       // show offer i on the live palette; -1 puts it back
     callback assist-accept(int);                        // keep offer i
+    callback assist-dismiss(int);                       // wave off offer i (a roll, or an option asked for)
     in-out property <bool> assist-showing;              // an offer is on the live palette, not yet kept
     in-out property <image> assist-before;              // the palette as it was while one is
     in-out property <bool> assist-keys;                 // the picker has the keyboard
@@ -429,7 +443,6 @@ export global State {
     in-out property <[string]> roll-wilds;              // how far it can stray, by name
     in-out property <int> roll-mode;
     in-out property <int> roll-wild;
-    callback assist-dismiss(int);                       // wave off offer i (a roll, or an option asked for)
     callback roll();                                    // roll a palette and put it on show
     callback roll-choose(int, int);                     // (mode, wildness) for the next rolls
     in-out property <int> picker-focus;                 // bumped to hand the picker the keyboard
@@ -543,8 +556,11 @@ export global State {
     in-out property <int> action-choice: 0;           // selected action index
     in-out property <string> action-param: "";        // the action's parameter (key name / cmd / delta)
     in-out property <string> clipboard-pattern: "";
+    in-out property <string> clipboard-sample: "order 7391 shipped";
     in-out property <string> clipboard-preview: "";
     in-out property <string> clipboard-preview-status: "sample a pattern";
+    in-out property <string> clipboard-pipeline-preview: "";
+    in-out property <string> clipboard-pipeline-status: "";
     in-out property <[string]> clipboard-operations: [];
     in-out property <[string]> clipboard-macros: [];
     in-out property <int> clipboard-macro-index: 0;
@@ -574,7 +590,17 @@ export global State {
     callback remove-clipboard-variable(int, string, string, string, bool);
     callback clear-clipboard-variables();
     callback preview-clipboard-example(string, string, string, bool);
+    callback paste-clipboard-sample();
     callback forget-pocket(string);
+    in-out property <bool> pocket-inspect-open: false;
+    in-out property <string> pocket-inspect-name: "";
+    in-out property <string> pocket-inspect-kind: "";
+    in-out property <string> pocket-inspect-summary: "";
+    in-out property <string> pocket-inspect-formats: "";
+    in-out property <string> pocket-inspect-body: "";
+    callback inspect-pocket(string);
+    callback copy-pocket-text(string);
+    callback bind-macro(string);
     callback capture-action-param();                   // press-to-fill: capture a key/chord/button into the param
     callback record-action-keys();                     // toggle the key-sequence recorder (REC ⇄ STOP)
     in-out property <bool> recording-keys: false;      // a sequence take is rolling
@@ -722,6 +748,7 @@ export global State {
     callback delete-rhythm(int);                        // unbind a rhythm (remove the RhythmBind by taps)
     in-out property <int> radial-sectors: 8;
     in-out property <int> pad-feel: 100;              // the radial's feel on a pad's motors, % (0 = off)
+    in-out property <bool> pad-haptics-connected: false; // at least one rumble gamepad is currently connected
     callback set-pad-feel(int);                       // persist a strength
     callback feel-pad();                              // play the knob's phrase on the connected pad
     in-out property <int> radial-max: 16;             // COMPUTED cap: 2π·deadzone / hand-jitter (no manual cap)
@@ -780,6 +807,8 @@ export global State {
     // `set-ui-accent` recolours the whole instrument live (Theme.accent + derived) and persists;
     // `set-weave-accent` retints the spellweaving cast/glyph/sigil and persists.
     in-out property <string> ui-accent: "4af2b0";
+    in-out property <float> ui-accent-contrast: 13.7;
+    in-out property <bool> ui-accent-contrast-low: false;
     in-out property <string> weave-accent: "4af2b0";
     in-out property <color> weave-accent-col: #4af2b0;   // parsed weave colour (Rust keeps in sync), for the preview swatch
     callback set-ui-accent(string);
@@ -948,6 +977,7 @@ export global State {
     callback set-snap-tap(bool);                          // enable/disable (perf-gated runtime write)
     callback write-flight-dump();                         // append a live snapshot to neuron-crash.log
     callback open-crash-log();                            // open neuron-crash.log in the default viewer
+    callback report-bug(string, bool);                    // write a bug report of what happened; true = copy a coding-agent prompt instead of opening the issue
     callback toggle-writes-paused();
     callback toggle-input-armed();                    // SAFE-MODE: arm/disarm real input synthesis
     callback open-config-dir();
@@ -977,7 +1007,6 @@ export global State {
     callback apply-import();
 
     // Diagnostics = the in-app test bench ("prove it works to me"): fire each capability live.
-    callback report-bug(string, bool);                    // write a bug report of what happened; true = copy a coding-agent prompt instead of opening the issue
     in-out property <[DiagRow]> diagnostics;
     in-out property <bool> diag-running: false;
     in-out property <int> diag-pass: 0;               // the segmented verdict bar's three widths
@@ -985,6 +1014,7 @@ export global State {
     in-out property <int> diag-skip: 0;
     in-out property <string> diag-summary: "Run diagnostics to prove every capability live.";
     callback run-diagnostics();
+    callback copy-diagnostics();
 
     // generic: jump to a page (the ONE audited navigation entrypoint for tray + cross-panel links)
     callback goto-page(int);

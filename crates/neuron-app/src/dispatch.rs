@@ -57,6 +57,7 @@ enum LiveCommand {
         persist: bool,
         reply: Sender<Result<ProfileApplyResult, String>>,
     },
+    UndoLatest,
     RunWorkerIntent {
         runtime_id: u64,
         intent: neuron::action::Intent,
@@ -277,6 +278,11 @@ pub fn apply_profile(name: String, persist: bool) -> Result<ProfileApplyResult, 
     // the pre-apply look. 20s lets a slow apply actually land (it still returns the instant it finishes).
     rx.recv_timeout(Duration::from_secs(20))
         .map_err(|_| format!("profile '{name}' apply timed out"))?
+}
+
+/// Ask the live worker to execute `undo_latest` off the UI thread and report the outcome back.
+pub fn request_undo() -> bool {
+    send_live(LiveCommand::UndoLatest)
 }
 
 /// Whether a `HyperShift` layer is held right now (the radial swaps to its `HyperShift` set on this).
@@ -982,6 +988,27 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                     post_status(&ctx.weak, &ctx.status);
                 }
                 let _ = reply.send(result);
+            }
+            LiveCommand::UndoLatest => {
+                let msg = undo_latest(&mut ctx.devices.borrow_mut());
+                let active_profile = neuron::profile::active();
+                {
+                    let mut s = ctx
+                        .status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    s.last_action.clone_from(&msg);
+                    s.active_profile.clone_from(&active_profile);
+                }
+                let weak = ctx.weak.clone();
+                let status = ctx.status.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = weak.upgrade() {
+                        app.global::<State>().set_status_line(msg.into());
+                        crate::glue::refresh_undo_state(&app);
+                    }
+                });
+                post_status(&ctx.weak, &status);
             }
             LiveCommand::RunWorkerIntent { runtime_id, intent, ticket, reply, .. } => {
                 if runtime_id != ctx.runtime_id || ctx.stop.load(Ordering::SeqCst) {

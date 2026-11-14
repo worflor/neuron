@@ -741,6 +741,75 @@ pub fn sigil_svg_of(slot: &str, size: f32) -> String {
         .unwrap_or_default()
 }
 
+/// Detailed read-only snapshot of a pocket slot for UI inspection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PocketInspection {
+    pub durable: bool,
+    pub kind: PocketKind,
+    pub summary: String,
+    pub format_count: usize,
+    pub body: String,
+}
+
+/// Inspect one named pocket's full contents (capped for display) without modifying the clipboard.
+pub fn inspect_slot(slot: &str) -> PocketInspection {
+    let g = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = g.get(slot) else {
+        return PocketInspection::default();
+    };
+    let view = entry.pocket.view();
+    let body = match view.kind {
+        PocketKind::Text => {
+            let full = entry
+                .pocket
+                .text()
+                .or_else(|| {
+                    entry.pocket.get(CF_TEXT).map(|b| {
+                        String::from_utf8_lossy(b).trim_end_matches('\0').to_string()
+                    })
+                })
+                .unwrap_or_default();
+            if full.chars().count() > 2000 {
+                let cut: String = full.chars().take(2000).collect();
+                format!("{cut}\u{2026}")
+            } else {
+                full
+            }
+        }
+        PocketKind::Files => entry
+            .pocket
+            .get(CF_HDROP)
+            .map(parse_hdrop)
+            .unwrap_or(view.files.clone())
+            .join("\n"),
+        PocketKind::Image => view.summary.clone(),
+        PocketKind::Other => {
+            let ids: Vec<String> = entry.pocket.formats.iter().map(|f| format!("0x{:X} ({} B)", f.id, f.bytes.len())).collect();
+            ids.join(" · ")
+        }
+        PocketKind::Empty => String::new(),
+    };
+    PocketInspection {
+        durable: entry.durable,
+        kind: view.kind,
+        summary: view.summary,
+        format_count: view.format_count,
+        body,
+    }
+}
+
+/// Read the full un-truncated text payload stored in `slot`, if any.
+pub fn slot_text(slot: &str) -> Option<String> {
+    let g = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = g.get(slot)?;
+    entry.pocket.text().or_else(|| {
+        entry
+            .pocket
+            .get(CF_TEXT)
+            .map(|b| String::from_utf8_lossy(b).trim_end_matches('\0').to_string())
+    })
+}
+
 // ---- preview helpers (platform-neutral, unit-tested) -----------------------------------------
 
 fn plural(n: usize) -> &'static str {
@@ -1144,9 +1213,21 @@ fn read_clip_state() -> ClipState {
     read_clip_snapshot().0
 }
 
-/// Write the clipboard — the in-memory test clipboard if installed, else the OS.
-/// Text-only capability used by the BOUND macro broker. It goes through the same full clipboard
-/// serializer/test seam as pockets, so it inherits the process-wide clipboard lock and retry rules.
+/// The clipboard's plain text (Unicode or ANSI), if any — the in-memory test clipboard if
+/// installed, else the OS. Read-only.
+pub fn clipboard_text() -> Option<String> {
+    match read_clip_state() {
+        ClipState::Carryable(p) => p.text().or_else(|| {
+            p.get(CF_TEXT)
+                .map(|b| String::from_utf8_lossy(b).trim_end_matches('\0').to_string())
+        }),
+        ClipState::Empty | ClipState::Busy | ClipState::Uncarryable => None,
+    }
+}
+
+/// The clipboard's text for the BOUND macro broker. It and [`macro_clipboard_set`] go through
+/// the same serializer and test seam as pockets, so they inherit the process-wide clipboard lock
+/// and retry rules.
 pub(crate) fn macro_clipboard_get() -> Option<String> {
     match read_clip_state() {
         ClipState::Carryable(p) => p.get(CF_UNICODETEXT).map(utf16_to_string),
@@ -1853,5 +1934,34 @@ mod tests {
 
         assert!(reader_a.join().is_ok(), "pocket clipboard reader thread panicked");
         assert!(reader_b.join().is_ok(), "context clipboard reader thread panicked");
+    }
+
+    #[test]
+    fn a_macro_clipboard_write_is_refused_while_disarmed() {
+        let _lock = CLIP_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::action::arm_input(false);
+        testclip::install_text("keep me");
+        assert!(!macro_clipboard_set("from a macro"));
+        assert_eq!(clipboard_text().as_deref(), Some("keep me"));
+        testclip::uninstall();
+    }
+
+    #[test]
+    fn copy_text_and_clipboard_text_and_inspect_slot_work_while_disarmed() {
+        let _lock = CLIP_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::action::arm_input(false);
+        testclip::install_text("before copy");
+        assert_eq!(clipboard_text().as_deref(), Some("before copy"));
+        assert!(copy_text("copied from ui"));
+        assert_eq!(clipboard_text().as_deref(), Some("copied from ui"));
+        testclip::uninstall();
+
+        let slot = format!("inspect-{}-{}", std::process::id(), next_slot_revision());
+        testclip::seed_slot(&slot, text_pocket("hello pocket"), false);
+        let info = inspect_slot(&slot);
+        assert_eq!(info.kind, PocketKind::Text);
+        assert_eq!(info.body, "hello pocket");
+        assert_eq!(slot_text(&slot).as_deref(), Some("hello pocket"));
+        let _ = delete(&slot);
     }
 }

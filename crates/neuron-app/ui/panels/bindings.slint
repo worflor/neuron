@@ -13,6 +13,7 @@ import { RuleRow, PocketCard, MacroBlock, MacroCard } from "../models.slint";
 // tints it from the weave palette so the type reads at a glance too.
 component PocketCardEl inherits Rectangle {
     in property <PocketCard> p;
+    in property <bool> selected: false;
     property <bool> forget-armed: false;
     // pocket content is data, not a signal, so it inks in the weave colour rather than a signal hue;
     // the summary line names the kind.
@@ -20,10 +21,15 @@ component PocketCardEl inherits Rectangle {
     width: 128px;
     height: 104px;
     border-radius: Theme.radius;
-    background: Theme.bg-2;
+    background: root.selected ? Theme.accent-glow : (pocket-hit.has-hover ? Theme.well-hi : Theme.bg-2);
     border-width: Theme.hair;
-    border-color: p.filled ? root.tint : Theme.line;
-    animate border-color { duration: Theme.quick; }
+    border-color: root.selected ? Theme.accent-line
+        : (pocket-hit.has-hover ? Theme.text-faint : (p.filled ? root.tint : Theme.line));
+    animate background, border-color { duration: Theme.quick; }
+    pocket-hit := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { State.inspect-pocket(root.p.name); }
+    }
     VerticalLayout {
         padding: 8px;
         spacing: 3px;
@@ -146,13 +152,52 @@ component MacroCardEl inherits Rectangle {
             // kind, INVALID (an unreadable mode header) as a failure
             if root.c.mode == "RAW" : Pill { text: root.c.mode; }
             if root.c.mode == "INVALID" : Pill { text: root.c.mode; signal: Signal.consequence; tint: Theme.danger; }
-            // the binding(s) that fire it — dim when nothing does ("(unbound)"), accent when bound.
-            Mono {
-                text: root.c.trigger;
-                color: root.unbound ? Theme.text-faint : Theme.accent-dim;
-                font-size: Theme.fs-small;
-                vertical-alignment: center;
-                overflow: elide;
+            // the binding(s) that fire it — clickable chip: bind an unbound macro in WireEditor, or
+            // jump/filter the rules list to show where a bound macro is wired.
+            Rectangle {
+                height: 20px;
+                horizontal-stretch: 0;
+                border-radius: Theme.radius-sm;
+                background: mbind-ta.has-hover ? (root.unbound ? Theme.accent-glow : Theme.well) : transparent;
+                border-width: Theme.hair;
+                border-color: mbind-ta.has-hover ? Theme.accent-line : (root.unbound ? Theme.line : Theme.line-soft);
+                animate background, border-color { duration: Theme.quick; }
+                HorizontalLayout {
+                    padding-left: 6px; padding-right: 6px;
+                    Mono {
+                        text: root.unbound && mbind-ta.has-hover ? "bind \u{2192}" : root.c.trigger;
+                        color: mbind-ta.has-hover ? Theme.accent : (root.unbound ? Theme.text-faint : Theme.accent-dim);
+                        font-size: Theme.fs-small;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        max-width: 120px;
+                    }
+                }
+                mbind-ta := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        if (root.unbound) {
+                            State.bind-macro(root.c.name);
+                        } else {
+                            State.editing-rule = -1;
+                            State.filter-rules(root.c.name, false);
+                            if (State.rule-matches > 0) {
+                                State.input-layer-request = 0;
+                            } else {
+                                State.filter-rules(root.c.name, true);
+                                if (State.hyper-rule-matches > 0) {
+                                    State.input-layer-request = 1;
+                                } else {
+                                    // bound by a sector, gesture or rhythm, not a rule row: both
+                                    // layers go back to every rule, never to an empty filter
+                                    State.reset-rule-view(true);
+                                    State.reset-rule-view(false);
+                                    State.input-layer-request = 0;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // delete — click to ARM (turns red), click again to confirm. Its touch is the LAST sibling
             // so it wins this corner over the card-wide open beneath.
@@ -981,6 +1026,33 @@ export component BindingsPanel inherits VerticalLayout {
     // The MACRO·PYTHON editor's vertical offset from the panel top — the cross-panel "author a
     // macro" jump scrolls the page Flickable to this so the link lands ON the editor (see app.slint).
     out property <length> macro-y: macro_row.absolute-position.y - root.absolute-position.y;
+    out property <length> rules-y: rules_section.absolute-position.y - root.absolute-position.y;
+    out property <length> wire-y: wire_section.absolute-position.y - root.absolute-position.y;
+    public function apply-layer-request() {
+        if (State.input-layer-request >= 0) {
+            if (State.input-layer-request == 1) {
+                root.hyper-open = true;
+            }
+            root.view-layer = State.input-layer-request;
+            root.add-open = false;
+            State.editing-rule = -1;
+            State.input-layer-request = -1;
+        }
+    }
+    public function apply-macro-bind() {
+        if (State.macro-bind-request != "") {
+            root.view-layer = 0;
+            State.bind-hypershift = false;
+            State.bind-trigger-ready = false;
+            State.bind-trigger-label = "—";
+            State.bind-trigger-badge.pid = "";
+            State.dup-trigger-note = "";
+            State.editing-rule = -1;
+            root.add-open = true;
+            State.macro-bind-request = "";
+            State.input-layer-request = -1;
+        }
+    }
     // the stance is string-keyed in the engine but index-keyed in the SplitToggle rail
     property <int> stance-idx: State.hypershift-mode == "hold" ? 0
         : State.hypershift-mode == "latch" ? 1
@@ -1270,7 +1342,7 @@ export component BindingsPanel inherits VerticalLayout {
             }
 
             // ── the active layer's binds (LIST) ──
-            VerticalLayout {
+            rules_section := VerticalLayout {
                 spacing: 11px;
                 RuleList {
                     title: root.view-layer == 0 ? "BASE BINDS" : "HYPERSHIFT BINDS";
@@ -1287,46 +1359,49 @@ export component BindingsPanel inherits VerticalLayout {
                 // INLINE "+ bind a control" — the press-to-bind flow, in place. New binds land on the
                 // layer you're viewing, so there's no "on HyperShift layer" checkbox to forget. Both
                 // halves hide while a row is being edited (its inline editor owns the shared picker).
-                if !root.add-open && State.editing-rule < 0 : Rectangle {
-                    height: 34px;
-                    border-radius: Theme.radius-sm;
-                    background: addta.has-hover ? Theme.well : Theme.bg-2;
-                    border-width: Theme.hair;
-                    border-color: addta.has-hover ? Theme.text-faint : Theme.line;
-                    animate background, border-color { duration: Theme.quick; }
-                    addta := TouchArea {
-                        mouse-cursor: MouseCursor.pointer;
-                        // a clean slate for a NEW bind: drop any stale captured trigger so the slot
-                        // shows "press-to-bind" (the commit button gates on bind-trigger-ready, so a
-                        // leftover capture can't be committed blind). The ACTION side is shared with
-                        // every other picker on this page (edit-in-place, radial, gesture binder), so
-                        // it can't be trusted to already be clean here — force it back to the first
-                        // real choice (index 0 is always a header) so a just-edited/cancelled rule's
-                        // action can never leak into the next fresh bind.
-                        clicked => {
-                            State.bind-hypershift = (root.view-layer == 1);
-                            State.bind-trigger-ready = false;
-                            State.bind-trigger-label = "—";
-                            State.bind-trigger-badge.pid = "";
-                            State.dup-trigger-note = "";   // fresh slate — no stale clash note
-                            State.action-choice = 1;
-                            State.action-param = "";
-                            State.action-choice-changed();  // refresh the suggestion chips — no stale leftovers
-                            root.add-open = true;
+                wire_section := VerticalLayout {
+                    spacing: 0;
+                    if !root.add-open && State.editing-rule < 0 : Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: addta.has-hover ? Theme.well : Theme.bg-2;
+                        border-width: Theme.hair;
+                        border-color: addta.has-hover ? Theme.text-faint : Theme.line;
+                        animate background, border-color { duration: Theme.quick; }
+                        addta := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            // a clean slate for a NEW bind: drop any stale captured trigger so the slot
+                            // shows "press-to-bind" (the commit button gates on bind-trigger-ready, so a
+                            // leftover capture can't be committed blind). The ACTION side is shared with
+                            // every other picker on this page (edit-in-place, radial, gesture binder), so
+                            // it can't be trusted to already be clean here — force it back to the first
+                            // real choice (index 0 is always a header) so a just-edited/cancelled rule's
+                            // action can never leak into the next fresh bind.
+                            clicked => {
+                                State.bind-hypershift = (root.view-layer == 1);
+                                State.bind-trigger-ready = false;
+                                State.bind-trigger-label = "—";
+                                State.bind-trigger-badge.pid = "";
+                                State.dup-trigger-note = "";   // fresh slate — no stale clash note
+                                State.action-choice = 1;
+                                State.action-param = "";
+                                State.action-choice-changed();  // refresh the suggestion chips — no stale leftovers
+                                root.add-open = true;
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: 12px; padding-right: 12px; spacing: 8px;
+                            VerticalLayout { alignment: center; Text { text: "+"; color: addta.has-hover ? Theme.text : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-body; font-weight: 700; } }
+                            VerticalLayout { alignment: center; Text { text: root.view-layer == 1 ? "bind a control to the HyperShift layer" : "bind a control"; color: addta.has-hover ? Theme.text-mid : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; } }
+                            Rectangle {}
                         }
                     }
-                    HorizontalLayout {
-                        padding-left: 12px; padding-right: 12px; spacing: 8px;
-                        VerticalLayout { alignment: center; Text { text: "+"; color: addta.has-hover ? Theme.text : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-body; font-weight: 700; } }
-                        VerticalLayout { alignment: center; Text { text: root.view-layer == 1 ? "bind a control to the HyperShift layer" : "bind a control"; color: addta.has-hover ? Theme.text-mid : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; } }
-                        Rectangle {}
+                    if root.add-open && State.editing-rule < 0 : WireEditor {
+                        hyper: root.view-layer == 1;
+                        editing: false;
+                        commit => { State.bind-hypershift = (root.view-layer == 1); State.add-binding(); }
+                        close => { root.add-open = false; }
                     }
-                }
-                if root.add-open && State.editing-rule < 0 : WireEditor {
-                    hyper: root.view-layer == 1;
-                    editing: false;
-                    commit => { State.bind-hypershift = (root.view-layer == 1); State.add-binding(); }
-                    close => { root.add-open = false; }
                 }
             }
 
@@ -1553,15 +1628,107 @@ export component BindingsPanel inherits VerticalLayout {
             // POCKETS — portable clipboards, each with its emergent content-sigil
             VerticalLayout {
                 spacing: 9px;
-                SectionTitle { text: "POCKETS"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    SectionTitle { text: "POCKETS"; }
+                    if State.pockets.length > 0 : VerticalLayout {
+                        alignment: center;
+                        Mono { text: "click a pocket to inspect"; color: Theme.text-faint; font-size: Theme.fs-small; }
+                    }
+                    Rectangle {}
+                }
                 if State.pockets.length == 0 : Mono {
                     text: "no pockets yet · bind a `pocket` action, then activate it with something on your clipboard";
                     color: Theme.text-faint;
                 }
-                if State.pockets.length > 0 : HorizontalLayout {
-                    spacing: 8px;
-                    for pk in State.pockets : PocketCardEl { p: pk; }
-                    Rectangle {}
+                if State.pockets.length > 0 : pocket-carousel := Rectangle {
+                    height: 104px;
+                    clip: true;
+                    property <length> step: 136px;
+                    property <length> content: max(0px, State.pockets.length * self.step - 8px);
+                    property <length> floor: min(0px, self.width - self.content);
+                    property <length> scroll: 0px;
+                    pocket-pan := TouchArea {
+                        scroll-event(e) => {
+                            // the wheel pans the row while it can move that way; at an end, or with
+                            // every pocket in view, it scrolls the page as usual
+                            let from = clamp(pocket-carousel.scroll, pocket-carousel.floor, 0px);
+                            let to = clamp(from + e.delta-y + e.delta-x, pocket-carousel.floor, 0px);
+                            if (to == from) {
+                                return reject;
+                            }
+                            pocket-carousel.scroll = to;
+                            return accept;
+                        }
+                    }
+                    for pk[i] in State.pockets : PocketCardEl {
+                        p: pk;
+                        selected: State.pocket-inspect-open && State.pocket-inspect-name == pk.name;
+                        x: i * pocket-carousel.step + clamp(pocket-carousel.scroll, pocket-carousel.floor, 0px);
+                        y: 0px;
+                        width: 128px;
+                        height: 104px;
+                    }
+                }
+                if State.pocket-inspect-open : Card {
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Mono {
+                                    text: State.pocket-inspect-name == "" ? "(default)" : State.pocket-inspect-name;
+                                    color: Theme.accent;
+                                    font-weight: 700;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Pill { text: State.pocket-inspect-kind; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Mono {
+                                    text: State.pocket-inspect-formats;
+                                    color: Theme.text-faint;
+                                    font-size: Theme.fs-small;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            if State.pocket-inspect-kind == "text" : Button {
+                                text: "copy text";
+                                clicked => { State.copy-pocket-text(State.pocket-inspect-name); }
+                            }
+                            Button {
+                                text: "close";
+                                clicked => { State.pocket-inspect-open = false; }
+                            }
+                        }
+                        if State.pocket-inspect-summary != "" : Mono {
+                            text: State.pocket-inspect-summary;
+                            color: Theme.text-dim;
+                            font-size: Theme.fs-small;
+                            wrap: word-wrap;
+                        }
+                        if State.pocket-inspect-body != "" : Rectangle {
+                            background: Theme.bg;
+                            border-radius: Theme.radius-sm;
+                            border-width: Theme.hair;
+                            border-color: Theme.line;
+                            clip: true;
+                            VerticalLayout {
+                                padding: 8px;
+                                Mono {
+                                    text: State.pocket-inspect-body;
+                                    color: Theme.text-mid;
+                                    font-size: Theme.fs-small;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

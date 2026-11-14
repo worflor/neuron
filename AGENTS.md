@@ -81,6 +81,7 @@ never touch the user's.
 | Dated research and diagnosis snapshots | [`docs/archive/`](docs/archive/README.md) — not current, not authoritative |
 | How to send a change | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 | The label taxonomy, if you're filing or picking up issues | [`.github/LABELS.md`](.github/LABELS.md) |
+| Periodic doc health, shaping, and anti-slop passes | [`worflor/agentic-toolkit`](https://github.com/worflor/agentic-toolkit) (`project-shaping`, `anti-slop`); neuron's doc map is [Keeping the docs true](#keeping-the-docs-true) |
 | You're helping a *user* install, update, or run neuron, not changing its code | [`skills/neuron-lazy-update/SKILL.md`](skills/neuron-lazy-update/SKILL.md) |
 | You're writing a Python macro or using beacons | [`skills/neuron-macros/SKILL.md`](skills/neuron-macros/SKILL.md), API in [`docs/reference/MACROS.md`](docs/reference/MACROS.md) |
 | You're setting up or changing a user's binds, lighting, profiles or whole setup through the CLI | [`skills/neuron-cli/SKILL.md`](skills/neuron-cli/SKILL.md), reference in [`docs/reference/CLI.md`](docs/reference/CLI.md) |
@@ -298,6 +299,15 @@ commit message and changelog. A design note for work not yet built goes in
 `docs/briefs/` with a status line saying so; once it ships, move what is durable into
 GDD or TDD and leave the brief as a record. A convention worth enforcing belongs in a
 test or lint (as `uilint.rs` and the protocol ledger do), then a line here at most.
+
+Keep the root clean — working notes, plans, and investigations belong in `docs/briefs/`
+rather than extra top-level files — promote only durable understanding to its canonical
+home so the repo stands on its own without the session that wrote it, and keep comments
+sparse, non-conversational, and strictly about the code ([`Comments`](#comments)). For
+periodic doc health — reconciling docs against what the tree and history actually show
+without flattening neuron's voice — use [`project-shaping`](https://github.com/worflor/agentic-toolkit/blob/main/skills/project-shaping/SKILL.md)
+and [`anti-slop`](https://github.com/worflor/agentic-toolkit/blob/main/skills/anti-slop/SKILL.md)
+in [`worflor/agentic-toolkit`](https://github.com/worflor/agentic-toolkit).
 
 ## Verifying your work honestly
 
