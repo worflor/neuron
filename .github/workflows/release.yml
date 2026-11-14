@@ -94,6 +94,9 @@ jobs:
     name: windows x86_64
     needs: preflight
     runs-on: windows-latest
+    # The update signing key is a secret of the `release` environment, which only `v*` tags may
+    # enter; a manual test build stays outside it and is built unsigned.
+    environment: ${{ github.event_name == 'push' && 'release' || '' }}
     # `-Mode full` runs the test compile, a clippy compile, four feature checks, and a ThinLTO
     # release build, all on 2 cores - 60 min would time out before that finishes.
     timeout-minutes: 180

@@ -1,6 +1,6 @@
 # changelog
 
-## unreleased
+## 0.1.8 · 2026-11-14
 the colour picker grew a brain: Luma-T, a tiny colour model that edits with you. neuron updates itself now too, and there's a pile of fixes from living with it every day.
 ![picker v2 with Luma-T's first idea drafted on a stop, contour rings around where it fits](docs/media/picker-v2-suggest.webp)
 ![a fresh roll on show, with the roll drawer open](docs/media/picker-v2-roll.webp)
