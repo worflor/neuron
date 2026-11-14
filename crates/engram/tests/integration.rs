@@ -32,6 +32,11 @@ fn load_text(name: &str) -> String {
     if let Ok(t) = std::fs::read_to_string(&fixture_path) {
         return t;
     }
+    // a test binary run by hand from elsewhere still finds the crate's own fixtures
+    let anchored = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&fixture_path);
+    if let Ok(t) = std::fs::read_to_string(&anchored) {
+        return t;
+    }
 
     let golden_path = format!("{GOLDEN_DIR}/{name}.txt");
     if let Ok(t) = std::fs::read_to_string(&golden_path) {

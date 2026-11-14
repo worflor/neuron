@@ -111,6 +111,7 @@ impl Manifest {
                 return bad("notes media entry is invalid");
             }
         }
+        let mut platforms = Vec::new();
         for a in &self.assets {
             if Platform::from_id(&a.platform).is_none() {
                 continue;
@@ -118,6 +119,11 @@ impl Manifest {
             if !asset_name_ok(&a.name) || a.size == 0 || !is_sha256(&a.sha256) {
                 return bad("asset entry is invalid");
             }
+            // the app takes a platform's first asset: a second would never be used
+            if platforms.contains(&a.platform) {
+                return bad("two assets for one platform");
+            }
+            platforms.push(a.platform.clone());
         }
         Ok(version)
     }
@@ -226,6 +232,15 @@ pub(crate) mod tests {
         assert_eq!(m.asset(Platform::LinuxPortable).unwrap().size, 6);
         assert!(m.asset(Platform::WindowsPortable).is_none());
         assert_eq!(m.release_notes().unwrap().sections[0].items[0].title, "Updates.");
+    }
+
+    #[test]
+    fn two_assets_for_one_platform_are_refused() {
+        let mut m = sample("0.1.8");
+        assert!(m.validate().is_ok());
+        let again = m.assets[0].clone();
+        m.assets.push(Asset { name: "neuron-v0.1.8-windows-x86_64-setup-old.exe".into(), ..again });
+        assert!(m.validate().is_err(), "a second setup would never be used");
     }
 
     #[test]

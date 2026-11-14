@@ -136,8 +136,8 @@ fn status_kind(text: &str) -> &'static str {
         || (orig[i - 1].is_ascii_lowercase() && orig[i].is_ascii_uppercase());
     let has_phrase = |needle: &str| {
         let nb = needle.as_bytes();
-        let check_left = nb.first().is_some_and(|b| b.is_ascii_alphanumeric());
-        let check_right = nb.last().is_some_and(|b| b.is_ascii_alphanumeric());
+        let check_left = nb.first().is_some_and(u8::is_ascii_alphanumeric);
+        let check_right = nb.last().is_some_and(u8::is_ascii_alphanumeric);
         let mut from = 0;
         while let Some(rel) = t[from..].find(needle) {
             let start = from + rel;
@@ -1234,6 +1234,7 @@ fn handle_tray(resident: &Rc<RefCell<Resident>>, action: TrayAction) {
                 app.global::<State>().invoke_update_install();
             }
         }
+        TrayAction::UpdateRestart => updater::restart(),
         TrayAction::UpdateNotes => {
             show_window(resident);
             if let Some(app) = resident.borrow().window.as_ref() {
@@ -1255,6 +1256,7 @@ fn set_brightness(resident: &Rc<RefCell<Resident>>, v: f32) {
             st.set_status_line("writes paused — brightness unchanged".into());
             return; // don't move the slider to a value the device never received
         }
+        let v = v.clamp(0.0, 100.0);
         st.set_brightness(v);
         st.invoke_apply_brightness(v);
     }
@@ -1267,6 +1269,7 @@ fn set_dpi(resident: &Rc<RefCell<Resident>>, v: f32) {
             st.set_status_line("writes paused — DPI unchanged".into());
             return;
         }
+        let v = v.clamp(100.0, 30000.0);
         st.set_dpi(v);
         st.invoke_apply_dpi(v);
     }

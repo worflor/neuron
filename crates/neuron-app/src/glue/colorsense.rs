@@ -23,7 +23,10 @@
 //! colour, so it holds still while the stop is dragged. With `picker_journal` set in the preferences, picks and what was offered are
 //! appended to `models/picker-sessions.jsonl` in the run root ([`neuron::assist::journal`]).
 
-use super::*;
+use super::{
+    edit_active_palette, palette_strip_image, rgb_to_color, update_value_model, AppWindow, Cell, ComponentHandle, Image,
+    ModelRc, RefCell, Rgb, Rgba8Pixel, SharedPixelBuffer, SharedRt, SharedString, State, VecModel,
+};
 use crate::ui::{AssistOffer, StopDoubt};
 use neuron::assist::journal::{Control, Journal};
 use neuron::assist::learned::{Asked, Learned, Terrain};
@@ -110,7 +113,9 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(90);
 
 thread_local! {
     static SENSE: RefCell<Sense> = RefCell::default();
-    /// The learned model in the run root, read on first use.
+    /// The learned model in the run root, read on first use: `None` until it has been read, then
+    /// whether there is one.
+    #[allow(clippy::option_option)]
     static MODEL: RefCell<Option<Option<Arc<Learned>>>> = const { RefCell::new(None) };
     /// The window and state a model answer is delivered to.
     static HOME: RefCell<Option<(slint::Weak<AppWindow>, SharedRt)>> = const { RefCell::new(None) };
@@ -281,7 +286,8 @@ fn learn_taste() {
 }
 
 fn same_shape(a: &[Stop], b: &[Stop]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.at == y.at)
+    // the same positions, bit for bit: a palette whose stops have not moved
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.at.to_bits() == y.at.to_bits())
 }
 
 /// Put the palette back if an offer is on show: an edit is made to the palette as it is, never
@@ -1033,12 +1039,12 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
         pick(app, sh, Control::Slider, |from, vivid| {
             let (l, vivid) = hue_shows(from.l, vivid);
             (Lch { l, h: hue.clamp(0.0, 1.0) % 1.0, ..from }, vivid)
-        })
+        });
     });
     st.on_picker_hue_pick(move |h| hue(h, 0.0, 0.0));
     st.on_picker_nudge(bind(|app, sh, vivid, light, hue| {
         pick(app, sh, Control::Other, |from, was| {
-            let (l, was) = if hue != 0.0 { hue_shows(from.l, was) } else { (from.l, was) };
+            let (l, was) = if hue == 0.0 { (from.l, was) } else { hue_shows(from.l, was) };
             (Lch { l: (l + light).clamp(0.0, 1.0), h: (from.h + hue).rem_euclid(1.0), ..from }, (was + vivid).clamp(0.0, 1.0))
         });
     }));

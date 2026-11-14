@@ -1991,7 +1991,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let hyper = st.get_hypershift_rules().iter().any(|r| matches_row(&r));
             let base = st.get_rules().iter().any(|r| matches_row(&r));
             let target_hyper = hyper && !base;
-            st.set_input_layer_request(if target_hyper { 1 } else { 0 });
+            st.set_input_layer_request(i32::from(target_hyper));
             // a rule left open in its editor would make the filter stand down
             st.set_editing_rule(-1);
             st.invoke_filter_rules(needle.into(), target_hyper);
@@ -5467,9 +5467,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_copy_diagnostics(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
+                use std::fmt::Write as _;
                 let mut out = format!("Neuron Diagnostics: {}\n", st.get_diag_summary());
                 for row in st.get_diagnostics().iter() {
-                    out.push_str(&format!("- [{}] {}: {}\n", row.state, row.name, row.detail));
+                    let _ = writeln!(out, "- [{}] {}: {}", row.state, row.name, row.detail);
                 }
                 if neuron::pocket::copy_text(out.trim_end()) {
                     st.set_status_line("diagnostics summary copied".into());

@@ -24,7 +24,8 @@ pub enum UpdateCmd {
     Install,
     /// Show the update UI in a state, with this build's own notes and no release
     ///
-    /// available, downloading, ready, installing, updated, rolled-back or error; `off` ends it.
+    /// available, downloading, ready, installing, installed, updated, rolled-back or error; `off`
+    /// ends it.
     /// The pill's buttons then walk the states as a real update would. Nothing is fetched or
     /// installed, and it works in any build, a source build included.
     Preview { phase: String },
@@ -32,7 +33,10 @@ pub enum UpdateCmd {
 
 pub fn run(action: UpdateCmd) -> Result<()> {
     match action {
-        UpdateCmd::Status => status(),
+        UpdateCmd::Status => {
+            status();
+            Ok(())
+        }
         UpdateCmd::Check => check(),
         UpdateCmd::Install => install(),
         UpdateCmd::Preview { phase } => preview(&phase),
@@ -85,20 +89,31 @@ fn document(live: Option<&state::Live>, rec: &state::State) -> serde_json::Value
 }
 
 fn line(live: Option<&state::Live>, rec: &state::State) -> String {
+    use std::fmt::Write as _;
     let mut out = format!("neuron {}", env!("CARGO_PKG_VERSION"));
     if let Some(why) = disabled() {
-        out.push_str(&format!(" · does not update itself: {why}"));
+        let _ = write!(out, " · does not update itself: {why}");
     }
     match live {
-        Some(l) if l.phase == "downloading" => out.push_str(&format!("\ndownloading v{} · {:.0}%", l.version, l.progress * 100.0)),
-        Some(l) if !l.phase.is_empty() => out.push_str(&format!("\n{}{} · {}", if l.preview { "preview · " } else { "" }, l.phase, if l.error.is_empty() { format!("v{}", l.version) } else { l.error.clone() })),
-        Some(l) if !l.status.is_empty() => out.push_str(&format!("\n{}", l.status)),
+        Some(l) if l.phase == "downloading" => {
+            let _ = write!(out, "\ndownloading v{} · {:.0}%", l.version, l.progress * 100.0);
+        }
+        Some(l) if !l.phase.is_empty() => {
+            let what = if l.error.is_empty() { format!("v{}", l.version) } else { l.error.clone() };
+            let _ = write!(out, "\n{}{} · {what}", if l.preview { "preview · " } else { "" }, l.phase);
+        }
+        Some(l) if !l.status.is_empty() => {
+            let _ = write!(out, "\n{}", l.status);
+        }
         _ => {}
     }
-    if let Some(r) = &rec.release {
-        out.push_str(&format!("\nnewest release {} · checked {}", r.tag, ago(rec.last_check)));
-    } else {
-        out.push_str(&format!("\nchecked {}", ago(rec.last_check)));
+    match &rec.release {
+        Some(r) => {
+            let _ = write!(out, "\nnewest release {} · checked {}", r.tag, ago(rec.last_check));
+        }
+        None => {
+            let _ = write!(out, "\nchecked {}", ago(rec.last_check));
+        }
     }
     if livesync::app_on_this_root().is_none() {
         out.push_str("\nthe app is not running");
@@ -106,23 +121,22 @@ fn line(live: Option<&state::Live>, rec: &state::State) -> String {
     out
 }
 
-fn status() -> Result<()> {
+fn status() {
     let rec = state::State::load(&neuron::runroot::run_root());
     let live = live();
     out::done(document(live.as_ref(), &rec), line(live.as_ref(), &rec));
-    Ok(())
 }
 
 /// Send `op` to the app and wait until its live view is newer than `sent` and done checking.
 fn ask_app(op: UpdateOp, wait: Duration) -> Result<Option<state::Live>> {
-    let sent = now();
+    let sent = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     if !livesync::notify_app(&Command::Update { op }, Duration::from_millis(2500)).unwrap_or(false) {
         bail!("the running app did not pick the request up");
     }
     let root = neuron::runroot::run_root();
     let start = Instant::now();
     while start.elapsed() < wait {
-        if let Some(l) = state::Live::load(&root).filter(|l| l.at >= sent && !l.checking) {
+        if let Some(l) = state::Live::load(&root).filter(|l| l.at_ms > sent && !l.checking) {
             return Ok(Some(l));
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -176,6 +190,7 @@ fn install() -> Result<()> {
     let live = ask_app(UpdateOp::Install, Duration::from_secs(25))?;
     let rec = state::State::load(&neuron::runroot::run_root());
     let text = match live.as_ref().map(|l| l.phase.as_str()) {
+        Some("installed") => format!("v{} is installed · restart neuron to use it", live.as_ref().map_or("", |l| l.version.as_str())),
         Some("downloading" | "ready" | "installing") => format!("installing v{} · neuron restarts when it is done", live.as_ref().map_or("", |l| l.version.as_str())),
         Some("error") => format!("the update stopped: {}", live.as_ref().map_or("", |l| l.error.as_str())),
         _ => "no newer release to install".to_string(),
@@ -185,7 +200,7 @@ fn install() -> Result<()> {
 }
 
 fn preview(phase: &str) -> Result<()> {
-    const PHASES: [&str; 7] = ["available", "downloading", "ready", "installing", "updated", "rolled-back", "error"];
+    const PHASES: [&str; 8] = ["available", "downloading", "ready", "installing", "installed", "updated", "rolled-back", "error"];
     if livesync::app_on_this_root().is_none() {
         bail!("start neuron first: the preview shows in the app");
     }

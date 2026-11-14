@@ -1021,6 +1021,7 @@ export global State {
 
     // ── UPDATES — the header pill and the SYSTEM row ─────────────────────
     // phase: "" (nothing to show) · "available" · "downloading" · "ready" · "installing" ·
+    // "installed" (Setup replaced the files under a running copy; restart to use them) ·
     // "error" (update-error says what, in a few words) · "updated" (this launch is a fresh install)
     in-out property <string> update-phase: "";
     in-out property <string> update-version: "";     // the incoming (or just-installed) version, no "v"
@@ -1042,6 +1043,7 @@ export global State {
     callback update-install();      // download if needed, then install and restart
     callback update-dismiss();
     callback update-check-now();
+    callback update-restart();      // start the version Setup just installed under this one
     callback update-set-auto(bool);
     callback update-open-release();
 }

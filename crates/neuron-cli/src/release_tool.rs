@@ -58,6 +58,13 @@ fn keygen(args: &[String]) -> Result<(), String> {
     use base64::Engine as _;
     let public = base64::engine::general_purpose::STANDARD.encode(public);
     std::fs::write(&key_path, format!("{private}\n")).map_err(|e| e.to_string())?;
+    // the private key is the root of every install's trust: owner-only where the system has modes
+    // (on Windows the profile folder it lands in is already the owner's)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    }
     std::fs::write(out.join("neuron-update.pub"), format!("{public}\n")).map_err(|e| e.to_string())?;
     println!("private key: {}", key_path.display());
     println!("public key:  {public}");
@@ -179,6 +186,7 @@ fn verify(args: &[String]) -> Result<(), String> {
     let body = std::fs::read(dir.join(manifest::MANIFEST_NAME)).map_err(|e| e.to_string())?;
     let sig = std::fs::read(dir.join(manifest::SIGNATURE_NAME)).map_err(|e| e.to_string())?;
     let (m, v) = manifest::verify(&body, &sig, &key).map_err(|e| format!("{e:?}"))?;
+    let mut checked = 0;
     for a in &m.assets {
         let path = dir.join(&a.name);
         if path.is_file() {
@@ -186,8 +194,13 @@ fn verify(args: &[String]) -> Result<(), String> {
             if size != a.size || sha != a.sha256 {
                 return Err(format!("{} does not match the manifest", a.name));
             }
+            checked += 1;
         }
     }
-    println!("ok: {v}, {} asset(s)", m.assets.len());
+    // a manifest beside none of its packages proves only that it is signed
+    if checked == 0 {
+        return Err(format!("none of the manifest's packages are in {}", dir.display()));
+    }
+    println!("ok: {v}, {checked} of {} asset(s) checked", m.assets.len());
     Ok(())
 }

@@ -186,8 +186,9 @@ fn ui_sources_keep_elements_and_text_inside_their_bounds() {
     let mut report = String::new();
     for (file, source) in &sources {
         for f in lint_in(source, &layouts) {
-            let shown = file.strip_prefix(&root).unwrap_or(&file).display();
-            report.push_str(&format!("\n  ui/{shown}:{}  {}  {}", f.line, f.rule, f.what));
+            use std::fmt::Write as _;
+            let shown = file.strip_prefix(&root).unwrap_or(file).display();
+            let _ = write!(report, "\n  ui/{shown}:{}  {}  {}", f.line, f.rule, f.what);
         }
     }
     assert!(

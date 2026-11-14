@@ -138,7 +138,9 @@ export component UpdatePill inherits Rectangle {
             clicked => { State.update-dismiss(); }
         }
         if root.phase != "rolled-back" : PillSeg {
-            text: root.phase == "updated" ? "updated · v" + State.update-version : "v" + State.update-version;
+            text: root.phase == "updated" ? "updated · v" + State.update-version
+                : root.phase == "installed" ? "v" + State.update-version + " installed"
+                : "v" + State.update-version;
             ink: Theme.accent;
             strong: true;
             clicked => { State.update-notes-open = !State.update-notes-open; }
@@ -177,6 +179,12 @@ export component UpdatePill inherits Rectangle {
                 vertical-alignment: center;
                 horizontal-alignment: center;
             }
+        }
+        if root.phase == "installed" : PillSeg {
+            text: "restart";
+            ink: Theme.accent;
+            strong: true;
+            clicked => { State.update-restart(); }
         }
         if root.phase == "error" : PillSeg {
             text: State.update-error + " · retry";

@@ -29,11 +29,14 @@ struct Behaviour {
     no_range: bool,
 }
 
+/// Each request the server saw: its path and headers.
+type RequestLog = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+
 struct Server {
     port: u16,
     files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     behaviour: Arc<Mutex<Behaviour>>,
-    log: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+    log: RequestLog,
     release_json: Arc<Mutex<String>>,
 }
 

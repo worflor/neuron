@@ -1921,7 +1921,7 @@ fn second_picker_survives_random_sequences() {
         let after = stops();
         let ctx = || format!("step {step} ({what}), showing before {showing}");
         // whatever was on show, letting go of it puts back the settled palette
-        if matches!(op, 0 | 1 | 2) && !st.get_assist_showing() {
+        if matches!(op, 0..=2) && !st.get_assist_showing() {
             assert_eq!(after, settled, "{}: letting go did not restore the palette", ctx());
         }
         // a stop held before this step keeps its colour unless this step recoloured it by hand or

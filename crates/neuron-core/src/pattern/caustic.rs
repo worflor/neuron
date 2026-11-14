@@ -266,12 +266,9 @@ impl Caustic {
     fn sample_field(
         field: &[f32],
         active: &[bool],
-        r: usize,
-        c: usize,
-        dr: isize,
-        dc: isize,
-        rows: usize,
-        cols: usize,
+        (r, c): (usize, usize),
+        (dr, dc): (isize, isize),
+        (rows, cols): (usize, usize),
     ) -> f32 {
         let rr = r as isize + dr;
         let cc = c as isize + dc;
@@ -317,7 +314,7 @@ impl Caustic {
             let r = idx / cols;
             let c = idx % cols;
             let center = field[idx];
-            let s = |dr, dc| Self::sample_field(field, active, r, c, dr, dc, rows, cols);
+            let s = |dr, dc| Self::sample_field(field, active, (r, c), (dr, dc), (rows, cols));
 
             let hxx = s(0, 1) - 2.0 * center + s(0, -1);
             let hyy = (s(1, 0) - 2.0 * center + s(-1, 0)) * ky;
@@ -670,7 +667,7 @@ impl Pattern for Caustic {
         for &idx in &self.active_indices {
             let r = idx / cols;
             let c = idx % cols;
-            let s = |dr, dc| Self::sample_field(&self.h, &self.active, r, c, dr, dc, rows, cols);
+            let s = |dr, dc| Self::sample_field(&self.h, &self.active, (r, c), (dr, dc), (rows, cols));
 
             let center = self.h[idx];
             let hxx_s = s(0, 1) - 2.0 * center + s(0, -1);

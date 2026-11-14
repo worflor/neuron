@@ -1076,7 +1076,7 @@ fn direction(prev: Option<&str>, value: f64) -> Dir {
 fn kind_anchor(k: Kind) -> i32 {
     match k {
         Kind::Profile => 0,
-        Kind::Brightness | Kind::Scroll => 1,
+        Kind::Brightness | Kind::Scroll | Kind::Update => 1,
         // sniper shares DPI's pitch home — same aim family, and the card title tells them apart
         Kind::Dpi | Kind::Sniper | Kind::Macro => 2,
         Kind::Polling => 3,
@@ -1086,7 +1086,6 @@ fn kind_anchor(k: Kind) -> i32 {
         Kind::SidePlate => 5,
         // a game alert means "come back", so it takes the top of the register
         Kind::Game => 6,
-        Kind::Update => 1,
     }
 }
 

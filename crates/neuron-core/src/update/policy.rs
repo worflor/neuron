@@ -80,7 +80,7 @@ pub fn steam_detected(exe_dir: &Path) -> bool {
     exe_dir.join("steam_appid.txt").is_file()
         || std::env::var_os("SteamAppId").is_some()
         || std::env::var_os("SteamGameId").is_some()
-        || exe_dir.components().any(|c| c.as_os_str().eq_ignore_ascii_case("steamapps"))
+        || exe_dir.components().map(|c| c.as_os_str().to_ascii_lowercase()).collect::<Vec<_>>().windows(2).any(|w| w[0] == "steamapps" && w[1] == "common")
 }
 
 /// The packaging scripts set `NEURON_RELEASE_BUILD` for the build they package.
@@ -183,6 +183,15 @@ mod tests {
 
     fn env(kind: InstallKind) -> Environment {
         Environment { release_build: true, steam: false, env_off: false, has_key: true, kind }
+    }
+
+    /// Only a real Steam library path counts: a folder that happens to be named "steamapps" does not.
+    #[test]
+    fn a_steam_library_is_its_common_folder_not_any_steamapps_name() {
+        assert!(steam_detected(Path::new("D:/SteamLibrary/steamapps/common/neuron")));
+        assert!(steam_detected(Path::new("C:/Program Files (x86)/Steam/SteamApps/Common/neuron")));
+        assert!(!steam_detected(Path::new("D:/games/steamapps/neuron")));
+        assert!(!steam_detected(Path::new("C:/Program Files/Neuron")));
     }
 
     #[test]

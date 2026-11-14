@@ -42,6 +42,8 @@ pub enum TrayAction {
     UpdateInstall,
     /// Open the window on the update's notes.
     UpdateNotes,
+    /// Restart into the version just installed.
+    UpdateRestart,
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -93,6 +95,7 @@ pub(crate) fn update_line(phase: &str, version: &str, tenths: u8) -> Option<(Str
         "available" | "ready" => (format!("Install v{version} and restart"), Some(TrayAction::UpdateInstall)),
         "downloading" => (format!("Downloading v{version} · {}%", u32::from(tenths) * 10), None),
         "installing" => (format!("Installing v{version}…"), None),
+        "installed" => (format!("Restart to finish v{version}"), Some(TrayAction::UpdateRestart)),
         "error" => (format!("Update to v{version} stopped · try again"), Some(TrayAction::UpdateInstall)),
         "updated" => (format!("Updated to v{version} · what's new"), Some(TrayAction::UpdateNotes)),
         "rolled-back" => (format!("v{version} rolled back · details"), Some(TrayAction::UpdateNotes)),

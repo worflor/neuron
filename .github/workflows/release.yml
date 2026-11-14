@@ -35,10 +35,10 @@ on:
         description: "Version label for a manual build (defaults to the workspace version)"
         required: false
 
+# Each job asks for only what it needs: the build and its signing step can read the source and
+# nothing more; only the publish job can write releases and attestations.
 permissions:
-  contents: write # create the release + upload assets
-  id-token: write # provenance attestation signing
-  attestations: write # record the attestation
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -77,6 +77,12 @@ jobs:
             echo "::error::release label $version does not match workspace version $cargo_ver"
             exit 1
           fi
+          # The updater has no pre-release channel: a published pre-release would become the
+          # latest release every copy is offered, and the app inside it reports the bare version.
+          if [ "${{ github.event_name }}" = "push" ] && [ "$version" != "$cargo_ver" ]; then
+            echo "::error::pre-release tag $version: tag the bare version $cargo_ver, or use a manual test build"
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # Provenance attestations only work on public repos. SOURCE.txt tells users to verify
@@ -110,13 +116,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned: it runs beside the release signing key
         with:
           # Match the validated release compiler; moving stable also changes Clippy's gates.
           toolchain: 1.96.0
           components: clippy # -Mode full runs clippy; without this it reports a phantom failure
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3, pinned: it runs beside the release signing key
         with:
           cache-on-failure: true # same reason as ci.yml: a failed run must still warm the cache
 
@@ -183,6 +189,10 @@ jobs:
           if-no-files-found: error
 
   publish:
+    permissions:
+      contents: write # create the release + upload assets
+      id-token: write # provenance attestation signing
+      attestations: write # record the attestation
     name: draft release
     needs: [preflight, windows]
     runs-on: ubuntu-latest
@@ -243,8 +253,11 @@ jobs:
           for manifest in dist/neuron-update.json dist/neuron-update.json.sig; do
             if [ -f "$manifest" ]; then assets+=("$manifest"); fi
           done
+          # --target pins a manual build's draft to the commit that was built, not whatever the
+          # default branch holds when it is published.
           if ! gh release create "$VERSION" "${assets[@]}" \
             --draft \
+            --target "$GITHUB_SHA" \
             --title "$title" \
             "${notes_args[@]}"; then
             if [ "$(gh release view "$VERSION" --json isDraft --jq '.isDraft')" != true ]; then
@@ -252,4 +265,8 @@ jobs:
               exit 1
             fi
             gh release upload "$VERSION" "${assets[@]}" --clobber
+            # a draft left by an earlier run keeps its old words unless they are replaced too
+            if [ -f dist/release-notes.md ]; then
+              gh release edit "$VERSION" --title "$title" --notes-file dist/release-notes.md
+            fi
           fi

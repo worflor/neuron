@@ -54,8 +54,26 @@ pub fn log_path(work: &Path) -> PathBuf {
     work.join("apply.log")
 }
 
-fn ps_literal(p: &Path) -> String {
-    format!("'{}'", p.to_string_lossy().replace('\'', "''"))
+/// A shell wait for `pid` to exit that gives up after 120 s, as the Windows wrappers do: a hung
+/// app must not hold an update or a rollback back forever. What runs next checks for itself
+/// whether the app is still there.
+pub(crate) fn sh_wait_for(pid: u32) -> String {
+    format!("n=0; while kill -0 {pid} 2>/dev/null && [ $n -lt 600 ]; do sleep 0.2; n=$((n+1)); done;")
+}
+
+/// `p` as a PowerShell single-quoted literal. PowerShell ends such a string on any of the
+/// typographic single quotes as well as `'`, so each is doubled: a folder named `Ada’s neuron`
+/// stays one path, never path text read as code.
+pub(crate) fn ps_literal(p: &Path) -> String {
+    let mut out = String::from("'");
+    for c in p.to_string_lossy().chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 fn sh_quote(p: &Path) -> String {
@@ -82,7 +100,12 @@ pub fn extract_script(platform: Platform, package: &Path, work: &Path) -> std::i
         if name.ends_with(suffix) && !name.split('/').any(|s| s == "..") {
             found += 1;
             bytes.clear();
-            reader.take(MAX_SCRIPT_BYTES).read_to_end(&mut bytes)?;
+            // one byte past the cap tells an oversized script from one exactly at it: a script cut
+            // short must never run
+            reader.take(MAX_SCRIPT_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_SCRIPT_BYTES {
+                return Err(std::io::Error::other("the update script in the package is too large"));
+            }
         }
         Ok(())
     };
@@ -169,11 +192,11 @@ pub fn plan(inputs: &Inputs<'_>) -> std::io::Result<Handoff> {
             let sums = write_sums(inputs)?;
             let app = inputs.install_dir.join("neuron-app");
             let body = format!(
-                "trap '' HUP; while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; \
+                "trap '' HUP; {wait} \
                  bash {script} --action apply --install-dir {dir} --archive {pkg} --sums {sums} > {log} 2>&1; \
                  echo $? > {out}; \
                  if {relaunch} && ! pgrep -x neuron-app >/dev/null 2>&1; then cd {dir} && nohup {app} >/dev/null 2>&1 & fi",
-                pid = inputs.pid,
+                wait = sh_wait_for(inputs.pid),
                 script = sh_quote(&script),
                 dir = sh_quote(inputs.install_dir),
                 pkg = sh_quote(inputs.package),
@@ -196,6 +219,39 @@ fn write_sums(inputs: &Inputs<'_>) -> std::io::Result<PathBuf> {
 }
 
 /// Start `h` so it outlives this process.
+/// A detached helper that waits for process `pid` to exit (at most 30 s) and then starts `exe`
+/// from its folder: "restart" for a copy whose files were already replaced under it.
+#[must_use]
+pub fn relaunch_after(pid: u32, exe: &Path) -> Handoff {
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    if cfg!(windows) {
+        let body = format!(
+            "try {{ Wait-Process -Id {pid} -Timeout 30 -ErrorAction SilentlyContinue }} catch {{ }}; Start-Process -FilePath {} -WorkingDirectory {}",
+            ps_literal(exe),
+            ps_literal(dir),
+        );
+        use base64::Engine as _;
+        let utf16: Vec<u8> = body.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+        Handoff {
+            program: windows_powershell(),
+            args: ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand"]
+                .into_iter()
+                .map(OsString::from)
+                .chain(std::iter::once(OsString::from(encoded)))
+                .collect(),
+            self_quit: true,
+        }
+    } else {
+        let body = format!(
+            "trap '' HUP; n=0; while kill -0 {pid} 2>/dev/null && [ $n -lt 150 ]; do sleep 0.2; n=$((n+1)); done; cd {} && nohup {} >/dev/null 2>&1 &",
+            sh_quote(dir),
+            sh_quote(exe),
+        );
+        Handoff { program: PathBuf::from("/bin/sh"), args: vec!["-c".into(), body.into()], self_quit: true }
+    }
+}
+
 pub fn spawn(h: &Handoff) -> std::io::Result<std::process::Child> {
     let mut cmd = std::process::Command::new(&h.program);
     cmd.args(&h.args)
@@ -270,6 +326,13 @@ pub fn setup_exit_reason(code: i32) -> String {
 mod tests {
     use super::*;
     use crate::update::state::Pending;
+
+    #[test]
+    fn a_powershell_literal_doubles_every_kind_of_single_quote() {
+        assert_eq!(ps_literal(Path::new(r"C:\it's")), r"'C:\it''s'");
+        assert_eq!(ps_literal(Path::new("D:\\Ada\u{2019}s neuron")), "'D:\\Ada\u{2019}\u{2019}s neuron'");
+        assert_eq!(ps_literal(Path::new("\u{2018}x\u{201A}\u{201B}")), "'\u{2018}\u{2018}x\u{201A}\u{201A}\u{201B}\u{201B}'");
+    }
     use crate::update::version::Version;
 
     fn scratch(tag: &str) -> PathBuf {

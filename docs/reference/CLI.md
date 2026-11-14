@@ -294,7 +294,7 @@ progress (`--json`: `version`, `updates_itself`, `why_not`, `app_running`, `late
 `last_check`, `phase`, `offered`, `progress`, `error`, `preview`, `status`). `update check` asks
 for a newer release now, through the app when it runs and from the CLI when it does not.
 `update install` has the app download, verify, install and restart; it needs the app running.
-`update preview <phase>` shows the update UI in `available`, `downloading`, `ready`,
+`update preview <phase>` shows the update UI in `available`, `downloading`, `ready`, `installed`,
 `installing`, `updated`, `rolled-back` or `error` with this build's own notes, fetching and
 installing nothing; the pill's buttons then walk the states. `update preview off` ends it. It
 works in any build.

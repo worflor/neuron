@@ -20,8 +20,9 @@ pub const NEW_ISSUE: &str = "https://github.com/worflor/neuron/issues/new";
 pub const SKILL_URL: &str = "https://github.com/worflor/neuron/tree/main/skills/neuron-lazy-update";
 /// The most of the crash log a report keeps: its newest lines.
 const CRASH_TAIL_LINES: usize = 400;
-/// A browser and GitHub both cut long links; the drafted body stays under this.
-const URL_BODY_MAX: usize = 5500;
+/// A browser and GitHub both cut long links; the drafted body stays under this many characters
+/// once percent-encoded, where a space or a newline is three and an accented letter six.
+const URL_BODY_MAX: usize = 6000;
 
 /// What goes into a report.
 #[derive(Clone, Debug, Default)]
@@ -74,6 +75,8 @@ pub fn skill_location() -> String {
 #[derive(Clone, Debug, Default)]
 pub struct Private {
     pub home: Option<String>,
+    /// The home folder's 8.3 short form (`C:\Users\ADALOV~1`), when it has one of its own.
+    pub home_short: Option<String>,
     pub user: Option<String>,
     pub machine: Option<String>,
 }
@@ -83,47 +86,88 @@ impl Private {
     #[must_use]
     pub fn current() -> Private {
         let var = |k: &str| std::env::var(k).ok().filter(|v| v.len() >= 2);
+        let home = var("USERPROFILE").or_else(|| var("HOME"));
         Private {
-            home: var("USERPROFILE").or_else(|| var("HOME")),
+            home_short: home.as_deref().and_then(short_path).filter(|s| Some(s) != home.as_ref()),
+            home,
             user: var("USERNAME").or_else(|| var("USER")),
             machine: var("COMPUTERNAME").or_else(|| var("HOSTNAME")),
         }
     }
 }
 
+/// The 8.3 short form of `path`, as old tools and some crash logs print it.
+#[cfg(windows)]
+fn short_path(path: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buf` is writable for the length passed.
+    let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
+}
+
+#[cfg(not(windows))]
+fn short_path(_: &str) -> Option<String> {
+    None
+}
+
 /// `text` with the home folder, user name and computer name replaced (any case, either slash).
 #[must_use]
 pub fn scrub(text: &str, private: &Private) -> String {
     let mut out = text.to_string();
-    let mut replace = |needle: &str, with: &str| {
+    // a path is replaced wherever it appears; a name only as a whole word, so a person called
+    // "user" or "neuron" does not have those words cut out of the rest of the report
+    let mut replace = |needle: &str, with: &str, whole: bool| {
         if needle.is_empty() {
             return;
         }
-        for variant in [needle.to_string(), needle.replace('\\', "/")] {
+        // a path in both slash forms; a name with no backslash is one form, replaced once (twice
+        // would replace inside its own "<user>")
+        let mut variants = vec![needle.to_string()];
+        if needle.contains('\\') {
+            variants.push(needle.replace('\\', "/"));
+        }
+        for variant in variants {
             // ASCII folding keeps byte offsets: a name with other letters matches exactly
             let lower = out.to_ascii_lowercase();
             let find = variant.to_ascii_lowercase();
             let mut result = String::with_capacity(out.len());
             let mut at = 0;
-            while let Some(found) = lower[at..].find(&find) {
-                let start = at + found;
+            let word = |i: usize| lower.as_bytes().get(i).is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+            let mut from = 0;
+            while let Some(found) = lower[from..].find(&find) {
+                let start = from + found;
+                let end = start + find.len();
+                if whole && !((start == 0 || word(start - 1)) && word(end)) {
+                    from = start + 1;
+                    while !lower.is_char_boundary(from) {
+                        from += 1;
+                    }
+                    continue;
+                }
                 result.push_str(&out[at..start]);
                 result.push_str(with);
-                at = start + find.len();
+                at = end;
+                from = end;
             }
             result.push_str(&out[at..]);
             out = result;
         }
     };
     // longest first: a computer name often contains the user name
+    // the short form first: the full home is a prefix of it ("C:\Users\Ada" of "C:\Users\ADA~1")
+    if let Some(short) = &private.home_short {
+        replace(short, "~", false);
+    }
     if let Some(home) = &private.home {
-        replace(home, "~");
+        replace(home, "~", false);
     }
     if let Some(machine) = &private.machine {
-        replace(machine, "<pc>");
+        replace(machine, "<pc>", true);
     }
     if let Some(user) = &private.user {
-        replace(user, "<user>");
+        replace(user, "<user>", true);
     }
     out
 }
@@ -146,6 +190,11 @@ fn stamp(secs: u64) -> (String, String) {
 }
 
 /// Percent-encode for a URL query value.
+/// How long `text` is once [`encode`]d.
+fn encoded_len(text: &str) -> usize {
+    text.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { 1 } else { 3 }).sum()
+}
+
 fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len() * 3 / 2);
     for b in text.bytes() {
@@ -185,8 +234,12 @@ fn body(input: &Input, files: &str) -> String {
 /// Write a report for `input` under `root/reports`, scrubbed of `private`, and pack it.
 pub fn build(input: &Input, root: &Path, private: &Private, now_secs: u64, skill: &str) -> Result<Report> {
     let (date, time) = stamp(now_secs);
-    let name = format!("bug-{date}-{time}");
     let reports = root.join("reports");
+    // a second report in the same second gets its own folder, never the first one's files
+    let name = (1..)
+        .map(|n| if n == 1 { format!("bug-{date}-{time}") } else { format!("bug-{date}-{time}-{n}") })
+        .find(|name| !reports.join(name).exists())
+        .unwrap_or_else(|| format!("bug-{date}-{time}"));
     let dir = reports.join(&name);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut files: Vec<(&str, String)> = Vec::new();
@@ -216,13 +269,20 @@ pub fn build(input: &Input, root: &Path, private: &Private, now_secs: u64, skill
     std::fs::write(&zip, archive.finish()?.into_inner()).with_context(|| format!("write {}", zip.display()))?;
 
     let mut url_body = report;
-    if url_body.len() > URL_BODY_MAX {
-        let mut cut = URL_BODY_MAX;
-        while !url_body.is_char_boundary(cut) {
-            cut -= 1;
-        }
+    if encoded_len(&url_body) > URL_BODY_MAX {
+        // keep the longest start that, encoded with the note after it, still fits
+        let note = "\n\n_(cut short; the full report is in the attached zip)_\n";
+        let budget = URL_BODY_MAX.saturating_sub(encoded_len(note) + 300);
+        let mut used = 0;
+        let cut = url_body
+            .char_indices()
+            .find(|(_, c)| {
+                used += encoded_len(c.encode_utf8(&mut [0; 4]));
+                used > budget
+            })
+            .map_or(url_body.len(), |(i, _)| i);
         url_body.truncate(cut);
-        url_body.push_str("\n\n_(cut short; the full report is in the attached zip)_\n");
+        url_body.push_str(note);
     }
     url_body.push_str(&format!("\n_drag `{name}.zip` here to attach it._\n"));
     let title = input.what.trim().lines().next().unwrap_or("").chars().take(80).collect::<String>();
@@ -247,7 +307,7 @@ mod tests {
     use super::*;
 
     fn private() -> Private {
-        Private { home: Some(r"C:\Users\Ada".into()), user: Some("Ada".into()), machine: Some("ADA-PC".into()) }
+        Private { home: Some(r"C:\Users\Ada".into()), home_short: Some(r"C:\Users\ADA~1".into()), user: Some("Ada".into()), machine: Some("ADA-PC".into()) }
     }
 
     #[test]
@@ -256,6 +316,10 @@ mod tests {
         let out = scrub(text, &private());
         assert!(!out.to_lowercase().contains("ada"), "{out}");
         assert!(out.contains(r"~\AppData\x.rs") && out.contains("~/y") && out.contains("<pc>"), "{out}");
+        assert_eq!(scrub(r"C:\Users\ADA~1\Temp\z", &private()), r"~\Temp\z");
+        // a name is a word: inside other words it stays
+        let named = Private { user: Some("user".into()), ..Private::default() };
+        assert_eq!(scrub("the user is user, users stay", &named), "the <user> is <user>, users stay");
     }
 
     #[test]
@@ -300,7 +364,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let input = Input { what: "é".repeat(5000), version: "0.1.8".into(), ..Input::default() };
         let report = build(&input, &root, &Private::default(), 0, SKILL_URL).unwrap();
-        assert!(report.issue_url.len() < 3 * URL_BODY_MAX + 2000, "the link stays bounded");
+        assert!(report.issue_url.len() < URL_BODY_MAX + 1500, "the link stays bounded once encoded: {}", report.issue_url.len());
         assert!(std::fs::read_to_string(report.dir.join("report.md")).unwrap().contains(&"é".repeat(5000)));
         let _ = std::fs::remove_dir_all(&root);
     }

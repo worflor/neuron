@@ -97,9 +97,10 @@ impl Error {
         }
     }
 
-    /// Errors that say nothing is wrong with the release, only with reaching it.
+    /// Errors that say nothing is wrong with the release, only with reaching it. A local disk
+    /// error is not one: retrying it only looks like a hang.
     pub fn transient(&self) -> bool {
-        matches!(self, Error::Offline | Error::RateLimited { .. } | Error::Http(500..=599) | Error::Io(_))
+        matches!(self, Error::Offline | Error::RateLimited { .. } | Error::Http(500..=599))
     }
 }
 

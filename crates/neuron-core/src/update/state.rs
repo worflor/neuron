@@ -103,8 +103,9 @@ pub struct Live {
     pub enabled: bool,
     /// The state shown is a preview (`neuron update preview`), not a real release.
     pub preview: bool,
-    /// When this was written, unix seconds.
-    pub at: u64,
+    /// When this was written, unix milliseconds: fine enough that a view written before a request
+    /// is never taken for its answer.
+    pub at_ms: u64,
 }
 
 impl Live {
@@ -129,6 +130,15 @@ impl Live {
 impl State {
     pub fn path(run_root: &Path) -> PathBuf {
         dir(run_root).join("state.json")
+    }
+
+    /// Take the launch guard's fields from `disk`. The guard (probation, a rollback notice, the
+    /// version to skip) writes the record outside the running updater, which holds its own copy:
+    /// saving that copy whole would restore what the guard had cleared.
+    pub fn adopt_guard(&mut self, disk: &State) {
+        self.probation.clone_from(&disk.probation);
+        self.rolled_back.clone_from(&disk.rolled_back);
+        self.skip.clone_from(&disk.skip);
     }
 
     /// Never fails: a missing or unreadable record is a fresh one.
@@ -160,8 +170,12 @@ mod tests {
         assert_eq!(State::load(&root), s);
         std::fs::write(State::path(&root), b"{not json").unwrap();
         assert_eq!(State::load(&root), State::default());
+        // the updater's copy, saved after the guard cleared a rollback, keeps it cleared
+        let mut ours = State { rolled_back: Some(RolledBack { from: "0.1.8".into(), to: "0.1.7".into(), crash_log: String::new(), kept: String::new() }), failures: 3, ..State::default() };
+        ours.adopt_guard(&State::default());
+        assert!(ours.rolled_back.is_none() && ours.failures == 3);
         assert_eq!(Live::load(&root), None);
-        let live = Live { phase: "downloading".into(), version: "0.1.8".into(), progress: 0.5, enabled: true, at: 9, ..Live::default() };
+        let live = Live { phase: "downloading".into(), version: "0.1.8".into(), progress: 0.5, enabled: true, at_ms: 9, ..Live::default() };
         live.save(&root).unwrap();
         assert_eq!(Live::load(&root), Some(live));
         let _ = std::fs::remove_dir_all(&root);

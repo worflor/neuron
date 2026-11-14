@@ -25,7 +25,7 @@ const RELEASES: &str = "https://github.com/worflor/neuron/releases";
 const REPORT: &str = "https://github.com/worflor/neuron/issues/new";
 /// The longest the worker sleeps at once, so a wall-clock deadline passed during system sleep
 /// is noticed soon after resume.
-const MAX_NAP: Duration = Duration::from_secs(15 * 60);
+const MAX_NAP: Duration = Duration::from_mins(15);
 /// Notes images are drawn at most ~420 px wide; decode to twice that for high-DPI glass.
 const MEDIA_MAX_WIDTH: u32 = 840;
 /// Opening the window checks again when the last check is older than this.
@@ -199,7 +199,7 @@ fn post(v: &View) {
         checking: v.checking,
         enabled: v.enabled,
         preview: PREVIEW.load(Ordering::SeqCst),
-        at: now_unix(),
+        at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
     };
     if let Err(e) = live.save(&neuron::runroot::run_root()) {
         eprintln!("neuron: update status not written: {e}");
@@ -238,6 +238,7 @@ pub fn install(app: &AppWindow) {
     st.on_update_install(|| request(|r| r.install = true));
     st.on_update_dismiss(|| request(|r| r.dismiss = true));
     st.on_update_check_now(|| request(|r| r.check = true));
+    st.on_update_restart(restart);
     st.on_update_set_auto({
         let w = app.as_weak();
         move |v| {
@@ -274,7 +275,7 @@ pub fn command(op: neuron::livesync::UpdateOp) {
 }
 
 /// The phases a preview can open on.
-pub const PREVIEW_PHASES: [&str; 7] = ["available", "downloading", "ready", "installing", "updated", "rolled-back", "error"];
+pub const PREVIEW_PHASES: [&str; 8] = ["available", "downloading", "ready", "installing", "installed", "updated", "rolled-back", "error"];
 
 /// Show the pill in `phase` with this build's own notes. Its buttons then walk the states as a
 /// real update would: download fills the bar, install restarts into "updated". Nothing is fetched
@@ -308,7 +309,7 @@ fn preview_release() -> Option<notes::Release> {
 fn run_preview(run: u64, phase: &str) {
     let live = || PREVIEW_RUN.load(Ordering::SeqCst) == run;
     let current = Version::current();
-    let next = Version { patch: current.patch + 1, pre: Vec::new(), ..current.clone() };
+    let next = Version { patch: current.patch + 1, pre: Vec::new(), ..current };
     let release = preview_release();
     let mut view = View {
         phase: "",
@@ -365,6 +366,7 @@ fn run_preview(run: u64, phase: &str) {
         }
         "installing" => install(&mut view),
         "updated" => show(&mut view, "updated"),
+        "installed" => show(&mut view, "installed"),
         "rolled-back" => {
             view.status = format!("{next} rolled back · preview");
             show(&mut view, "rolled-back");
@@ -409,6 +411,19 @@ fn run_preview(run: u64, phase: &str) {
     }
 }
 
+/// Restart into the version just installed: a helper waits for this process to end and starts
+/// the app again, then the event loop quits the normal way (devices handed back).
+pub fn restart() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    match install::spawn(&install::relaunch_after(std::process::id(), &exe)) {
+        Ok(_) => {
+            clean_exit();
+            let _ = slint::quit_event_loop();
+        }
+        Err(e) => eprintln!("neuron: could not restart: {e}"),
+    }
+}
+
 /// The running version's own notes images, decoded off the UI thread.
 fn seed_installed_media(weak: slint::Weak<AppWindow>) {
     crate::worker::spawn_detached("neuron-notes-media", move || {
@@ -435,6 +450,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
     let _ = UI.set(weak.clone());
     seed_installed_media(weak);
     start_health_clock();
+    watch_session_end();
     let env = environment();
     let Ok(platform) = policy::availability(&env) else { return };
     let Some(key) = update::release_key() else { return };
@@ -481,9 +497,54 @@ fn start_health_clock() {
     });
 }
 
-/// A clean quit does not count against a version on probation.
+/// Windows ending the session (shut down, restart, sign out) is a clean exit too: a new version
+/// must not be rolled back because the computer was turned off within its first minute. Windows
+/// sends WM_ENDSESSION only to top-level windows, so a hidden one on the UI thread listens.
+#[cfg(windows)]
+fn watch_session_end() {
+    use std::sync::atomic::AtomicIsize;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, CreateWindowExW, SetWindowLongPtrW, GWLP_WNDPROC, WM_ENDSESSION, WNDPROC, WS_POPUP,
+    };
+    static PREVIOUS: AtomicIsize = AtomicIsize::new(0);
+    unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_ENDSESSION && wparam != 0 {
+            clean_exit();
+        }
+        // SAFETY: PREVIOUS holds the STATIC class's own window procedure, set before this one
+        // could be called, and the arguments are passed through unchanged.
+        unsafe {
+            let previous: WNDPROC = std::mem::transmute::<isize, WNDPROC>(PREVIOUS.load(Ordering::SeqCst));
+            CallWindowProcW(previous, hwnd, msg, wparam, lparam)
+        }
+    }
+    const STATIC: &[u16] = &[b'S' as u16, b'T' as u16, b'A' as u16, b'T' as u16, b'I' as u16, b'C' as u16, 0];
+    // SAFETY: STATIC is NUL-terminated; a hidden, parentless popup of a built-in class needs no
+    // other parameters. The window lives for the process, on this (the UI) thread, whose event
+    // loop dispatches its messages.
+    unsafe {
+        let hwnd = CreateWindowExW(0, STATIC.as_ptr(), STATIC.as_ptr(), WS_POPUP, 0, 0, 0, 0,
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+        if hwnd.is_null() {
+            return;
+        }
+        let handler: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = proc;
+        let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, handler as usize as isize);
+        PREVIOUS.store(previous, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(windows))]
+fn watch_session_end() {}
+
+/// A clean quit does not count against a version on probation. Once per process: a session end
+/// and the quit that follows it are one exit.
 pub fn clean_exit() {
-    update::guard::clean_exit(&neuron::runroot::run_root(), &Version::current());
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::SeqCst) {
+        update::guard::clean_exit(&neuron::runroot::run_root(), &Version::current());
+    }
 }
 
 fn now_unix() -> u64 {
@@ -507,15 +568,23 @@ struct Worker {
     view: View,
     launched: u64,
     cancel: AtomicBool,
+    /// An install is under way: probation is this worker's to write.
+    owns_guard: bool,
 }
 
 impl Worker {
     fn new(engine: Engine) -> Self {
         let rec = Record::load(&engine.run_root);
-        Self { engine, rec, offer: None, view: View { enabled: true, ..View::default() }, launched: now_unix(), cancel: AtomicBool::new(false) }
+        Self { engine, rec, offer: None, view: View { enabled: true, ..View::default() }, launched: now_unix(), cancel: AtomicBool::new(false), owns_guard: false }
     }
 
-    fn save(&self) {
+    /// Save the record, keeping what the launch guard wrote since this worker loaded it, unless
+    /// this worker is the one installing (it then writes probation itself).
+    fn save(&mut self) {
+        if !self.owns_guard {
+            let disk = Record::load(&self.engine.run_root);
+            self.rec.adopt_guard(&disk);
+        }
         if let Err(e) = self.rec.save(&self.engine.run_root) {
             crate::flight::trace("update", "state not saved", 0);
             eprintln!("neuron: update state not saved: {e}");
@@ -563,7 +632,7 @@ impl Worker {
         if let Some(rb) = update::guard::take_rollback_notice(&self.engine.run_root, &self.engine.current) {
             crate::flight::trace("update", "rolled back a version that did not start", 0);
             self.view.phase = "rolled-back";
-            self.view.version = rb.from.clone();
+            self.view.version.clone_from(&rb.from);
             self.view.status = format!("{} rolled back{}", rb.from, if rb.crash_log.is_empty() { String::new() } else { format!(" · crash log in {}", rb.crash_log) });
             *RELEASE_URL.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = REPORT.into();
         }
@@ -598,7 +667,7 @@ impl Worker {
                 return std::mem::take(&mut *g);
             }
             let now = now_unix();
-            if crate::prefs::update_auto() && now >= due {
+            if !PREVIEW.load(Ordering::SeqCst) && crate::prefs::update_auto() && now >= due {
                 return Requests::default();
             }
             let nap = Duration::from_secs(due.saturating_sub(now).max(1)).min(MAX_NAP);
@@ -650,7 +719,10 @@ impl Worker {
             Err(e) => {
                 crate::flight::trace("update", "check refused a release", 0);
                 eprintln!("neuron: update check: {e}");
-                self.view.status = format!("latest release refused: {}", e.short());
+                self.view.status = match &e {
+                    client::Error::Io(_) | client::Error::DiskFull => format!("update folder: {}", e.short()),
+                    _ => format!("latest release refused: {}", e.short()),
+                };
                 if manual {
                     self.view.phase = "error";
                     self.view.error = e.short();
@@ -733,9 +805,8 @@ impl Worker {
                 }
             };
             result = self.engine.download(&offer, &mut progress, &self.cancel);
-            match &result {
-                Err(e) if e.transient() => continue,
-                _ => break,
+            if !matches!(&result, Err(e) if e.transient()) {
+                break;
             }
         }
         match result {
@@ -758,6 +829,7 @@ impl Worker {
     }
 
     fn fail(&mut self, reason: String) {
+        self.owns_guard = true;
         self.rec.pending = None;
         if let Some(p) = self.rec.probation.take() {
             let _ = std::fs::remove_dir_all(p.kept);
@@ -777,6 +849,7 @@ impl Worker {
         }
         self.view.phase = "installing";
         self.publish();
+        self.owns_guard = true;
         let handoff = match self.engine.prepare_install(&offer, &exe_dir(), std::process::id(), true, &mut self.rec) {
             Ok(h) => h,
             Err(e) => return self.fail(e.short()),
@@ -803,8 +876,10 @@ impl Worker {
             let _ = std::fs::write(&p.outcome, code.to_string());
         }
         if code == 0 {
-            self.view.phase = "error";
-            self.view.error = "installed · restart neuron".into();
+            // Setup finished without needing this process gone: the new files are in place and
+            // a restart picks them up
+            self.view.phase = "installed";
+            self.view.error.clear();
             self.publish();
         } else {
             self.fail(install::setup_exit_reason(code));

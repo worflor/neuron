@@ -28,7 +28,9 @@ yes for ordinary binds: use **INPUT** to connect a button or gesture to a suppor
 
 ### how do i update it?
 
-if you used the installer, download and run the newer setup from [Releases](https://github.com/worflor/neuron/releases/latest). your settings are kept separately in `%LOCALAPPDATA%\neuron`.
+from 0.1.8 on, neuron does it for you. when a newer release is out, a small pill shows up in the header and a line in the tray: click `& install` (or the tray line) and it downloads, checks, installs and restarts, keeping your settings. click the version first to read what's new. `neuron update status`, `check` and `install` do the same from a terminal. it's off for source builds and Steam copies, and `NEURON_NO_UPDATE` turns it off anywhere.
+
+by hand: if you used the installer, download and run the newer setup from [Releases](https://github.com/worflor/neuron/releases/latest). your settings are kept separately in `%LOCALAPPDATA%\neuron`.
 
 if you're using the portable ZIP, open PowerShell in the folder containing `neuron-app.exe`. the bundled updater works on its own, without installing anything else:
 

@@ -203,9 +203,7 @@ pub fn take_rollback_notice(run_root: &Path, current: &Version) -> Option<Rolled
     Some(rb)
 }
 
-fn ps_literal(p: &Path) -> String {
-    format!("'{}'", p.to_string_lossy().replace('\'', "''"))
-}
+use super::install::ps_literal;
 
 fn sh_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
@@ -243,8 +241,9 @@ pub fn restore_plan(kept: &Path, install_dir: &Path, work: &Path, pid: u32, rela
         })
     } else {
         let body = format!(
-            "trap '' HUP; while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; cp -a {kept}/. {dir}/; echo $? > {out}; \
+            "trap '' HUP; {wait} cp -a {kept}/. {dir}/; echo $? > {out}; \
              if {relaunch}; then cd {dir} && nohup ./neuron-app >/dev/null 2>&1 & fi",
+            wait = super::install::sh_wait_for(pid),
             kept = sh_quote(kept),
             dir = sh_quote(install_dir),
             out = sh_quote(&outcome),
@@ -262,6 +261,10 @@ pub fn begin_probation(st: &mut State, from: &Version, to: &Version, kept: &Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A process id no process holds, so a restore's wait for the old app ends at once. (pid 1
+    /// never exits, and as root a wait for it never ended.)
+    const GONE: u32 = 0x7fff_fffe;
 
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("neuron-guard-{tag}-{}", std::process::id()));
@@ -298,9 +301,9 @@ mod tests {
         let crash = root.join("neuron-crash.log");
         std::fs::write(&crash, "[panic] boom").unwrap();
         let new = v("0.1.8");
-        assert_eq!(on_launch(&root, &new, &install, 1, &crash, false), Verdict::Probation, "first start");
-        assert_eq!(on_launch(&root, &new, &install, 1, &crash, false), Verdict::Probation, "phoenix restart");
-        let Verdict::RollBack(handoff) = on_launch(&root, &new, &install, 1, &crash, false) else { panic!("third start rolls back") };
+        assert_eq!(on_launch(&root, &new, &install, GONE, &crash, false), Verdict::Probation, "first start");
+        assert_eq!(on_launch(&root, &new, &install, GONE, &crash, false), Verdict::Probation, "phoenix restart");
+        let Verdict::RollBack(handoff) = on_launch(&root, &new, &install, GONE, &crash, false) else { panic!("third start rolls back") };
         assert!(handoff.self_quit);
         let st = State::load(&root);
         assert_eq!(st.skip.as_deref(), Some("0.1.8"));
@@ -319,7 +322,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(install.join("app.toml")).unwrap(), "config = 1", "config is never touched");
 
         let old = v("0.1.7");
-        assert_eq!(on_launch(&root, &old, &install, 1, &crash, false), Verdict::Continue);
+        assert_eq!(on_launch(&root, &old, &install, GONE, &crash, false), Verdict::Continue);
         let notice = take_rollback_notice(&root, &old).unwrap();
         assert_eq!(notice.from, "0.1.8");
         assert!(!kept.exists(), "the kept copy goes once the restore is confirmed");
@@ -336,14 +339,14 @@ mod tests {
         st.save(&root).unwrap();
         let new = v("0.1.8");
         let crash = root.join("none.log");
-        assert_eq!(on_launch(&root, &new, &install, 1, &crash, false), Verdict::Probation);
+        assert_eq!(on_launch(&root, &new, &install, GONE, &crash, false), Verdict::Probation);
         clean_exit(&root, &new);
-        assert_eq!(on_launch(&root, &new, &install, 1, &crash, false), Verdict::Probation);
-        assert_eq!(on_launch(&root, &new, &install, 1, &crash, false), Verdict::Probation, "a clean exit did not count");
+        assert_eq!(on_launch(&root, &new, &install, GONE, &crash, false), Verdict::Probation);
+        assert_eq!(on_launch(&root, &new, &install, GONE, &crash, false), Verdict::Probation, "a clean exit did not count");
         assert!(proved_healthy(&root, &new));
         assert!(!kept.exists());
         assert!(State::load(&root).probation.is_none());
-        assert_eq!(on_launch(&root, &new, &install, 1, &crash, false), Verdict::Continue);
+        assert_eq!(on_launch(&root, &new, &install, GONE, &crash, false), Verdict::Continue);
         assert_eq!(std::fs::read_to_string(install.join("neuron-app.exe")).unwrap(), "new");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -355,7 +358,7 @@ mod tests {
         let mut st = State::default();
         begin_probation(&mut st, &v("0.1.7"), &v("0.1.8"), &kept);
         st.save(&root).unwrap();
-        assert_eq!(on_launch(&root, &v("0.1.7"), &install, 1, &root.join("x"), false), Verdict::Continue);
+        assert_eq!(on_launch(&root, &v("0.1.7"), &install, GONE, &root.join("x"), false), Verdict::Continue);
         assert!(!kept.exists());
         assert!(State::load(&root).probation.is_none());
         let _ = std::fs::remove_dir_all(&root);

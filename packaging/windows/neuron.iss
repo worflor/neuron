@@ -59,8 +59,13 @@ var
 
 function PowerShellLiteral(Value: String): String;
 begin
+  // PowerShell also ends a single-quoted string on the typographic single quotes: double each.
   Result := Value;
   StringChangeEx(Result, '''', '''''', True);
+  StringChangeEx(Result, #$2018, #$2018#$2018, True);
+  StringChangeEx(Result, #$2019, #$2019#$2019, True);
+  StringChangeEx(Result, #$201A, #$201A#$201A, True);
+  StringChangeEx(Result, #$201B, #$201B#$201B, True);
   Result := '''' + Result + '''';
 end;
 

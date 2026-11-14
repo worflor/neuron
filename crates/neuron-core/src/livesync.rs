@@ -325,35 +325,49 @@ pub fn publish_app_root() {
 ", std::process::id(), root.display()));
 }
 
-/// CLI side: the pid of a live app that published this run root, if there is one.
+/// CLI side: the pid of a live app that published this run root, if there is one. A pid the
+/// system has since given to another program does not count: the process must be neuron's app.
 #[must_use]
 pub fn app_on_this_root() -> Option<u32> {
     let text = std::fs::read_to_string(app_pid_path()).ok()?;
     let pid: u32 = text.lines().next()?.trim().parse().ok()?;
-    pid_alive(pid).then_some(pid)
+    // this very process counts too: a test (or a tool) publishing itself is still the publisher
+    (pid == std::process::id() || pid_alive(pid)).then_some(pid)
+}
+
+/// Whether a program file's name is the app's (`neuron-app`, `neuron-app.exe`). Linux marks a
+/// running program whose file was replaced (an update) with " (deleted)".
+fn is_app_image(path: &str) -> bool {
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    std::path::Path::new(path).file_stem().is_some_and(|s| s.eq_ignore_ascii_case("neuron-app"))
 }
 
 #[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
     const STILL_ACTIVE: u32 = 259;
-    // SAFETY: a failed open returns null and is not used; a valid handle is closed exactly once.
+    // SAFETY: a failed open returns null and is not used; the name buffer is writable for the
+    // length passed; a valid handle is closed exactly once.
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
             return false;
         }
         let mut code = 0u32;
-        let ok = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE;
+        let alive = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let named = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &raw mut len) != 0
+            && is_app_image(&String::from_utf16_lossy(&buf[..len as usize]));
         CloseHandle(h);
-        ok
+        alive && named
     }
 }
 
 #[cfg(not(windows))]
 fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| is_app_image(&exe.to_string_lossy()))
 }
 
 /// Is a command waiting to be claimed?
@@ -406,6 +420,13 @@ pub fn notify_app(cmd: &Command, wait: Duration) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_apps_own_program_counts_as_the_app() {
+        assert!(is_app_image("C:/Program Files/Neuron/neuron-app.exe"));
+        assert!(is_app_image("/opt/neuron/neuron-app (deleted)"));
+        assert!(!is_app_image("C:/Windows/notepad.exe") && !is_app_image("/usr/bin/neuron"));
+    }
 
     #[test]
     fn commands_round_trip_in_order_and_the_claim_empties_the_queue() {
