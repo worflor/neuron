@@ -3,8 +3,8 @@
 ## the quick version
 
 - **Windows beta:** this is the release you can download today. i use it instead of Synapse on my Naga V2 Pro and BlackWidow Chroma V2.
-- **Other Razer devices:** not all verified. identification, successful reads and actual working controls are different things.
-- **Beyond Razer:** a PowerA gamepad has been tested for input and rumble on Windows. Logitech HID++ discovery is experimental and read-only, without hardware verification.
+- **Other Razer devices:** many are detected and partly work. detected isn't the same as tested, so the tables below say what's been checked on what.
+- **Beyond Razer:** gamepads, spellweaving, the radial, app profiles, clipboard tools and window actions run on ordinary Windows input, not device commands, so they don't depend on your gear's brand. a PowerA gamepad has been tested for input and rumble on Windows. Logitech HID++ discovery is experimental and read-only, without hardware verification.
 - **Linux:** the app and CLI build from source, but no Linux package or native Razer HID test yet. **macOS:** no backend yet.
 - **Got different hardware?** [share what works](https://github.com/worflor/neuron/issues/new?template=device_report.yml), or [collect evidence yourself](reference/COMPATIBILITY-LAB.md#try-it-yourself).
 
