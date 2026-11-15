@@ -2,7 +2,7 @@
 
 ## the quick version
 
-- **Windows beta:** this is the release you can download today. i use it instead of Synapse on my Naga V2 Pro and BlackWidow Chroma V2.
+- **Windows beta:** this is the release you can download today. i use it on my Naga V2 Pro and BlackWidow Chroma V2 and don't run Synapse.
 - **Other Razer devices:** many are detected and partly work. detected isn't the same as tested, so the tables below say what's been checked on what.
 - **Beyond Razer:** gamepads, spellweaving, the radial, app profiles, clipboard tools and window actions run on ordinary Windows input, not device commands, so they don't depend on your gear's brand. a PowerA gamepad has been tested for input and rumble on Windows. Logitech HID++ discovery is experimental and read-only, without hardware verification.
 - **Linux:** the app and CLI build from source, but no Linux package or native Razer HID test yet. **macOS:** no backend yet.
@@ -12,7 +12,7 @@ The current downloadable release is [v0.1.8](https://github.com/worflor/neuron/r
 
 The Compatibility Lab was checked against 30 HID collections across six Windows device groups and an unrelated ITE device (`0b05:1866`). This verifies descriptor inventory and reviewable export, not device command support. Passive input capture and Linux hardware collection still need physical testing. [How the Lab works](reference/COMPATIBILITY-LAB.md).
 
-Lighting scene changes now dissolve through the persistent base renderer. Software regressions cover interrupted edits, renderer state and local/host parity; live LED fades have been checked on the owner's Windows setup. Other hardware and game coexistence still need verification.
+Lighting scene changes dissolve through the persistent base renderer. Software regressions cover interrupted edits, renderer state and local/host parity; live LED fades have been checked on the owner's Windows setup. Other hardware and game coexistence still need verification.
 
 The table below grades what actually works. [The README](../README.md#honesty-proven-gated-absent) has the device-write ledger.
 
@@ -26,6 +26,17 @@ The table below grades what actually works. [The README](../README.md#honesty-pr
 A row's grade changes only with evidence: name the hardware, the platform and the date, and
 say what is still unverified. Mock and software-renderer results are recorded as such and never
 raise a grade on their own. What changed in each release is in [`CHANGELOG.md`](../CHANGELOG.md).
+
+## Your devices
+
+reports from people trying neuron on hardware i don't have. each one is how a device gets supported, so thank you.
+
+| device | reported by | what they saw | since then |
+|---|---|---|---|
+| BlackWidow V4 X (wired) | [@shinobun33t](https://github.com/worflor/neuron/issues/23), 2026-10-15 | detected; lighting and M keys didn't work | v0.1.7 fixes the M keys on a keyboard picked up after launch and the lighting region its generated file used. not yet retried on a V4 X |
+| BlackWidow V3 (wired) | [@kurakanai](https://github.com/worflor/neuron/issues/33), 2026-11-01 | hardware game mode worked; lighting and macros didn't | v0.1.7 fixes the lighting region for its protocol. not yet retried on a V3 |
+
+got one of these, or something else? [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml). on `main` (not in v0.1.8), a device neuron learned on its own shows **learned · tell me what works** on its row, which opens that report with the device filled in.
 
 ## Feature status
 

@@ -24,13 +24,13 @@ neuron can import supported plaintext Synapse exports. encrypted cloud-only prof
 
 ### do i need Razer gear?
 
-not for a lot of it. gamepads, spellweaving and the radial, app-aware profile switching, clipboard pockets and transforms, window, audio and screenshot actions, and macros work with whatever mouse, keyboard or pad you have. device settings like DPI and polling, and per-key lighting, need supported Razer hardware.
+not for a lot of it. gamepads, spellweaving and the radial, app-aware profile switching, clipboard pockets and transforms, window, audio and screenshot actions, and macros run on ordinary Windows input, so they don't care what brand your gear is. device settings like DPI and polling, and per-key lighting, need supported Razer hardware.
 
 ### does it work with anti-cheat?
 
-yes. neuron has no kernel driver and doesn't inject anything into games or read their memory. it listens to your input through Windows and talks to your devices the same way Synapse does. Chroma games paint through neuron using the same Chroma interface they use with Synapse.
+neuron itself won't get you banned. it has no kernel driver, injects nothing into games and reads no game memory. it listens to your input through Windows and talks to your devices the same way Synapse does.
 
-binds your device can do itself are written to the device; the rest go out as ordinary Windows key and mouse input, like any macro tool. so what's left is the game's own rules: if a game bans macros, that covers macros from any app, and some competitive games don't allow snap tap on keyboards that support it. the app marks snap tap that way where you turn it on.
+what you do with it is on you. a bind or macro that plays the game for you is cheating, whatever app sends it. snap tap is a hardware feature on keyboards that support it, and whether it's allowed is up to each game's anti-cheat; the app says so where you turn it on.
 
 ### can i remap buttons and make macros without writing code?
 

@@ -8,7 +8,7 @@ i don't run Synapse anymore. neuron handles my Naga V2 Pro and BlackWidow Chroma
 
 **more than a replacement.** layered reactive lighting, Python macros, app-aware binds, radial menus and gesture controls. it's the Synapse stuff i needed, plus the things i always wanted.
 
-**not just for Razer.** gamepads, the radial, spellweaving, app-aware profiles, clipboard tools and window actions work with whatever mouse, keyboard or pad you have. Razer hardware gets device controls and lighting on top. [here's what works on what](docs/STATUS.md).
+**not just for Razer.** gamepads, the radial, spellweaving, app-aware profiles, clipboard tools and window actions run on ordinary Windows input, so they don't care what brand your mouse, keyboard or pad is. Razer hardware gets device controls and lighting on top. [here's what works on what](docs/STATUS.md).
 
 **[download for Windows](https://github.com/worflor/neuron/releases/latest)** · [FAQ & manual help](docs/FAQ.md) · [check device support](docs/STATUS.md) · [help test yours](#help-neuron-on-your-hardware)
 
@@ -35,7 +35,7 @@ i wanted the basic stuff to work without an account, background clutter or havin
 
 everything in neuron is **one primitive**. *something happened* (a `Trigger`) so *do this* (an `Action`). that's the magic. a button press, a drawn glyph, a radial flick, the foreground app changing, a tap on your mic, a held hypershift layer are all `Trigger`s; a keystroke, a macro, a dpi cycle, a profile switch, a python script, "teleport to the other monitor" are all `Action`s.
 
-that isn't a description of the architecture, it's the reason the thing is worth building. because a drawn glyph and a button press are *the same kind of event*, anything you can bind to one you can bind to the other, and a new input source doesn't need a new pipeline to hang off. there is exactly one dispatch engine in here.
+because a drawn glyph and a button press are *the same kind of event*, anything you can bind to one you can bind to the other, and a new input source doesn't need a new pipeline to hang off. there is exactly one dispatch engine in here.
 
 **press-to-bind anything and everything**: don't like my setup? make it yours.
 
@@ -115,10 +115,10 @@ neuron can change hardware settings, send input and run Python. the boring safet
 </tr>
 </table>
 
-- **[input has a switch](docs/GDD.md#the-arm-gate).** a normal Windows launch arms live binds when the input engine starts. `--safe` keeps input disarmed and device writes paused. disarming is instant; turning input back on manually asks first. tests can't arm real input.
+- **[input has a switch](docs/GDD.md#the-arm-gate).** a normal Windows launch arms live binds when the input engine starts. `--safe` keeps input disarmed and device writes paused. disarming is instant; turning input back on manually asks first.
 - **[hardware changes get checked](docs/GDD.md#writes-that-verify-themselves).** settings like DPI and polling check back with your device to confirm what landed. anything neuron isn't sure your hardware supports stays locked unless you explicitly opt in.
 - **[notifications are yours](docs/GDD.md#confirmations).** on-screen cards tell you when supported changes land. move them, quiet them, or turn them off entirely.
-- **[fine with anti-cheat](docs/FAQ.md#does-it-work-with-anti-cheat).** no kernel driver, nothing injected into games. neuron listens to your input and talks to your devices the same way Synapse does.
+- **[stays out of your games](docs/FAQ.md#does-it-work-with-anti-cheat).** no kernel driver, nothing injected into games, no game memory read. neuron listens to your input and talks to your devices the same way Synapse does.
 
 and if you turn on RAW Python macros, they run with your Windows account's full permissions, not inside a sandbox. [here's the actual security model](SECURITY.md).
 
@@ -230,7 +230,7 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 [the full status page](docs/STATUS.md) tracks feature maturity and hardware testing; the [protocol ledger](crates/neuron-core/protocol/ledger.toml) holds the byte-level evidence.
 
-Linux builds from source but still needs native Razer hardware testing. [OpenRazer](https://github.com/openrazer/openrazer) is the mature Linux option for now; [OpenRGB](https://openrgb.org) covers broader RGB hardware. Neuron's Logitech HID++ discovery remains experimental and read-only.
+linux builds from source but still needs native Razer hardware testing. [OpenRazer](https://github.com/openrazer/openrazer) is the mature Linux option for now; [OpenRGB](https://openrgb.org) covers broader RGB hardware. neuron's Logitech HID++ discovery is experimental and read-only.
 
 | capability | status |
 |---|---|
@@ -247,13 +247,13 @@ Linux builds from source but still needs native Razer hardware testing. [OpenRaz
 
 things it doesn't do, so you know before you install:
 
-- **doesn't crack synapse's encrypted cloud profiles.** the encrypted account cache stays untouched; migration reads the plaintext *export* Synapse makes for you.
+- **can't read synapse's encrypted cloud profiles.** import uses the plaintext *export* Synapse makes for you.
 - **doesn't sandbox RAW macros.** BOUND macros run in a restricted Python mode; RAW ones can do anything your Windows account can, so only run RAW code you trust.
-- **no telemetry, account, or cloud.** Luma-T runs completely offline too.
+- **no telemetry, account, or cloud.** Luma-T runs completely offline too. the one thing neuron asks the internet is whether a newer release is out, and `NEURON_NO_UPDATE` turns that off.
 
 ## philosophy / non-goals
 
-- do what's asked, change nothing else; if neuron doesn't know something about your hardware, it says so instead of guessing.
+- do what's asked, change nothing else; if neuron doesn't know something about your hardware, it says so and doesn't guess.
 - lean is a feature. every background cost has to earn itself, and extra features only ship if they stay deliberate and low-level.
 - novelty done well (spellweaving, radial, the open effects engine, Luma-T) is the fun. reheated gimmicks are not.
 - started on my desk. i'm building the tools to make it work on more of yours, one verified device at a time.
