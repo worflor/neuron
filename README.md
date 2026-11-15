@@ -73,7 +73,7 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 
 yes, the app built to escape a 2GB mouse driver now has an AI in the colour picker.
 
-**[Luma-T](docs/GDD.md#lighting)** is a 663k-parameter generative colour model built right into neuron, designed to collaborate with you while you edit and play with your lighting. it doesn't even need a GPU or an internet connection. two small models work side by side in real time: a **592k colour model** that imagines where your palette could go next, and a **70k taste model** that decides what's actually worth showing you.
+**[Luma-T](docs/GDD.md#lighting)** is a 663k-parameter generative colour model built right into neuron, designed to collaborate with you while you edit and play with your lighting. it doesn't even need a GPU or an internet connection. two small models work side by side in real time: a **592k colour model** that imagines where your palette could go next, and a **70k taste model** that decides what's actually worth showing you. both fit in under 3 MB.
 
 - **see what it's thinking.** colours that feel out of place get an amber squiggle, like a spellchecker's. behind the colour square, faint contour rings trace where stronger fits live, and hills along the hue bar point toward matching hues.
 - **preview in an instant.** auto-predict suggestions for the colour you're editing land right inside the square as dots; full-palette adjustments appear as pills underneath. hover to try them live across your palette and gear, click to keep (or from the keyboard: `Tab` to preview, `Tab` or `Enter` to keep), `Esc` to let go, or `hold` any colour to lock it down.
