@@ -981,6 +981,8 @@ export global State {
     callback toggle-writes-paused();
     callback toggle-input-armed();                    // SAFE-MODE: arm/disarm real input synthesis
     callback open-config-dir();
+    callback open-repo();                             // neuron's GitHub page, from the SYSTEM nameplate
+    callback report-device(string, string);           // (name, link mode) -> the device report form, filled in
 
     // PURGE SYNAPSE — kill every Razer Synapse process + demote its respawning services to manual.
     // Razer's slopware is a hydra (Synapse 3 esp.); this button sets the SYSTEM services to demand-start

@@ -2273,6 +2273,92 @@ export component InputHead inherits HorizontalLayout {
     }
 }
 
+// The GitHub star key: a quiet outline at rest. Pointed at, the star leans toward the pointer and
+// fills with Luma-T's gold; pressed, it squeezes; clicked, it turns one point (the shape lands on
+// itself) and throws a brief ring of sparks. Nothing runs at rest.
+export component StarKey inherits Rectangle {
+    in property <string> text: "star on GitHub";
+    callback clicked();
+    property <color> gold: #f5c542;
+    property <bool> hot: ta.has-hover;
+    // the star's centre along the key, and how far the pointer sits from it, -1..1
+    property <length> mid: 8px + 7px;
+    property <float> lean: root.hot ? clamp((ta.mouse-x - root.mid) / 48px, -1, 1) : 0;
+    property <int> turns: 0;
+    // a click's burst: 0..1 through it while it runs; the clock is read only then
+    property <bool> bursting: false;
+    property <duration> burst-at: 0ms;
+    property <float> burst: root.bursting ? clamp((animation-tick() - root.burst-at) / 520ms, 0, 1) : 1;
+    horizontal-stretch: 0;
+    width: lay.preferred-width;
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    border-color: root.hot ? Theme.text-faint : Theme.line;
+    background: ta.pressed ? Theme.well-hi : root.hot ? Theme.well : transparent;
+    animate background, border-color { duration: root.hot ? Theme.hover-in : Theme.hover-out; }
+    Timer {
+        interval: 540ms;
+        running: root.bursting;
+        triggered => { root.bursting = false; }
+    }
+    lay := HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 10px;
+        spacing: 7px;
+        Rectangle {
+            width: 14px;
+            // the sparks leave from the gaps between the star's points, just outside its edge
+            for k in 5 : Rectangle {
+                property <angle> at: k * 72deg - 54deg;
+                property <length> reach: 7px + 8px * (1 - (1 - root.burst) * (1 - root.burst));
+                x: parent.width / 2 + cos(self.at) * self.reach - 1.5px;
+                y: parent.height / 2 + sin(self.at) * self.reach - 1.5px;
+                width: 3px;
+                height: 3px;
+                border-radius: 1.5px;
+                background: root.gold;
+                opacity: root.bursting ? 1 - root.burst * root.burst : 0;
+            }
+            Path {
+                y: (parent.height - self.height) / 2;
+                width: 14px;
+                height: 14px;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: "M12 2.6 L14.8 8.8 L21.5 9.5 L16.4 14 L17.9 20.6 L12 17.2 L6.1 20.6 L7.6 14 L2.5 9.5 L9.2 8.8 Z";
+                fill: root.hot ? root.gold : transparent;
+                stroke: root.hot ? root.gold : Theme.text-dim;
+                stroke-width: 1.3px;
+                transform-origin: { x: self.width / 2, y: self.height / 2 };
+                transform-rotation: root.lean * 14deg + root.turns * 72deg;
+                transform-scale-x: ta.pressed ? 84% : root.hot ? 116% : 100%;
+                transform-scale-y: ta.pressed ? 84% : root.hot ? 116% : 100%;
+                animate fill, stroke { duration: Theme.settle; }
+                animate transform-rotation { duration: 520ms; easing: ease-out; }
+                animate transform-scale-x, transform-scale-y { duration: 160ms; easing: ease-out; }
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.hot ? Theme.text : Theme.text-mid;
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+            vertical-alignment: center;
+            animate color { duration: Theme.settle; }
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            root.turns += 1;
+            root.burst-at = animation-tick();
+            root.bursting = true;
+            root.clicked();
+        }
+    }
+}
+
 // THE GUIDE CHIP — opens an in-app GUIDE popup anchored at itself. A tiny hand-drawn BOOK with a "?"
 // resting on its cover, in a tight, hairline-framed cell, using the SAME chip language as Pill / Contact
 // (radius-sm, accent-glow fill + accent-line border when lit) so it reads as a real instrument control,

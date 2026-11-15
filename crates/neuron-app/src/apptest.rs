@@ -2216,6 +2216,86 @@ fn the_real_release_notes_draw_in_the_update_drawer() {
     frame("update-real-notes-short");
 }
 
+/// A device neuron learned on its own asks what works on its row, and the SYSTEM nameplate's star
+/// key draws at rest, under the pointer, pressed and mid-spark, at the window's minimum width and a
+/// wide one. The glue is left unbound, so a click opens nothing.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn learned_device_ask_and_star_key_draw_and_fit() {
+    use crate::ui::DeviceRow;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use slint::LogicalPosition;
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let st = app.global::<State>();
+    let row = DeviceRow {
+        name: "Razer BlackWidow V4 X Tenkeyless HyperSpeed".into(),
+        pid: "02a5".into(),
+        mode: "wired".into(),
+        icon: "keyboard".into(),
+        kind: "keyboard".into(),
+        id: "unit-1".into(),
+        connected: true,
+        learned: true,
+        ..Default::default()
+    };
+    st.set_devices(slint::ModelRc::new(slint::VecModel::from(vec![row])));
+    st.set_selected_device(0);
+    st.set_app_version("0.1.8".into());
+    st.set_window_shown(true);
+    let shots = std::env::var_os("NEURON_INSPECTOR_SHOTS").map(std::path::PathBuf::from);
+    let settle = |app: &AppWindow, name: &str| {
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(70));
+            slint::platform::update_timers_and_animations();
+        }
+        let f = snap(app).expect("a frame is drawn");
+        if let Some(dir) = &shots {
+            std::fs::create_dir_all(dir).unwrap();
+            image::save_buffer(dir.join(format!("{name}.png")), f.as_bytes(), f.width(), f.height(), image::ColorType::Rgba8).unwrap();
+        }
+    };
+    for width in [900.0, 1240.0] {
+        app.window().set_size(slint::LogicalSize::new(width, 800.0));
+        app.show().expect("show the window");
+        st.set_page(0);
+        settle(&app, &format!("learned-row-{width}"));
+        let (ax, ay, aw, ah) = crate::uifit::rect_of(app.window(), "AskWhatWorks").expect("the ask is on the learned row");
+        for x in [ax + 2.0, ax + aw / 2.0, ax + aw - 2.0] {
+            app.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(x, ay + ah / 2.0) });
+            snap(&app).expect("a hovered ask frame is drawn");
+        }
+        app.window().dispatch_event(WindowEvent::PointerExited);
+
+        st.set_page(3);
+        settle(&app, "system-top");
+        app.window().dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(width / 2.0, 400.0), delta_x: 0.0, delta_y: -20000.0 });
+        settle(&app, &format!("star-rest-{width}"));
+        let (sx, sy, sw, sh) = crate::uifit::rect_of(app.window(), "StarKey").expect("the star key is in the nameplate");
+        // the star follows the pointer across the key, then is pressed and clicked
+        for x in [sx + 2.0, sx + 14.0, sx + sw / 2.0, sx + sw - 2.0] {
+            app.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(x, sy + sh / 2.0) });
+            snap(&app).expect("a hovered star frame is drawn");
+        }
+        settle(&app, &format!("star-hover-{width}"));
+        let at = LogicalPosition::new(sx + sw / 2.0, sy + sh / 2.0);
+        app.window().dispatch_event(WindowEvent::PointerPressed { position: at, button: PointerEventButton::Left });
+        settle(&app, &format!("star-pressed-{width}"));
+        app.window().dispatch_event(WindowEvent::PointerReleased { position: at, button: PointerEventButton::Left });
+        for i in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            slint::platform::update_timers_and_animations();
+            let f = snap(&app).expect("a spark frame is drawn");
+            if let Some(dir) = &shots {
+                image::save_buffer(dir.join(format!("star-spark-{width}-{i}.png")), f.as_bytes(), f.width(), f.height(), image::ColorType::Rgba8).unwrap();
+            }
+        }
+        app.window().dispatch_event(WindowEvent::PointerExited);
+        settle(&app, &format!("star-after-{width}"));
+    }
+}
+
 /// Every SYSTEM group, jumped to from the page's index and drawn with long data, at the window's
 /// minimum width and a wide one.
 #[test]

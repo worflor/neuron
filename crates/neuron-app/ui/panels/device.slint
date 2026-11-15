@@ -191,6 +191,32 @@ component FeelTile inherits Rectangle {
     }
 }
 
+// The ask on a device neuron learned on its own: one click opens the device report with this
+// device already filled in.
+component AskWhatWorks inherits Rectangle {
+    callback clicked();
+    // it gives way before the row does: in a narrow column it elides and the row keeps its width
+    horizontal-stretch: 0;
+    min-width: 0;
+    preferred-width: lbl.preferred-width;
+    clip: true;
+    lbl := Text {
+        width: parent.width;
+        height: parent.height;
+        overflow: elide;
+        text: "learned · tell me what works";
+        color: ta.has-hover ? Theme.accent : Theme.accent-dim;
+        font-size: Theme.fs-small;
+        font-family: Theme.mono;
+        vertical-alignment: center;
+        animate color { duration: ta.has-hover ? Theme.hover-in : Theme.hover-out; }
+    }
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // One device channel — flat strip; a phosphor index tick marks the selected one.
 component DeviceLine inherits Rectangle {
     in property <DeviceRow> d;
@@ -278,17 +304,24 @@ component DeviceLine inherits Rectangle {
                         weight: 700;
                         tracking: Theme.track-1;
                     }
-                    SheenText {
-                        value: root.d.pid != ""
-                            ? "pid " + root.d.pid + (root.d.mode != "" ? " · " + root.d.mode : "")
-                              + (root.lone-fw && root.d.firmware != "" && root.d.firmware != "—"
-                                  ? " · fw " + root.d.firmware : "")
-                            : root.d.detail;
-                        live: root.sheen-live;
-                        ink: Theme.text-faint;
-                        size: Theme.fs-small;
-                        weight: 400;
-                        tracking: 0px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        SheenText {
+                            value: root.d.pid != ""
+                                ? "pid " + root.d.pid + (root.d.mode != "" ? " · " + root.d.mode : "")
+                                  + (root.lone-fw && root.d.firmware != "" && root.d.firmware != "—"
+                                      ? " · fw " + root.d.firmware : "")
+                                : root.d.detail;
+                            live: root.sheen-live;
+                            ink: Theme.text-faint;
+                            size: Theme.fs-small;
+                            weight: 400;
+                            tracking: 0px;
+                        }
+                        // a device neuron learned on its own asks, right here, what works on it
+                        if root.d.learned && !root.d.adopting : AskWhatWorks {
+                            clicked => { State.report-device(root.d.name, root.d.mode); }
+                        }
                     }
                 }
             }
@@ -1055,9 +1088,9 @@ export component DevicePanel inherits VerticalLayout {
             // a width FLOOR for the list. The cards now report ~0 preferred width (their content lives
             // in a preferred-0 Flickable so it can't inflate the column), which is what stops the row
             // overflowing into FEEL — but it also means the column would otherwise collapse toward
-            // FEEL's larger preferred. This floor keeps the list the wide 2/3 it's meant to be: 440 +
-            // FEEL's 340 + the 24 gutter = 804, inside the 856 work area at the 900px-min window.
-            min-width: 440px;
+            // FEEL's larger preferred. This floor keeps the list wide: 420 + FEEL's 410 + the 24
+            // gutter = 854, inside the 856 work area at the 900px-min window.
+            min-width: 420px;
             if State.devices.length == 0 : VerticalLayout {
                 padding-top: 24px; spacing: 6px;
                 Mono { text: "no recognized Razer devices"; color: Theme.text-dim; }

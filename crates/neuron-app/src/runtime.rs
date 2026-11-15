@@ -91,6 +91,9 @@ pub struct DeviceState {
     /// hardware whose functional face already sits in the device list, so they moved out of the row
     /// model entirely and became one dim FOOTNOTE line: see `AppRuntime::unclaimed`.)
     pub adopting: bool,
+    /// Its definition was synthesized here (`devices/auto/`), not curated: neuron learned it on
+    /// its own and nobody has confirmed what works on it.
+    pub learned: bool,
 }
 
 /// One live lighting stream's controls, owned PER-DEVICE in [`AppRuntime::anim`]: the stop flag its
@@ -2150,6 +2153,7 @@ fn learning_row(i: &transport::HidDeviceInfo, family: &str, instance: String) ->
         cap_plate: false,
         cap_game_mode: false,
         adopting: true,
+        learned: false,
     }
 }
 
@@ -2200,6 +2204,7 @@ fn placeholder_row(
         cap_plate: false,
         cap_game_mode: false,
         adopting: true,
+        learned: false,
     }
 }
 
@@ -2347,6 +2352,7 @@ fn read_device_state(
         cap_plate: def.has_side_plates(),
         cap_game_mode: def.supports(neuron::registry::Capability::SetGameMode),
         adopting: false,
+        learned: def.origin == neuron::registry::DefOrigin::Auto,
     };
     // Park this device's host lighting writer for the whole getter sweep —
     // without the gate, streaming frames clobber every getter's pending reply

@@ -189,12 +189,40 @@ fn stamp(secs: u64) -> (String, String) {
     (format!("{y:04}-{m:02}-{d:02}"), format!("{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60))
 }
 
-/// Percent-encode for a URL query value.
+/// The device report form, filled in with what neuron knows about the device: its name, how it is
+/// connected (when the link mode says), and this system and version. The person adds what worked.
+#[must_use]
+pub fn device_report_url(name: &str, mode: &str, version: &str) -> String {
+    let link = mode.to_ascii_lowercase();
+    // the form's own option labels; anything unrecognised is left for the person to pick
+    let connection = if link.contains("bluetooth") {
+        "Bluetooth"
+    } else if ["dongle", "receiver", "wireless", "hyperspeed"].iter().any(|w| link.contains(w)) {
+        "USB receiver / dongle"
+    } else if link.contains("wired") || link.contains("usb") {
+        "Wired / USB"
+    } else {
+        ""
+    };
+    let mut url = format!(
+        "{NEW_ISSUE}?template=device_report.yml&title={}&device={}&version={}",
+        encode(&format!("[device] {name}")),
+        encode(name),
+        encode(&format!("{}, neuron v{version}", os_line())),
+    );
+    if !connection.is_empty() {
+        url.push_str("&connection=");
+        url.push_str(&encode(connection));
+    }
+    url
+}
+
 /// How long `text` is once [`encode`]d.
 fn encoded_len(text: &str) -> usize {
     text.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { 1 } else { 3 }).sum()
 }
 
+/// Percent-encode for a URL query value.
 fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len() * 3 / 2);
     for b in text.bytes() {
@@ -367,5 +395,15 @@ mod tests {
         assert!(report.issue_url.len() < URL_BODY_MAX + 1500, "the link stays bounded once encoded: {}", report.issue_url.len());
         assert!(std::fs::read_to_string(report.dir.join("report.md")).unwrap().contains(&"é".repeat(5000)));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_device_report_comes_filled_in() {
+        let url = device_report_url("Razer BlackWidow V4 X", "wired", "0.1.8");
+        assert!(url.starts_with(NEW_ISSUE) && url.contains("template=device_report.yml"));
+        assert!(url.contains("device=Razer%20BlackWidow%20V4%20X") && url.contains("title=%5Bdevice%5D%20Razer%20BlackWidow%20V4%20X"));
+        assert!(url.contains("connection=Wired%20%2F%20USB") && url.contains("neuron%20v0.1.8"));
+        assert!(device_report_url("Razer Viper", "dongle", "0.1.8").contains("connection=USB%20receiver%20%2F%20dongle"));
+        assert!(!device_report_url("Razer Viper", "?", "0.1.8").contains("connection="), "an unknown link is left to the person");
     }
 }

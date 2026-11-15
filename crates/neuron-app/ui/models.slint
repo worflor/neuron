@@ -56,6 +56,8 @@ export struct DeviceRow {
     // row that replaces it — same unit id), but INERT (no reseed against a missing def) and
     // never AUTO-picked (the default-selection sweep skips it).
     adopting: bool,
+    // its definition was synthesized on this machine, not curated: what works on it is unconfirmed
+    learned: bool,
 }
 
 export struct ChromaDeviceRow {

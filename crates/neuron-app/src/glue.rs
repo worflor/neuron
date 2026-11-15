@@ -2337,6 +2337,24 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_open_repo(move || {
+            open_external("https://github.com/worflor/neuron");
+            if let Some(app) = w.upgrade() {
+                app.global::<State>().set_status_line("opened neuron on GitHub".into());
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_report_device(move |name, mode| {
+            open_external(&neuron::report::device_report_url(&name, &mode, env!("CARGO_PKG_VERSION")));
+            if let Some(app) = w.upgrade() {
+                app.global::<State>().set_status_line(format!("opened a device report for {name}").into());
+            }
+        });
+    });
 
     // PURGE SYNAPSE — stop Razer's respawning services then terminate every Synapse process. Razer
     // services run as SYSTEM, so an unelevated app relaunches itself via UAC; either way we report
@@ -7947,6 +7965,7 @@ fn audio_rows() -> Vec<DeviceRow> {
                 cap_game_mode: false, // audio endpoints have no firmware game mode
                 plate: "".into(), // audio endpoints have no plate
                 adopting: false,  // audio endpoints are never HID-adopted
+                learned: false,
             });
         }
     }
@@ -8714,6 +8733,7 @@ fn apply_scanned_devices(
                 "".into()
             },
             adopting: d.adopting,
+            learned: d.learned,
         })
         .collect();
     // 2) EMERGENT audio endpoints appended — mic + every output, generic over any hardware.
