@@ -30,7 +30,7 @@ not for a lot of it. gamepads, spellweaving and the radial, app-aware profile sw
 
 yes. neuron has no kernel driver and doesn't inject anything into games or read their memory. it listens to your input through Windows and talks to your devices the same way Synapse does. Chroma games paint through neuron using the same Chroma interface they use with Synapse.
 
-binds your device can do itself are written to the device; the rest go out as ordinary Windows key and mouse input, like any macro tool. so the one thing to keep in mind is the game's own rules: if a game bans macros, that covers macros from any app.
+binds your device can do itself are written to the device; the rest go out as ordinary Windows key and mouse input, like any macro tool. so what's left is the game's own rules: if a game bans macros, that covers macros from any app, and some competitive games don't allow snap tap on keyboards that support it. the app marks snap tap that way where you turn it on.
 
 ### can i remap buttons and make macros without writing code?
 
