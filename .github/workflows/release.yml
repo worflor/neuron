@@ -249,10 +249,14 @@ jobs:
             notes_args=(--generate-notes)
             title="neuron $VERSION"
           fi
-          assets=(dist/*-setup.exe dist/*.zip dist/SHA256SUMS.txt)
-          for manifest in dist/neuron-update.json dist/neuron-update.json.sig; do
-            if [ -f "$manifest" ]; then assets+=("$manifest"); fi
-          done
+          # each asset carries a label saying what it is for (`file#label`); names and URLs are
+          # unchanged, so the signed manifest and the checksums still match
+          assets=()
+          for f in dist/*-setup.exe; do assets+=("$f#Windows installer (start here)"); done
+          for f in dist/*.zip; do assets+=("$f#Portable ZIP (no install)"); done
+          assets+=("dist/SHA256SUMS.txt#Checksums")
+          if [ -f dist/neuron-update.json ]; then assets+=("dist/neuron-update.json#Update manifest (used by the app)"); fi
+          if [ -f dist/neuron-update.json.sig ]; then assets+=("dist/neuron-update.json.sig#Update signature (used by the app)"); fi
           # --target pins a manual build's draft to the commit that was built, not whatever the
           # default branch holds when it is published.
           if ! gh release create "$VERSION" "${assets[@]}" \
