@@ -36,10 +36,12 @@ claim = "Sensor index followed by big-endian DPI"
 
 [[exchanges]]
 channel = "output_input"
-request = "11 FF 07 2A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+request = "11 FF 07 2C 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
 [[exchanges.replies]]
 kind = "bytes"
-hex = "11 FF 07 2A"
+hex = "11 FF 07 2C"
+[[exchanges.replies]]
+kind = "timeout"
 [[exchanges.replies]]
 kind = "timeout"
 [[exchanges.replies]]

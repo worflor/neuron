@@ -98,6 +98,24 @@ No findings is also valid: standard HID controls can have an unmapped function
 without exposing a vendor command surface. Use the person's observed problem to
 prepare a draft via the handoff reference; do not manufacture a native finding.
 
+## A Razer keyboard that is detected but stays dark
+
+When a Razer keyboard shows up in Neuron but its lighting does nothing (or Neuron says no
+device supports brightness), run the read-only lighting probe for that board once the build
+has it (`neuron compat --help` lists `lighting`):
+
+```text
+neuron compat lighting --pid PID --json
+```
+
+Ask the person to quit Synapse and other RGB apps first, and to turn off Windows Dynamic
+Lighting (Settings › Personalization › Dynamic Lighting) if the probe reports a LampArray.
+The probe sends only getters. Read the table against the atlas line it prints: which
+collection answers the brightness and state reads, at which transaction id, at which LED.
+`busy` cells mean another program was writing; ask them to close it and run it again.
+The JSON holds no serial, path or product string, so it can go in the issue as is after
+the person has looked at it. It shows what the board answers, not what it displays.
+
 For Linux, receiver/wired comparisons or a second OS, read
 [platforms.md](references/platforms.md). Stay on the current machine unless the
 person requests a second-host run; an available Linux host is not automatic access.

@@ -40,6 +40,7 @@ export projection and integrity checks. The CLI is a thin front-end; the
 and explains them. Collection uses `transport::enumerate` and the hardware-policy
 guarded `research_metadata` seam. It does not use the adoption ledger, synthesize
 definitions, acquire device custody, send commands or create another dispatcher.
+The [lighting getters recipe](#lighting-getters-recipe) is separate and sends getters.
 
 Windows reads zero-access HID metadata, all three report kinds and collection
 links through the OS parser. PnP Container IDs supply grouping evidence; the
@@ -126,7 +127,37 @@ from the contributor. A mapping requires isolated repeat evidence and a decoder
 regression. The recipe stops on refusal or access failure rather than elevating
 or installing interception.
 
+## Lighting getters recipe
+
+`razer-lighting-getters-v1` (`neuron compat lighting`, `neuron-core::lightprobe`) is
+the one recipe that talks to a device. It asks each Razer control collection of a
+unit a fixed list of getters at each transaction-id cohort, under the pipe's wire
+lock, and records what came back: an answer, a status, a reply the production
+validator would reject (wrong tx or CRC), another program's traffic, or silence.
+Every request is a getter the synthesis catalog already sends (a test enforces it).
+It reads no serial, and its report carries no path or device string. A board busy
+with another writer drops requests, so the probe re-sends while it sees cross-talk.
+A board that ignores a request leaves its previous reply in the buffer; the probe
+reads the buffer before asking, so an unchanged buffer is reported as silence.
+Units are grouped by Windows Container ID (Linux: USB ancestor), not by path.
+
+The table separates failures that look alike from outside: a collection that
+answers identity reads but no lighting, a board that answers lighting at one cohort
+only, an LED the board lacks, and replies the validator drops. It reports what the
+board answers, never what its LEDs show; physical confirmation stays separate.
+
 ## Investigation without the hardware
+
+`neuron-core::transport::firmware` models a Razer board's firmware with state:
+writes change it, getters read it back, and the model says what its LEDs display.
+What real firmware does at the edges is a knob each test states: the tx cohort and
+which commands it covers, how a foreign request is refused, the LED set, effect size
+strictness, driver-mode dependence, and decoy collections that answer identity
+getters only. The keyboard conformance suite
+(`crates/neuron-testkit/tests/keyboard_conformance.rs`) builds a unit per keyboard
+atlas wire shape and drives production adoption, the first-light heal, a static
+colour, brightness read-back and a custom frame under each assumption. A pass means
+Neuron reaches a board that behaves that way, not that a real board does.
 
 `neuron-testkit::compat::RecordedInput` consumes the core recording schema and
 implements `InputReader`. A test can feed the exact report order into a production

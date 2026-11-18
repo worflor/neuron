@@ -286,6 +286,10 @@ pub fn set_polling_hz_hires(dev: &Device, hz: u32) -> Result<u32> {
 /// own verified varstore and LED prefix. Both paths read back that exact prefix before succeeding.
 pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
     let level = (u16::from(pct.min(100)) * 255 / 100) as u8;
+    // VIA writes are always unsaved and checked by their own read-back; `store` has no meaning there.
+    if dev.def.dialect == "via" {
+        return crate::via::set_brightness(dev, level);
+    }
     anyhow::ensure!(
         dev.def.has_command("brightness"),
         "brightness write on '{}' has no read-back getter",

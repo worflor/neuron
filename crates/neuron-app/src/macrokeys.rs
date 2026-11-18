@@ -114,7 +114,7 @@ fn ensure_driver_mode(reg: &neuron::registry::Registry, pids: &BTreeSet<u16>) {
     for def in &reg.devices {
         if def.vendor_id != neuron::synth::RAZER_VID || def.dialect != "razer"
             || !def.has_command("device_mode") || def.supports(neuron::registry::Capability::Dpi)
-            || def.custody != neuron::registry::Custody::Driver { continue }
+            || def.custody() != neuron::registry::Custody::Driver { continue }
         for pid in def.product_ids().filter(|pid| pids.contains(pid)) {
             let Ok(dev) = neuron::device::Device::open(def.clone(), pid) else {
                 continue; // not connected

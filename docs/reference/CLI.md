@@ -14,9 +14,9 @@ help, as are the debug harnesses (`prof`, `probe`, `discover`) and `bind legacy|
 ## Compatibility Lab
 
 `neuron compat` collects hardware evidence independently of normal device adoption.
-It never initializes live dispatch or sends protocol commands. `collect` reads the
-registry without migrating app configuration; offline verbs need neither registry
-nor hardware access.
+It never initializes live dispatch. Only `lighting` sends protocol commands, and only
+getters. `collect` reads the registry without migrating app configuration; offline
+verbs need neither registry nor hardware access.
 
 ```text
 neuron compat collect --out LOCAL_DIRECTORY --json
@@ -27,7 +27,17 @@ neuron compat export LOCAL_DIRECTORY --device DEVICE_ID --out SHAREABLE_DIRECTOR
 neuron compat verify SHAREABLE_DIRECTORY --json
 neuron compat pack SHAREABLE_DIRECTORY --out ATTACHMENT.zip --json
 neuron compat replay APPROVED_INPUT_BUNDLE --json
+neuron compat lighting [--pid 024e] [--wait-ms 120] --json
 ```
+
+`lighting` asks every Razer control collection (each 91-byte feature collection of a
+unit) the lighting reads at transaction ids 0x1F, 0x3F, 0x9F and 0xFF: firmware, device
+mode, matrix brightness at LEDs 0x05, 0x04 and 0x00 and with VARSTORE, matrix state, and
+the legacy brightness, state and game-mode reads. Each cell is an answer, a refusal, a
+reply Neuron's validator would reject (wrong tx or CRC), another program's traffic, or
+nothing. The report shows what the keyboard atlas expects for the PID and whether the unit
+also exposes a HID LampArray. It names no serial, path or product string. Quit other
+lighting software for a clean table.
 
 Device and interface IDs are positive and scoped to a single dossier. `--local-names`
 shows local product strings for selection; it is not shareable evidence. `--device`
@@ -213,8 +223,8 @@ blend. It lives on a profile (`--profile P`, painted by `profile apply`) or as a
 |---|---|
 | `lighting catalog` | presets, patterns, knob schemas (range, enum options, toggles) |
 | `lighting stack list --profile P` | layers, bottom first, with problems |
-| `lighting stack add (--preset S \| --pattern K \| --spec JSON) [--color RRGGBB] [--gradient A,B,..] [--motion drift:0.5] [--blend add] [--param k=v]... [--region 0,1,2 \| --rect r0,c0,r1,c1 --board 6x22] [--disable] [--at N]` | add a layer |
-| `lighting stack set INDEX ...` | edit in place |
+| `lighting stack add (--preset S \| --pattern K \| --spec JSON) [--color RRGGBB] [--gradient A,B,..] [--motion drift:0.5] [--blend add] [--opacity 60] [--duck] [--param k=v]... [--region 0,1,2 \| --rect r0,c0,r1,c1 --board 6x22] [--disable] [--at N]` | add a layer |
+| `lighting stack set INDEX ...` | edit in place (`--no-duck` stops ducking) |
 | `lighting stack rm INDEX`, `mv FROM TO`, `clear --yes`, `replace JSON` | |
 | `lighting saved save NAME [--tags A,B] --profile P` | save a validated layer stack as a reusable effect; reports replacement |
 | `lighting saved list`, `delete SLUG --yes` | list or remove saved effects |

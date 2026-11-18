@@ -22,7 +22,7 @@
 # Fact fields:
 #   key       "<dialect>/<class>/<id>" (hex, lowercase) for get/set, optionally "#variant";
 #             "<dialect>/<topic>/<name>" otherwise (e.g. "razer/push/05-3a", "razer/frame/crc")
-#   dialect   "razer" | "razer-audio" | "hidpp"
+#   dialect   "razer" | "razer-audio" | "hidpp" | "via"
 #   kind      get | set | push | frame | tx | mode | enum
 #   class, id opcode bytes (get/set only)
 #   layout    byte layout, e.g. "[varstore] -> [varstore, stage]"
@@ -48,6 +48,26 @@ url = "https://github.com/openrazer/openrazer"
 license = "GPL-2.0-or-later"
 sha = "6820f9da169d354bc7e6e93a0aa8683a6bb75792"
 note = "Kernel driver (driver/). The common ancestor most other Razer projects copy; per-device tx ids are a table of what worked, never validated on replies."
+
+[sources.openrazer-cd5c4243]
+url = "https://github.com/openrazer/openrazer"
+license = "GPL-2.0-or-later"
+sha = "cd5c4243bfafb08df7e2d2963367c3c150626eac"
+derived_from = "openrazer"
+note = "Driver and daemon read 2026-11-16 for the keyboard atlas (protocol/razer-keyboards.toml)."
+
+[sources.openrgb-e4af57cd]
+url = "https://gitlab.com/CalcProgrammer1/OpenRGB"
+license = "GPL-2.0-or-later"
+sha = "e4af57cdfcd25c4a1e1c97185fe9c6cbf2ac79c3"
+derived_from = "openrgb"
+note = "Controllers/RazerController read 2026-11-16 for the keyboard atlas."
+
+[sources.signalrgb-95031635]
+url = "https://gitlab.com/signalrgb/signal-plugins"
+license = "NOASSERTION"
+sha = "95031635526054e267124fb32cf04509375f34ea"
+note = "Plugins/Razer read 2026-11-16 for the keyboard atlas: per-PID interface and custom-frame row reports. JavaScript plugins with their own packet builders, so the atlas counts it as its own lineage; independence is judged from the code's shape, not stated by the project."
 
 [sources.openrazer-wiki]
 url = "https://github.com/openrazer/openrazer.wiki.git"
@@ -204,6 +224,18 @@ license = "NOASSERTION"
 sha = "f9107a4e3190d798f9be8c5d596f255f5e5741d2"
 note = "Official HID++ 2.0 report structure documentation."
 
+[sources.qmk-8252b630]
+url = "https://github.com/qmk/qmk_firmware"
+license = "GPL-2.0-or-later"
+sha = "8252b6309752f0be6882c387e15989ba51323d8f"
+note = "QMK firmware: the raw HID usage and report size, and the VIA command handler in quantum/via.c and via.h."
+
+[sources.vial-gui-aef8222a]
+url = "https://github.com/vial-kb/vial-gui"
+license = "GPL-2.0-or-later"
+sha = "aef8222a2d0429a183b2ed692d5f9efcfd383f08"
+note = "Vial's desktop app: how it picks which raw HID collections to talk to."
+
 [sources.solaar]
 url = "https://github.com/pwr-Solaar/Solaar"
 license = "GPL-2.0-or-later"
@@ -282,6 +314,7 @@ grade = "live"
 evidence = [
   { kind = "live", date = "2026-09-29", what = "Naga 15/00 [00,3] answered FAIL (3); 15/80 answered SUCCESS (2)" },
   { kind = "live", date = "2026-07-06", what = "Naga answered UNSUPPORTED (5) to 00/C0" },
+  { kind = "live", date = "2026-11-17", what = "Naga dongle 00a8 answered TIMEOUT (4) to every getter at all four tx cohorts while the mouse slept (`neuron compat lighting`, read-only)" },
   { kind = "source", src = "openrazer", at = "driver/razercommon.h#L79-L83", what = "same constants" },
   { kind = "source", src = "razerqdhid", at = "public/py/qdrazer/protocol.py#L24-L30", what = "same table" },
 ]
@@ -308,8 +341,8 @@ conflicts = [
 key = "razer/frame/exec-poll"
 dialect = "razer"
 kind = "frame"
-layout = "SET, then up to 60 polls x 10 ms; re-send SET when i%12==11; Busy/Timeout/New keep polling; Fail/Unsupported terminal"
-meaning = "ACK'd command discipline (about 600 ms budget)."
+layout = "SET, then up to 60 polls x 10 ms; re-send SET when i%12==11; Busy/New keep polling; Fail/Unsupported terminal; a Timeout (4) re-sends once and a second Timeout ends the exchange as Unreachable"
+meaning = "ACK'd command discipline (about 600 ms budget). A receiver whose peripheral is asleep answers in about 20 ms instead of the full budget."
 devices = ["00a7", "00a8", "0221"]
 grade = "live"
 evidence = [
@@ -324,12 +357,18 @@ conflicts = [
 key = "razer/frame/stream-drain"
 dialect = "razer"
 kind = "frame"
-layout = "SET, sleep stream_wait_us, ONE GET drain; success iff valid Success; no retry"
+layout = "SET, sleep stream_wait_us, GET drain; Success or Busy = taken; New, a non-matching or short reply = re-read up to 4 times 1 ms apart, then unconfirmed; Fail, Unsupported, Timeout or an I/O error = lost. Rows: lost stops the frame, unconfirmed still latches and the next frame is sent whole. No re-send."
 meaning = "Fire-and-drain lighting stream write; skipping the drain freezes the device."
 devices = ["00a8", "0221"]
 grade = "live"
 evidence = [
   { kind = "live", date = "2026-07-02", what = "live_stream_strategy_probe: 90 frames at 30 fps on BW 0221, 0 failures, device alive after (memory legacy-6fps-was-folklore)" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerkbd_driver.c#L476-L479", what = "Busy treated as success: some commands answer busy but succeed" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerkbd_driver.c#L4676-L4682", what = "no GET after custom-frame rows on BlackWidow V4, V4 Pro, V4 75% and Joro" },
+  { kind = "source", src = "openrgb-e4af57cd", at = "Controllers/RazerController/RazerController/RazerController.cpp#L2101-L2130", what = "after a send, polls every 2 ms until the reply is no longer New or Busy, then moves on regardless" },
+]
+conflicts = [
+  "The Busy, re-read and unconfirmed branches come from openrazer and OpenRGB; the owned BlackWidow answers Success, so they are unexercised on hardware.",
 ]
 
 [[fact]]
@@ -365,11 +404,12 @@ conflicts = [
 key = "razer/frame/synth-stream-wait"
 dialect = "razer"
 kind = "frame"
-layout = "auto defs: stream_wait_us = 31000 if the measured round-trip >= 15 ms OR the def has battery_level, else 0"
-meaning = "Pacing guess for synthesized defs; latency alone under-detects wireless (the Naga dongle ACKs getters in about 6 ms)."
+layout = "auto defs: stream_wait_us = the larger of 31000 (measured round-trip >= 15 ms) and the PID's known wait (openrazer's per-PID reply wait from the keyboard or mouse atlas when above 1000 µs; else 31000 when the def has battery_level), capped at 250000"
+meaning = "Pacing for synthesized defs; latency alone under-detects wireless (the Naga dongle ACKs getters in about 6 ms), and some receivers need longer than the generic 31 ms."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L160-L182", what = "neuron's heuristic" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razermouse_driver.c#L33-L125", what = "per-PID mouse waits: 600 µs wired, 31 ms newer receivers, 59.9 ms Viper receivers, 400 ms Atheris and Orochi V2" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs", what = "stream_wait_for" },
 ]
 
 [[fact]]
@@ -387,7 +427,7 @@ evidence = [
 key = "razer/frame/synth-probe"
 dialect = "razer"
 kind = "frame"
-layout = "timed_exec: 2 ms grain, PROBE_POLLS 160 (about 320 ms), QUALIFY_POLLS 1000 (about 2 s, first command wakes a radio), re-arm at i%48==47, tx 0x1F"
+layout = "timed_exec: 2 ms grain, PROBE_POLLS 160 (about 320 ms), QUALIFY_POLLS 1000 (about 2 s, first command wakes a radio) for the first cohort and PROBE_POLLS for the rest, re-arm at i%48==47, tx per call (razer/tx/keyboard-cohorts)"
 meaning = "Auto-synthesis probe exec; measured round-trip feeds stream_wait_us."
 grade = "derived"
 evidence = [
@@ -423,6 +463,7 @@ evidence = [
 ]
 conflicts = [
   "uchroma routes all mice to USB interface 1 (device_manager.py#L170-L191); neither neuron nor OpenRGB/naga-companion find the Naga pipe there.",
+  "Keyboards differ: OpenRGB opens the BlackWidow V3 at MI 3, usage 0x0C/0x01 (openrgb-e4af57cd RazerControllerDetect.cpp#L263) and the V4 X at MI 2, 0x01/0x02 (#L277); openrazer addresses the V3 at wIndex 3 and the V4 X at wIndex 2 (openrazer-cd5c4243 driver/razerkbd_driver.c#L346-L415). Adoption probes every claimed 91-byte collection of a unit, the atlas's first, keeps the one whose lighting answers, and pins `interface` in the def when the collection shape repeats on another interface.",
 ]
 
 [[fact]]
@@ -482,6 +523,7 @@ devices = ["00a7", "00a8"]
 grade = "live"
 evidence = [
   { kind = "live", date = "2026-09-29", what = "15/00, 15/80, 15/81, 15/87 all answered at 0x1F over the dongle" },
+  { kind = "live", date = "2026-11-16", what = "`neuron compat lighting` over the receiver: firmware, mode and 0F/82 + 0F/84 reads answered at 0x1F and 0x3F, status 0x04 at 0x9F and 0xFF" },
   { kind = "live", date = "2026-06-21", what = "TOML header: verified over the dongle against Synapse's own logged values (recorded in the repo's first commit; observation month 2026-06)" },
   { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L822-L837", what = "Naga V2 Pro wired+wireless firmware getter at 0x1F; same for every other Naga command" },
   { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L88-L89", what = "tx auto-probe converges on 0x1F" },
@@ -508,7 +550,7 @@ evidence = [
   { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4043-L4092", what = "brightness at 0xFF" },
 ]
 conflicts = [
-  "OpenRGB gives 0221 one tx, 0x3F, for everything (Controllers/RazerController/RazerDevices.cpp#L1438-L1444). Getters appear to ignore tx, so both work for reads.",
+  "OpenRGB gives 0221 one tx, 0x3F, for everything (Controllers/RazerController/RazerDevices.cpp#L1438-L1444). Getters ignore tx on this board (live 2026-11-16: firmware, 03/83, 03/88 and 03/80 answered at 0x1F, 0x3F, 0x9F and 0xFF), so both work for reads.",
 ]
 
 [[fact]]
@@ -536,27 +578,95 @@ conflicts = [
 key = "razer/tx/auto-cohorts"
 dialect = "razer"
 kind = "tx"
-layout = "first_light_heal tries [0x1F, 0x3F, 0xFF, 0x9F]: write a custom frame + display, read lighting_state, first that lands wins and is written into the auto TOML"
-meaning = "Self-healing tx for synthesized defs."
+layout = "calibrate::settle, once per firmware and file per generated keyboard def: (1) at each claimed collection that answers a lighting read, each tx (brightness's, the def's, then 0x1F, 0x3F, 0x9F, 0xFF) and LED (current, atlas, 0x05): take custody at that tx, read 0F/84 [00, led] (at that tx, else the def's), write 0F/04 [00, led, level-1] (NOSTORE), read back, write level back; level 0 is not nudged; the first that reads back level-1 is the brightness setter's tx and LED; (2) first_light_heal: from the current lighting tx, each cohort: take custody at it, send off, read lighting_state, send the custom display, read again; it lands when the state moves to the custom frame; the effect and frame commands take that tx as an override; getters keep the def's tx; the outcome goes to <file>.settle.toml"
+meaning = "Self-healing tx, LED and collection for synthesized defs, verified by write and read-back."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/writes.rs#L1392-L1422", what = "neuron's candidate list" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/calibrate.rs (settle, calibrate, nudge)", what = "calibration and the settle order" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/writes.rs (first_light_heal)", what = "neuron's candidate list" },
   { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerDevices.cpp#L1716", what = "0x9F exists as a tx on newer wireless keyboards" },
 ]
 conflicts = [
   "0x9F has no neuron hardware observation; naga-companion probes 9F but only ever saw 1F/FF answer.",
   "OpenSnek's rule: a status 03 is a firmware rejection and must not be retried with another tx (docs/protocol/USB_PROTOCOL.md#L962-L970); neuron's heal retries across cohorts by design.",
+  "Calibration's one-step brightness nudge has run only on the firmware model; no generated keyboard def has been settled on real hardware.",
 ]
 
 [[fact]]
 key = "razer/tx/era-heuristic"
 dialect = "razer"
 kind = "tx"
-layout = "matrix-era or no lighting -> 0x1F; legacy-only lighting -> 0xFF with 0x3F baked into the lighting block"
-meaning = "Synthesized-def tx guess, flagged HEURISTIC in the emitted file."
+layout = "keyboard: the tx its backlight read answered at (razer/tx/keyboard-cohorts); other matrix-era or no lighting -> the tx the pipe qualified at (0x1F unless the atlas names another); legacy-only lighting -> 0xFF with the atlas's lighting tx (0x3F on the Chroma family) baked into the lighting block"
+meaning = "Synthesized-def tx, flagged HEURISTIC in the emitted file; the first-light heal verifies the lighting tx by read-back."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L530-L534", what = "neuron's heuristic" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs (synthesize, `transaction_id`)", what = "neuron's heuristic" },
+]
+
+[[fact]]
+key = "razer/0f/02#keyboard"
+dialect = "razer"
+kind = "set"
+class = 0x0F
+id = 0x02
+layout = "[00, led, effect, …] at openrazer's fixed data_size (off/spectrum/wave 6, static/breathing/reactive 9); custom display [00, 00, 08] size 0x0C; led 0x05 or the atlas LED that answered"
+meaning = "Effects and custom display on a synthesized (learned) matrix keyboard."
+grade = "single"
+ungated_debt = "Learned keyboards only. calibrate::settle write-verifies each unit's effect path (off then display, read back at 0F/82) before rewriting its file and records the outcome; a board where nothing lands is recorded unverified. No keyboard has been settled on real hardware."
+evidence = [
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerchromacommon.c#L498-L706", what = "extended-matrix effect builders and sizes, BACKLIGHT_LED on keyboards" },
+  { kind = "source", src = "openrgb-e4af57cd", at = "Controllers/RazerController/RazerDevices.cpp#L1515", what = "BlackWidow V3: extended matrix, LED BACKLIGHT" },
+]
+
+[[fact]]
+key = "razer/0f/03#keyboard"
+dialect = "razer"
+kind = "set"
+class = 0x0F
+id = 0x03
+layout = "[00, 00, row, 00, stop, RGB × n], data_size = args.len() (0x47 for 22 columns)"
+meaning = "Custom-frame rows on a synthesized matrix keyboard."
+grade = "capture"
+evidence = [
+  { kind = "capture", what = "Synapse 3 on a BlackWidow V3 (1532:024E), usbmon capture in github.com/justZaduma/upload at 230dfe6 linked from openrazer#1319: 0F/03 [00, 00, row, 00, 0x15, RGB × 22], data_size 0x47" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerchromacommon.c#L746-L749", what = "rows at data_size 0x47" },
+]
+conflicts = [
+  "Rows are not read back: the heal proves the display, not the rows. openrazer sends V3 rows at tx 0x1F while OpenRGB sends everything at 0x3F; synthesis sends rows at the effect tx.",
+]
+
+[[fact]]
+key = "razer/0f/04#keyboard"
+dialect = "razer"
+kind = "set"
+class = 0x0F
+id = 0x04
+layout = "[00, led, level] NOSTORE, read back at 0F/84 [00, led]; calibration sends level-1 then level and reads the first back"
+meaning = "Brightness on a synthesized matrix keyboard, and the calibration nudge."
+grade = "single"
+ungated_debt = "Learned keyboards only. Every write is read back at the same LED (capability::set_brightness), and calibrate::settle proves the tx and LED with a one-step nudge it restores; it never nudges a board at level 0. No keyboard has been settled on real hardware."
+evidence = [
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerchromacommon.c#L714-L739", what = "extended brightness set and get" },
+]
+
+[[fact]]
+key = "razer/tx/keyboard-cohorts"
+dialect = "razer"
+kind = "tx"
+layout = "qualify at the atlas's txs, then 0x1F, 0x3F, 0x9F, 0xFF (the first that answers 00/81 runs the catalog); a keyboard's backlight read 0F/84 [00, led] is retried at each until one answers, and that tx becomes the def's transaction_id"
+meaning = "A board may answer getters only at its own tx, so lighting reads are retried per cohort before synthesis concludes a keyboard has no lighting."
+devices = ["0221", "00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-11-16", what = "`neuron compat lighting` on the Naga V2 Pro receiver (00a8): every getter answered at 0x1F and 0x3F, status 0x04 (timeout) at 0x9F and 0xFF" },
+  { kind = "live", date = "2026-11-16", what = "same probe on the BlackWidow Chroma V2 (0221): firmware, legacy brightness, legacy state and game-mode reads answered at all four; every class 0x0F read UNSUPPORTED at all four" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerkbd_driver.c#L4375-L4382", what = "BlackWidow V3 / V3 TK / V3 Pro wired, Huntsman v1, Cynosa v1 and DeathStalker V2 read brightness at 0x3F; V4 family at 0x1F (L4385-L4405)" },
+  { kind = "source", src = "openrgb-e4af57cd", at = "Controllers/RazerController/RazerDevices.cpp#L1515", what = "BlackWidow V3 driven at 0x3F" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs (cohort_order, synthesize)", what = "the retry" },
+]
+conflicts = [
+  "Whether a BlackWidow V3 leaves 0x1F reads unanswered is source-derived (openrazer reads it at 0x3F), not observed: no V3 on the desk. The 0.1.7/0.1.8 report of 'no connected device supports SetBrightness' is consistent with it.",
+  "OpenRGB sends the whole V3 protocol at 0x3F; openrazer sends its frame rows at 0x1F. Synthesis uses one tx for all lighting.",
 ]
 
 [[fact]]
@@ -616,9 +726,13 @@ evidence = [
   { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L25-L38", what = "mode forced to 0x00 or 0x03; 0x02 blocked as a factory test mode" },
   { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L72-L77", what = "same pair on Naga V2 Pro" },
   { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L148-L156", what = "00 00 normal, 03 00 driver; never write 3 on Tartarus Pro" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerkbd_driver.c#L6072-L6079", what = "Tartarus Pro resets when it receives the mode write; openrazer skips it" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerkbd_driver.c#L536-L543", what = "no mode write to Blade laptops" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "daemon/openrazer_daemon/hardware/mouse.py#L2011-L2028", what = "one mouse class sets DRIVER_MODE = True: Basilisk V3 X HyperSpeed (00B9)" },
 ]
 conflicts = [
   "razerqdhid documents mode 1 = enter bootloader and 2 = test; neuron only ever sends 0 or 3.",
+  "neuron never sends this to the Tartarus Pro (0244) or a Blade laptop, reads 00/84 before handing custody back and writes 0x00 only from 0x03, and keeps a mouse without stated custody in normal mode unless it is the Basilisk V3 X HyperSpeed. Source-derived; no owned Tartarus Pro or Blade.",
 ]
 
 [[fact]]
@@ -1319,7 +1433,7 @@ evidence = [
   { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L528-L550", what = "same effect layout" },
 ]
 conflicts = [
-  "data_size: neuron sends args.len(), openrazer and naga-tray send fixed sizes per effect.",
+  "data_size: the Naga gets args.len() (live); openrazer and naga-tray send fixed sizes per effect, which synthesized keyboards now send (framing = fixed).",
   "openrazer paints Naga V2 Pro static as a 0F/02 [0,0,08,0,0,0] mode switch followed by 0F/03 size 0x0E [0,0,0,0,02,RGB x3] (driver/razermouse_driver.c#L1106-L1130); OpenRGB sends the custom display with led 0x00.",
 ]
 
@@ -2490,18 +2604,22 @@ conflicts = [
 key = "razer/enum/synth-lighting-blocks"
 dialect = "razer"
 kind = "enum"
-layout = "matrix mouse (DPI answered): effect 0F/02 [0,4] + custom 0F/03 [0,4] + brightness 0F/04 [0,4], wave 0x03 / spectrum 0x04; matrix keyboard (no DPI): effect 0F/02 [0,0] + custom 0F/03 [0,0], brightness write 0F/04 [0,5] and read 0F/84 [0,5] through the lighting block (no top-level set_brightness), spectrum 0x03 / wave 0x04; custom_id 0x08 both; legacy: effect 03/0A size 8 tx 0x3F + custom 03/0B size 0x46 [0xFF] tx 0x3F, custom_id 0x05. Emitted files carry '# synth-version: 2'; an unversioned 6x22 matrix file on LED 0x04 is left unloaded, then moved to .toml.v1.bak and re-synthesized by adoption."
+layout = "matrix mouse (DPI answered): effect 0F/02 [0,4] + custom 0F/03 [0,4] + brightness 0F/04 [0,4], wave 0x03 / spectrum 0x04, compact sizes; matrix keyboard (no DPI, backlight read answered at some tx cohort, or atlas-extended with a matrix read): effect 0F/02 [0, led] at openrazer's fixed sizes (framing = fixed: off/spectrum/wave 6, static/breathing/reactive 9, wave [dir 1, speed 0x28], breathing type 1, reactive speed 1), rows 0F/03 [0,0], display [0,0,08] size 0x0C, brightness 0F/04 [0, led] read at 0F/84 [0, led] (no top-level set_brightness), lighting_state 0F/82 at the lighting tx, spectrum 0x03 / wave 0x04; led = 0x05 or the atlas LED that answered; custom_id 0x08 both; legacy: effect 03/0A size 8 + custom 03/0B size 0x46 [0xFF] at the atlas's lighting tx (0x3F on the Chroma family), custom_id 0x05. Matrix size from the keyboard atlas when it has one. The keyboard block is taken only by an atlas keyboard or a unit with a boot-keyboard collection. Emitted files carry '# synth-version: 3' and '# synth-digest:'; v1/v2 keyboard files in the shapes those versions emitted, and keyboard files with no lighting block, are left unloaded, moved to .toml.v<N>.bak and re-synthesized by adoption."
 meaning = "Lighting setters baked into auto defs from curated ones; only getter presence is probed."
 grade = "derived"
 evidence = [
   { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L356-L427", what = "unprobed setters, corrected after the fact by first_light_heal" },
   { kind = "source", src = "synapse3-modules", at = "RzCtl_024E.dll / RzCtl_0293.dll GetProductConfig + extended lighting class", what = "BlackWidow V3 and V4 X: 6x22 matrix, VARSTORE flag clear (NOSTORE); whole-device 0F/02 and 0F/03 carry LED 0x00; custom activation [00,00,08]; 0F/04 write LED 0x00; 0F/84 / 0F/82 reads default to LED 0x05; effect ids static 01 breathing 02 spectrum 03 wave 04 reactive 05; V3 device table lists logo zone 0x04" },
   { kind = "capture", what = "Synapse 3 streaming every Quick Option to a BlackWidow V3 (1532:024E), usbmon capture BWV3QuickOptionsEverySubOptionToggledInOrderTopToBottom.pcapng.tar.gz in github.com/justZaduma/upload at 230dfe6 (sha256 9976541c...), linked from openrazer#1319: 10,104 x 0F/03 at tx 0x1F, wIndex 3, data_size 0x47, args [00, 00, row 0-5, 00, 0x15, RGB x 22]" },
+  { kind = "source", src = "openrazer-cd5c4243", at = "driver/razerchromacommon.c#L498-L706", what = "extended-matrix effect builders: fixed data_size per effect, wave direction + 0x28 speed, custom display [00,00,08] size 0x0C" },
+  { kind = "source", src = "openrgb-e4af57cd", at = "Controllers/RazerController/RazerDevices.cpp#L1515", what = "BlackWidow V3: extended matrix, tx 0x3F, LED BACKLIGHT, 6x22" },
 ]
 conflicts = [
   "These setters reach unknown hardware ungated; the kind is enum, so the gating test does not see them.",
-  "Keyboard LED: openrazer sends VARSTORE + BACKLIGHT 0x05 for BlackWidow V3/V4 X effects and brightness; Synapse's own modules send NOSTORE + 0x00. neuron follows Synapse (volatile). UNVERIFIED on a V3/V4 X: no such board on the desk.",
-  "Keyboard brightness region: Synapse writes 0F/04 at LED 0x00 and reads 0F/84 at 0x05; openrazer writes and reads 0x05. neuron writes and reads 0x05 (NOSTORE) so the read-back checks the region it wrote.",
+  "Keyboard LED: openrazer (VARSTORE) and OpenRGB (NOSTORE) both address BlackWidow V3/V4 X effects and brightness at BACKLIGHT 0x05 (openrazer-cd5c4243 driver/razerkbd_driver.c static group at L3022; openrgb-e4af57cd RazerDevices.cpp#L1515, #L2012). The static read of Synapse's modules suggested 0x00 for effects; neuron v2 followed it, v3 follows the open sources and keeps 0x00 only for the custom display. UNVERIFIED on a V3/V4 X: no such board on the desk.",
+  "Keyboard brightness region: Synapse writes 0F/04 at LED 0x00 and reads 0F/84 at 0x05; openrazer writes and reads 0x05. neuron writes and reads the same LED (NOSTORE) so the read-back checks the region it wrote.",
+  "Effect sizes: the Naga takes compact data_size (live); keyboards get openrazer's fixed sizes, never observed by neuron on a keyboard.",
+  "DeathStalker V2 Pro: OpenRGB addresses LED 0x00, openrazer 0x05; synthesis asks the board about each and keeps the one that answers.",
 ]
 
 # ------------------------------------------------------------------------------------------------
@@ -2642,65 +2760,73 @@ grade = "derived"
 evidence = [
   { kind = "source", src = "logitech-cpg-docs", at = "hidpp20/README.rst#L31-L36", what = "standard short 0x10 reports are 7 bytes; long 0x11 reports are 20" },
   { kind = "source", src = "solaar", at = "lib/logitech_receiver/base.py#L90-L100", what = "standard short/long report IDs and lengths" },
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L38-L52", what = "neuron emits standard LONG reports only" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron emits standard LONG reports only" },
 ]
 
 [[fact]]
 key = "hidpp/frame/device-index"
 dialect = "hidpp"
 kind = "frame"
-layout = "device index 0xFF = direct-attached; receiver slots 1..6 not implemented"
+layout = "device index 0xFF = direct-attached (a reply on 0x00 is accepted, Bluetooth-direct); a receiver's devices answer on pairing slots 1..6, and a def carries its slot in transaction_id (0 = direct)"
 meaning = "Addressing."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L108-L116", what = "neuron transcription" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/base.py#L729", what = "accepts a reply on devnumber or devnumber ^ 0xFF (Bluetooth device returning 0x00)" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/receiver.py#L178-L187", what = "a receiver holds 1 to 6 devices" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "DEVICE_INDEX, PAIRING_SLOTS, address_of, is_our_device" },
 ]
 
 [[fact]]
 key = "hidpp/frame/reply-validation"
 dialect = "hidpp"
 kind = "frame"
-layout = "complete logical frame only (0x10/7 bytes or 0x11/20 bytes); an explicitly padded transport may deliver short reports in a 20-byte envelope; then match swId 0x0A, device index 0xFF, feature index and (fn<<4)|0x0A; no CRC"
+layout = "complete logical frame only (0x10/7 bytes or 0x11/20 bytes); an explicitly padded transport may deliver short reports in a 20-byte envelope; then match swId 0x0C, device index 0xFF (or 0x00), feature index and (fn<<4)|0x0C; no CRC. swId 0x0C avoids the ids other HID++ clients claim (0x07 OpenRGB, 0x0A LGSTrayEx, 0x0B Solaar, 0x0D G HUB, 0x0F firmware)"
 meaning = "Reply matching and complete-frame validation."
 grade = "derived"
 evidence = [
   { kind = "source", src = "logitech-cpg-docs", at = "hidpp20/README.rst#L31-L36", what = "short 0x10 reports are 7 bytes; long 0x11 reports are 20" },
   { kind = "source", src = "solaar", at = "lib/logitech_receiver/base.py#L542-L554", what = "validates actual read length by report ID, with a separate 63-byte Centurion form" },
   { kind = "source", src = "microsoft-hid-samples", at = "hid/hclient/report.c#L39-L62", what = "ReadFile uses the collection's maximum InputReportByteLength and the sample asserts the returned byte count equals it" },
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L212-L217", what = "neuron's field-match rule after complete-frame validation" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/base.py#L897-L910", what = "fixed software ids in use by other HID++ clients" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron's field-match rule after complete-frame validation" },
 ]
 
 [[fact]]
 key = "hidpp/frame/errors"
 dialect = "hidpp"
 kind = "frame"
-layout = "error report: byte2 0x8F (1.0) or 0xFF (2.0) with byte1 0xFF, code at byte 5; 0x01 Unknown .. 0x09 Unsupported"
+layout = "error report: byte2 0x8F (1.0) or 0xFF (2.0), bytes 3-4 echo the request's feature index and (fn<<4)|swId, code at byte 5; an error without our echo belongs to another client. 1.0 codes 0x01 InvalidSubId .. 0x0C WrongPinCode; 2.0 codes 0x01 Unknown .. 0x09 Unsupported"
 meaning = "Error detection and names."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L173-L199", what = "neuron transcription from Linux hid-logitech-hidpp.c (unpinned)" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/base.py#L729-L747", what = "1.0 and 2.0 errors matched on the echoed request bytes" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/hidpp10_constants.py#L129-L141", what = "HID++ 1.0 error codes" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron's names and echo match" },
 ]
 
 [[fact]]
 key = "hidpp/frame/timing"
 dialect = "hidpp"
 kind = "frame"
-layout = "write output report, then up to 10 x read_input(100 ms); mismatches skipped; Busy (0x08) surfaced as an error"
+layout = "reply handle opened before the write; then read_input in windows of up to 100 ms until a 2 s deadline or 10 silent windows; frames that aren't ours never shorten the wait; an error for our request surfaces as an error"
 meaning = "Exchange discipline."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L214-L232", what = "neuron's own choice" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/base.py#L719-L725", what = "reply wait by deadline from the write" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron's deadline" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron's wait loop" },
 ]
 
 [[fact]]
 key = "hidpp/frame/transport"
 dialect = "hidpp"
 kind = "frame"
-layout = "OUTPUT report via WriteFile, INPUT replies via ReadFile; claim VID 0x046D, not a receiver pid, output_len 20, input_len 7 or 20; larger input maxima remain unclaimed"
+layout = "OUTPUT report via WriteFile, INPUT replies via ReadFile; claim VID 0x046D, not a webcam pid (0x0800..0x09FF), output_len 20, input_len 7 or 20; larger input maxima remain unclaimed. A receiver pipe is claimed and adopted through the first pairing slot whose device answers the 2.0 ping"
 meaning = "Control-pipe claim."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L293-L301", what = "neuron's own choice" },
+  { kind = "source", src = "solaar", at = "lib/hidapi/hidapi_impl.py#L256-L260", what = "skips Logitech webcams, which can lock up during the HID++ check" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "claims, is_webcam_pid, find_device" },
 ]
 
 [[fact]]
@@ -2708,10 +2834,22 @@ key = "hidpp/enum/receiver-pids"
 dialect = "hidpp"
 kind = "enum"
 layout = "C517, C518, C51A, C51B, C521, C525, C526, C52E, C52F, C531, C534, C535, C537, 6042, C52B, C532, C548, C539, C53A, C53D, C53F, C541, C545, C547, C54D"
-meaning = "Receivers recognised and left unclaimed."
+meaning = "Receivers: claimed, and reached through their pairing slots."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L87-L100", what = "transcribed from Solaar base_usb.py (unpinned)" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "transcribed from Solaar base_usb.py (unpinned)" },
+]
+
+[[fact]]
+key = "hidpp/enum/device-name-0005"
+dialect = "hidpp"
+kind = "enum"
+layout = "0x0005 DeviceName fn0 -> [length]; fn1 [offset] -> name bytes from offset (up to 16); control bytes dropped; the def's name when present, else the USB product string"
+meaning = "A device behind a receiver names itself; the receiver's USB string names only the receiver."
+grade = "single"
+evidence = [
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/hidpp20.py#L1851-L1870", what = "length from fn0, fragments from fn1 at the running offset" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "device_name" },
 ]
 
 [[fact]]
@@ -2722,7 +2860,7 @@ layout = "IRoot 0x0000 fn0 [id_hi, id_lo] -> [feature index] (0 = absent)"
 meaning = "Feature discovery."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L563-L580", what = "neuron transcription" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron transcription" },
 ]
 
 [[fact]]
@@ -2733,18 +2871,41 @@ layout = "IRoot fn1 [0x00, 0x00, 0x5A] -> [major, minor, 0x5A echo]; require maj
 meaning = "Probe and HID++ 1.0 rejection."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L537-L560", what = "neuron transcription" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron transcription" },
 ]
 
 [[fact]]
 key = "hidpp/enum/battery-1000"
 dialect = "hidpp"
 kind = "enum"
-layout = "0x1000 BatteryLevelStatus fn0 -> [level 0..100, ...]; reshaped to 0..255 at args[1]"
+layout = "0x1000 BatteryLevelStatus fn0 -> [level 0..100, ...]; reshaped to 0..255 at args[1]; level 0 means unknown and is an error, never 0%"
 meaning = "Battery."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L235-L250", what = "neuron transcription" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron transcription" },
+]
+
+[[fact]]
+key = "hidpp/enum/battery-1004"
+dialect = "hidpp"
+kind = "enum"
+layout = "0x1004 UnifiedBattery fn1 getStatus -> [state of charge %, level bitmask, status, ...]; asked only when 0x1000 is absent; reshaped like 0x1000 (0 = unknown)"
+meaning = "Battery on newer devices."
+grade = "single"
+evidence = [
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/hidpp20.py#L1901-L1904", what = "getStatus is function 1 of UNIFIED_BATTERY" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/hidpp20.py#L2244-L2265", what = "reply bytes: discharge percentage, level, status" },
+]
+
+[[fact]]
+key = "hidpp/enum/dpi-2202"
+dialect = "hidpp"
+kind = "enum"
+layout = "0x2202 ExtendedAdjustableDPI fn5 getSensorDpiParameters [sensor 0] -> [sensor, X hi, X lo, X default (2), Y hi, Y lo, Y default (2), ...]; asked only when 0x2201 is absent; a zero Y reads as X"
+meaning = "Per-axis DPI on newer devices."
+grade = "single"
+evidence = [
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/settings_templates.py#L1088-L1140", what = "read function 0x50 (fn 5) with sensor 0; X at bytes 1-2, Y at bytes 5-6" },
 ]
 
 [[fact]]
@@ -2755,18 +2916,18 @@ layout = "0x2201 AdjustableDPI fn2 getSensorDpi -> [sensor, dpi_hi, dpi_lo, ...]
 meaning = "DPI (single axis)."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L235-L262", what = "neuron transcription" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron transcription" },
 ]
 
 [[fact]]
 key = "hidpp/enum/reshape-tags"
 dialect = "hidpp"
 kind = "enum"
-layout = "spec args[0]: 0x00 NONE, 0x01 BATTERY, 0x02 DPI (stripped before the wire)"
+layout = "spec args[0]: 0x00 NONE, 0x01 BATTERY, 0x02 DPI, 0x03 DPI_XY (stripped before the wire)"
 meaning = "Dialect-private reply reshaping."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L137-L140", what = "neuron's own tags" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron's own tags" },
 ]
 
 [[fact]]
@@ -2777,7 +2938,78 @@ layout = "no HID++ setters are synthesized"
 meaning = "HID++ writes are absent: no unproven bytes."
 grade = "derived"
 evidence = [
-  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L317-L334", what = "neuron's policy" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs", what = "neuron's policy" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# QMK VIA (raw HID). Read-only adoption; no VIA board has been on neuron's wire.
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "via/frame/raw-hid"
+dialect = "via"
+kind = "frame"
+layout = "usage page 0xFF60, usage 0x61; 32-byte output and input reports (33 with the report-id byte Windows counts); request [command, data...]; the reply echoes it with the answer written over the data; an unhandled command comes back with byte 0 = 0xFF; asked only when the same unit enumerates a boot-keyboard collection (0x0001/0x0006)"
+meaning = "VIA transport, claim and reply matching."
+grade = "single"
+evidence = [
+  { kind = "source", src = "qmk-8252b630", at = "tmk_core/protocol/usb_descriptor_common.h#L45-L49", what = "RAW_USAGE_PAGE 0xFF60, RAW_USAGE_ID 0x61" },
+  { kind = "source", src = "qmk-8252b630", at = "tmk_core/protocol/usb_descriptor.h#L304", what = "RAW_EPSIZE 32" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L479-L489", what = "unknown command ids answer id_unhandled (0xFF); the same buffer is sent back" },
+  { kind = "source", src = "vial-gui-aef8222a", at = "src/main/python/util.py#L96-L126", what = "talks only to raw HID collections it recognises: Vial serial magic, a known VID:PID, or a user-named device" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/via.rs", what = "neuron's claim and echo match" },
+]
+
+[[fact]]
+key = "via/enum/protocol-version"
+dialect = "via"
+kind = "enum"
+layout = "0x01 -> [0x01, version_hi, version_lo]; a non-zero version is a VIA board"
+meaning = "Adoption probe."
+grade = "single"
+evidence = [
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.h#L55", what = "id_get_protocol_version = 0x01" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L301-L305", what = "version written big-endian into the reply" },
+]
+
+[[fact]]
+key = "via/enum/custom-get-brightness"
+dialect = "via"
+kind = "enum"
+layout = "0x08 [channel, 0x01] -> [0x08, channel, 0x01, level 0..255]; channels asked in order 3 RGB matrix, 2 RGB light, 5 LED matrix, 1 backlight; reshaped to args[2]"
+meaning = "Lighting brightness read."
+grade = "single"
+evidence = [
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.h#L88-L119", what = "channel ids and value id 1 = brightness on each lighting channel" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L690-L714", what = "RGB matrix brightness scaled to 0..255" },
+]
+
+[[fact]]
+key = "via/07/03"
+dialect = "via"
+kind = "set"
+class = 0x07
+id = 0x03
+layout = "custom set 0x07 [channel, 0x01, level 0..255]; channel 0x03 RGB matrix shown, and 0x02 RGB light, 0x05 LED matrix and 0x01 backlight take the same shape; applied without saving; read back through 0x08 after every write"
+meaning = "Unsaved lighting brightness on a VIA board."
+grade = "single"
+ungated_debt = "QMK's own handler applies it with the *_noeeprom calls and neuron never sends the 0x09 save, so a reboot restores the board's stored brightness; every write is read back and fails when the board stays put. No VIA board has been on neuron's wire."
+evidence = [
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L716-L723", what = "RGB matrix brightness set with rgb_matrix_sethsv_noeeprom, scaled to RGB_MATRIX_MAXIMUM_BRIGHTNESS" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L544-L551", what = "backlight brightness set without saving, in BACKLIGHT_LEVELS steps" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L628-L634", what = "RGB light brightness set without saving" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L799-L805", what = "LED matrix brightness set without saving" },
+]
+
+[[fact]]
+key = "via/mode/never-sent"
+dialect = "via"
+kind = "mode"
+layout = "never sent: 0x05, 0x06, 0x09, 0x0A, 0x0F, 0x10, 0x13, 0x15 (EEPROM and keymap writes), 0x0B (bootloader jump), keyboard value 0x03 (live switch matrix); the only write is the unsaved brightness set (via/07/03)"
+meaning = "Nothing VIA sends is saved to the board; the matrix read is a keylogger surface."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/via.rs", what = "neuron's policy" },
 ]
 
 # ------------------------------------------------------------------------------------------------

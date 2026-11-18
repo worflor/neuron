@@ -76,8 +76,7 @@ pub enum Fault {
     CrossTalk,
     /// The reply frame carries this body instead of the scripted one.
     Garbage(Vec<u8>),
-    /// A structurally valid reply with a corrupted CRC byte. Nothing in neuron verifies receive
-    /// CRC today — this fault is the test that will fail until something does.
+    /// A structurally valid reply with a corrupted CRC byte; `razer_reply_status` must reject it.
     CrcCorrupt,
     /// `get_feature` fills only the first `n` bytes and leaves the rest untouched.
     ShortRead(usize),

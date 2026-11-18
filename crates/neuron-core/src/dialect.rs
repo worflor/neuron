@@ -24,6 +24,10 @@ pub const RAZER_VID: u16 = 0x1532;
 /// [`RAZER_VID`] — duplicated in `synth.rs` until wave 2.)
 pub const RAZER_FEATURE_LEN: u16 = 91;
 
+/// The Razer transaction-id cohorts every tx search walks, in this order (ledger
+/// `razer/tx/keyboard-cohorts`): synthesis, calibration, the first-light heal and the lighting probe.
+pub const RAZER_COHORTS: [u8; 4] = [0x1F, 0x3F, 0x9F, 0xFF];
+
 /// The device never answered a command: asleep, out of range, or gone. A caller walking many
 /// commands to one device can stop at the first one, since the rest will not be answered either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +44,34 @@ impl std::fmt::Display for NoReply {
 
 impl std::error::Error for NoReply {}
 
-/// Did this error come from a device that never answered?
+/// A receiver answered for its peripheral with status 0x04: the receiver is there, the wireless
+/// device behind it is asleep or out of range. Live on the Naga V2 Pro's dongle (00A8), which
+/// answers 0x04 to every getter at every tx while the mouse sleeps. Also a [`NoReply`] to callers
+/// that only ask whether the device answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unreachable {
+    pub class: u8,
+    pub id: u8,
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the wireless device is asleep or out of range ({:#04x}/{:#04x})", self.class, self.id)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// Did this error come from a device that never answered (including an unreachable one)?
 #[must_use]
 pub fn is_no_reply(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<NoReply>())
+    e.chain().any(|c| c.is::<NoReply>() || c.is::<Unreachable>())
+}
+
+/// Did a receiver say its wireless device is asleep or out of range?
+#[must_use]
+pub fn is_unreachable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Unreachable>())
 }
 
 /// A wire-protocol FAMILY: how to recognize its pipes, frame its commands, and read its replies.
@@ -114,7 +142,7 @@ pub trait Dialect: Send + Sync {
     ) -> Result<[u8; 80]>;
 
     /// The fire-and-drain streaming write (lighting frames): send, wait the link's round-trip,
-    /// drain the reply ONCE (no retry loop). The wait discipline (`stream_wait_us`) is registry
+    /// drain the reply briefly (no re-send). The wait discipline (`stream_wait_us`) is registry
     /// data passed in by the caller — not read from a def here, so this stays a pure wire op.
     #[allow(clippy::too_many_arguments)]
     fn exec_fast(
@@ -126,7 +154,7 @@ pub trait Dialect: Send + Sync {
         size: u8,
         args: &[u8],
         stream_wait_us: u64,
-    ) -> bool;
+    ) -> Sent;
 
     /// Release the family's CUSTODY of a device back to firmware — the rest-state restore that
     /// runs at stream teardown and app exit (DIALECT-RND "Device-mode lifecycle"). Per-family
@@ -179,6 +207,48 @@ pub trait Dialect: Send + Sync {
     }
 }
 
+/// What became of one streamed write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sent {
+    /// The device answered Success or Busy.
+    Taken,
+    /// The write went out but no answer confirmed it. Some boards never answer frame rows
+    /// (openrazer sends no GET after custom frames on the BlackWidow V4 family,
+    /// `razerkbd_driver.c` @cd5c4243), so this is not a refusal.
+    Unconfirmed,
+    /// The device refused it, the peripheral is unreachable, or the pipe failed.
+    Lost,
+}
+
+/// Re-reads a streamed write's reply gets before the write counts as unconfirmed.
+const FAST_DRAIN_POLLS: u32 = 4;
+const FAST_DRAIN_GAP: Duration = Duration::from_millis(1);
+
+/// Drain one streamed write's reply. A write is taken on Success or Busy: openrazer accepts Busy
+/// as success because "some commands respond with 'busy' but succeed" (`razerkbd_driver.c`
+/// `razer_send_payload` @cd5c4243). A reply that hasn't landed yet (New), a cross-talk or corrupt
+/// frame, or a short read is re-read a few times, as OpenRGB polls until the device stops
+/// answering New/Busy (`RazerController.cpp` `razer_usb_send` @e4af57cd), then counts as
+/// unconfirmed. Fail, Unsupported, an unreachable peripheral or a dead pipe loses the write.
+fn drain_fast<const N: usize>(t: &dyn Transport, status: impl Fn(&[u8; N]) -> Option<Status>) -> Sent {
+    for poll in 0..FAST_DRAIN_POLLS {
+        if poll > 0 {
+            std::thread::sleep(FAST_DRAIN_GAP);
+        }
+        let mut b = [0u8; N];
+        match t.get_feature(&mut b) {
+            Ok(n) if n >= N => match status(&b) {
+                Some(Status::Success | Status::Busy) => return Sent::Taken,
+                Some(Status::New) | None => {}
+                Some(_) => return Sent::Lost,
+            },
+            Ok(_) => {}
+            Err(_) => return Sent::Lost,
+        }
+    }
+    Sent::Unconfirmed
+}
+
 /// Build the outgoing 91-byte `razer_report` feature buffer once, in ONE place. Both [`exec`] and
 /// [`exec_fast`] frame through here (DIALECT-RND ruling: `send_lighting_fast`'s duplicated
 /// `Report::command → to_buf` build collapses to this). Args past the 80-byte body are dropped,
@@ -201,7 +271,9 @@ fn frame(tx: u8, class: u8, id: u8, size: u8, args: &[u8]) -> [u8; BUF_LEN] {
 /// 0x03 = driver — same pair `ensure_custody` flips, verified live.)
 const DEVICE_MODE_CLASS: u8 = 0x00;
 const DEVICE_MODE_SET_ID: u8 = 0x04;
+const DEVICE_MODE_GET_ID: u8 = 0x84;
 const DEVICE_MODE_NORMAL: u8 = 0x00;
+const DEVICE_MODE_DRIVER: u8 = 0x03;
 
 /// The `razer_report` family: the 90-byte vendor report, its CRC, and the busy-poll exec discipline.
 /// The only family with hardware on this desk today; every builtin/auto def speaks it.
@@ -224,6 +296,10 @@ impl Dialect for RazerDialect {
         c.usage_page == info.usage_page
             && c.usage == info.usage
             && c.feature_report_len == info.feature_len
+            && match (c.interface, info.interface()) {
+                (Some(want), Some(got)) => want == got,
+                _ => true,
+            }
     }
 
     /// Widen to the whole Razer VENDOR: any 0x1532 pipe is Razer hardware even when its report
@@ -265,6 +341,7 @@ impl Dialect for RazerDialect {
         let cmd_id = spec_id;
         let out = frame(transaction_id, spec_class, spec_id, size, args);
         t.set_feature(&out)?;
+        let mut unreachable = 0;
         for i in 0..60 {
             std::thread::sleep(Duration::from_millis(10));
             let mut b = [0u8; BUF_LEN];
@@ -285,7 +362,17 @@ impl Dialect for RazerDialect {
                         Status::Unsupported => {
                             bail!("command {cmd_class:#04x}/{cmd_id:#04x} unsupported")
                         }
-                        _ => {} // busy / timeout / new — keep polling
+                        // The receiver gave up on its peripheral. Send once more in case the
+                        // link was waking; a second give-up is the answer.
+                        Status::Timeout => {
+                            unreachable += 1;
+                            if unreachable >= 2 {
+                                return Err(Unreachable { class: cmd_class, id: cmd_id }.into());
+                            }
+                            t.set_feature(&out)?;
+                            continue;
+                        }
+                        _ => {} // busy / new — keep polling
                     }
                 }
             }
@@ -306,31 +393,39 @@ impl Dialect for RazerDialect {
         size: u8,
         args: &[u8],
         stream_wait_us: u64,
-    ) -> bool {
+    ) -> Sent {
         // Hold the pipe's wire lock for the WHOLE conversation (set → poll/drain [→ re-arm]):
         // pair-atomicity is the unit; between conversations other actors may interleave freely.
         let wire = t.wire_lock();
         let _wire = wire.as_ref().map(|w| w.acquire());
 
-        // MOVED from device.rs::send_lighting_fast: SetFeature, wait the receiver round-trip if
-        // the def calibrated one, then a single GetFeature drain (the razer_report protocol
-        // requires the reply be read before the next write — skip it and the device freezes).
+        // SetFeature, wait the receiver round-trip if the def calibrated one, then drain (the
+        // razer_report protocol requires the reply be read before the next write — skip it and
+        // the device freezes).
         let out = frame(transaction_id, class, id, size, args);
-        if t.set_feature(&out).is_err() { return false; }
+        if t.set_feature(&out).is_err() { return Sent::Lost; }
         if stream_wait_us > 0 {
             std::thread::sleep(Duration::from_micros(stream_wait_us));
         }
-        let mut b = [0u8; BUF_LEN];
-        t.get_feature(&mut b).is_ok_and(|n| n >= BUF_LEN)
-            && crate::protocol::razer_reply_status(&b, transaction_id, class, id) == Some(Status::Success)
+        drain_fast::<BUF_LEN>(t, |b| crate::protocol::razer_reply_status(b, transaction_id, class, id))
     }
 
     /// Return the driver-mode LEASE: `device_mode` -> NORMAL (0x00), re-enabling the board's onboard
     /// buttons/FN combos and the firmware's own wake-restore (DIALECT-RND "Device-mode lifecycle").
     /// Framed through this dialect's own `exec` (tx = the def's transaction id), so the bytes are
-    /// `razer_report` and the ACK is awaited — byte-identical to the raw `writes::set_device_mode(d,
-    /// 0x00)` this REPLACES at teardown, now dialect-routed so a non-razer def can never receive it.
+    /// `razer_report` and the ACK is awaited, and a non-razer def can never receive it.
+    ///
+    /// Only a held lease is returned: the mode is read first and the write goes out only when the
+    /// device is in driver mode, so a device neuron never switched gets nothing. Devices that must
+    /// never take a mode write ([`crate::writes::refuses_mode_writes`]) are not touched at all.
     fn release_custody(&self, t: &dyn Transport, def: &crate::registry::DeviceDef) -> Result<()> {
+        if crate::writes::refuses_mode_writes(def) {
+            return Ok(());
+        }
+        let mode = self.exec(t, def.transaction_id, DEVICE_MODE_CLASS, DEVICE_MODE_GET_ID, 0x02, &[])?;
+        if mode[0] != DEVICE_MODE_DRIVER {
+            return Ok(());
+        }
         self.exec(
             t,
             def.transaction_id,
@@ -441,6 +536,7 @@ impl Dialect for RazerAudioDialect {
                 usage_page: ctx.usage_page,
                 usage: ctx.usage,
                 feature_report_len: ctx.feature_len,
+                interface: None,
             },
             commands: BTreeMap::new(),
             lighting: None,
@@ -452,7 +548,7 @@ impl Dialect for RazerAudioDialect {
             // `event_dialect_for`; a per-device `[events]` override is a config addition later.
             events: None,
             buttons: Vec::new(),
-            custody: crate::registry::Custody::default(),
+            custody: None,
         };
         Some(Synthesis::from_probe(
             def,
@@ -523,22 +619,19 @@ impl Dialect for RazerAudioDialect {
         size: u8,
         args: &[u8],
         stream_wait_us: u64,
-    ) -> bool {
+    ) -> Sent {
         // Hold the pipe's wire lock for the WHOLE conversation (set → poll/drain [→ re-arm]):
         // pair-atomicity is the unit; between conversations other actors may interleave freely.
         let wire = t.wire_lock();
         let _wire = wire.as_ref().map(|w| w.acquire());
 
-        // Mirrors RazerDialect::exec_fast: SetFeature, wait the calibrated round-trip, one drain —
-        // never a busy-retry loop.
+        // Mirrors RazerDialect::exec_fast: SetFeature, wait the calibrated round-trip, drain.
         let out = frame_audio(transaction_id, class, id, size, args);
-        if t.set_feature(&out).is_err() { return false; }
+        if t.set_feature(&out).is_err() { return Sent::Lost; }
         if stream_wait_us > 0 {
             std::thread::sleep(Duration::from_micros(stream_wait_us));
         }
-        let mut b = [0u8; AUDIO_BUF_LEN];
-        t.get_feature(&mut b).is_ok_and(|n| n >= AUDIO_BUF_LEN)
-            && reply_status(&b, class, id) == Some(Status::Success)
+        drain_fast::<AUDIO_BUF_LEN>(t, |b| reply_status(b, class, id))
     }
 
     // NB: `release_custody` is INTENTIONALLY NOT overridden — the trait's default no-op is correct.
@@ -624,7 +717,10 @@ static RAZER_AUDIO: RazerAudioDialect = RazerAudioDialect;
 /// order between them is immaterial for claiming). No `lazy_static/once_cell`: a `static` slice over
 /// the `static` items is a plain const initializer (the `&Dialect → &dyn Dialect` unsizing happens in
 /// const context).
-static DIALECTS: &[&dyn Dialect] = &[&RAZER, &RAZER_AUDIO, &HIDPP];
+static DIALECTS: &[&dyn Dialect] = &[&RAZER, &RAZER_AUDIO, &HIDPP, &VIA];
+
+/// QMK VIA raw HID: its own usage page, disjoint from every Razer and HID++ shape.
+static VIA: crate::via::ViaDialect = crate::via::ViaDialect;
 
 /// The first dialect that PUSHES device events on this collection ([`Dialect::pushes_events`]) —
 /// slice order = claim order. `hidwatch::arm_new` arms a collection when this is `Some` OR a
@@ -667,13 +763,19 @@ mod tests {
     /// reply round-trips back through `reply_status`. Simplified from synth.rs's `MockDevice`.
     struct RecordingMock {
         last: Mutex<Option<[u8; BUF_LEN]>>,
+        /// What a device-mode GET answers.
+        mode: u8,
     }
 
     impl RecordingMock {
         fn new() -> Self {
             RecordingMock {
                 last: Mutex::new(None),
+                mode: 0x00,
             }
+        }
+        fn in_mode(mode: u8) -> Self {
+            RecordingMock { mode, ..Self::new() }
         }
     }
 
@@ -690,6 +792,9 @@ mod tests {
             // Echo class/id (and tx/size) from the recorded request, status SUCCESS.
             let mut rep = Report::command(req[2], req[7], req[8], req[6]);
             rep.status = 0x02; // SUCCESS
+            if (req[7], req[8]) == (DEVICE_MODE_CLASS, DEVICE_MODE_GET_ID) {
+                rep.args[0] = self.mode;
+            }
             let out = rep.to_buf();
             let n = buf.len().min(BUF_LEN);
             buf[..n].copy_from_slice(&out[..n]);
@@ -756,13 +861,40 @@ mod tests {
                     .answering(0x0F, 0x03, &[])
                     .faulting(fault),
             );
-            assert!(!RazerDialect.exec_fast(&phantom.handle(), 0x1F, 0x0F, 0x03, 2, &[], 0));
+            assert_eq!(RazerDialect.exec_fast(&phantom.handle(), 0x1F, 0x0F, 0x03, 2, &[], 0), Sent::Unconfirmed);
+        }
+    }
+
+    #[test]
+    fn an_unreachable_peripheral_fails_fast_and_says_so() {
+        use crate::transport::mock::MockDevice;
+        let dongle = Arc::new(MockDevice::razer(0x00A8, "Dongle").refusing(0x00, 0x87, 0x04));
+        let start = std::time::Instant::now();
+        let err = RazerDialect.exec(&dongle.handle(), 0x1F, 0x00, 0x87, 0x02, &[]).unwrap_err();
+        assert!(is_unreachable(&err), "{err:#}");
+        assert!(is_no_reply(&err), "callers that stop on silence still stop");
+        assert!(start.elapsed() < std::time::Duration::from_millis(200), "no full timeout budget");
+        assert_eq!(dongle.log().len(), 2, "sent once, then once more");
+    }
+
+    #[test]
+    fn a_busy_stream_reply_counts_as_taken() {
+        use crate::transport::mock::MockDevice;
+        let busy = Arc::new(MockDevice::razer(0x1234, "Busy").refusing(0x0F, 0x03, 0x01));
+        assert_eq!(RazerDialect.exec_fast(&busy.handle(), 0x1F, 0x0F, 0x03, 2, &[], 0), Sent::Taken);
+        for status in [0x03, 0x04, 0x05] {
+            let refused = Arc::new(MockDevice::razer(0x1234, "Refused").refusing(0x0F, 0x03, status));
+            assert_eq!(
+                RazerDialect.exec_fast(&refused.handle(), 0x1F, 0x0F, 0x03, 2, &[], 0),
+                Sent::Lost,
+                "status {status:#04x} loses the write"
+            );
         }
     }
 
     #[test]
     fn razer_release_custody_emits_the_golden_mode_normal_frame() {
-        let mock = RecordingMock::new();
+        let mock = RecordingMock::in_mode(DEVICE_MODE_DRIVER);
         // def_with stamps transaction_id 31 (0x1F) — release_custody frames with the def's own tx.
         let def = def_with("razer", 0x0c, 0x01, 91);
         RazerDialect
@@ -776,6 +908,24 @@ mod tests {
             sent, want,
             "release_custody must emit exactly the mode-normal frame"
         );
+    }
+
+    #[test]
+    fn razer_release_custody_leaves_a_device_in_normal_mode_alone() {
+        let mock = RecordingMock::new();
+        let def = def_with("razer", 0x0c, 0x01, 91);
+        RazerDialect.release_custody(&mock, &def).expect("mode read answers");
+        let sent = mock.last.lock().unwrap().expect("the mode was read");
+        assert_eq!((sent[7], sent[8]), (DEVICE_MODE_CLASS, DEVICE_MODE_GET_ID), "only the read went out");
+    }
+
+    #[test]
+    fn a_tartarus_pro_never_gets_a_mode_write() {
+        let mut def = def_with("razer", 0x0c, 0x01, 91);
+        def.modes = vec![crate::registry::Mode { name: "wired".into(), product_id: 0x0244 }];
+        let mock = RecordingMock::in_mode(DEVICE_MODE_DRIVER);
+        RazerDialect.release_custody(&mock, &def).unwrap();
+        assert!(mock.last.lock().unwrap().is_none(), "nothing touches the wire");
     }
 
     #[test]
@@ -1114,6 +1264,7 @@ mod tests {
             usage: 0x0001,
             feature_len: 64,
             product: "Razer Seiren V3 Mini".into(),
+            keyboard: false,
         };
         let s = RazerAudioDialect
             .probe(&PanicOnIo, &ctx)
@@ -1150,6 +1301,7 @@ mod tests {
             usage: 0x0001,
             feature_len: 64,
             product: String::new(),
+            keyboard: false,
         };
         let s = RazerAudioDialect.probe(&PanicOnIo, &ctx).unwrap();
         assert_eq!(s.def.name, "Razer audio device 056a");

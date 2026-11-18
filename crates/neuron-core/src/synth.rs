@@ -22,9 +22,13 @@
 //!   emitted only when their PAIRED getter answered, mirroring how the builtins were proven.
 //! * no capture-only commands — `set_scroll_stage` (wire-captured) and `[side_plates]`
 //!   (push-report map) can't be discovered by asking; they stay per-device curated config.
-//! * no transaction-id brute force — writes don't echo honesty (the Chroma V2's wrong-tx
-//!   lighting writes ACK'd then no-op'd), so tx comes from the era heuristic below and is a
-//!   one-line config fix when a board disagrees.
+//! * no write-side transaction-id search — writes don't echo honesty (the Chroma V2's wrong-tx
+//!   lighting writes ACK'd then no-op'd). Getters are retried across the tx cohorts, because a
+//!   board that holds lighting reads to one cohort answers only there; the tx a keyboard's
+//!   backlight read answers at becomes its lighting tx, and the first-light heal verifies writes.
+//!
+//! Priors come from the keyboard atlas ([`crate::atlas`]): which tx and collection to try first,
+//! the LED a keyboard's effects address, and the matrix size no getter reveals.
 
 use crate::lighting::{LightingDef, Protocol};
 use crate::registry::{CommandSpec, ControlInterface, DefOrigin, DeviceDef, Mode, Registry};
@@ -68,9 +72,25 @@ impl<T> Proven<T> {
 /// reached the def by reasoning about the device class, not by watching the device answer.
 pub struct Heuristic<T>(pub T);
 
-/// Probe transaction id. Getters ignore the tx field (proven live on both eras), so any
-/// value works for the read-only probe; 0x1F matches `discover`.
-const PROBE_TX: u8 = 0x1F;
+/// The Razer transaction-id cohorts, tried in this order after any the keyboard atlas names
+/// (ledger `razer/tx/keyboard-cohorts`). The Chroma V2 answers getters at all four; the Naga's
+/// receiver only at 0x1F and 0x3F (live 2026-11-16); openrazer reads the BlackWidow V3 at 0x3F.
+const COHORTS: [u8; 4] = crate::dialect::RAZER_COHORTS;
+
+/// The first cohort, which `discover` also uses.
+#[cfg(test)]
+const PROBE_TX: u8 = COHORTS[0];
+
+/// `first` followed by every [`COHORTS`] entry it lacks.
+fn cohort_order(first: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for &tx in first.iter().chain(COHORTS.iter()) {
+        if !out.contains(&tx) {
+            out.push(tx);
+        }
+    }
+    out
+}
 
 /// A setter emitted alongside its proven getter (never probed — writes are not probes).
 struct Setter {
@@ -161,6 +181,9 @@ const CATALOG: &[CatalogEntry] = &[
 const WIRELESS_STREAM_WAIT_US: u64 = 31_000;
 /// Round-trips at/above this are a slow (wireless) link that needs the stream wait.
 const WIRELESS_ROUNDTRIP_MS: u64 = 15;
+/// An atlas reply wait at or below this is a wired link's (openrazer waits 600 µs on wired
+/// keyboards and 4900 µs on wireless ones).
+const WIRED_REPLY_WAIT_US: u32 = 1_000;
 
 /// `stream_wait_us` for the synthesized def. A wireless link overruns without pacing —
 /// streamed lighting writes outrun the host→dongle→device round-trip and DROP frames (the
@@ -172,13 +195,22 @@ const WIRELESS_ROUNDTRIP_MS: u64 = 15;
 ///   * a battery (`wireless_capable`) — a battery-bearing board is built to run wireless,
 ///     and the wait on a wired link only lowers the stream fps ceiling, never corrupts;
 ///     flicker-by-default on a real dongle would be the dishonest failure mode.
+///
+/// A device the atlas knows carries openrazer's per-PID reply wait instead of the battery guess:
+/// Razer gives each link its own PID, so a wired PID needs no pacing and a wireless one gets its
+/// own wait (4.9 ms for a keyboard, 59.9 ms for a Viper receiver). The two pieces of evidence
+/// combine by the larger, capped where a definition may ask: a slow measured link is never paced
+/// below the receiver wait, and a receiver openrazer waits longer on is never paced shorter.
 #[must_use]
-pub fn stream_wait_for(roundtrip_ms: u64, wireless_capable: bool) -> u64 {
-    if roundtrip_ms >= WIRELESS_ROUNDTRIP_MS || wireless_capable {
-        WIRELESS_STREAM_WAIT_US
-    } else {
-        0
-    }
+pub fn stream_wait_for(roundtrip_ms: u64, wireless_capable: bool, atlas_wait_us: Option<u32>) -> u64 {
+    let measured = if roundtrip_ms >= WIRELESS_ROUNDTRIP_MS { WIRELESS_STREAM_WAIT_US } else { 0 };
+    let known = match atlas_wait_us {
+        Some(w) if w > WIRED_REPLY_WAIT_US => u64::from(w),
+        Some(_) => 0,
+        None if wireless_capable => WIRELESS_STREAM_WAIT_US,
+        None => 0,
+    };
+    measured.max(known).min(crate::defcheck::MAX_STREAM_WAIT_US)
 }
 
 /// The parrot canary: a (class, id, size) triple no Razer device implements. Class 0xFE is outside
@@ -197,8 +229,10 @@ const QUALIFY_POLLS: usize = 1000;
 /// Send one getter and poll (2ms grain, up to `max_polls`) for its echoed reply. Returns the
 /// args and how long the round-trip took. Finer-grained than `discover::exec` because the
 /// measured latency FEEDS `stream_wait_us` — 8ms polling would read every wired board as ~8ms.
+#[allow(clippy::too_many_arguments)]
 fn timed_exec(
     t: &dyn Transport,
+    tx: u8,
     class: u8,
     id: u8,
     size: u8,
@@ -213,7 +247,7 @@ fn timed_exec(
     let wire = t.wire_lock();
     let _wire = wire.as_ref().map(|w| w.acquire());
 
-    let mut req = Report::command(PROBE_TX, class, id, size);
+    let mut req = Report::command(tx, class, id, size);
     for (i, b) in args.iter().enumerate() {
         if i < req.args.len() {
             req.args[i] = *b;
@@ -226,7 +260,7 @@ fn timed_exec(
         std::thread::sleep(Duration::from_millis(2));
         let mut b = [0u8; BUF_LEN];
         if t.get_feature(&mut b).ok() == Some(BUF_LEN) {
-            if let Some(status) = razer_reply_status(&b, PROBE_TX, class, id) {
+            if let Some(status) = razer_reply_status(&b, tx, class, id) {
                 match status {
                     Status::Success => return Some((Report::from_buf(&b).args, start.elapsed())),
                     Status::Fail | Status::Unsupported => return None,
@@ -254,6 +288,10 @@ pub struct SynthCtx {
     pub feature_len: u16,
     /// USB product string (may be empty) — becomes the def's honest name.
     pub product: String,
+    /// The unit also enumerates a boot-keyboard collection (usage 0x01/0x06). With the keyboard
+    /// atlas, the only signal that a DPI-less matrix device is a keyboard rather than a mat, dock
+    /// or stand.
+    pub keyboard: bool,
 }
 
 impl SynthCtx {
@@ -266,6 +304,7 @@ impl SynthCtx {
             usage: i.usage,
             feature_len: i.feature_len,
             product: i.product.clone(),
+            keyboard: false,
         }
     }
 }
@@ -295,6 +334,9 @@ pub struct Synthesis {
     /// answers unlock) — minted inside the probe loop, so a `Proven` here is by construction the
     /// OBSERVED result. Equals `def.commands`' keys.
     pub proven_commands: Proven<Vec<String>>,
+    /// How the lighting tx, LED and matrix size were chosen: one `#   - …` comment line each,
+    /// carried into the emitted file's header.
+    pub provenance: Vec<String>,
 }
 
 impl Synthesis {
@@ -333,6 +375,7 @@ impl Synthesis {
             dims,
             stream_wait,
             proven_commands: Proven::mint(answered_commands),
+            provenance: Vec::new(),
         }
     }
 }
@@ -354,18 +397,48 @@ fn cmd_tx(class: u8, id: u8, size: u8, args: &[u8], tx: u8) -> CommandSpec {
     }
 }
 
-/// The matrix (extended, class 0x0F) lighting block. `custom_id` MUST be 0x08 on this era (0x05
-/// is a real native effect there — REACTIVE on the Naga — and using it as the display id
-/// painted-then-un-painted every streamed frame).
-///
-/// Mice keep the Naga-proven values: LED 0x04 (logo region) and its effect-id table. Keyboards
-/// (no DPI) take what Synapse's own BlackWidow V3/V4 X middleware sends: NOSTORE + LED 0x00 (the
-/// whole device; 0x04 is only the V3's logo zone) for effects and frame rows, with spectrum 0x03 /
-/// wave 0x04. Keyboard brightness writes and reads the backlight region 0x05, so the read-back
-/// checks the region it wrote. Ledger `razer/enum/synth-lighting-blocks` carries the evidence.
-fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool, keyboard: bool) -> LightingDef {
-    let (led, wave, spectrum) = if keyboard { (0x00, 0x04, 0x03) } else { (0x04, 0x03, 0x04) };
-    let brightness_region = if keyboard { 0x05 } else { led };
+/// The matrix (extended, class 0x0F) lighting block for mice and other non-keyboard matrix
+/// devices: the Naga-proven values, LED 0x04 (logo region) and its effect-id table. `custom_id`
+/// MUST be 0x08 on this era (0x05 is a real native effect there — REACTIVE on the Naga — and
+/// using it as the display id painted-then-un-painted every streamed frame).
+fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool) -> LightingDef {
+    LightingDef {
+        protocol: Protocol::Matrix,
+        rows,
+        cols,
+        varstore: 0x00,
+        led_id: 0x04,
+        effects: [
+            ("off", 0x00u8),
+            ("static", 0x01),
+            ("breathing", 0x02),
+            ("wave", 0x03),
+            ("spectrum", 0x04),
+            ("reactive", 0x05),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+        custom_id: 0x08,
+        effect: cmd(0x0F, 0x02, 0x0C, &[0x00, 0x04]),
+        custom_frame: Some(cmd(0x0F, 0x03, 0x40, &[0x00, 0x04])),
+        // The matrix dialect HAS a brightness getter (0x0F/0x84 — the same probe that gates the
+        // top-level `set_brightness` command), so the block's brightness rides that SAME evidence:
+        // emit it only when the getter answered. `lighting.brightness` is now a WRITE path
+        // (`DeviceDef::supports(SetBrightness)` reads it), so an unanswered getter must mean NO
+        // brightness write anywhere in the def — leave it `None` and `supports(SetBrightness)`
+        // honestly reads false rather than promising an unproven write.
+        brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, 0x04])),
+        framing: crate::lighting::Framing::Compact,
+        display_args: None,
+    }
+}
+
+/// The matrix lighting block for keyboards, as openrazer and OpenRGB drive them
+/// (ledger `razer/enum/synth-lighting-blocks`): effects and brightness on the backlight LED
+/// (0x05, or the atlas's LED), NOSTORE, openrazer's fixed effect sizes, frame rows `[00, 00, …]`
+/// and the custom display `[00, 00, 08]` at size 0x0C. Brightness is written where it is read.
+fn keyboard_lighting(rows: u8, cols: u8, led: u8, brightness_proven: bool) -> LightingDef {
     LightingDef {
         protocol: Protocol::Matrix,
         rows,
@@ -376,8 +449,8 @@ fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool, keyboard: bool) 
             ("off", 0x00u8),
             ("static", 0x01),
             ("breathing", 0x02),
-            ("wave", wave),
-            ("spectrum", spectrum),
+            ("spectrum", 0x03),
+            ("wave", 0x04),
             ("reactive", 0x05),
         ]
         .into_iter()
@@ -385,21 +458,17 @@ fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool, keyboard: bool) 
         .collect(),
         custom_id: 0x08,
         effect: cmd(0x0F, 0x02, 0x0C, &[0x00, led]),
-        custom_frame: Some(cmd(0x0F, 0x03, 0x40, &[0x00, led])),
-        // The matrix dialect HAS a brightness getter (0x0F/0x84 — the same probe that gates the
-        // top-level `set_brightness` command), so the block's brightness rides that SAME evidence:
-        // emit it only when the getter answered. `lighting.brightness` is now a WRITE path
-        // (`DeviceDef::supports(SetBrightness)` reads it), so an unanswered getter must mean NO
-        // brightness write anywhere in the def — leave it `None` and `supports(SetBrightness)`
-        // honestly reads false rather than promising an unproven write.
-        brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, brightness_region])),
+        custom_frame: Some(cmd(0x0F, 0x03, 0x47, &[0x00, 0x00])),
+        brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, led])),
+        framing: crate::lighting::Framing::Fixed,
+        display_args: Some(vec![0x00, 0x00, 0x08]),
     }
 }
 
 /// The legacy (standard, class 0x03) lighting block — Chroma-V2-proven values, including the
 /// split-brain tx: getters ride the device default while EFFECT and CUSTOM-FRAME writes need
-/// 0x3F (at the default they ACK and silently no-op).
-fn legacy_lighting(rows: u8, cols: u8, brightness_proven: bool) -> LightingDef {
+/// `lighting_tx` (0x3F on the Chroma family; at the default they ACK and silently no-op).
+fn legacy_lighting(rows: u8, cols: u8, brightness_proven: bool, lighting_tx: u8) -> LightingDef {
     LightingDef {
         protocol: Protocol::Legacy,
         rows,
@@ -418,11 +487,13 @@ fn legacy_lighting(rows: u8, cols: u8, brightness_proven: bool) -> LightingDef {
         .map(|(k, v)| (k.to_string(), v))
         .collect(),
         custom_id: 0x05,
-        effect: cmd_tx(0x03, 0x0A, 0x08, &[], 0x3F),
-        custom_frame: Some(cmd_tx(0x03, 0x0B, 0x46, &[0xFF], 0x3F)),
+        effect: cmd_tx(0x03, 0x0A, 0x08, &[], lighting_tx),
+        custom_frame: Some(cmd_tx(0x03, 0x0B, 0x46, &[0xFF], lighting_tx)),
         // The paired 0x03/0x83 getter proves the standard 0x03/0x03 setter and its persistent
         // BACKLIGHT_LED prefix. If that getter does not answer, synthesis emits no write path.
         brightness: brightness_proven.then(|| cmd(0x03, 0x03, 0x03, &[0x01, 0x05])),
+        framing: crate::lighting::Framing::Compact,
+        display_args: None,
     }
 }
 
@@ -442,7 +513,7 @@ pub(crate) fn known_commands() -> Vec<(&'static str, u8, u8)> {
 /// across the matrix mouse, matrix keyboard and legacy shapes.
 pub(crate) fn lighting_opcodes() -> Vec<(u8, u8)> {
     let mut out = Vec::new();
-    for l in [matrix_lighting(1, 2, true, false), matrix_lighting(6, 22, true, true), legacy_lighting(6, 22, true)] {
+    for l in [matrix_lighting(1, 2, true), keyboard_lighting(6, 22, 0x05, true), legacy_lighting(6, 22, true, 0x3F)] {
         out.push((l.effect.class, l.effect.id));
         out.extend(l.custom_frame.iter().map(|c| (c.class, c.id)));
         out.extend(l.brightness.iter().map(|c| (c.class, c.id)));
@@ -454,10 +525,24 @@ pub(crate) fn lighting_opcodes() -> Vec<(u8, u8)> {
 /// `None` when the pipe never answers the firmware getter (not a talking `razer_report` pipe —
 /// e.g. a secondary collection that enumerates with the right shape but stays mute).
 pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
+    use crate::atlas::Class;
+
+    let atlas = crate::atlas::lookup(ctx.vid, ctx.pid);
+    let mouse_atlas = crate::atlas::lookup_mouse(ctx.vid, ctx.pid).filter(|_| atlas.is_none());
+    let atlas_tx = atlas
+        .map(crate::atlas::Keyboard::tx_candidates)
+        .or_else(|| mouse_atlas.map(|m| m.tx().candidates()))
+        .unwrap_or_default();
+
     // Wake + qualify: the first command to a sleeping wireless device can take an outlier
     // round-trip (it also has to wake the radio — the long QUALIFY window), so it qualifies
-    // the pipe but doesn't count toward the latency sample.
-    timed_exec(t, 0x00, 0x81, 0x02, &[], QUALIFY_POLLS)?;
+    // the pipe but doesn't count toward the latency sample. A board that holds every request to
+    // its tx cohort answers only one of the cohorts; the radio is awake after the first window,
+    // so the rest take the short one.
+    let probe_tx = cohort_order(&atlas_tx).into_iter().enumerate().find_map(|(i, tx)| {
+        let polls = if i == 0 { QUALIFY_POLLS } else { PROBE_POLLS };
+        timed_exec(t, tx, 0x00, 0x81, 0x02, &[], polls).map(|_| tx)
+    })?;
 
     // PARROT CANARY. `timed_exec` believes the reply's STATUS byte, which is the only signal the
     // wire gives — but a board that answers SUCCESS-with-an-empty-body to *everything* (observed;
@@ -467,14 +552,14 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     // this pipe could give.
     //
     // Getter-shaped (id >= 0x80) so the canary itself honours the module's no-writes rule.
-    if timed_exec(t, CANARY.0, CANARY.1, CANARY.2, &[], PROBE_POLLS).is_some() {
+    if timed_exec(t, probe_tx, CANARY.0, CANARY.1, CANARY.2, &[], PROBE_POLLS).is_some() {
         return None;
     }
 
     // Measure the link: median of three firmware round-trips.
     let mut samples: Vec<u64> = (0..3)
         .filter_map(|_| {
-            timed_exec(t, 0x00, 0x81, 0x02, &[], PROBE_POLLS).map(|(_, d)| d.as_millis() as u64)
+            timed_exec(t, probe_tx, 0x00, 0x81, 0x02, &[], PROBE_POLLS).map(|(_, d)| d.as_millis() as u64)
         })
         .collect();
     samples.sort_unstable();
@@ -487,7 +572,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     let mut matrix = false;
     let mut legacy = false;
     for e in CATALOG {
-        let Some((args, _)) = timed_exec(t, e.class, e.id, e.size, e.args, PROBE_POLLS) else {
+        let Some((args, _)) = timed_exec(t, probe_tx, e.class, e.id, e.size, e.args, PROBE_POLLS) else {
             continue;
         };
         if e.name == "serial" {
@@ -524,42 +609,134 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     // flagged loudly in the emitted file. Wrong dims degrade custom frames (partial paint),
     // never native effects, which are whole-device.
     let has_dpi = commands.contains_key("dpi");
-    // A keyboard's backlight is region 0x05, which Synapse reads for 0F/84; the Naga-shaped
-    // catalog probe reads 0x04, which is the logo (or nothing) on a keyboard. Read-only.
-    // Only an answering backlight getter marks a keyboard. Other DPI-less matrix devices (docks,
-    // mats, stands) keep the logo-region bytes they had before.
-    let backlight = !has_dpi && !legacy
-        && timed_exec(t, 0x0F, 0x84, 0x03, &[0x00, 0x05], PROBE_POLLS).is_some();
-    if backlight {
+    let atlas_class = atlas.and_then(|k| k.class().preferred());
+    let extended_hint = atlas_class == Some(Class::Extended);
+    let standard_hint = matches!(atlas_class, Some(Class::Standard | Class::Linear));
+    let mut provenance: Vec<String> = Vec::new();
+
+    // KEYBOARD BACKLIGHT. A keyboard's lighting reads 0F/84 at its backlight LED (0x05, or the
+    // atlas's), not the Naga's logo region 0x04 the catalog asks about. Boards of the 2018-2021
+    // cohort hold lighting requests to tx 0x3F (openrazer reads the V3 there), so the read is
+    // retried at each cohort until one answers; the answering tx carries the board's lighting.
+    // Skipped for mice, for boards the atlas names legacy, and for boards that answered legacy
+    // lighting getters unless the atlas names them extended. Read-only.
+    // Where the sources disagree on the backlight LED, the board is asked about each.
+    let leds = atlas.map(|k| k.led().candidates()).filter(|l| !l.is_empty()).unwrap_or_else(|| vec![0x05]);
+    let mut led = leds[0];
+    let mut keyboard_tx: Option<u8> = None;
+    let mut backlight = false;
+    let is_keyboard = atlas.is_some() || ctx.keyboard;
+    if !has_dpi && is_keyboard && !standard_hint && (!legacy || extended_hint) {
+        let mut refused = Vec::new();
+        'probe: for tx in cohort_order(&[&atlas_tx[..], &[probe_tx]].concat()) {
+            for &candidate in &leds {
+                if timed_exec(t, tx, 0x0F, 0x84, 0x03, &[0x00, candidate], PROBE_POLLS).is_some() {
+                    keyboard_tx = Some(tx);
+                    led = candidate;
+                    backlight = true;
+                    break 'probe;
+                }
+            }
+            refused.push(tx);
+        }
+        if let Some(tx) = keyboard_tx {
+            let how = if refused.is_empty() {
+                "answered at the first tx asked".to_string()
+            } else {
+                let r: Vec<String> = refused.iter().map(|x| format!("0x{x:02X}")).collect();
+                format!("unanswered at {}", r.join(", "))
+            };
+            provenance.push(format!(
+                "#   - lighting tx 0x{tx:02X}: the backlight read 0F/84 [00, {led:02X}] answered there ({how})."
+            ));
+        }
+    }
+    // Atlas-extended keyboards whose only matrix evidence is the catalog's state read still get
+    // the keyboard block, at the atlas's lighting tx, without a brightness write.
+    if keyboard_tx.is_none() && !has_dpi && extended_hint && matrix {
+        if let Some(k) = atlas {
+            keyboard_tx = k.lighting_tx().preferred();
+            if let Some(tx) = keyboard_tx {
+                provenance.push(format!(
+                    "#   - lighting tx 0x{tx:02X}: keyboard atlas, {}; the backlight read answered at no tx.",
+                    k.lighting_tx().grade()
+                ));
+            }
+        }
+    }
+    let keyboard = keyboard_tx.is_some();
+    if keyboard {
         matrix = true;
-        commands.insert("brightness".to_string(), cmd(0x0F, 0x84, 0x03, &[0x00, 0x05]));
-    }
-    // The top-level setter writes the Naga's region 0x04 (capability::set_brightness), which is a
-    // keyboard's logo; keyboard brightness goes through the lighting block instead.
-    if matrix && backlight {
+        legacy = false;
+        let tx = keyboard_tx.unwrap_or(probe_tx);
+        if backlight {
+            commands.insert("brightness".to_string(), cmd(0x0F, 0x84, 0x03, &[0x00, led]));
+        } else if commands.get("brightness").is_some_and(|c| c.class != 0x0F) {
+            commands.remove("brightness");
+        }
+        // The top-level setter writes the Naga's region 0x04 (capability::set_brightness), which
+        // is a keyboard's logo; keyboard brightness goes through the lighting block instead.
         commands.remove("set_brightness");
+        // The landing check reads lighting_state in the block's own dialect, at the lighting tx.
+        if timed_exec(t, tx, 0x0F, 0x82, 0x20, &[], PROBE_POLLS).is_some() {
+            commands.insert("lighting_state".to_string(), cmd(0x0F, 0x82, 0x20, &[]));
+        } else if commands.get("lighting_state").is_some_and(|c| c.class != 0x0F) {
+            commands.remove("lighting_state");
+        }
     }
-    let lighting = if matrix {
-        let (rows, cols) = if has_dpi { (1, 2) } else { (6, 22) };
-        let region = if backlight { 0x05 } else { 0x04 };
+
+    // rows×cols is the one thing a getter can't reveal: the atlas's value when it has one, else a
+    // HEURISTIC (a DPI class = a mouse). Wrong dims degrade custom frames (partial paint), never
+    // native effects, which are whole-device.
+    let atlas_dims = atlas.and_then(|k| k.dims().preferred()).filter(|&(r, c)| r > 0 && c > 0);
+    if let (Some((r, c)), Some(k)) = (atlas_dims, atlas) {
+        if keyboard || (legacy && !has_dpi) {
+            provenance.push(format!("#   - [lighting] {r}x{c}: keyboard atlas, {}.", k.dims().grade()));
+        }
+    }
+    let lighting = if keyboard {
+        let (rows, cols) = atlas_dims.unwrap_or((6, 22));
+        if let Some(k) = atlas {
+            let how = if backlight && leds.len() > 1 { "answered the backlight read; " } else { "" };
+            provenance.push(format!("#   - [lighting] led 0x{led:02X}: {how}keyboard atlas, {}.", k.led().grade()));
+        }
+        Some(keyboard_lighting(rows, cols, led, backlight))
+    } else if matrix {
+        let mouse_dims = mouse_atlas.and_then(|m| m.dims().preferred()).filter(|&(r, c)| r > 0 && c > 0);
+        let (rows, cols) = match (has_dpi, mouse_dims) {
+            (true, Some(d)) => d,
+            (true, None) => (1, 2),
+            (false, _) => (6, 22),
+        };
+        if let (true, Some((r, c)), Some(m)) = (has_dpi, mouse_dims, mouse_atlas) {
+            provenance.push(format!("#   - [lighting] {r}x{c}: mouse atlas, {}.", m.dims().grade()));
+        }
         let brightness_proven = commands.get("brightness").is_some_and(|c| {
-            c.class == 0x0F && c.id == 0x84 && c.size == 0x03 && c.args == [0x00, region]
+            c.class == 0x0F && c.id == 0x84 && c.size == 0x03 && c.args == [0x00, 0x04]
         });
-        Some(matrix_lighting(rows, cols, brightness_proven, backlight))
+        Some(matrix_lighting(rows, cols, brightness_proven))
     } else if legacy {
         let brightness_proven = commands.get("brightness").is_some_and(|c| {
             c.class == 0x03 && c.id == 0x83 && c.size == 0x03 && c.args == [0x01, 0x05]
         });
-        Some(legacy_lighting(6, 22, brightness_proven))
+        let (rows, cols) = atlas_dims.unwrap_or((6, 22));
+        let lighting_tx = atlas
+            .filter(|_| standard_hint)
+            .and_then(|k| k.lighting_tx().preferred())
+            .unwrap_or(0x3F);
+        Some(legacy_lighting(rows, cols, brightness_proven, lighting_tx))
     } else {
         None
     };
 
-    // Era tx heuristic: matrix-era boards take 0x1F device-wide (Naga-proven); legacy-only
-    // boards default 0xFF with the 0x3F lighting override baked into the lighting block
-    // (Chroma-V2-proven). Getters ignore tx either way — only writes can disagree, and the
-    // emitted file says exactly which knob to turn.
-    let transaction_id = if matrix || !legacy { 0x1F } else { 0xFF };
+    // Device tx: a keyboard runs at the tx its lighting answered at; other matrix-era devices at
+    // the tx the pipe qualified at (0x1F on the Naga); legacy-only boards default 0xFF with the
+    // lighting tx baked into the lighting block (Chroma-V2-proven split brain).
+    let transaction_id = match keyboard_tx {
+        Some(tx) => tx,
+        None if matrix || !legacy => probe_tx,
+        None => 0xFF,
+    };
 
     // The name mirrors the emitted file, which is the source of truth: a TOML basic string can't
     // carry control bytes, so `emit_toml` maps them to spaces — strip them here too (via the same
@@ -571,7 +748,17 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         comment_safe(ctx.product.trim())
     };
     let wireless_capable = commands.contains_key("battery_level");
-    let stream_wait_us = stream_wait_for(roundtrip_ms.unwrap_or(0), wireless_capable);
+    let (atlas_wait, which) = match (atlas, mouse_atlas) {
+        (Some(k), _) => (k.reply_wait_us(), "keyboard"),
+        (None, Some(m)) => (m.reply_wait_us(), "mouse"),
+        (None, None) => (None, ""),
+    };
+    let stream_wait_us = stream_wait_for(roundtrip_ms.unwrap_or(0), wireless_capable, atlas_wait);
+    if let Some(w) = atlas_wait.filter(|&w| u64::from(w) == stream_wait_us || stream_wait_us == 0) {
+        provenance.push(format!(
+            "#   - stream_wait_us {stream_wait_us}: {which} atlas, openrazer's {w} µs reply wait for this PID."
+        ));
+    }
     // The evidence twins, captured at the SAME points the def's data is computed: dims mirror the
     // lighting block's guessed rows/cols (None when there's no block — nothing to warn about),
     // proven_commands mirror the answered command map. Both DUPLICATE what lands in the def; the
@@ -600,6 +787,8 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
             usage_page: ctx.usage_page,
             usage: ctx.usage,
             feature_report_len: RAZER_FEATURE_LEN,
+            // Adoption pins the interface when the unit exposes this collection shape twice.
+            interface: None,
         },
         commands,
         lighting,
@@ -611,7 +800,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         events: None,
         // Button functions are a write surface; synthesis never adopts writes it hasn't proven.
         buttons: Vec::new(),
-        custody: crate::registry::Custody::default(),
+        custody: None,
     };
     Some(Synthesis {
         def,
@@ -621,6 +810,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         dims,
         stream_wait: Heuristic(stream_wait_us),
         proven_commands,
+        provenance,
     })
 }
 
@@ -684,6 +874,8 @@ struct EmitNotes {
     /// The "HEURISTIC fields worth checking" caveat lines, in order — each a full `#   - …`
     /// comment (already control-safe). The `transaction_id` line is the one the heal rewrites.
     heuristic_lines: Vec<String>,
+    /// How the lighting tx, LED and matrix size were chosen (see [`Synthesis::provenance`]).
+    provenance: Vec<String>,
 }
 
 /// Serialize a synthesized def to the same commented-TOML shape as the curated files. The
@@ -724,6 +916,7 @@ pub fn emit_toml(s: &Synthesis) -> String {
             serial: s.serial.clone(),
             roundtrip_ms: s.roundtrip_ms,
             heuristic_lines,
+            provenance: s.provenance.clone(),
         },
     )
 }
@@ -760,13 +953,21 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
         None => out.push_str(&format!("# stream_wait_us = {} (not measured).\n", d.stream_wait_us)),
     }
     out.push_str(
-        "# This file is CONFIG, not discovery: edit freely (it is never overwritten), or copy\n\
-         # it into devices/ to promote it to a curated def that shadows this one.\n\
+        "# This file is CONFIG, not discovery: edit freely, or copy it into devices/ to promote it\n\
+         # to a curated def that shadows this one. Neuron rewrites it only to record a\n\
+         # hardware-verified correction, and never once it has been edited by hand.\n\
          # HEURISTIC fields worth checking on a new board:\n",
     );
     for line in &notes.heuristic_lines {
         out.push_str(line);
         out.push('\n');
+    }
+    if !notes.provenance.is_empty() {
+        out.push_str("# How the lighting bytes were chosen:\n");
+        for line in &notes.provenance {
+            out.push_str(&comment_safe(line));
+            out.push('\n');
+        }
     }
     out.push('\n');
     out.push_str(&format!("name = \"{}\"\n", toml_escape(&d.name)));
@@ -791,9 +992,13 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
         ));
     }
     out.push_str(&format!(
-        "[control_interface]\nusage_page = 0x{:04X}\nusage = 0x{:04X}\nfeature_report_len = {}\n\n",
+        "[control_interface]\nusage_page = 0x{:04X}\nusage = 0x{:04X}\nfeature_report_len = {}\n",
         d.control_interface.usage_page, d.control_interface.usage, d.control_interface.feature_report_len
     ));
+    if let Some(i) = d.control_interface.interface {
+        out.push_str(&format!("interface = {i}   # the unit exposes this collection on more than one interface\n"));
+    }
+    out.push('\n');
     if d.commands.is_empty() {
         // `commands` has no `#[serde(default)]` (a load-time typo'd/truncated table should fail
         // loudly, not silently deserialize to empty) — so a genuinely EMPTY map (e.g. razer-audio's
@@ -809,10 +1014,23 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
             Protocol::Matrix => "matrix",
             Protocol::Legacy => "legacy",
         };
+        let pid = d.modes.first().map_or(0, |m| m.product_id);
+        let dims_note = match crate::atlas::lookup(d.vendor_id, pid).map(crate::atlas::Keyboard::dims) {
+            Some(dims) if dims.preferred() == Some((l.rows, l.cols)) => format!("keyboard atlas: {}", dims.grade()),
+            _ => "HEURISTIC guess — refine for full custom-frame coverage".to_string(),
+        };
         out.push_str(&format!(
-            "[lighting]\nprotocol = \"{proto}\"\nrows = {}\ncols = {}   # HEURISTIC guess — refine for full custom-frame coverage\nvarstore = 0x{:02X}\nled_id = 0x{:02X}\ncustom_id = 0x{:02X}\n\n",
+            "[lighting]\nprotocol = \"{proto}\"\nrows = {}\ncols = {}   # {dims_note}\nvarstore = 0x{:02X}\nled_id = 0x{:02X}\ncustom_id = 0x{:02X}\n",
             l.rows, l.cols, l.varstore, l.led_id, l.custom_id
         ));
+        if l.framing == crate::lighting::Framing::Fixed {
+            out.push_str("framing = \"fixed\"\n");
+        }
+        if let Some(a) = &l.display_args {
+            let a: Vec<String> = a.iter().map(|b| format!("0x{b:02X}")).collect();
+            out.push_str(&format!("display_args = [{}]\n", a.join(", ")));
+        }
+        out.push('\n');
         out.push_str("[lighting.effects]\n");
         for (k, v) in &l.effects {
             out.push_str(&format!("{k} = 0x{v:02X}\n"));
@@ -826,30 +1044,113 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
             emit_cmd(&mut out, "lighting.brightness", b);
         }
     }
+    with_digest(&out)
+}
+
+/// `def` with its lighting effects and frame rows at `tx`, as overrides on those two commands.
+/// The device default keeps serving getters (where reads answered) and brightness keeps its own
+/// tx, so proving one path never moves another. No override is added when `tx` already is the
+/// device default and the block had none.
+#[must_use]
+pub fn with_lighting_tx(def: &DeviceDef, tx: u8) -> DeviceDef {
+    let mut healed = def.clone();
+    let device_tx = healed.transaction_id;
+    if let Some(l) = healed.lighting.as_mut() {
+        let overridden = l.effect.transaction_id.is_some();
+        let value = (overridden || tx != device_tx).then_some(tx);
+        l.effect.transaction_id = value;
+        if let Some(cf) = l.custom_frame.as_mut() {
+            cf.transaction_id = value;
+        }
+    }
+    healed
+}
+
+/// The digest line every emitted file carries, so a hand edit can be told from Neuron's own output.
+const DIGEST_MARK: &str = "# synth-digest: ";
+
+/// FNV-1a over the file text without its digest line.
+fn digest_of(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for line in text.lines().filter(|l| !l.starts_with(DIGEST_MARK)) {
+        for b in line.bytes().chain([b'\n']) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// Stamp `text` with its digest, right after the version line.
+fn with_digest(text: &str) -> String {
+    let digest = digest_of(text);
+    let mut out = String::with_capacity(text.len() + 40);
+    let mut stamped = false;
+    for line in text.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if !stamped && line.starts_with(VERSION_MARK) {
+            out.push_str(&format!("{DIGEST_MARK}{digest}\n"));
+            stamped = true;
+        }
+    }
     out
 }
 
-/// Rewrite an AUTO def's file with a HARDWARE-VERIFIED transaction id (the first-light heal's
-/// result). The tx line stops being heuristic — the emitted comment says exactly how it was
-/// proven. Refuses non-auto paths by construction (only [`auto_def_path`] is ever written), so a
-/// curated/builtin def can never be clobbered by this path even if a caller passed one in.
-///
-/// The notes carry the SAME caveats [`emit_toml`] derives EXCEPT the tx line, which now records
-/// the proof. Serial + measured round-trip aren't recoverable from the def alone (they were probe
-/// facts, not stored fields), so the header omits the serial and says the round-trip was not
-/// measured — the honest cost of healing from the loaded def rather than a fresh probe; the tx
-/// proof is the line that matters here.
-pub fn heal_auto_tx(dialect_id: &str, pid: u16, def: &DeviceDef, verified_tx: u8) -> Result<()> {
-    let mut healed = def.clone();
-    healed.transaction_id = verified_tx;
-    // Rebuild the caveat block: every heuristic line EXCEPT tx persists (dims + brightness ride the
-    // lighting block exactly as emit_toml gates them; stream_wait is always present); the tx line
-    // now states hardware proof instead of era-inference.
+/// Has a generated file been edited since Neuron wrote it? `None` when it predates the digest.
+#[must_use]
+pub fn hand_edited(text: &str) -> Option<bool> {
+    let stamp = text.lines().find_map(|l| l.strip_prefix(DIGEST_MARK))?;
+    Some(stamp.trim() != digest_of(text))
+}
+
+/// Write `text` to `file` through a temporary sibling, so a crash never leaves a half file that
+/// the registry skips and adoption refuses to replace.
+fn write_atomic(file: &Path, text: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(file.parent().expect("auto path has a parent"))?;
+    let tmp = file.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, file)
+}
+
+/// The provenance lines an existing file carries: its "how the lighting bytes were chosen" notes
+/// and every hardware-verified line, oldest first.
+fn kept_provenance(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        if line.starts_with("# How the lighting bytes were chosen:") {
+            in_block = true;
+            continue;
+        }
+        let note = line.starts_with("#   - ");
+        if note && (in_block || line.contains("HARDWARE-VERIFIED")) {
+            out.push(line.to_string());
+        } else if !line.starts_with("#     ") {
+            in_block = false;
+        }
+    }
+    out
+}
+
+/// Rewrite an AUTO def's file from `def`, adding `verified` (one `#   - …` line per hardware-verified
+/// change) to the provenance the file already carries. Only [`auto_def_path`] is ever written, so
+/// a curated or builtin def can never be clobbered here. A file edited by hand since Neuron wrote
+/// it is left alone (`Err`), so a person's change and comments are never overwritten. The serial
+/// and measured round-trip were probe facts, not stored fields, so the header omits them.
+pub fn rewrite_auto(dialect_id: &str, pid: u16, def: &DeviceDef, verified: &[String]) -> Result<()> {
+    let file = auto_def_path(dialect_id, pid);
+    let existing = std::fs::read_to_string(&file).unwrap_or_default();
+    if hand_edited(&existing) == Some(true) {
+        anyhow::bail!("{} was edited by hand; not rewritten", file.display());
+    }
+    let mut provenance = kept_provenance(&existing);
+    for line in verified {
+        if !provenance.contains(line) {
+            provenance.push(line.clone());
+        }
+    }
     let mut heuristic_lines: Vec<String> = Vec::new();
-    heuristic_lines.push(format!(
-        "#   - transaction_id: HARDWARE-VERIFIED by first-light heal (custom frame landed + read back at 0x{verified_tx:02X})."
-    ));
-    if healed.lighting.is_some() {
+    if def.lighting.is_some() {
         heuristic_lines
             .push("#   - [lighting] rows/cols: a GUESS — native effects don't need it, custom frames do.".into());
         heuristic_lines.push(
@@ -862,22 +1163,32 @@ pub fn heal_auto_tx(dialect_id: &str, pid: u16, def: &DeviceDef, verified_tx: u8
          #     it); set it to 0 for a permanently-wired board to raise the stream fps ceiling.".into(),
     );
     let text = emit(
-        &healed,
+        def,
         &EmitNotes {
             serial: String::new(),
             roundtrip_ms: None,
             heuristic_lines,
+            provenance,
         },
     );
-    // Only ever the auto path — the file name is built from the dialect id + pid, exactly where a
-    // reload expects it. create_dir_all mirrors adopt_filtered (the dir already exists since the
-    // def was loaded from it, but a mid-run delete must not turn the heal into a panic).
-    let file = auto_def_path(dialect_id, pid);
-    std::fs::create_dir_all(file.parent().expect("auto path has a parent"))
-        .and_then(|()| std::fs::write(&file, text))
-        .with_context(|| format!("healing {} failed", file.display()))?;
+    write_atomic(&file, &text).with_context(|| format!("rewriting {} failed", file.display()))?;
     crate::registry::invalidate();
     Ok(())
+}
+
+/// Rewrite an AUTO def's file with a HARDWARE-VERIFIED lighting transaction id (the first-light
+/// heal's result), returning the def the file now holds.
+pub fn heal_auto_tx(dialect_id: &str, pid: u16, def: &DeviceDef, verified_tx: u8) -> Result<DeviceDef> {
+    let healed = with_lighting_tx(def, verified_tx);
+    rewrite_auto(
+        dialect_id,
+        pid,
+        &healed,
+        &[format!(
+            "#   - lighting effect tx 0x{verified_tx:02X}: HARDWARE-VERIFIED by first-light heal (state moved to the custom frame after off + display at that tx)."
+        )],
+    )?;
+    Ok(healed)
 }
 
 /// The collision-free adoption identity: a pid is only unique WITHIN a wire family (two
@@ -915,7 +1226,10 @@ pub struct Adoption {
 }
 
 /// Bumped when synthesis changes the bytes it emits for hardware it may already have adopted.
-pub const SYNTH_VERSION: u32 = 2;
+/// 2: keyboard lighting left the Naga logo region. 3: keyboard lighting reads retried across tx
+/// cohorts, effects on the backlight LED at openrazer's sizes, atlas matrix sizes. 4: mice take
+/// their matrix size and reply wait from the mouse atlas.
+pub const SYNTH_VERSION: u32 = 4;
 
 /// The emitted header line carrying [`SYNTH_VERSION`].
 const VERSION_MARK: &str = "# synth-version: ";
@@ -928,30 +1242,59 @@ fn synth_version(text: &str) -> u32 {
         .unwrap_or(1)
 }
 
-/// Where [`retire_stale_auto_def`] keeps a set-aside file.
-fn stale_backup_path(path: &Path) -> PathBuf {
-    path.with_extension("toml.v1.bak")
+/// Where [`retire_stale_auto_def`] keeps a set-aside file written by synthesis `version`.
+fn stale_backup_path(path: &Path, version: u32) -> PathBuf {
+    path.with_extension(format!("toml.v{version}.bak"))
 }
 
-/// Is this auto def a version-1 synthesis that aimed no-DPI matrix lighting at the Naga logo
-/// region (6x22 grid, effects on LED 0x04)? A file whose lighting was edited away from that shape
-/// is kept, and so is one whose backup already exists (a deliberately restored copy). Other edits
-/// are not detectable; they survive in the backup. Pure: touches nothing.
+/// Is this auto def an earlier synthesis that the current version builds differently? For a
+/// keyboard (no DPI command): a file with no lighting block, or one whose lighting is exactly what
+/// version 1 (6x22 matrix on the logo LED 0x04) or version 2 (6x22 matrix on LED 0x00, compact
+/// framing) emitted. For a mouse: the generated 1x2 logo block, when the mouse atlas gives this PID
+/// another matrix size or reply wait. Legacy lighting, lighting edited away from those shapes and
+/// files whose backup already exists (a deliberately restored copy) are kept. Other edits are not
+/// detectable; they survive in the backup. Pure: touches nothing.
 pub(crate) fn is_stale_auto_def(path: &Path, text: &str, def: &DeviceDef) -> bool {
-    if synth_version(text) >= 2 {
+    let version = synth_version(text);
+    if version >= SYNTH_VERSION || def.dialect != "razer" {
         return false;
     }
+    if stale_backup_path(path, version).exists() {
+        return false;
+    }
+    if def.commands.contains_key("dpi") {
+        return is_stale_mouse(def);
+    }
+    let Some(l) = def.lighting.as_ref() else {
+        return true;
+    };
+    let generated_matrix = l.protocol == Protocol::Matrix
+        && (l.rows, l.cols) == (6, 22)
+        && l.framing == crate::lighting::Framing::Compact
+        && l.display_args.is_none();
+    let v1 = l.led_id == 0x04 && l.effect.args == [0x00, 0x04];
+    let v2 = version == 2 && l.led_id == 0x00 && l.effect.args == [0x00, 0x00];
+    generated_matrix && (v1 || v2)
+}
+
+fn is_stale_mouse(def: &DeviceDef) -> bool {
+    let Some(m) = def.modes.iter().find_map(|md| crate::atlas::lookup_mouse(def.vendor_id, md.product_id)) else {
+        return false;
+    };
     let Some(l) = def.lighting.as_ref() else {
         return false;
     };
-    l.protocol == Protocol::Matrix
-        && (l.rows, l.cols) == (6, 22)
+    let generated = l.protocol == Protocol::Matrix
+        && (l.rows, l.cols) == (1, 2)
+        && l.framing == crate::lighting::Framing::Compact
         && l.led_id == 0x04
-        && l.effect.args == [0x00, 0x04]
-        && !stale_backup_path(path).exists()
+        && l.display_args.is_none();
+    let dims = m.dims().preferred().is_some_and(|d| d != (1, 2));
+    let wait = m.reply_wait_us().is_some_and(|w| stream_wait_for(0, true, Some(w)) != def.stream_wait_us);
+    generated && (dims || wait)
 }
 
-/// Move a stale auto def (see [`is_stale_auto_def`]) to `<name>.toml.v1.bak` so adoption can
+/// Move a stale auto def (see [`is_stale_auto_def`]) to `<name>.toml.v<N>.bak` so adoption can
 /// rebuild it. Never replaces an existing backup. `Ok(None)` when the file is not stale.
 fn retire_stale_auto_def(path: &Path) -> std::io::Result<Option<PathBuf>> {
     let text = std::fs::read_to_string(path)?;
@@ -961,7 +1304,7 @@ fn retire_stale_auto_def(path: &Path) -> std::io::Result<Option<PathBuf>> {
     if !is_stale_auto_def(path, &text, &def) {
         return Ok(None);
     }
-    let backup = stale_backup_path(path);
+    let backup = stale_backup_path(path, synth_version(&text));
     {
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&backup)?;
@@ -1015,6 +1358,7 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
     // The dedupe ledger keys on the FULL adoption identity, not bare pid: two families sharing a
     // pid each get their own probe (marking one tried must not veto the other's sibling pipe).
     let mut tried: Vec<AdoptKey> = Vec::new();
+    let mut probe_after: Vec<u16> = Vec::new();
     for i in &infos {
         // Route by CLAIMING, not a hardcoded razer signature: the first dialect whose `claims()`
         // is true owns this pipe and will `probe()` it. A pipe no family claims is not ours to
@@ -1068,10 +1412,19 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
         }
         // Several collections share one pid; probe pipes until one talks. Only a talking
         // pipe marks the pid tried — a mute vendor collection must not veto its sibling.
-        let Ok(t) = transport::open_path(&i.path) else {
-            continue;
+        let synth = if d.id() == "razer" {
+            // Every collection of this unit was just probed; another pass would repeat it.
+            tried.push(key);
+            razer_best_pipe(d, &infos, i)
+        } else {
+            let mut ctx = SynthCtx::from_info(i);
+            let unit = transport::unit_key(i);
+            ctx.keyboard = infos.iter().any(|s| {
+                s.pid == i.pid && (s.usage_page, s.usage) == (0x0001, 0x0006) && transport::unit_key(s) == unit
+            });
+            transport::open_path(&i.path).ok().and_then(|t| d.probe(&*t, &ctx))
         };
-        let Some(mut synth) = d.probe(&*t, &SynthCtx::from_info(i)) else {
+        let Some(mut synth) = synth else {
             continue;
         };
         // Family identity is OWNED by this loop, not trusted from the probe: the file name and
@@ -1082,9 +1435,11 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
         // different exec loops. Assignment makes the mismatch unrepresentable instead.)
         synth.def.dialect = d.id().to_string();
         tried.push(key);
-        let write = std::fs::create_dir_all(file.parent().expect("auto path has a parent"))
-            .and_then(|()| std::fs::write(&file, emit_toml(&synth)));
+        let write = write_atomic(&file, &emit_toml(&synth));
         crate::registry::invalidate();
+        if write.is_ok() && d.id() == "razer" && !synth.def.commands.contains_key("dpi") {
+            probe_after.push(i.pid);
+        }
         match write {
             Ok(()) => out.adopted.push(Adopted {
                 pid: i.pid,
@@ -1097,7 +1452,72 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
                 .push(format!("pid {:04x}: writing {} failed: {e}", i.pid, file.display())),
         }
     }
+    // A learned keyboard keeps a read-only lighting probe beside its file, so a device report can
+    // carry what the board answered without anyone running a command. After the pass, so the probe
+    // never delays another device's adoption.
+    for pid in probe_after {
+        let _ = crate::lightprobe::record(pid);
+    }
     Ok(out)
+}
+
+/// Synthesize one Razer unit from the collection that carries its lighting.
+///
+/// A keyboard can expose the 91-byte control shape on several interfaces, and a collection that
+/// answers the identity getters is not necessarily the one that answers lighting (OpenRGB moved
+/// the BlackWidow V3 to interface 3, usage 0x0C/0x01, for exactly this). So every claimed
+/// collection of the unit is probed, the atlas's collections first, and the first whose synthesis
+/// carries lighting wins; otherwise the first that talks. When the chosen collection's shape
+/// repeats on another interface, the def pins its interface so the device opens the same one.
+fn razer_best_pipe(
+    d: &dyn crate::dialect::Dialect,
+    infos: &[HidDeviceInfo],
+    first: &HidDeviceInfo,
+) -> Option<Synthesis> {
+    let unit = transport::unit_key(first);
+    let siblings: Vec<&HidDeviceInfo> =
+        infos.iter().filter(|i| i.pid == first.pid && transport::unit_key(i) == unit).collect();
+    // The unit enumerates a boot-keyboard collection: a keyboard, not a mat, dock or stand.
+    let keyboard = siblings.iter().any(|i| (i.usage_page, i.usage) == (0x0001, 0x0006));
+    let mut pipes: Vec<&HidDeviceInfo> = siblings.into_iter().filter(|i| d.claims(i)).collect();
+    if let Some(k) = crate::atlas::lookup(first.vid, first.pid) {
+        let shapes = k.collections();
+        let iface = k.interface().preferred();
+        pipes.sort_by_key(|i| {
+            let rank = shapes
+                .iter()
+                .position(|c| (c.usage_page, c.usage) == (i.usage_page, i.usage) && c.interface.is_none_or(|x| i.interface() == Some(x)))
+                .unwrap_or(shapes.len());
+            let on_iface = iface.is_some() && i.interface() == iface;
+            (rank, !on_iface)
+        });
+    }
+    let mut fallback: Option<(Synthesis, &HidDeviceInfo)> = None;
+    let mut chosen: Option<(Synthesis, &HidDeviceInfo)> = None;
+    for &i in &pipes {
+        let Ok(t) = transport::open_path(&i.path) else {
+            continue;
+        };
+        let ctx = SynthCtx { keyboard, ..SynthCtx::from_info(i) };
+        let Some(s) = d.probe(&*t, &ctx) else {
+            continue;
+        };
+        if s.def.lighting.is_some() {
+            chosen = Some((s, i));
+            break;
+        }
+        if fallback.is_none() {
+            fallback = Some((s, i));
+        }
+    }
+    let (mut s, info) = chosen.or(fallback)?;
+    let twins = pipes.iter().filter(|p| {
+        (p.usage_page, p.usage, p.feature_len) == (info.usage_page, info.usage, info.feature_len)
+    });
+    if twins.count() > 1 {
+        s.def.control_interface.interface = info.interface();
+    }
+    Some(s)
 }
 
 /// Are there connected control pipes SOME dialect claims but the registry doesn't recognize?
@@ -1226,6 +1646,8 @@ mod tests {
         /// (class, id, first two args) requests refused even though the opcode is supported.
         refused: Vec<(u8, u8, [u8; 2])>,
         last: Mutex<Option<Pending>>,
+        /// The pending request's tx, echoed in the reply as firmware does.
+        tx: Mutex<u8>,
     }
 
     impl MockDevice {
@@ -1234,6 +1656,7 @@ mod tests {
                 supports: cmds.iter().map(|&(c, i)| (c, i, [0u8; 80])).collect(),
                 refused: Vec::new(),
                 last: Mutex::new(None),
+                tx: Mutex::new(PROBE_TX),
             }
         }
         fn refusing_args(mut self, class: u8, id: u8, args: [u8; 2]) -> Self {
@@ -1253,13 +1676,14 @@ mod tests {
     impl Transport for MockDevice {
         fn set_feature(&self, buf: &[u8]) -> anyhow::Result<()> {
             *self.last.lock().unwrap() = Some((buf[7], buf[8], buf[6], [buf[9], buf[10]]));
+            *self.tx.lock().unwrap() = buf[2];
             Ok(())
         }
         fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
             let Some((class, id, size, head)) = *self.last.lock().unwrap() else {
                 anyhow::bail!("no pending command");
             };
-            let mut rep = Report::command(PROBE_TX, class, id, size);
+            let mut rep = Report::command(*self.tx.lock().unwrap(), class, id, size);
             let refused = self.refused.contains(&(class, id, head));
             match self.supports.iter().find(|(c, i, _)| *c == class && *i == id && !refused) {
                 Some((_, _, args)) => {
@@ -1283,6 +1707,7 @@ mod tests {
             usage: 0x0002,
             feature_len: RAZER_FEATURE_LEN,
             product: product.into(),
+            keyboard: false,
         }
     }
 
@@ -1304,13 +1729,13 @@ mod tests {
         report.status = 2;
         report.args[..2].copy_from_slice(&[1, 2]);
         let good = report.to_buf();
-        assert!(timed_exec(&Reply { bytes: good, reported: BUF_LEN }, 0x00, 0x81, 2, &[], 1).is_some());
+        assert!(timed_exec(&Reply { bytes: good, reported: BUF_LEN }, PROBE_TX, 0x00, 0x81, 2, &[], 1).is_some());
         // Synthetic variable-length reply: request capacity is not a reply-length contract.
         report.class = 0x04;
         report.id = 0x86;
         report.data_size = 10;
         report.args[..10].copy_from_slice(&[0, 1, 1, 1, 0x03, 0x20, 0x03, 0x20, 0, 0]);
-        assert!(timed_exec(&Reply { bytes: report.to_buf(), reported: BUF_LEN }, 0x04, 0x86, 0x26, &[], 1).is_some());
+        assert!(timed_exec(&Reply { bytes: report.to_buf(), reported: BUF_LEN }, PROBE_TX, 0x04, 0x86, 0x26, &[], 1).is_some());
         for (name, bytes, reported) in [
             ("short read", good, 9),
             ("wrong transaction", { let mut b = good; b[2] ^= 1; b }, BUF_LEN),
@@ -1319,7 +1744,7 @@ mod tests {
             ("nonzero reserved byte", { let mut b = good; b[90] = 1; b }, BUF_LEN),
             ("invalid payload size", { let mut b = good; b[6] = 81; b[89] = crate::protocol::crc(&b); b }, BUF_LEN),
         ] {
-            assert!(timed_exec(&Reply { bytes, reported }, 0x00, 0x81, 2, &[], 1).is_none(), "{name}");
+            assert!(timed_exec(&Reply { bytes, reported }, PROBE_TX, 0x00, 0x81, 2, &[], 1).is_none(), "{name}");
         }
     }
 
@@ -1344,6 +1769,21 @@ mod tests {
             (0x03, 0x80), (0x03, 0x83), (0x03, 0x88), (0x03, 0x89),
         ])
         .with_args(0x03, 0x83, &[0x01, 0x05, 0x66])
+    }
+
+    #[test]
+    fn a_mouse_the_atlas_knows_gets_its_strip_and_its_receiver_wait() {
+        // Basilisk V3: an 11-LED strip, wired (openrazer waits 600 µs), so no pacing despite a battery
+        // getter answering.
+        let s = synthesize(&mock_matrix_mouse(), &ctx(0x0099, "Razer Basilisk V3")).unwrap();
+        let l = s.def.lighting.as_ref().unwrap();
+        assert_eq!((l.rows, l.cols), (1, 11));
+        assert_eq!(s.def.stream_wait_us, 0);
+        assert!(s.provenance.iter().any(|p| p.contains("1x11: mouse atlas")), "{:?}", s.provenance);
+        // Viper Ultimate on its receiver: openrazer waits 59.9 ms there.
+        let s = synthesize(&mock_matrix_mouse(), &ctx(0x007A, "Razer Viper Ultimate")).unwrap();
+        assert_eq!(s.def.stream_wait_us, 59_900);
+        assert_eq!(s.def.lighting.as_ref().map(|l| (l.rows, l.cols)), Some((1, 1)));
     }
 
     #[test]
@@ -1547,12 +1987,18 @@ mod tests {
 
     #[test]
     fn stream_wait_tracks_link_and_wireless_capability() {
-        assert_eq!(stream_wait_for(1, false), 0, "wired-class round-trip, no battery");
-        assert_eq!(stream_wait_for(8, false), 0);
-        assert_eq!(stream_wait_for(15, false), WIRELESS_STREAM_WAIT_US, "slow link alone");
-        assert_eq!(stream_wait_for(32, false), WIRELESS_STREAM_WAIT_US);
+        assert_eq!(stream_wait_for(1, false, None), 0, "wired-class round-trip, no battery");
+        assert_eq!(stream_wait_for(8, false, None), 0);
+        assert_eq!(stream_wait_for(15, false, None), WIRELESS_STREAM_WAIT_US, "slow link alone");
+        assert_eq!(stream_wait_for(32, false, None), WIRELESS_STREAM_WAIT_US);
         // battery-bearing board on a FAST link still gets the pacing (the live Naga case)
-        assert_eq!(stream_wait_for(1, true), WIRELESS_STREAM_WAIT_US);
+        assert_eq!(stream_wait_for(1, true, None), WIRELESS_STREAM_WAIT_US);
+        // A known keyboard PID's own wait replaces the battery guess; a slow link still wins.
+        assert_eq!(stream_wait_for(1, true, Some(600)), 0, "a wired PID with a battery");
+        assert_eq!(stream_wait_for(1, true, Some(4900)), 4900, "a wireless keyboard PID");
+        assert_eq!(stream_wait_for(40, true, Some(4900)), WIRELESS_STREAM_WAIT_US);
+        assert_eq!(stream_wait_for(40, true, Some(59_900)), 59_900, "a Viper receiver outwaits the measured link");
+        assert_eq!(stream_wait_for(1, true, Some(400_000)), 250_000, "capped where a definition may ask");
     }
 
     #[test]
@@ -1609,8 +2055,9 @@ mod tests {
         assert_eq!(proven_set, keys, "proven_commands must equal def.commands keys");
     }
 
-    /// A matrix-era keyboard (no DPI) shaped like the `BlackWidow` V3 / V4 X gets the bytes
-    /// Synapse's own middleware sends those boards, not the Naga's logo-region values.
+    /// A matrix-era keyboard (no DPI) shaped like the `BlackWidow` V3 gets the bytes openrazer and
+    /// OpenRGB send those boards, not the Naga's logo-region values. A board that answers at any
+    /// tx runs at the atlas's (0x3F for the V3).
     #[test]
     fn matrix_keyboard_targets_the_whole_board_not_the_logo() {
         let kbd = MockDevice::new(&[
@@ -1618,13 +2065,15 @@ mod tests {
         ]);
         let s = synthesize(&kbd, &ctx(0x024E, "Razer BlackWidow V3")).unwrap();
         let d = &s.def;
-        assert_eq!(d.transaction_id, 0x1F);
+        assert_eq!(d.transaction_id, 0x3F, "the atlas's lighting tx, tried first");
         let l = d.lighting.as_ref().unwrap();
         assert_eq!(l.protocol, Protocol::Matrix);
-        assert_eq!((l.rows, l.cols, l.varstore, l.led_id), (6, 22, 0x00, 0x00));
-        assert_eq!(l.effect.args, [0x00, 0x00]);
+        assert_eq!((l.rows, l.cols, l.varstore, l.led_id), (6, 22, 0x00, 0x05));
+        assert_eq!(l.effect.args, [0x00, 0x05], "effects on the backlight LED");
+        assert_eq!(l.framing, crate::lighting::Framing::Fixed);
         assert_eq!(l.custom_frame.as_ref().unwrap().args, [0x00, 0x00]);
-        assert_eq!(l.custom_display_report().args, [0x00, 0x00, 0x08]);
+        let display = l.custom_display_report();
+        assert_eq!((display.args, display.size), (vec![0x00, 0x00, 0x08], Some(0x0C)));
         assert_eq!(l.effects["spectrum"], 0x03);
         assert_eq!(l.effects["wave"], 0x04);
         assert_eq!(l.brightness.as_ref().unwrap().args, [0x00, 0x05], "write the backlight");
@@ -1632,6 +2081,24 @@ mod tests {
         assert_eq!((get.class, get.id, &get.args[..]), (0x0F, 0x84, &[0x00u8, 0x05][..]), "read the backlight");
         assert!(d.command("set_brightness").is_none(), "the top-level setter writes the logo region");
         assert!(d.supports(crate::registry::Capability::SetBrightness));
+        let text = emit_toml(&s);
+        assert!(text.contains("keyboard atlas: OpenRGB, SignalRGB, openrazer agree independently"), "{text}");
+        assert_eq!(d.stream_wait_us, 0, "openrazer's wired V3 PID needs no pacing");
+        assert!(text.contains("lighting tx 0x3F"), "{text}");
+    }
+
+    /// The V3 failure as reported: lighting reads at 0x1F go unanswered. Retrying the cohorts finds
+    /// the board at 0x3F; without a PID the atlas knows, the retry alone still finds it.
+    #[test]
+    fn a_keyboard_that_reads_lighting_only_at_0x3f_is_found() {
+        use crate::transport::firmware::{control, Behaviour, Board};
+        for pid in [0x024E, 0x7E57] {
+            let board = std::sync::Arc::new(Board::new(pid, Behaviour::extended(&[0x3F], 6, 22)));
+            let s = synthesize(&*control(&board), &SynthCtx { keyboard: true, ..ctx(pid, "kbd") }).expect("adopted");
+            assert_eq!(s.def.transaction_id, 0x3F, "{pid:04x}");
+            assert!(s.def.lighting.as_ref().is_some_and(|l| l.brightness.is_some()), "{pid:04x}");
+            assert_eq!(s.def.command("lighting_state").map(|c| (c.class, c.id)), Some((0x0F, 0x82)));
+        }
     }
 
     /// A DPI-less matrix device whose backlight getter refuses (a dock, mat or stand) is not a
@@ -1677,8 +2144,9 @@ mod tests {
             .refusing_args(0x0F, 0x84, [0x00, 0x04]);
         let s = synthesize(&kbd, &ctx(0x0293, "Razer BlackWidow V4 X")).unwrap();
         let l = s.def.lighting.as_ref().expect("backlight read proves matrix lighting");
-        assert_eq!((l.protocol, l.led_id), (Protocol::Matrix, 0x00));
+        assert_eq!((l.protocol, l.led_id), (Protocol::Matrix, 0x05));
         assert!(l.brightness.is_some());
+        assert_eq!(s.def.transaction_id, 0x1F, "OpenRGB's V4 X tx is tried first");
     }
 
     /// A mouse never takes the keyboard backlight probe.
@@ -1728,14 +2196,49 @@ mod tests {
     fn v1_keyboard_file() -> String {
         let kbd = MockDevice::new(&[(0x00, 0x81), (0x00, 0x84), (0x0F, 0x84), (0x0F, 0x82)]);
         let mut s = synthesize(&kbd, &ctx(0x024E, "Razer BlackWidow V3")).unwrap();
+        s.def.transaction_id = 0x1F;
+        s.provenance.clear();
         let l = s.def.lighting.as_mut().unwrap();
-        l.led_id = 0x04;
-        l.effect.args = vec![0x00, 0x04];
-        l.custom_frame.as_mut().unwrap().args = vec![0x00, 0x04];
-        l.brightness.as_mut().unwrap().args = vec![0x00, 0x04];
+        *l = matrix_lighting(6, 22, true);
         s.def.commands.get_mut("brightness").unwrap().args = vec![0x00, 0x04];
         s.def.commands.insert("set_brightness".into(), cmd(0x0F, 0x04, 0x03, &[]));
         emit_toml(&s).lines().filter(|l| !l.starts_with(VERSION_MARK)).map(|l| format!("{l}\n")).collect()
+    }
+
+    /// A version-2 keyboard file: matrix lighting on LED 0x00, compact framing, at tx 0x1F.
+    fn v2_keyboard_file() -> String {
+        let v1 = v1_keyboard_file();
+        let mut def: DeviceDef = toml::from_str(&v1).unwrap();
+        let l = def.lighting.as_mut().unwrap();
+        l.led_id = 0x00;
+        l.effect.args = vec![0x00, 0x00];
+        l.custom_frame.as_mut().unwrap().args = vec![0x00, 0x00];
+        l.brightness.as_mut().unwrap().args = vec![0x00, 0x05];
+        def.commands.remove("set_brightness");
+        def.commands.get_mut("brightness").unwrap().args = vec![0x00, 0x05];
+        let s = Synthesis::from_probe(def.clone(), def.commands.keys().cloned().collect(), Heuristic(0x1F), None, Heuristic(0), String::new(), None);
+        emit_toml(&s).replace(&format!("{VERSION_MARK}{SYNTH_VERSION}"), &format!("{VERSION_MARK}2"))
+    }
+
+    /// Version 3 rebuilds version-2 keyboard files and keyboard files with no lighting at all
+    /// (a board whose lighting reads went unanswered at 0x1F), never mice.
+    #[test]
+    fn version_two_and_unlit_keyboard_files_are_rebuilt() {
+        let dir = std::env::temp_dir().join(format!("neuron-stale3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("razer-024e.toml");
+        let v2 = v2_keyboard_file();
+        assert_eq!(synth_version(&v2), 2);
+        assert!(is_stale_auto_def(&path, &v2, &toml::from_str(&v2).unwrap()), "a v2 keyboard");
+        let mut unlit: DeviceDef = toml::from_str(&v2).unwrap();
+        unlit.lighting = None;
+        assert!(is_stale_auto_def(&path, &v2, &unlit), "a keyboard that got no lighting");
+        let mut mouse = unlit.clone();
+        mouse.commands.insert("dpi".into(), cmd(0x04, 0x85, 0x07, &[]));
+        assert!(!is_stale_auto_def(&path, &v2, &mouse), "mice keep their files");
+        std::fs::write(&path, &v2).unwrap();
+        assert_eq!(retire_stale_auto_def(&path).unwrap(), Some(dir.join("razer-024e.toml.v2.bak")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1766,7 +2269,12 @@ mod tests {
         assert!(!is_stale_auto_def(&path, &old, &edited), "lighting edited by hand");
         let mouse = emit_toml(&synthesize(&mock_matrix_mouse(), &ctx(0x00A8, "Razer Naga V2 Pro")).unwrap());
         let mouse_v1: String = mouse.lines().filter(|l| !l.starts_with(VERSION_MARK)).collect::<Vec<_>>().join("\n");
-        assert!(!is_stale_auto_def(&path, &mouse_v1, &toml::from_str(&mouse_v1).unwrap()), "mouse grid");
+        assert!(!is_stale_auto_def(&path, &mouse_v1, &toml::from_str(&mouse_v1).unwrap()), "the atlas agrees with the Naga's file");
+        let mut basilisk: DeviceDef = toml::from_str(&mouse_v1).unwrap();
+        basilisk.modes[0].product_id = 0x0099;
+        assert!(is_stale_auto_def(&path, &mouse_v1, &basilisk), "an old 1x2 Basilisk V3 file rebuilds as 1x11");
+        basilisk.lighting.as_mut().unwrap().cols = 5;
+        assert!(!is_stale_auto_def(&path, &mouse_v1, &basilisk), "a grid edited by hand is kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1820,18 +2328,20 @@ mod tests {
             refused: Vec<(u8, u8, [u8; 2])>,
             serial: [u8; 80],
             sent: Mutex<Vec<Pending>>,
+            tx: Mutex<u8>,
         }
 
         impl Transport for Fuzz {
             fn set_feature(&self, buf: &[u8]) -> anyhow::Result<()> {
                 self.sent.lock().unwrap().push((buf[7], buf[8], buf[6], [buf[9], buf[10]]));
+                *self.tx.lock().unwrap() = buf[2];
                 Ok(())
             }
             fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
                 let Some(&(class, id, size, head)) = self.sent.lock().unwrap().last() else {
                     anyhow::bail!("no pending command");
                 };
-                let mut rep = Report::command(PROBE_TX, class, id, size);
+                let mut rep = Report::command(*self.tx.lock().unwrap(), class, id, size);
                 let ok = (class, id) == (0x00, 0x81)
                     || (self.supports.contains(&(class, id)) && !self.refused.contains(&(class, id, head)));
                 rep.status = if ok { 0x02 } else { 0x05 };
@@ -1865,6 +2375,7 @@ mod tests {
                         refused,
                         serial: serial.try_into().unwrap(),
                         sent: Mutex::new(Vec::new()),
+                        tx: Mutex::new(PROBE_TX),
                     }
                 })
         }
@@ -1909,21 +2420,34 @@ mod tests {
                     prop_assert!(!d.commands.contains_key(set) || d.commands.contains_key(get), "{set} without {get}");
                 }
                 let mouse = d.commands.contains_key("dpi");
-                let keyboard = !mouse && d.command("brightness")
-                    .is_some_and(|g| (g.class, g.id, &g.args[..]) == (0x0F, 0x84, &[0x00u8, 0x05][..]));
+                let atlas = crate::atlas::lookup(RAZER_VID, pid);
+                let atlas_leds = atlas.map(|k| k.led().candidates()).filter(|l| !l.is_empty()).unwrap_or_else(|| vec![0x05]);
+                let atlas_dims = atlas.and_then(|k| k.dims().preferred()).filter(|&(r, c)| r > 0 && c > 0);
                 if let Some(l) = &d.lighting {
                     if let Some(b) = &l.brightness {
                         let get = d.command("brightness");
                         prop_assert!(get.is_some_and(|g| g.class == b.class), "brightness write without its getter");
                     }
+                    let keyboard = l.framing == crate::lighting::Framing::Fixed;
+                    prop_assert!(!(keyboard && mouse), "a mouse took the keyboard block");
                     if l.protocol == Protocol::Matrix {
                         if let (Some(b), Some(get)) = (&l.brightness, d.command("brightness")) {
                             prop_assert_eq!(&b.args, &get.args, "brightness writes one region and reads another");
                         }
-                        prop_assert!(!keyboard || !d.commands.contains_key("set_brightness"), "keyboard kept the logo setter");
-                        prop_assert_eq!(l.led_id, if keyboard { 0x00 } else { 0x04 });
                         prop_assert_eq!(&l.effect.args, &vec![0x00, l.led_id]);
-                        prop_assert_eq!((l.rows, l.cols), if mouse { (1, 2) } else { (6, 22) });
+                        if keyboard {
+                            prop_assert!(!d.commands.contains_key("set_brightness"), "keyboard kept the logo setter");
+                            prop_assert!(atlas_leds.contains(&l.led_id), "led {:02X} is no source's", l.led_id);
+                            prop_assert_eq!(l.display_args.as_deref(), Some(&[0x00u8, 0x00, 0x08][..]));
+                            prop_assert_eq!(&l.custom_frame.as_ref().unwrap().args, &vec![0x00, 0x00]);
+                            prop_assert_eq!((l.rows, l.cols), atlas_dims.unwrap_or((6, 22)));
+                            if let Some(st) = d.command("lighting_state") {
+                                prop_assert_eq!((st.class, st.id), (0x0F, 0x82), "landing check in another dialect");
+                            }
+                        } else {
+                            prop_assert_eq!(l.led_id, 0x04);
+                            prop_assert_eq!((l.rows, l.cols), if mouse { (1, 2) } else { (6, 22) });
+                        }
                     }
                 }
                 if mouse {

@@ -135,7 +135,7 @@ impl Device {
     /// Send a command, then busy-poll for the echoed reply until SUCCESS (or terminal error).
     /// Returns the 80-byte argument payload. Read-only commands are non-mutating.
     pub fn exec(&self, cmd: &CommandSpec) -> Result<[u8; 80]> {
-        self.exec_dynamic(cmd.class, cmd.id, cmd.size, &cmd.args)
+        self.exec_dynamic_tx(cmd.transaction_id.unwrap_or(self.def.transaction_id), cmd.class, cmd.id, cmd.size, &cmd.args)
     }
 
     /// Like `exec` but with caller-supplied class/id/size/args — needed for lighting, whose
@@ -193,8 +193,9 @@ impl Device {
         Ok(())
     }
 
-    /// Fast streaming write: send the report, wait the device's round-trip, then drain the reply ONCE
-    /// (no busy-poll retry loop). The `razer_report` protocol requires the response to be read before the
+    /// Fast streaming write: send the report, wait the device's round-trip, then drain the reply
+    /// briefly, never re-sending; the result says whether the device took it
+    /// ([`Sent`](crate::dialect::Sent)). The `razer_report` protocol requires the response to be read before the
     /// next command — skip it and the device ignores every subsequent write (frozen frame). It ALSO
     /// requires giving the link time to carry the command: on a 2.4 GHz dongle the SET round-trips
     /// host→dongle→mouse→back, and reading/firing again before that completes overruns the device and
@@ -204,8 +205,8 @@ impl Device {
     ///
     /// ROUTED through the device's protocol [`Dialect`](crate::dialect::Dialect): the
     /// build-frame/set/wait/drain body now lives in `dialect::RazerDialect::exec_fast`, which
-    /// receives `self.def.stream_wait_us` as the wait discipline — byte-identical to before.
-    pub fn send_lighting_fast(&self, rep: &crate::lighting::Report) -> bool {
+    /// receives `self.def.stream_wait_us` as the wait discipline.
+    pub fn send_lighting_fast(&self, rep: &crate::lighting::Report) -> crate::dialect::Sent {
         let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
         let tx = rep.tx.unwrap_or(self.def.transaction_id);
         // Fire-and-forget path: a silent no-op on a mistagged def is the SAFE failure (Finding 2).
@@ -213,7 +214,7 @@ impl Device {
         // already refuses to select such a def — so reaching here at all means a def slipped through;
         // the right move is to put NOTHING on the wire rather than razer-frame it blindly.
         let Ok(dialect) = self.dialect() else {
-            return false;
+            return crate::dialect::Sent::Lost;
         };
         dialect.exec_fast(
             self.transport.as_ref(),
@@ -254,7 +255,7 @@ impl Device {
             .def
             .command(name)
             .with_context(|| format!("device '{}' has no command '{}'", self.def.name, name))?;
-        self.exec_dynamic(cmd.class, cmd.id, cmd.size, args)
+        self.exec_dynamic_tx(cmd.transaction_id.unwrap_or(self.def.transaction_id), cmd.class, cmd.id, cmd.size, args)
     }
 }
 

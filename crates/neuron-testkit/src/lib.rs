@@ -20,6 +20,7 @@
 //! (≈10 fps steady cadence, three-buffer lockstep fanout, 4-byte pixels at a fixed array
 //! offset) are pinned by this crate's tests so the format and the facts cannot drift apart.
 
+pub mod atlas_extract;
 pub mod budget;
 pub mod census;
 pub mod compat;

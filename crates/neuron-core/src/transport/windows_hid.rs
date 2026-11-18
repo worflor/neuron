@@ -315,6 +315,9 @@ pub struct WinHid {
     /// interior mutability the `&self` trait method needs; `WinHid` is single-threaded per `Device`
     /// so the lock is uncontended. `None` until the first `read_input`.
     read_handle: Mutex<Option<HANDLE>>,
+    /// Set once `write_output` has tried to pre-open `read_handle`, so a collection that refuses
+    /// read access costs one failed open, not one per output report.
+    read_preopened: std::sync::atomic::AtomicBool,
     /// The pipe's shared WIRE LOCK, resolved via [`wire_lock_for`] on `path` — every `WinHid`
     /// opened on the same `DevicePath` (a separate handle from a separate in-process actor) gets
     /// the IDENTICAL `Arc`, so a `Dialect`'s conversation-holding guard serializes them; the
@@ -363,9 +366,39 @@ impl WinHid {
                 can_write,
                 path: path.clone(),
                 read_handle: Mutex::new(None),
+                read_preopened: std::sync::atomic::AtomicBool::new(false),
                 wire: wire_lock_for(path),
             })
         }
+    }
+}
+
+impl WinHid {
+    /// The overlapped read handle `read_input` waits on, opened on first use and cached.
+    fn read_handle(&self) -> Result<HANDLE> {
+        let mut slot = self.read_handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rh) = *slot {
+            return Ok(rh);
+        }
+        let wide = self.path.to_wide_nul();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call; the returned
+        // handle is owned by `self.read_handle` and closed in `Drop`.
+        let rh = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ_FLAG,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            )
+        };
+        if rh == INVALID_HANDLE_VALUE {
+            bail!("CreateFile (overlapped input read) failed — collection is OS-protected or busy");
+        }
+        *slot = Some(rh);
+        Ok(rh)
     }
 }
 
@@ -584,6 +617,12 @@ impl Transport for WinHid {
         if !self.can_write {
             bail!("output report needs a GENERIC_WRITE handle; this collection opened access-0 only");
         }
+        // Windows queues input reports per open handle, from the moment it opens. Open the reply
+        // handle before the request goes out, or a fast reply lands before it exists and is lost.
+        // A failure here resurfaces from `read_input`.
+        if !self.read_preopened.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let _ = self.read_handle();
+        }
         unsafe {
             let mut written: u32 = 0;
             if WriteFile(
@@ -606,27 +645,7 @@ impl Transport for WinHid {
         // GENERIC_READ + FILE_FLAG_OVERLAPPED and enforce the timeout with WaitForSingleObject +
         // CancelIo. Opened lazily on first use (many devices never speak the output/input surface)
         // and cached in `read_handle`. Contained here — the proven feature-report path never sees it.
-        let mut slot = self.read_handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_none() {
-            let wide = self.path.to_wide_nul();
-            unsafe {
-                let rh = CreateFileW(
-                    wide.as_ptr(),
-                    GENERIC_READ_FLAG,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED,
-                    ptr::null_mut(),
-                );
-                if rh == INVALID_HANDLE_VALUE {
-                    bail!("CreateFile (overlapped input read) failed — collection is OS-protected or busy");
-                }
-                *slot = Some(rh);
-            }
-        }
-        let rh = slot.expect("read handle opened just above");
-        drop(slot); // HANDLE is Copy — don't hold the lock across the blocking wait
+        let rh = self.read_handle()?;
         // `read_input`'s contract (unlike `InputReader::read`) is request/reply: "did the reply
         // arrive in the window" — a timeout here IS the caller's answer, not a spurious wakeup to
         // loop past. So the shared helper's `Ok(None)` is turned back into an honest error.

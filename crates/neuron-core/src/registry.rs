@@ -40,6 +40,11 @@ pub struct ControlInterface {
     pub usage_page: u16,
     pub usage: u16,
     pub feature_report_len: u16,
+    /// The USB interface the collection sits on. Set when a board exposes the same collection
+    /// shape on more than one interface and only one of them carries lighting; a path that names
+    /// no interface still matches.
+    #[serde(default)]
+    pub interface: Option<u8>,
 }
 
 /// The serde default for [`DeviceDef::dialect`]: every TOML that predates the dialect field
@@ -153,9 +158,10 @@ pub struct DeviceDef {
     /// from the factory. See [`crate::buttons`].
     #[serde(default)]
     pub buttons: Vec<ButtonSpec>,
-    /// Which device mode neuron keeps the device in. See [`Custody`].
+    /// Which device mode neuron keeps the device in, when the def says. Read it through
+    /// [`DeviceDef::custody`], which supplies the default by device kind.
     #[serde(default)]
-    pub custody: Custody,
+    pub custody: Option<Custody>,
 }
 
 /// Who owns a razer device while neuron runs, i.e. which `device_mode` host writes happen in.
@@ -229,6 +235,22 @@ impl DeviceDef {
             .map(std::string::String::as_str)
     }
 
+    /// Which device mode neuron keeps this device in: the def's own `custody`, else by kind. Razer
+    /// mice take lighting and DPI in normal mode: openrazer switches one of its 121 mouse models to
+    /// driver mode, the Basilisk V3 X HyperSpeed (`daemon/openrazer_daemon/hardware/mouse.py`
+    /// L2011-L2028 @cd5c4243), so a mouse defaults to firmware custody. Everything else defaults to
+    /// driver.
+    #[must_use]
+    pub fn custody(&self) -> Custody {
+        const DRIVER_MODE_MICE: &[u16] = &[0x00B9];
+        self.custody.unwrap_or_else(|| {
+            let mouse = self.vendor_id == crate::dialect::RAZER_VID
+                && self.has_command("dpi")
+                && !self.modes.iter().any(|m| DRIVER_MODE_MICE.contains(&m.product_id));
+            if mouse { Custody::Firmware } else { Custody::Driver }
+        })
+    }
+
     /// Does this device's registry expose a command under `name`? The registry-driven answer to
     /// "can I run this on this device" — cheaper and more honest than a hardcoded per-device match.
     /// Callers (CLI/GUI) use it to grey-out a control the device can't do rather than firing a
@@ -236,6 +258,13 @@ impl DeviceDef {
     #[must_use]
     pub fn has_command(&self, name: &str) -> bool {
         self.commands.contains_key(name)
+    }
+
+    /// The transaction id lighting writes go out at: the lighting block's own override when it
+    /// carries one (the Chroma V2's split brain), else the device default. `None` without lighting.
+    #[must_use]
+    pub fn lighting_tx(&self) -> Option<u8> {
+        self.lighting.as_ref().map(|l| l.effect.transaction_id.unwrap_or(self.transaction_id))
     }
 
     /// Does this device expose a given semantic [`Capability`]? This is the additive, registry-driven
@@ -754,7 +783,7 @@ impl Registry {
         let mice: BTreeSet<u16> = self.devices.iter().filter(razer)
             .filter(|d| d.supports(Capability::Dpi)).flat_map(DeviceDef::owned_event_pids).collect();
         self.devices.iter().filter(razer)
-            .filter(|d| d.has_command("device_mode") && !d.supports(Capability::Dpi) && d.custody == Custody::Driver)
+            .filter(|d| d.has_command("device_mode") && !d.supports(Capability::Dpi) && d.custody() == Custody::Driver)
             .flat_map(DeviceDef::owned_event_pids).filter(|pid| !mice.contains(pid)).collect()
     }
 
@@ -1081,7 +1110,7 @@ mod tests {
         other_vendor.vendor_id = 0x046D;
         other_vendor.modes[0].product_id = 0x4565;
         reg.devices.push(other_vendor);
-        keyboard.custody = Custody::Firmware;
+        keyboard.custody = Some(Custody::Firmware);
         keyboard.modes[0].product_id = 0x4566;
         keyboard.event_alias_pids.clear();
         reg.devices.push(keyboard);

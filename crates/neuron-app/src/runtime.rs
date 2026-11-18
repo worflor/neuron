@@ -94,6 +94,9 @@ pub struct DeviceState {
     /// Its definition was synthesized here (`devices/auto/`), not curated: neuron learned it on
     /// its own and nobody has confirmed what works on it.
     pub learned: bool,
+    /// The lamp a learned device's row draws for how its lighting settled
+    /// (`calibrate::LightingTrust::lamp`): 0 none.
+    pub lighting_trust: i32,
 }
 
 /// One live lighting stream's controls, owned PER-DEVICE in [`AppRuntime::anim`]: the stop flag its
@@ -715,6 +718,12 @@ impl AppRuntime {
         .map(|(def, _)| def.clone())
     }
 
+    /// The def driving `pid` on `unit`, for work on a board that is not the selection.
+    pub fn def_at(&self, pid: u16, unit: &str) -> Option<DeviceDef> {
+        let infos = transport::enumerate().ok()?;
+        resolve_plane(&self.registry, &infos, pid, unit, "").map(|(def, _)| def.clone())
+    }
+
     // ── performance setters (gated) ──────────────────────────────────────
 
     pub fn apply_dpi(&self, dpi: u16) -> String {
@@ -915,14 +924,15 @@ impl AppRuntime {
         }
     }
 
-    /// Apply the in-game polling split (wired/dongle Hz) — verify-gated (`NEURON_INGAME_POLL_WRITE`).
-    pub fn apply_ingame_polling(&self, wired: u32, dongle: u32) -> String {
+    /// Apply the HyperPolling rate — verify-gated (`NEURON_INGAME_POLL_WRITE`). `set_in_game_polling`
+    /// ignores its dongle argument; 1000 fills that slot.
+    pub fn apply_ingame_polling(&self, wired: u32) -> String {
         if self.writes_paused() {
             return "writes paused".into();
         }
         match self.open_selected() {
-            Ok(d) => match neuron::writes::set_in_game_polling(&d, wired, dongle) {
-                Ok(()) => format!("in-game polling {wired}/{dongle} Hz"),
+            Ok(d) => match neuron::writes::set_in_game_polling(&d, wired, 1000) {
+                Ok(()) => format!("in-game polling {wired} Hz"),
                 Err(e) => format!("in-game polling [gated]: {e}"),
             },
             Err(e) => format!("no device: {e}"),
@@ -2154,6 +2164,7 @@ fn learning_row(i: &transport::HidDeviceInfo, family: &str, instance: String) ->
         cap_game_mode: false,
         adopting: true,
         learned: false,
+        lighting_trust: 0,
     }
 }
 
@@ -2205,6 +2216,7 @@ fn placeholder_row(
         cap_game_mode: false,
         adopting: true,
         learned: false,
+        lighting_trust: 0,
     }
 }
 
@@ -2353,6 +2365,7 @@ fn read_device_state(
         cap_game_mode: def.supports(neuron::registry::Capability::SetGameMode),
         adopting: false,
         learned: def.origin == neuron::registry::DefOrigin::Auto,
+        lighting_trust: neuron::calibrate::lighting_trust(def).map_or(0, neuron::calibrate::LightingTrust::lamp),
     };
     // Park this device's host lighting writer for the whole getter sweep —
     // without the gate, streaming frames clobber every getter's pending reply

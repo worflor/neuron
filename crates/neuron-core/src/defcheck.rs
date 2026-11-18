@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 /// Longest per-command settle wait a file may ask for. The Naga's measured wireless pacing is
 /// 31 ms; this leaves headroom while keeping a frame from holding the wire lock indefinitely.
-const MAX_STREAM_WAIT_US: u64 = 250_000;
+pub(crate) const MAX_STREAM_WAIT_US: u64 = 250_000;
 
 struct Knowledge {
     /// (dialect, command name) -> opcodes that name may use.
@@ -79,6 +79,9 @@ fn knowledge() -> &'static Knowledge {
 /// Refuse a run-root definition that would make Neuron send something its protocol knowledge
 /// does not back. `Err` names the first problem.
 pub fn check(def: &DeviceDef) -> Result<(), String> {
+    if def.dialect == "via" {
+        return check_via(def);
+    }
     let vendor = match def.dialect.as_str() {
         "razer" | "razer-audio" => crate::dialect::RAZER_VID,
         "hidpp" => crate::hidpp::HIDPP_VID,
@@ -124,11 +127,38 @@ pub fn check(def: &DeviceDef) -> Result<(), String> {
             }
         }
     }
+    check_lighting(def)
+}
+
+/// A VIA board carries its maker's vendor id, so the bound is the commands: only the reads VIA
+/// adoption itself emits, no lighting block and no binds.
+fn check_via(def: &DeviceDef) -> Result<(), String> {
+    if let Some((name, _)) = def.commands.iter().find(|(_, c)| !crate::via::is_adopted_command(c)) {
+        return Err(format!("command `{name}` is not a command VIA adoption sends"));
+    }
+    if def.lighting.is_some() {
+        return Err("a VIA definition carries no lighting writes".into());
+    }
+    if let Some((table, usage, action)) = binds_of(def).next() {
+        return Err(format!("{table} binds {usage} to `{action}`, which a VIA definition cannot carry"));
+    }
+    Ok(())
+}
+
+fn check_lighting(def: &DeviceDef) -> Result<(), String> {
+    let k = knowledge();
     if let Some(l) = &def.lighting {
         let writes = std::iter::once(&l.effect).chain(l.custom_frame.iter()).chain(l.brightness.iter());
         for c in writes {
             if !k.lighting.contains(&(c.class, c.id)) {
                 return Err(format!("lighting writes {:02x}/{:02x}, which Neuron does not use for lighting", c.class, c.id));
+            }
+        }
+        // The display rides the effect opcode; its bytes may only select the custom frame.
+        if let Some(a) = &l.display_args {
+            let shaped = l.protocol == crate::lighting::Protocol::Matrix && a.len() == 3 && a[2] == l.custom_id;
+            if !shaped {
+                return Err(format!("display_args {a:02x?} is not a [varstore, led, custom_id] custom-frame display"));
             }
         }
     }
@@ -141,6 +171,35 @@ mod tests {
 
     fn builtin(i: usize) -> DeviceDef {
         toml::from_str(crate::registry::BUILTINS[i]).unwrap()
+    }
+
+    #[test]
+    fn a_via_file_holds_only_the_reads_via_adoption_sends() {
+        let text = "name = \"Q1\"
+codename = \"q\"
+dialect = \"via\"
+vendor_id = 13364
+transaction_id = 0
+             [[modes]]
+name = \"default\"
+product_id = 641
+             [control_interface]
+usage_page = 65376
+usage = 97
+feature_report_len = 0
+             [commands.brightness]
+class = 8
+id = 3
+size = 0
+args = [1, 1]
+";
+        let mut def: DeviceDef = toml::from_str(text).unwrap();
+        assert_eq!(check(&def), Ok(()), "any vendor, VIA's own read");
+        def.commands.get_mut("brightness").unwrap().class = 0x07; // a set wearing the read's shape
+        assert!(check(&def).is_err(), "only the shapes adoption writes load");
+        def.commands.get_mut("brightness").unwrap().class = 0x08;
+        def.commands.get_mut("brightness").unwrap().id = 0x00; // custom channel
+        assert!(check(&def).is_err(), "a channel adoption never asks is refused");
     }
 
     #[test]
@@ -224,6 +283,16 @@ mod tests {
         let l = d.lighting.as_mut().unwrap();
         (l.effect.class, l.effect.id) = (0x05, 0x0B);
         assert!(check(&d).unwrap_err().contains("lighting"));
+
+        let matrix = (0..crate::registry::BUILTINS.len())
+            .find(|&i| builtin(i).lighting.is_some_and(|l| l.protocol == crate::lighting::Protocol::Matrix))
+            .expect("a matrix builtin");
+        let mut d = builtin(matrix);
+        let l = d.lighting.as_mut().unwrap();
+        l.display_args = Some(vec![0x00, 0x00, l.custom_id]);
+        assert_eq!(check(&d), Ok(()), "a custom-frame display");
+        d.lighting.as_mut().unwrap().display_args = Some(vec![0x01, 0x05, 0x01, 0xFF, 0x00, 0x00]);
+        assert!(check(&d).unwrap_err().contains("display_args"), "an effect smuggled in as the display");
 
         let mut d = builtin(1);
         d.vendor_id = 0x046D;

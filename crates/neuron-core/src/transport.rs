@@ -111,6 +111,51 @@ impl HidDeviceInfo {
     pub fn instance(&self) -> String {
         path_instance(&self.path.0.to_string_lossy())
     }
+
+    /// The USB interface this collection belongs to, when its path names one — see
+    /// [`path_interface`].
+    #[must_use]
+    pub fn interface(&self) -> Option<u8> {
+        path_interface(&self.path.0.to_string_lossy())
+    }
+}
+
+/// The physical unit a collection belongs to, for grouping one device's collections: Windows'
+/// PnP Container ID or Linux's USB ancestor (both from [`research_metadata`]), else
+/// [`HidDeviceInfo::instance`]. On Windows `instance` differs per interface and per collection
+/// (`7&3a7ac2e1&0&0001` vs `8&3a869233&0&0000` on one BlackWidow Chroma V2, 2026-11-16), so it
+/// cannot group them.
+#[must_use]
+pub fn unit_key(info: &HidDeviceInfo) -> String {
+    use research::Grouping;
+    match research_metadata(&info.path) {
+        Ok(m) if matches!(m.grouping, Grouping::WindowsContainer | Grouping::LinuxUsbAncestor) => {
+            m.group_key.map_or_else(|| info.instance(), |k| format!("unit:{k}"))
+        }
+        _ => info.instance(),
+    }
+}
+
+/// The USB interface number in a HID collection path: Windows `mi_XX` (hex), or the Linux sysfs
+/// interface node `<bus-port>:<config>.<interface>`. `None` when the path names no interface (a
+/// single-interface device, or a shape this does not recognise).
+#[must_use]
+pub fn path_interface(path: &str) -> Option<u8> {
+    let lower = path.to_ascii_lowercase();
+    let windows = lower
+        .split(['#', '&', '\\'])
+        .find_map(|seg| seg.strip_prefix("mi_").and_then(|h| h.get(..2)).and_then(|h| u8::from_str_radix(h, 16).ok()));
+    if windows.is_some() {
+        return windows;
+    }
+    lower.split('/').rev().find_map(|comp| {
+        let (port, cfg) = comp.split_once(':')?;
+        let usb_port = port.contains('-') && port.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.');
+        if !usb_port {
+            return None;
+        }
+        cfg.split_once('.')?.1.parse().ok()
+    })
 }
 
 /// Reduce a raw HID device-interface path to the identity of the PHYSICAL device it belongs to —
@@ -638,6 +683,9 @@ mod parity;
 #[cfg(any(test, feature = "mock-transport"))]
 pub mod mock;
 
+#[cfg(any(test, feature = "mock-transport"))]
+pub mod firmware;
+
 #[cfg(windows)]
 fn platform_enumerate() -> Result<Vec<HidDeviceInfo>> {
     windows_hid::enumerate()
@@ -851,6 +899,19 @@ mod tests {
             t.read_input(&mut buf, 100).is_err(),
             "a feature-only transport must ERROR (not Ok(0)) when asked for an input report"
         );
+    }
+
+    // ── path_interface ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_usb_interface_is_read_from_both_path_shapes() {
+        let win = r"\\?\hid#vid_1532&pid_024e&mi_03&col02#8&2f5ca30f&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!(path_interface(win), Some(3));
+        assert_eq!(path_interface(&win.to_uppercase()), Some(3), "Windows paths vary in case");
+        let linux = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.4:1.2/0003:1532:024E.0003/hidraw/hidraw2#col01";
+        assert_eq!(path_interface(linux), Some(2), "the interface node behind a hub");
+        assert_eq!(path_interface(r"\\?\hid#vid_1532&pid_00a8#8&1&0&0000#{guid}"), None, "single interface");
+        assert_eq!(path_interface("compat-adoption-direct"), None, "an unrecognised shape names nothing");
     }
 
     // ── path_instance ──────────────────────────────────────────────────────────────────────────

@@ -217,6 +217,120 @@ pub fn device_report_url(name: &str, mode: &str, version: &str) -> String {
     url
 }
 
+/// What Neuron already knows about a learned device, for the report form's optional fields.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceEvidence {
+    /// Windows Dynamic Lighting's switch, when Windows says.
+    pub dynamic_lighting: Option<bool>,
+    /// What the generated definition says and where each lighting value came from (see
+    /// [`definition_summary`]), with the last settle's outcome.
+    pub device_file: Option<String>,
+    /// The lighting probe summary kept at adoption.
+    pub probe: Option<String>,
+}
+
+impl DeviceEvidence {
+    /// Gather it for a learned device: the definition summary and settle record, the kept probe and
+    /// the Dynamic Lighting switch. Missing pieces stay `None`.
+    #[must_use]
+    pub fn gather(dialect_id: &str, pid: u16) -> Self {
+        let file = std::fs::read_to_string(crate::synth::auto_def_path(dialect_id, pid)).ok();
+        let mut device_file = file.as_deref().and_then(definition_summary);
+        if let Some(r) = crate::calibrate::record_for(dialect_id, pid) {
+            let settle = format!("settled: {:?}\n{}", r.verdict, r.notes.join("\n")).to_lowercase();
+            device_file = Some(match device_file {
+                Some(s) => format!("{s}\n{settle}"),
+                None => settle,
+            });
+        }
+        DeviceEvidence {
+            dynamic_lighting: crate::dynlight::state().map(|d| d.enabled),
+            device_file,
+            probe: std::fs::read_to_string(crate::lightprobe::evidence_path(dialect_id, pid)).ok(),
+        }
+    }
+
+    /// [`gather`](Self::gather) for the learned device named `name`, found among the generated
+    /// files, so a device whose definition no longer resolves still carries its evidence.
+    #[must_use]
+    pub fn for_name(name: &str) -> Self {
+        let dir = crate::runroot::run_root().join("devices").join("auto");
+        let found = std::fs::read_dir(dir).ok().into_iter().flatten().flatten().find_map(|e| {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "toml") {
+                return None;
+            }
+            let def: crate::registry::DeviceDef = toml::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+            if def.name != name {
+                return None;
+            }
+            Some((def.dialect.clone(), def.modes.first()?.product_id))
+        });
+        found.map_or_else(DeviceEvidence::default, |(dialect, pid)| DeviceEvidence::gather(&dialect, pid))
+    }
+}
+
+/// A generated definition's lighting in a few lines: the bytes it sends and the provenance lines
+/// the file carries (probed, atlas, hardware-verified). Short enough for an issue form, unlike the
+/// whole file. `None` when `text` is not a definition.
+#[must_use]
+pub fn definition_summary(text: &str) -> Option<String> {
+    let def: crate::registry::DeviceDef = toml::from_str(text).ok()?;
+    let mut s = format!(
+        "{} · tx 0x{:02X} · collection {:04X}/{:04X}{}",
+        def.codename,
+        def.transaction_id,
+        def.control_interface.usage_page,
+        def.control_interface.usage,
+        def.control_interface.interface.map_or(String::new(), |i| format!(" on interface {i}"))
+    );
+    match &def.lighting {
+        Some(l) => {
+            let tx = |t: Option<u8>| t.map_or("default".to_string(), |t| format!("0x{t:02X}"));
+            s.push_str(&format!(
+                "\nlighting: {:?} {:?} · led 0x{:02X} · {}x{} · effects tx {} · brightness {}",
+                l.protocol,
+                l.framing,
+                l.led_id,
+                l.rows,
+                l.cols,
+                tx(l.effect.transaction_id),
+                l.brightness.as_ref().map_or("none".into(), |b| format!("tx {}", tx(b.transaction_id))),
+            ));
+        }
+        None => s.push_str("\nlighting: none"),
+    }
+    for line in text.lines().filter(|l| l.starts_with("#   - ") && (l.contains("HARDWARE-VERIFIED") || l.contains("lighting") || l.contains("atlas"))) {
+        s.push('\n');
+        s.push_str(line.trim_start_matches("#   - "));
+    }
+    Some(s)
+}
+
+/// [`device_report_url`] with `evidence` in the form's optional fields, each only while the link
+/// stays within the same budget as a bug report's.
+#[must_use]
+pub fn device_report_url_with(name: &str, mode: &str, version: &str, evidence: &DeviceEvidence) -> String {
+    let mut url = device_report_url(name, mode, version);
+    if let Some(on) = evidence.dynamic_lighting {
+        url.push_str("&dynamic-lighting=");
+        url.push_str(if on { "On" } else { "Off" });
+    }
+    let mut room = URL_BODY_MAX.saturating_sub(url.len());
+    for (field, text) in [("evidence", evidence.probe.as_deref()), ("device-file", evidence.device_file.as_deref())] {
+        let Some(text) = text.map(str::trim).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        let block = format!("```\n{text}\n```");
+        let cost = field.len() + 2 + encoded_len(&block);
+        if cost <= room {
+            url.push_str(&format!("&{field}={}", encode(&block)));
+            room -= cost;
+        }
+    }
+    url
+}
+
 /// How long `text` is once [`encode`]d.
 fn encoded_len(text: &str) -> usize {
     text.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { 1 } else { 3 }).sum()
@@ -405,5 +519,22 @@ mod tests {
         assert!(url.contains("connection=Wired%20%2F%20USB") && url.contains("neuron%20v0.1.8"));
         assert!(device_report_url("Razer Viper", "dongle", "0.1.8").contains("connection=USB%20receiver%20%2F%20dongle"));
         assert!(!device_report_url("Razer Viper", "?", "0.1.8").contains("connection="), "an unknown link is left to the person");
+    }
+
+    #[test]
+    fn a_device_report_carries_what_neuron_already_knows_within_the_budget() {
+        let evidence = DeviceEvidence {
+            dynamic_lighting: Some(true),
+            device_file: Some("name = \"x\"\n".repeat(2000)),
+            probe: Some("if3 000C/0001: bl:3F".into()),
+        };
+        let url = device_report_url_with("Razer BlackWidow V3", "wired", "0.1.9", &evidence);
+        assert!(url.contains("dynamic-lighting=On"));
+        assert!(url.contains("evidence=%60%60%60%0Aif3%20000C%2F0001%3A%20bl%3A3F"), "{url}");
+        assert!(!url.contains("device-file="), "a file too long for the link is left out, not cut");
+        assert!(url.len() <= URL_BODY_MAX, "{}", url.len());
+        let small = DeviceEvidence { device_file: Some("name = \"x\"".into()), ..DeviceEvidence::default() };
+        assert!(device_report_url_with("x", "wired", "0.1.9", &small).contains("device-file="));
+        assert_eq!(device_report_url_with("x", "?", "0.1.9", &DeviceEvidence::default()), device_report_url("x", "?", "0.1.9"));
     }
 }

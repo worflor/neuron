@@ -99,7 +99,26 @@ const NORMAL_MODE: u8 = 0x00;
 /// (dialect-routed), so a non-razer family can't be handed a razer-framed mode packet. This raw form
 /// is for the RAZER-EXPLICIT paths only (`ensure_custody`, the CLI `mode` verb).
 pub fn set_device_mode(d: &Device, mode: u8) -> Result<[u8; 80]> {
+    if refuses_mode_writes(&d.def) {
+        bail!("{} never takes device-mode writes", d.def.name);
+    }
     d.exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_SET, 0x02, &[mode, 0x00])
+}
+
+/// Razer Tartarus Pro: it resets when it receives a device-mode write (`razerkbd_driver.c`
+/// L6072-L6079 @cd5c4243).
+const MODE_WRITE_RESETS: &[u16] = &[0x0244];
+
+/// Devices neuron must never send a device-mode write: the Tartarus Pro, which resets on one, and
+/// every Blade laptop keyboard, which openrazer never switches (`razer_set_device_mode` returns
+/// early for laptops, `razerkbd_driver.c` L536-L543 @cd5c4243). They are painted in the mode they
+/// are in.
+#[must_use]
+pub fn refuses_mode_writes(def: &crate::registry::DeviceDef) -> bool {
+    def.modes.iter().any(|m| {
+        (def.vendor_id == crate::dialect::RAZER_VID && MODE_WRITE_RESETS.contains(&m.product_id))
+            || crate::atlas::lookup(def.vendor_id, m.product_id).is_some_and(crate::atlas::Keyboard::is_laptop)
+    })
 }
 
 /// Put the device in the mode its [`Custody`](crate::registry::Custody) policy needs for host
@@ -112,7 +131,10 @@ pub fn set_device_mode(d: &Device, mode: u8) -> Result<[u8; 80]> {
 /// burst; a `Firmware` device is left alone.
 pub fn ensure_custody(d: &Device) -> u8 {
     let prior = d.exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, 0x02, &[]).ok().map(|a| a[0]);
-    match d.def.custody {
+    if refuses_mode_writes(&d.def) {
+        return prior.unwrap_or(0);
+    }
+    match d.def.custody() {
         crate::registry::Custody::Driver if prior != Some(DRIVER_MODE) => {
             let _ = set_device_mode(d, DRIVER_MODE);
         }
@@ -1064,7 +1086,33 @@ pub fn set_in_game_polling(d: &Device, wired_hz: u32, _dongle_hz: u32) -> Result
         0,
         &[payload[1]],
     )?;
+    record_in_game_polling(d.pid, wired_hz);
     Ok(())
+}
+
+/// Per-PID record of the in-game rate a device confirmed by read-back this process lifetime. The
+/// 0x00/0xC0 getter isn't graded for a standalone read, so this is the only rate neuron can vouch for.
+fn in_game_polling_verified() -> &'static std::sync::Mutex<std::collections::HashMap<u16, u32>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u16, u32>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn record_in_game_polling(pid: u16, hz: u32) {
+    in_game_polling_verified()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(pid, hz);
+}
+
+/// The in-game polling rate device `pid` last confirmed after a [`set_in_game_polling`], if any.
+#[must_use]
+pub fn verified_in_game_polling(pid: u16) -> Option<u32> {
+    in_game_polling_verified()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&pid)
+        .copied()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1379,54 +1427,103 @@ pub fn set_snap_tap(d: &Device, pairs: &[SnapTapPair], enable: bool) -> Result<(
 /// reached the LEDs" from "the tx no-op'd", which is all the heal needs.
 #[must_use]
 pub fn lighting_landed(d: &Device, def: &DeviceDef, expected_effect: u8) -> Option<bool> {
-    let cmd = def.command("lighting_state")?;
-    let got = d.exec_dynamic(cmd.class, cmd.id, cmd.size, &cmd.args).ok()?;
-    match cmd.class {
-        // MATRIX: [varstore, led, effect, …] — the effect byte is the exact landed proof.
-        0x0F => Some(got[2] == expected_effect),
-        // LEGACY (and any other era): coarse — the 0x03/0x88 state has no clean effect byte, so a
-        // nonzero state = lit = landed; an all-zero state = the write no-op'd. Honest and blunt.
-        _ => {
-            let size = (cmd.size as usize).clamp(1, got.len());
-            Some(got[..size].iter().any(|&b| b != 0))
-        }
-    }
+    let state = lighting_state_at(d, def, def.transaction_id)?;
+    Some(match state {
+        LightingState::Effect(e) => e == expected_effect,
+        LightingState::Lit(lit) => lit,
+    })
 }
 
-/// FIRST-LIGHT HEAL (DIALECT-RND): on an AUTO def whose lighting writes may ride a wrong era-
-/// heuristic tx (writes don't echo honesty — a wrong tx ACKs then no-ops), re-issue the custom-
-/// frame DISPLAY report at each tx cohort candidate (0x1F, 0x3F, 0xFF, 0x9F), read back
-/// `lighting_state` after each, and return the FIRST tx that verifiably landed. Starts with the
-/// def's current tx (already-right = no extra writes). None = nothing verified (device asleep /
-/// no getter) — caller leaves the def alone. Writes are the same volatile lighting writes the
-/// caller was already streaming; no new write class is introduced.
+/// What the def's `lighting_state` getter says, read at `tx` and, when that goes unanswered, at
+/// the device default. MATRIX (0x0F/0x82): the effect byte at [2]. LEGACY (0x03/0x88): coarse lit
+/// or dark, an all-zero state being dark. `None` = no getter, or no answer.
+#[must_use]
+pub fn lighting_state_at(d: &Device, def: &DeviceDef, tx: u8) -> Option<LightingState> {
+    let cmd = def.command("lighting_state")?;
+    let got = d
+        .exec_dynamic_tx(tx, cmd.class, cmd.id, cmd.size, &cmd.args)
+        .or_else(|_| d.exec_dynamic_tx(def.transaction_id, cmd.class, cmd.id, cmd.size, &cmd.args))
+        .ok()?;
+    Some(match cmd.class {
+        0x0F => LightingState::Effect(got[2]),
+        _ => {
+            let size = (cmd.size as usize).clamp(1, got.len());
+            LightingState::Lit(got[..size].iter().any(|&b| b != 0))
+        }
+    })
+}
+
+/// A `lighting_state` reading, per era.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightingState {
+    /// Matrix: the effect id the board reports.
+    Effect(u8),
+    /// Legacy: whether anything is lit.
+    Lit(bool),
+}
+
+/// [`ensure_custody`] with the mode read and set at `tx`, for a board that holds requests to one
+/// tx cohort: custody taken at the wrong tx is acknowledged and ignored. Returns the mode read, if
+/// any.
+pub fn ensure_custody_at(d: &Device, tx: u8) -> Option<u8> {
+    let prior = d.exec_dynamic_tx(tx, CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, 0x02, &[]).ok().map(|a| a[0]);
+    if refuses_mode_writes(&d.def) {
+        return prior;
+    }
+    let want = match d.def.custody() {
+        crate::registry::Custody::Driver if prior != Some(DRIVER_MODE) => Some(DRIVER_MODE),
+        crate::registry::Custody::Firmware if prior == Some(DRIVER_MODE) => Some(NORMAL_MODE),
+        _ => None,
+    };
+    if let Some(mode) = want {
+        let _ = d.exec_dynamic_tx(tx, CLASS_DEVICE_MODE, ID_DEVICE_MODE_SET, 0x02, &[mode, 0x00]);
+    }
+    prior
+}
+
+/// FIRST-LIGHT HEAL: prove the tx a generated def's lighting effects land at, since a wrong-tx
+/// write is acknowledged and dropped. At each candidate (the current lighting tx, then the Razer
+/// cohorts) it takes custody at that tx, sends `off`, reads `lighting_state`, sends the custom-frame
+/// display, and reads it again. A candidate lands only when the state moves from not-displaying
+/// to displaying the custom frame, so a board that already showed a frame cannot pass a wrong tx.
+/// The state is read at the candidate tx first. `None` = nothing verified (asleep, no getter, no
+/// candidate landed). Only the volatile lighting writes the app streams, plus the device-mode
+/// switch every lighting write takes. Stops when writes are paused.
 #[must_use]
 pub fn first_light_heal(d: &Device, def: &DeviceDef) -> Option<u8> {
     let l = def.lighting.as_ref()?;
-    // The custom-frame DISPLAY report — the write whose landing we're proving. Its data_size is the
-    // report's explicit size if any, else the arg count (same rule apply_lighting/send_lighting_fast use).
-    let rep = l.custom_display_report();
-    let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
-    // The effect byte a landed custom frame echoes in lighting_state. MATRIX expects `custom_id`
-    // (0x08 on the Naga); the LEGACY display report's own effect id is ALSO `custom_id` (0x05), and
-    // legacy verification is coarse anyway — so `custom_id` is the right expectation for both.
-    let custom_id = l.custom_id;
-    // Cohort candidates, current tx FIRST so an already-correct def verifies in ONE write and the
-    // caller does no rewrite. The rest are the known Razer tx cohorts, minus the current one.
-    const COHORT: [u8; 4] = [0x1F, 0x3F, 0xFF, 0x9F];
-    let mut candidates: Vec<u8> = vec![def.transaction_id];
-    candidates.extend(COHORT.iter().copied().filter(|&c| c != def.transaction_id));
+    def.command("lighting_state")?;
+    let display = l.custom_display_report();
+    let display_size = display.size.unwrap_or_else(|| display.args.len().min(80) as u8);
+    let off = l.native_effect_report(crate::lighting::Effect::Off, None, false);
+    let current = def.lighting_tx().unwrap_or(def.transaction_id);
+    let mut candidates: Vec<u8> = vec![current];
+    candidates.extend(crate::dialect::RAZER_COHORTS.iter().copied().filter(|&c| c != current));
     for tx in candidates {
-        // ACK'd path (`exec_dynamic_tx`, NOT the fire-and-forget stream) — we WANT the ack, and we
-        // deliberately override the report's own tx with the candidate we're testing. A transport
-        // error (asleep link) just moves to the next candidate; only a verified landing returns.
-        if d
-            .exec_dynamic_tx(tx, rep.class, rep.id, size, &rep.args)
-            .is_err()
-        {
+        if writes_paused() {
+            return None;
+        }
+        ensure_custody_at(d, tx);
+        let before = match &off {
+            Some(off) => {
+                let size = off.size.unwrap_or_else(|| off.args.len().min(80) as u8);
+                if d.exec_dynamic_tx(tx, off.class, off.id, size, &off.args).is_err() {
+                    continue;
+                }
+                lighting_state_at(d, def, tx)
+            }
+            None => lighting_state_at(d, def, tx),
+        };
+        if d.exec_dynamic_tx(tx, display.class, display.id, display_size, &display.args).is_err() {
             continue;
         }
-        if lighting_landed(d, def, custom_id) == Some(true) {
+        let after = lighting_state_at(d, def, tx);
+        let landed = match (before, after) {
+            (Some(LightingState::Effect(b)), Some(LightingState::Effect(a))) => b != l.custom_id && a == l.custom_id,
+            (Some(LightingState::Lit(b)), Some(LightingState::Lit(a))) => !b && a,
+            _ => false,
+        };
+        if landed {
             return Some(tx);
         }
     }
@@ -1925,6 +2022,16 @@ mod tests {
     }
 
     #[test]
+    fn in_game_polling_record_is_per_device_and_starts_unknown() {
+        // PIDs no other test writes, so the process-global record can't be touched concurrently.
+        assert_eq!(verified_in_game_polling(0xFEE1), None);
+        record_in_game_polling(0xFEE1, 4000);
+        record_in_game_polling(0xFEE2, 8000);
+        assert_eq!(verified_in_game_polling(0xFEE1), Some(4000));
+        assert_eq!(verified_in_game_polling(0xFEE2), Some(8000));
+    }
+
+    #[test]
     fn idle_and_ingame_writes_gated_off_by_default() {
         // Default build: neither env set -> both derived writes are gated off (the safe posture).
         std::env::remove_var("NEURON_IDLE_WRITE");
@@ -2076,7 +2183,7 @@ mod tests {
     fn driver_custody_still_takes_driver_mode() {
         let mut def: crate::registry::DeviceDef =
             toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();
-        def.custody = crate::registry::Custody::Driver;
+        def.custody = Some(crate::registry::Custody::Driver);
         let phantom = Arc::new(
             MockDevice::razer(0x00A8, "phantom driver-custody mouse")
                 .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[NORMAL_MODE])

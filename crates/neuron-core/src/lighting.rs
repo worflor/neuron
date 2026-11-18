@@ -278,7 +278,34 @@ pub struct LightingDef {
     /// command to set brightness (optional).
     #[serde(default)]
     pub brightness: Option<CommandSpec>,
+    /// How matrix effect reports are sized; see [`Framing`].
+    #[serde(default)]
+    pub framing: Framing,
+    /// Full argument bytes of the matrix custom-frame display, when they are not the effect
+    /// prefix plus `custom_id`: keyboards display at `[00, 00, 08]` while their effects address
+    /// the backlight LED.
+    #[serde(default)]
+    pub display_args: Option<Vec<u8>>,
 }
+
+/// How matrix (class 0x0F) effect reports are laid out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Framing {
+    /// `data_size` is the argument count; colour effects carry a `00 00 01` preamble. The Naga's
+    /// live-verified layout.
+    #[default]
+    Compact,
+    /// openrazer's extended-matrix layout (razerchromacommon.c): fixed `data_size` per effect
+    /// (off, spectrum, wave 6; static, breathing, reactive, starlight 9; custom display 0x0C),
+    /// breathing's one-colour type byte, wave direction and speed, reactive and starlight speed.
+    Fixed,
+}
+
+/// Wave direction and speed for the fixed layout: openrazer's default speed 0x28, direction 1.
+const FIXED_WAVE: [u8; 2] = [0x01, 0x28];
+/// Reactive and starlight speed for the fixed layout (openrazer clamps to 1..=4 / 1..=3).
+const FIXED_SPEED: u8 = 0x01;
 
 fn default_custom_id() -> u8 {
     0x05
@@ -299,9 +326,12 @@ impl LightingDef {
             // OpenRazer standard_matrix_effect_custom_frame: [CUSTOMFRAME, varstore], data_size 0x02.
             Protocol::Legacy => (vec![self.custom_id, self.varstore], Some(0x02u8)),
             Protocol::Matrix => {
-                let mut a = self.effect.args.clone();
-                a.push(self.custom_id);
-                (a, None)
+                let a = self.display_args.clone().unwrap_or_else(|| {
+                    let mut a = self.effect.args.clone();
+                    a.push(self.custom_id);
+                    a
+                });
+                (a, (self.framing == Framing::Fixed).then_some(0x0C))
             }
         };
         Report {
@@ -348,11 +378,29 @@ impl LightingDef {
             Protocol::Matrix => {
                 let mut args = self.effect.args.clone(); // [varstore, led]
                 args.push(id);
-                if e.uses_color() {
-                    let c = color.unwrap_or(Rgb::new(0, 255, 0));
-                    // extended-matrix colour effects carry a `00 00 01` (one-colour) preamble,
-                    // then RGB — confirmed live on the Naga (static red rendered).
-                    args.extend_from_slice(&[0x00, 0x00, 0x01, c.r, c.g, c.b]);
+                let c = color.unwrap_or(Rgb::new(0, 255, 0));
+                let mut size = None;
+                match self.framing {
+                    Framing::Compact => {
+                        if e.uses_color() {
+                            // extended-matrix colour effects carry a `00 00 01` (one-colour)
+                            // preamble, then RGB — confirmed live on the Naga (static red rendered).
+                            args.extend_from_slice(&[0x00, 0x00, 0x01, c.r, c.g, c.b]);
+                        }
+                    }
+                    Framing::Fixed => {
+                        let (tail, fixed): (Vec<u8>, u8) = match e {
+                            Effect::Off | Effect::Spectrum => (Vec::new(), 0x06),
+                            Effect::Wave => (FIXED_WAVE.to_vec(), 0x06),
+                            Effect::Static => (vec![0x00, 0x00, 0x01, c.r, c.g, c.b], 0x09),
+                            Effect::Breathing => (vec![0x01, 0x00, 0x01, c.r, c.g, c.b], 0x09),
+                            Effect::Reactive | Effect::Starlight => {
+                                (vec![0x00, FIXED_SPEED, 0x01, c.r, c.g, c.b], 0x09)
+                            }
+                        };
+                        args.extend_from_slice(&tail);
+                        size = Some(fixed);
+                    }
                 }
                 // VARSTORE persists the effect to onboard memory (survives with no software) —
                 // only the Matrix dialect has storage, and its varstore byte is args[0] (the very
@@ -369,7 +417,8 @@ impl LightingDef {
                     id: self.effect.id,
                     args,
                     tx: self.effect.transaction_id,
-                    size: None, // matrix keeps data_size = args.len() (Naga byte-identical)
+                    // Compact keeps data_size = args.len() (Naga byte-identical).
+                    size,
                 })
             }
             Protocol::Legacy => {
@@ -1308,7 +1357,9 @@ impl<'a> Lights<'a> {
         if self.controlled.get() {
             return Ok(());
         }
-        if self.dev.def.custody == crate::registry::Custody::Firmware {
+        if self.dev.def.custody() == crate::registry::Custody::Firmware
+            || crate::writes::refuses_mode_writes(&self.dev.def)
+        {
             crate::writes::ensure_custody(self.dev);
         } else if self.dev.run("device_mode").map_or(0, |m| m[0]) != 0x03 {
             crate::writes::set_device_mode(self.dev, 0x03)?;
@@ -1438,20 +1489,29 @@ impl<'a> Lights<'a> {
             if stop() { break; }
             changed_rows_into(last_frame.as_deref(), &frame, cols, &mut changed);
 
-            // Push only the changed rows; LATCH (commit the frame) only if we actually wrote ≥1 row.
+            // Push only the changed rows; LATCH (commit the frame) only if we actually wrote ≥1 row
+            // and none was lost. An unconfirmed row still latches (some boards never answer frame
+            // rows), but leaves the frame uncertain so the next one is sent whole.
+            use crate::dialect::Sent;
             let mut sent_any = false;
+            let mut lost = false;
             let mut frame_complete = true;
             for &row in &changed {
-                if stop() { frame_complete = false; break; }
+                if stop() { frame_complete = false; lost = true; break; }
                 if let Some(rep) = self.def.row_report(&frame, row) {
-                    if !self.dev.send_lighting_fast(&rep) {
-                        frame_complete = false;
-                        break;
+                    match self.dev.send_lighting_fast(&rep) {
+                        Sent::Taken => {}
+                        Sent::Unconfirmed => frame_complete = false,
+                        Sent::Lost => {
+                            frame_complete = false;
+                            lost = true;
+                            break;
+                        }
                     }
                     sent_any = true;
                 }
             }
-            if sent_any && frame_complete && (stop() || !self.dev.send_lighting_fast(&display)) {
+            if sent_any && !lost && (stop() || self.dev.send_lighting_fast(&display) != Sent::Taken) {
                 frame_complete = false;
             }
 
@@ -1517,6 +1577,8 @@ mod tests {
                 args: vec![0x00, 0x00],
                 transaction_id: None,
             }),
+            framing: Framing::Compact,
+            display_args: None,
         }
     }
 
@@ -1569,7 +1631,50 @@ mod tests {
                 args: vec![0x01, 0x05],
                 transaction_id: None,
             }),
+            framing: Framing::Compact,
+            display_args: None,
         }
+    }
+
+    /// The fixed layout reproduces openrazer's documented extended-matrix packets byte for byte
+    /// (razerchromacommon.c at cd5c4243: the comment tables above each builder, VARSTORE swapped
+    /// for NOSTORE): static `00 05 01 00 00 01 RGB` size 9, wave `00 05 04 dir 28` size 6 with
+    /// direction 1 (the daemon's `WAVE_DIRS = (1, 2)` on these boards),
+    /// breathing `00 05 02 01 00 01 RGB` size 9, reactive `00 05 05 00 01 01 RGB` size 9,
+    /// spectrum and off size 6, custom display `00 00 08` size 0x0C.
+    #[test]
+    fn fixed_framing_matches_openrazer_extended_packets() {
+        let mut d = matrix_def();
+        d.framing = Framing::Fixed;
+        d.effect.args = vec![0x00, 0x05];
+        d.display_args = Some(vec![0x00, 0x00, 0x08]);
+        for (name, id) in [("breathing", 0x02), ("wave", 0x04), ("reactive", 0x05), ("starlight", 0x07)] {
+            d.effects.insert(name.into(), id);
+        }
+        let red = Some(Rgb::new(0xFF, 0x00, 0x00));
+        let built = |e: Effect| {
+            let r = d.native_effect_report(e, red, false).unwrap();
+            (r.args, r.size)
+        };
+        assert_eq!(built(Effect::Static), (vec![0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0xFF, 0x00, 0x00], Some(0x09)));
+        assert_eq!(built(Effect::Wave), (vec![0x00, 0x05, 0x04, 0x01, 0x28], Some(0x06)));
+        assert_eq!(built(Effect::Breathing), (vec![0x00, 0x05, 0x02, 0x01, 0x00, 0x01, 0xFF, 0x00, 0x00], Some(0x09)));
+        assert_eq!(built(Effect::Reactive), (vec![0x00, 0x05, 0x05, 0x00, 0x01, 0x01, 0xFF, 0x00, 0x00], Some(0x09)));
+        assert_eq!(built(Effect::Spectrum), (vec![0x00, 0x05, 0x03], Some(0x06)));
+        assert_eq!(built(Effect::Off), (vec![0x00, 0x05, 0x00], Some(0x06)));
+        let persisted = d.native_effect_report(Effect::Static, red, true).unwrap();
+        assert_eq!(persisted.args[0], 0x01, "persist still sets VARSTORE");
+        let display = d.custom_display_report();
+        assert_eq!((display.args, display.size), (vec![0x00, 0x00, 0x08], Some(0x0C)));
+    }
+
+    #[test]
+    fn compact_framing_is_unchanged() {
+        let d = matrix_def();
+        let r = d.native_effect_report(Effect::Static, Some(Rgb::new(1, 2, 3)), false).unwrap();
+        assert_eq!((r.args, r.size), (vec![0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 1, 2, 3], None));
+        let display = d.custom_display_report();
+        assert_eq!((display.args, display.size), (vec![0x00, 0x00, 0x05], None));
     }
 
     #[test]
@@ -1821,6 +1926,68 @@ mod tests {
         assert_eq!(rows, 3, "two initial rows, no static FPS resend, then only the changed row");
         assert!(trace.iter().all(|r| (r[7], r[8]) == (0x0F, 0x03) || (r[7], r[8]) == (0x0F, 0x02)));
         assert_eq!(trace.iter().filter(|r| r[8] == 0x02).count(), 2);
+    }
+
+    #[test]
+    fn a_board_that_answers_busy_still_latches_its_frames() {
+        use std::sync::{Arc, Mutex};
+        use std::cell::Cell;
+        struct BusyRows(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl crate::transport::Transport for BusyRows {
+            fn set_feature(&self, bytes: &[u8]) -> anyhow::Result<()> { self.0.lock().unwrap().push(bytes.to_vec()); Ok(()) }
+            fn get_feature(&self, bytes: &mut [u8]) -> anyhow::Result<usize> {
+                let trace = self.0.lock().unwrap();
+                let raw: [u8; crate::protocol::BUF_LEN] = trace.last().unwrap().as_slice().try_into().unwrap();
+                let mut reply = crate::protocol::Report::from_buf(&raw);
+                reply.status = if raw[8] == 0x03 { 0x01 } else { 0x02 };
+                bytes.copy_from_slice(&reply.to_buf()); Ok(bytes.len())
+            }
+        }
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let def: crate::registry::DeviceDef = toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml")).unwrap();
+        let device = crate::device::Device::with_transport(def, 0x0226, Box::new(BusyRows(reports.clone())));
+        let mut grid = matrix_def(); grid.rows = 2;
+        let lights = Lights::new(&device, grid);
+        lights.controlled.set(true);
+        let tick = Cell::new(0);
+        lights.animate_frames(|| 30, |_, _| {
+            tick.set(tick.get() + 1);
+            Ok(vec![Rgb::new(50, 60, 70); 4].into())
+        }, 1, || tick.get() >= 3).unwrap();
+        let trace = reports.lock().unwrap();
+        assert_eq!(trace.iter().filter(|r| r[8] == 0x03).count(), 2, "rows taken on busy are not resent");
+        assert_eq!(trace.iter().filter(|r| r[8] == 0x02).count(), 1, "the frame is latched");
+    }
+
+    #[test]
+    fn a_board_that_never_answers_its_rows_still_latches_and_resends_whole_frames() {
+        use std::sync::{Arc, Mutex};
+        use std::cell::Cell;
+        struct SilentRows(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl crate::transport::Transport for SilentRows {
+            fn set_feature(&self, bytes: &[u8]) -> anyhow::Result<()> { self.0.lock().unwrap().push(bytes.to_vec()); Ok(()) }
+            fn get_feature(&self, bytes: &mut [u8]) -> anyhow::Result<usize> {
+                let trace = self.0.lock().unwrap();
+                let raw: [u8; crate::protocol::BUF_LEN] = trace.last().unwrap().as_slice().try_into().unwrap();
+                let mut reply = crate::protocol::Report::from_buf(&raw);
+                reply.status = if raw[8] == 0x03 { 0x00 } else { 0x02 };
+                bytes.copy_from_slice(&reply.to_buf()); Ok(bytes.len())
+            }
+        }
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let def: crate::registry::DeviceDef = toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml")).unwrap();
+        let device = crate::device::Device::with_transport(def, 0x0226, Box::new(SilentRows(reports.clone())));
+        let mut grid = matrix_def(); grid.rows = 2;
+        let lights = Lights::new(&device, grid);
+        lights.controlled.set(true);
+        let tick = Cell::new(0);
+        lights.animate_frames(|| 30, |_, _| {
+            tick.set(tick.get() + 1);
+            Ok(vec![Rgb::new(50, 60, 70); 4].into())
+        }, 1, || tick.get() >= 3).unwrap();
+        let trace = reports.lock().unwrap();
+        assert_eq!(trace.iter().filter(|r| r[8] == 0x02).count(), 2, "every frame is latched");
+        assert_eq!(trace.iter().filter(|r| r[8] == 0x03).count(), 4, "unconfirmed frames are resent whole");
     }
 
     #[test]

@@ -65,6 +65,19 @@ pub enum CompatCmd {
     },
     /// Replay exported input through the neutral bit-variation analyzer, without hardware
     Replay { bundle: PathBuf },
+    /// Ask each Razer control collection the lighting getters at every transaction id; read-only
+    Lighting {
+        /// only this product id (hex, e.g. 024e)
+        #[arg(long, value_parser = parse_pid)]
+        pid: Option<u16>,
+        /// how long to wait for each answer, in milliseconds
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(10..=1000))]
+        wait_ms: u64,
+    },
+}
+
+fn parse_pid(s: &str) -> Result<u16, String> {
+    u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).map_err(|e| format!("{s}: {e}"))
 }
 
 pub fn run(action: CompatCmd) -> Result<()> {
@@ -139,6 +152,10 @@ pub fn run(action: CompatCmd) -> Result<()> {
             crate::out::emit(&analyses, || {
                 for a in &analyses { println!("Interface {}: {} reports, {} changing bits.", a.interface, a.sample_count, a.variations.len()); }
             })?;
+        }
+        CompatCmd::Lighting { pid, wait_ms } => {
+            let units = neuron::lightprobe::sweep(pid, std::time::Duration::from_millis(wait_ms))?;
+            crate::out::emit(&units, || print!("{}", neuron::lightprobe::render(&units)))?;
         }
     }
     Ok(())

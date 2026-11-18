@@ -75,13 +75,9 @@ use anyhow::{bail, Result};
 pub const HIDPP_VID: u16 = 0x046D;
 
 /// Known Logitech USB RECEIVER product ids (Unifying / Bolt / Nano / Lightspeed / EX100 families).
-/// A receiver is NOT a claimable HID++ 2.0 endpoint: the receiver ITSELF at [`DEVICE_INDEX`] `0xFF`
-/// speaks HID++ 1.0 REGISTERS (not the 2.0 feature protocol [`HidppDialect::probe`] pings), and its
-/// PAIRED devices answer on pairing SLOTS `1..=6` — addressing this dialect hard-codes away (see
-/// [`DEVICE_INDEX`]). Until the receiver device-connection enumeration lands (DIALECT-RND HID++
-/// wave), these pids are still recognized by [`HidppDialect::interested`] but never CLAIMED, so a
-/// receiver surfaces as unclaimed inventory instead of a mis-addressed 3-strike "unresponsive" row.
-/// List transcribed from Solaar `lib/logitech_receiver/base_usb.py` (the canonical VID-0x046D
+/// The receiver itself at [`DEVICE_INDEX`] `0xFF` speaks HID++ 1.0 registers; the devices paired to it
+/// answer the 2.0 feature protocol on pairing slots `1..=6` ([`PAIRING_SLOTS`]), so a receiver is
+/// adopted through the first slot whose device answers. List transcribed from Solaar `lib/logitech_receiver/base_usb.py` (the canonical VID-0x046D
 /// receiver enumeration; cross-checked against libratbag). `claims()` already gates on the VID, so an
 /// OEM-rebranded pid that is not truly a 0x046D device simply never matches — harmless.
 const RECEIVER_PIDS: &[u16] = &[
@@ -94,8 +90,7 @@ const RECEIVER_PIDS: &[u16] = &[
     0xC539, 0xC53A, 0xC53D, 0xC53F, 0xC541, 0xC545, 0xC547, 0xC54D,
 ];
 
-/// Is `pid` one of the [`RECEIVER_PIDS`]? A receiver is interested-but-never-claimed (see the
-/// claiming-contract doc): it has no direct-attached `0xFF` HID++ 2.0 endpoint to round-trip against.
+/// Is `pid` one of the [`RECEIVER_PIDS`]?
 fn is_receiver_pid(pid: u16) -> bool {
     RECEIVER_PIDS.contains(&pid)
 }
@@ -105,20 +100,31 @@ const REPORT_ID_LONG: u8 = 0x11; // 20-byte long report
 const SHORT_LEN: u16 = 7;
 const LONG_LEN: usize = 20;
 
-/// Device index for every framed request. `0xFF` addresses a DIRECT-attached (corded) HID++ 2.0
-/// device per spec (cpg-docs). This is CORRECT BY CONSTRUCTION for every CLAIMABLE pipe — not a
-/// documented wrong-for-wireless simplification anymore: `claims()` now excludes [`RECEIVER_PIDS`], so
-/// the only pipes this dialect adopts are direct-attached, and `0xFF` is exactly their endpoint. A
-/// receiver-paired WIRELESS device answers on a pairing slot (`1..=6`) resolved via the receiver's
-/// device-connection enumeration — but such pipes are no longer claimed (they sit on the
-/// [`HidppDialect::interested`] ledger), so no claimable request is ever mis-addressed. Slot
-/// addressing lands with the receiver-enumeration work in a later DIALECT-RND HID++ wave.
+/// Device index of a direct-attached (corded or Bluetooth) HID++ 2.0 device (cpg-docs).
 const DEVICE_INDEX: u8 = 0xFF;
 
-/// Our fixed softwareId nibble (byte 3 low nibble). Any value 1..=15 works; a reply echoes it so we
-/// can match our own replies. `0x0A` is arbitrary-but-distinctive (matches the `0x1A` byte-3 golden
-/// for a function-1 request: `(1<<4)|0x0A`).
-const SW_ID: u8 = 0x0A;
+/// The pairing slots a receiver's devices answer on: a receiver holds at most six (Solaar
+/// `receiver.py` L178-L187 @e7304c4c). It answers an empty or unreachable slot at once with a HID++
+/// 1.0 error.
+const PAIRING_SLOTS: std::ops::RangeInclusive<u8> = 1..=6;
+
+/// The device index a def's `transaction_id` names: 0 (no razer meaning here) is the direct device,
+/// 1..=6 a receiver's pairing slot.
+fn address_of(transaction_id: u8) -> u8 {
+    if transaction_id == 0 { DEVICE_INDEX } else { transaction_id }
+}
+
+/// Our fixed softwareId nibble (byte 3 low nibble); a reply echoes it so we can match our own.
+/// Other clients sharing the device claim fixed ids (Solaar `base.py` @e7304c4c: 0x07 OpenRGB,
+/// 0x0A LGSTrayEx, 0x0B Solaar, 0x0D G HUB, 0x0F firmware); 0x0C collides with none and keeps the
+/// high bit set so notifications (swId 0) stay distinct.
+const SW_ID: u8 = 0x0C;
+
+/// Reply wait, by time: a busy device interleaves notifications ahead of our reply, so frames that
+/// aren't ours never shorten the wait (Solaar waits by deadline too). Silence ends it sooner.
+const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+const READ_WINDOW_MS: u32 = 100;
+const MAX_SILENT_WINDOWS: u32 = 10;
 
 // IRoot (feature 0x0000) — confirmed: cpg-docs `hidpp20/features/0x0000-IRoot.rst`.
 const IROOT_FEATURE: u8 = 0x00;
@@ -138,22 +144,36 @@ const ERR_HIDPP20: u8 = 0xFF;
 pub const RESHAPE_NONE: u8 = 0x00;
 pub const RESHAPE_BATTERY: u8 = 0x01;
 pub const RESHAPE_DPI: u8 = 0x02;
+/// 0x2202 getSensorDpiParameters: X and Y read separately.
+pub const RESHAPE_DPI_XY: u8 = 0x03;
 
 /// Feature ids the probe looks for (documented HID++ 2.0 feature numbers).
 pub const FEATURE_BATTERY: u16 = 0x1000; // BatteryLevelStatus
 pub const FEATURE_ADJUSTABLE_DPI: u16 = 0x2201; // AdjustableDPI
+/// UnifiedBattery, the battery feature on most Logitech devices since 0x1000; asked when 0x1000 is
+/// absent (Solaar `hidpp20.py` L1901-L1904 @e7304c4c).
+pub const FEATURE_UNIFIED_BATTERY: u16 = 0x1004;
+/// ExtendedAdjustableDPI, the per-axis DPI feature; asked when 0x2201 is absent (Solaar
+/// `settings_templates.py` L1088-L1140 @e7304c4c).
+pub const FEATURE_EXTENDED_DPI: u16 = 0x2202;
+/// DeviceName.
+pub const FEATURE_DEVICE_NAME: u16 = 0x0005;
+const FN_NAME_COUNT: u8 = 0x00;
+const FN_NAME_FRAGMENT: u8 = 0x01;
 
 /// Function ids WITHIN those features, baked into the synthesized command specs as `spec_id` (the
 /// razer `id` slot). Function 0 of 0x1000 is getBatteryLevelStatus; getSensorDpi is the read on
 /// 0x2201 — matched to the [`reshape`]/`exec` golden tests' `func_swid(0x02)` DPI convention.
 const FN_GET_BATTERY_STATUS: u8 = 0x00; // 0x1000 getBatteryLevelStatus → discharge % at payload[0]
 const FN_GET_SENSOR_DPI: u8 = 0x02; // 0x2201 getSensorDpi → single big-endian resolution
+const FN_UNIFIED_GET_STATUS: u8 = 0x01; // 0x1004 getStatus → [state of charge %, level, status, ..]
+const FN_EXTENDED_GET_SENSOR_DPI: u8 = 0x05; // 0x2202 getSensorDpiParameters(sensor) → [sensor, X, X default, Y, Y default, ..]
 
 /// Build a 20-byte LONG request. `params` past the 16-byte body is dropped (a long report holds 16).
-fn build_long(feature_idx: u8, fn_id: u8, params: &[u8]) -> [u8; LONG_LEN] {
+fn build_long(index: u8, feature_idx: u8, fn_id: u8, params: &[u8]) -> [u8; LONG_LEN] {
     let mut r = [0u8; LONG_LEN];
     r[0] = REPORT_ID_LONG;
-    r[1] = DEVICE_INDEX;
+    r[1] = index;
     r[2] = feature_idx;
     r[3] = (fn_id << 4) | (SW_ID & 0x0F);
     for (i, b) in params.iter().enumerate() {
@@ -169,8 +189,26 @@ fn func_swid(fn_id: u8) -> u8 {
     (fn_id << 4) | (SW_ID & 0x0F)
 }
 
-/// Human name for a HID++ 2.0 error code — confirmed: cpg-docs error-code enumeration.
-fn err_name(code: u8) -> &'static str {
+/// Human name for an error code. HID++ 1.0 (marker 0x8F) and 2.0 (0xFF) number their errors
+/// differently: 1.0 per Solaar `hidpp10_constants.py` @e7304c4c, 2.0 per cpg-docs.
+fn err_name(marker: u8, code: u8) -> &'static str {
+    if marker == ERR_HIDPP10 {
+        return match code {
+            0x01 => "InvalidSubId",
+            0x02 => "InvalidAddress",
+            0x03 => "InvalidValue",
+            0x04 => "ConnectionFailed",
+            0x05 => "TooManyDevices",
+            0x06 => "AlreadyExists",
+            0x07 => "Busy",
+            0x08 => "UnknownDevice",
+            0x09 => "ResourceError",
+            0x0A => "RequestUnavailable",
+            0x0B => "UnsupportedParameterValue",
+            0x0C => "WrongPinCode",
+            _ => "unspecified",
+        };
+    }
     match code {
         0x00 => "NoError",
         0x01 => "Unknown",
@@ -206,53 +244,88 @@ fn logical_report<'a>(t: &dyn Transport, buf: &'a [u8]) -> Option<&'a [u8]> {
     }
 }
 
-/// Is `buf` an error report for our in-flight request? The feature-index slot carries `0x8F` (1.0)
-/// or `0xFF` (2.0). We drive one request at a time on a dedicated handle, so any error bearing our
-/// device index in the drain window is ours. Returns the error code (byte 5) only for a complete
-/// report.
-fn error_code(buf: &[u8]) -> Option<u8> {
-    if valid_report_shape(buf) && buf[1] == DEVICE_INDEX && (buf[2] == ERR_HIDPP10 || buf[2] == ERR_HIDPP20) {
-        Some(buf[5])
-    } else {
-        None
-    }
+/// A Bluetooth-direct device may answer on index 0x00 instead of the 0xFF it was addressed on
+/// (Solaar `base.py` @e7304c4c accepts `devnumber ^ 0xFF`).
+fn is_our_device(want: u8, got: u8) -> bool {
+    got == want || (want == DEVICE_INDEX && got == DEVICE_INDEX ^ 0xFF)
+}
+
+/// The `(marker, code)` of an error report for OUR request to `(feature_idx, fn_id)`. Both 1.0
+/// (0x8F) and 2.0 (0xFF) errors echo the request's feature index and function|swId at bytes 3-4;
+/// an error for another client's request (G HUB, Solaar) on the same device is not ours.
+fn error_for(buf: &[u8], index: u8, feature_idx: u8, fn_id: u8) -> Option<(u8, u8)> {
+    (valid_report_shape(buf)
+        && is_our_device(index, buf[1])
+        && (buf[2] == ERR_HIDPP10 || buf[2] == ERR_HIDPP20)
+        && buf[3] == feature_idx
+        && buf[4] == func_swid(fn_id))
+    .then(|| (buf[2], buf[5]))
 }
 
 /// Does `buf` echo a normal reply to `(feature_idx, fn_id)` for us? (report id short/long, our
 /// device index, echoed feature index, echoed function|softwareId, and the complete report length.)
-fn matches_reply(buf: &[u8], feature_idx: u8, fn_id: u8) -> bool {
+fn matches_reply(buf: &[u8], index: u8, feature_idx: u8, fn_id: u8) -> bool {
     valid_report_shape(buf)
-        && buf[1] == DEVICE_INDEX
+        && is_our_device(index, buf[1])
         && buf[2] == feature_idx
         && buf[3] == func_swid(fn_id)
 }
 
-/// Drain input reports (up to ~10 reads / ~1s) for the NORMAL reply to `(feature_idx, fn_id)`.
-/// `None` if an error report or nothing arrives — the diagnostic caller ([`probe_report`]) treats
-/// both as "feature absent / didn't answer". `exec` does its OWN loop so it can surface the error
-/// code as an `anyhow` error rather than a bare `None`.
-fn recv_matching(t: &dyn Transport, feature_idx: u8, fn_id: u8) -> Option<[u8; LONG_LEN]> {
-    for _ in 0..10 {
+enum Answer {
+    Reply([u8; LONG_LEN]),
+    Error { marker: u8, code: u8 },
+    Silent,
+}
+
+/// Wait for the answer to `(feature_idx, fn_id)`, skipping notifications and other clients'
+/// traffic until [`REPLY_DEADLINE`], or until the device has been silent for
+/// [`MAX_SILENT_WINDOWS`] read windows.
+fn await_reply(t: &dyn Transport, index: u8, feature_idx: u8, fn_id: u8) -> Answer {
+    let deadline = std::time::Instant::now() + REPLY_DEADLINE;
+    let mut silent = 0;
+    while silent < MAX_SILENT_WINDOWS {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let window = (left.as_millis() as u32).clamp(1, READ_WINDOW_MS);
         let mut buf = [0u8; LONG_LEN];
-        let n = match t.read_input(&mut buf, 100) {
+        let n = match t.read_input(&mut buf, window) {
             Ok(n) => n,
-            Err(_) => continue, // nothing in this window; keep draining
+            Err(_) => {
+                silent += 1;
+                continue;
+            }
         };
         if n > buf.len() {
             continue;
         }
         let Some(got) = logical_report(t, &buf[..n]) else { continue; };
-        if error_code(got).is_some() {
-            return None;
+        if let Some((marker, code)) = error_for(got, index, feature_idx, fn_id) {
+            return Answer::Error { marker, code };
         }
-        if matches_reply(got, feature_idx, fn_id) {
+        if matches_reply(got, index, feature_idx, fn_id) {
             let mut reply = [0u8; LONG_LEN];
             reply[..got.len()].copy_from_slice(got);
-            return Some(reply);
+            return Answer::Reply(reply);
         }
-        // else: a reply for a different request/softwareId — keep draining.
     }
-    None
+    Answer::Silent
+}
+
+/// The normal reply to `(feature_idx, fn_id)`, or `None` for an error or silence; the diagnostic
+/// callers treat both as "feature absent / didn't answer".
+fn recv_matching(t: &dyn Transport, index: u8, feature_idx: u8, fn_id: u8) -> Option<[u8; LONG_LEN]> {
+    match await_reply(t, index, feature_idx, fn_id) {
+        Answer::Reply(r) => Some(r),
+        Answer::Error { .. } | Answer::Silent => None,
+    }
+}
+
+/// Logitech webcams answer the HID++ check badly enough to lock up (Solaar `hidapi_impl.py`
+/// @e7304c4c skips this PID range for that reason).
+fn is_webcam_pid(pid: u16) -> bool {
+    (0x0800..=0x09FF).contains(&pid)
 }
 
 /// Reshape a raw 16-byte function payload into the 80-byte arg layout the semantic decoders expect.
@@ -278,6 +351,14 @@ fn reshape(tag: u8, payload: &[u8]) -> [u8; 80] {
             out[2] = lo;
             out[3] = hi;
             out[4] = lo;
+        }
+        RESHAPE_DPI_XY => {
+            // [sensor, X hi, X lo, X default hi, lo, Y hi, Y lo, ...]; a single-axis sensor reports
+            // no Y, which reads as X.
+            let at = |i: usize| payload.get(i).copied().unwrap_or(0);
+            let (x, y) = ([at(1), at(2)], [at(5), at(6)]);
+            let y = if y == [0, 0] { x } else { y };
+            out[1..5].copy_from_slice(&[x[0], x[1], y[0], y[1]]);
         }
         _ => {
             // RESHAPE_NONE: the raw function payload, left-aligned (args[0..]).
@@ -319,7 +400,7 @@ impl Dialect for HidppDialect {
         let output_supports_long_requests = info.output_len == LONG_LEN as u16;
         let input_carries_reply = info.input_len == SHORT_LEN || info.input_len == LONG_LEN as u16;
         info.vid == HIDPP_VID
-            && !is_receiver_pid(info.pid)
+            && !is_webcam_pid(info.pid)
             && output_supports_long_requests
             && input_carries_reply
     }
@@ -371,27 +452,23 @@ impl Dialect for HidppDialect {
         // HID++ probe can honestly measure; unlike razer it does NOT feed `stream_wait_us` (there is
         // no streamed-lighting write to pace here — see `exec_fast`), so it only rides the emitted
         // file's provenance header. Require a valid 2.0 echo: a non-answering / 1.0 pipe is not ours.
-        let ping = build_long(IROOT_FEATURE, IROOT_FN_GET_PROTOCOL, &[0x00, 0x00, PING_TOKEN]);
         let start = Instant::now();
-        let reply = {
-            // ONE request/reply conversation under the pipe's wire lock — per-pair, released before
-            // the getFeature conversations below (each guards itself in `get_feature_index`).
-            let wire = t.wire_lock();
-            let _wire =
-                wire.as_ref().map(|w| w.acquire());
-            t.write_output(&ping).ok()?;
-            recv_matching(t, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL)?
-        };
+        let (index, _major, _minor) = find_device(t, is_receiver_pid(ctx.pid))?;
         let roundtrip_ms = start.elapsed().as_millis() as u64;
-        let (major, echo) = (reply[4], reply[6]);
-        if echo != PING_TOKEN || major < 0x02 {
-            return None; // not a HID++ 2.0 device (or the echo didn't confirm)
-        }
 
         // Enumerate the features we can reshape. `get_feature_index` maps "index 0" (device lacks it)
         // to `None`, so a mouse without a battery feature simply gets no battery command.
-        let battery = get_feature_index(t, FEATURE_BATTERY);
-        let dpi = get_feature_index(t, FEATURE_ADJUSTABLE_DPI);
+        let battery = get_feature_index(t, index, FEATURE_BATTERY)
+            .map(|idx| (idx, FN_GET_BATTERY_STATUS))
+            .or_else(|| get_feature_index(t, index, FEATURE_UNIFIED_BATTERY).map(|idx| (idx, FN_UNIFIED_GET_STATUS)));
+        let dpi = get_feature_index(t, index, FEATURE_ADJUSTABLE_DPI)
+            .map(|idx| (idx, FN_GET_SENSOR_DPI, vec![RESHAPE_DPI]))
+            .or_else(|| {
+                get_feature_index(t, index, FEATURE_EXTENDED_DPI)
+                    .map(|idx| (idx, FN_EXTENDED_GET_SENSOR_DPI, vec![RESHAPE_DPI_XY, 0x00]))
+            });
+        // A receiver's USB product string names the receiver; the device names itself.
+        let name = device_name(t, index).unwrap_or_else(|| hidpp_name(&ctx.product, ctx.pid));
 
         // One getter command per answered feature. `class` = the resolved feature INDEX (razer's
         // class slot), `id` = the function id, `size` = 0 (INERT: HID++ framing is fixed-shape, exec
@@ -399,33 +476,28 @@ impl Dialect for HidppDialect {
         // to the reply). NO setters — writes without hardware to verify would break the no-unproven-
         // bytes rule (see the method doc); the reads are all this wave synthesizes.
         let mut commands: BTreeMap<String, CommandSpec> = BTreeMap::new();
-        if let Some(idx) = battery {
+        if let Some((idx, func)) = battery {
             commands.insert(
                 "battery_level".into(),
-                CommandSpec { class: idx, id: FN_GET_BATTERY_STATUS, size: 0, args: vec![RESHAPE_BATTERY], transaction_id: None },
+                CommandSpec { class: idx, id: func, size: 0, args: vec![RESHAPE_BATTERY], transaction_id: None },
             );
         }
-        if let Some(idx) = dpi {
-            commands.insert(
-                "dpi".into(),
-                CommandSpec { class: idx, id: FN_GET_SENSOR_DPI, size: 0, args: vec![RESHAPE_DPI], transaction_id: None },
-            );
+        if let Some((idx, func, args)) = dpi {
+            commands.insert("dpi".into(), CommandSpec { class: idx, id: func, size: 0, args, transaction_id: None });
         }
         // The evidence set the mint seam records: exactly the getters that answered (== the command
         // map keys, since we only inserted answered features). `from_probe` debug-asserts the subset.
         let answered: Vec<String> = commands.keys().cloned().collect();
 
         let def = DeviceDef {
-            name: hidpp_name(&ctx.product, ctx.pid),
+            name,
             codename: format!("auto-{:04x}", ctx.pid),
             dialect: "hidpp".into(),
             // Synthesized ⇒ Auto by construction (lands in devices/auto/, a reload re-stamps Auto).
             origin: DefOrigin::Auto,
             vendor_id: HIDPP_VID,
-            // transaction_id is INERT for HID++ (fixed-shape framing; `exec`/`exec_fast` ignore it) —
-            // 0 is the honest "unused" value, not an era guess. It rides `Heuristic` below only
-            // because the wrapper slot is required, never because it means anything on the wire.
-            transaction_id: 0,
+            // HID++ has no transaction ids; this slot carries the device index ([`address_of`]).
+            transaction_id: if index == DEVICE_INDEX { 0 } else { index },
             // No streamed-lighting path in this dialect ⇒ nothing to pace.
             stream_wait_us: 0,
             modes: vec![Mode { name: "default".into(), product_id: ctx.pid }],
@@ -437,6 +509,7 @@ impl Dialect for HidppDialect {
                 // `claims()` (VID + 20-byte LONG output shape), NOT the feature-report length —
                 // HID++ uses output/input reports, so this length is informational here.
                 feature_report_len: ctx.feature_len,
+                interface: None,
             },
             commands,
             // No lighting: HID++ lighting (feature 0x8070/…) is unspecified this wave.
@@ -447,7 +520,7 @@ impl Dialect for HidppDialect {
             // No push-report vocabulary probed this wave — an auto HID++ def carries none.
             events: None,
             buttons: Vec::new(),
-            custody: crate::registry::Custody::default(),
+            custody: None,
         };
 
         // Mint through the cross-dialect seam: tx/dims/stream_wait are all Heuristic/None (HID++ has
@@ -476,7 +549,8 @@ impl Dialect for HidppDialect {
         size: u8,
         args: &[u8],
     ) -> Result<[u8; 80]> {
-        let _ = (transaction_id, size); // razer vocabulary; no meaning in HID++
+        let _ = size; // razer vocabulary; no meaning in HID++
+        let index = address_of(transaction_id);
 
         // Hold the pipe's wire lock for the WHOLE conversation (write → read/drain): pair-atomicity
         // is the unit; between conversations other actors may interleave freely.
@@ -488,31 +562,25 @@ impl Dialect for HidppDialect {
         let reshape_tag = args.first().copied().unwrap_or(RESHAPE_NONE);
         let params = args.get(1..).unwrap_or(&[]); // strip the dialect-private tag byte
 
-        let req = build_long(feature_idx, fn_id, params);
+        let req = build_long(index, feature_idx, fn_id, params);
         t.write_output(&req)?;
 
-        // Drain input reports (~10 reads / ~1s) for our reply or an error report.
-        for _ in 0..10 {
-            let mut buf = [0u8; LONG_LEN];
-            let n = match t.read_input(&mut buf, 100) {
-                Ok(n) => n,
-                Err(_) => continue, // window empty; keep waiting
-            };
-            if n > buf.len() {
-                continue;
+        match await_reply(t, index, feature_idx, fn_id) {
+            Answer::Reply(got) => {
+                // 0x1000 reports level 0 for "unknown" (cpg-docs x1000), which is not an empty battery.
+                if reshape_tag == RESHAPE_BATTERY && got[4] == 0 {
+                    bail!("HID++ battery level unknown for feature {feature_idx:#06x}");
+                }
+                Ok(reshape(reshape_tag, &got[4..]))
             }
-            let Some(got) = logical_report(t, &buf[..n]) else { continue; };
-            if let Some(code) = error_code(got) {
-                bail!(
-                    "HID++ error {code:#04x} ({}) for feature {feature_idx:#06x} fn {fn_id:#x}",
-                    err_name(code)
-                );
-            }
-            if matches_reply(got, feature_idx, fn_id) {
-                return Ok(reshape(reshape_tag, &got[4..]));
+            Answer::Error { marker, code } => bail!(
+                "HID++ error {code:#04x} ({}) for feature {feature_idx:#06x} fn {fn_id:#x}",
+                err_name(marker, code)
+            ),
+            Answer::Silent => {
+                bail!("HID++ timed out waiting for reply to feature {feature_idx:#06x} fn {fn_id:#x}")
             }
         }
-        bail!("HID++ timed out waiting for reply to feature {feature_idx:#06x} fn {fn_id:#x}")
     }
 
     /// Fire-and-forget streamed write. HID++ has no streamed-lighting path in wave 3 (probe
@@ -528,15 +596,15 @@ impl Dialect for HidppDialect {
         size: u8,
         args: &[u8],
         stream_wait_us: u64,
-    ) -> bool {
-        let _ = (transaction_id, size);
+    ) -> crate::dialect::Sent {
+        let _ = size;
         let params = args.get(1..).unwrap_or(&[]);
-        let req = build_long(class, id, params);
+        let req = build_long(address_of(transaction_id), class, id, params);
         let sent = t.write_output(&req).is_ok();
         if stream_wait_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(stream_wait_us));
         }
-        sent
+        if sent { crate::dialect::Sent::Unconfirmed } else { crate::dialect::Sent::Lost }
     }
 
     // NB: `release_custody` is INTENTIONALLY NOT overridden — the trait's default no-op is the
@@ -567,41 +635,71 @@ pub struct HidppProbe {
 /// synthesize a real def; this stays as the standalone READ-ONLY diagnostic (protocol + feature
 /// indices, no def minted) that someone-with-hardware runs to confirm the spec against their device.
 pub fn probe_report(t: &dyn Transport) -> Option<HidppProbe> {
-    // getProtocolVersion: params [0x00, 0x00, pingData] — the two leading zeros + echoed ping are
-    // the documented HID++ 1.0/2.0 disambiguation trick. Reply payload = [major, minor, pingEcho].
-    let ping = build_long(IROOT_FEATURE, IROOT_FN_GET_PROTOCOL, &[0x00, 0x00, PING_TOKEN]);
-    let reply = {
-        // ONE request/reply conversation under the pipe's wire lock — per-pair, released before the
-        // getFeature conversations below (each takes its own guard inside `get_feature_index`).
-        let wire = t.wire_lock();
-        let _wire = wire.as_ref().map(|w| w.acquire());
-        t.write_output(&ping).ok()?;
-        recv_matching(t, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL)?
-    };
-    let (major, minor, echo) = (reply[4], reply[5], reply[6]);
-    if echo != PING_TOKEN || major < 0x02 {
-        return None; // not a HID++ 2.0 device (or the echo didn't confirm)
-    }
+    let (index, major, minor) = find_device(t, false).or_else(|| find_device(t, true))?;
     Some(HidppProbe {
         protocol_major: major,
         protocol_minor: minor,
-        battery_feature: get_feature_index(t, FEATURE_BATTERY),
-        dpi_feature: get_feature_index(t, FEATURE_ADJUSTABLE_DPI),
+        battery_feature: get_feature_index(t, index, FEATURE_BATTERY),
+        dpi_feature: get_feature_index(t, index, FEATURE_ADJUSTABLE_DPI),
     })
+}
+
+/// getProtocolVersion at `index`: params [0x00, 0x00, pingData], the documented HID++ 1.0/2.0
+/// disambiguation. `Some((major, minor))` for a 2.0 device that echoed the ping.
+fn ping(t: &dyn Transport, index: u8) -> Option<(u8, u8)> {
+    let req = build_long(index, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL, &[0x00, 0x00, PING_TOKEN]);
+    let wire = t.wire_lock();
+    let _wire = wire.as_ref().map(|w| w.acquire());
+    t.write_output(&req).ok()?;
+    let reply = recv_matching(t, index, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL)?;
+    let (major, minor, echo) = (reply[4], reply[5], reply[6]);
+    (echo == PING_TOKEN && major >= 0x02).then_some((major, minor))
+}
+
+/// The device a pipe reaches: the direct device at 0xFF, or a receiver's first pairing slot whose
+/// device answers. `(index, major, minor)`.
+fn find_device(t: &dyn Transport, receiver: bool) -> Option<(u8, u8, u8)> {
+    if receiver {
+        PAIRING_SLOTS.into_iter().find_map(|slot| ping(t, slot).map(|(a, b)| (slot, a, b)))
+    } else {
+        ping(t, DEVICE_INDEX).map(|(a, b)| (DEVICE_INDEX, a, b))
+    }
+}
+
+/// The device's own name through DeviceName (0x0005): fn0 gives its length, fn1 a fragment from an
+/// offset (Solaar `hidpp20.py` L1851-L1870 @e7304c4c). Control bytes are dropped, as for USB names.
+fn device_name(t: &dyn Transport, index: u8) -> Option<String> {
+    let feature = get_feature_index(t, index, FEATURE_DEVICE_NAME)?;
+    let ask = |fn_id: u8, params: &[u8]| {
+        let wire = t.wire_lock();
+        let _wire = wire.as_ref().map(|w| w.acquire());
+        t.write_output(&build_long(index, feature, fn_id, params)).ok()?;
+        recv_matching(t, index, feature, fn_id)
+    };
+    let len = usize::from(ask(FN_NAME_COUNT, &[])?[4]).min(64);
+    let mut name = Vec::with_capacity(len);
+    while name.len() < len {
+        let part = ask(FN_NAME_FRAGMENT, &[name.len() as u8])?;
+        let take = (len - name.len()).min(LONG_LEN - 4);
+        name.extend_from_slice(&part[4..4 + take]);
+    }
+    let name: String = String::from_utf8_lossy(&name).chars().filter(|c| !c.is_control()).collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// IRoot.getFeature(featureId) → feature INDEX, or `None` when the device lacks it (index 0 is
 /// reserved for `IRoot` itself, so 0 means "not present"). featureId is sent big-endian (MSB first).
-fn get_feature_index(t: &dyn Transport, feature_id: u16) -> Option<u8> {
+fn get_feature_index(t: &dyn Transport, index: u8, feature_id: u16) -> Option<u8> {
     let params = [(feature_id >> 8) as u8, feature_id as u8];
-    let req = build_long(IROOT_FEATURE, IROOT_FN_GET_FEATURE, &params);
+    let req = build_long(index, IROOT_FEATURE, IROOT_FN_GET_FEATURE, &params);
 
     // ONE request/reply conversation under the pipe's wire lock (per-pair, like every probe site).
     let wire = t.wire_lock();
     let _wire = wire.as_ref().map(|w| w.acquire());
 
     t.write_output(&req).ok()?;
-    let reply = recv_matching(t, IROOT_FEATURE, IROOT_FN_GET_FEATURE)?;
+    let reply = recv_matching(t, index, IROOT_FEATURE, IROOT_FN_GET_FEATURE)?;
     let idx = reply[4]; // payload[0] = featureIndex
     if idx == 0 {
         None
@@ -704,17 +802,17 @@ mod tests {
 
     #[test]
     fn getprotocolversion_request_matches_golden() {
-        // The exact 20-byte getProtocolVersion request: [0x11, 0xFF, 0x00, 0x1A, 0x00, 0x00, ping].
-        // 0x1A = (function 1 << 4) | softwareId 0x0A. Confirms build_long framing byte-for-byte.
+        // The exact 20-byte getProtocolVersion request: [0x11, 0xFF, 0x00, 0x1C, 0x00, 0x00, ping].
+        // 0x1C = (function 1 << 4) | softwareId 0x0C. Confirms build_long framing byte-for-byte.
         let mut want = [0u8; LONG_LEN];
         want[0] = 0x11; // long report id
         want[1] = 0xFF; // device index (receiver-direct default)
         want[2] = 0x00; // IRoot feature index
-        want[3] = 0x1A; // (getProtocolVersion=1 << 4) | swId 0x0A
+        want[3] = 0x1C; // (getProtocolVersion=1 << 4) | swId 0x0C
         want[4] = 0x00; // ping param byte 0
         want[5] = 0x00; // ping param byte 1
         want[6] = PING_TOKEN; // echoed ping token
-        let built = build_long(IROOT_FEATURE, IROOT_FN_GET_PROTOCOL, &[0x00, 0x00, PING_TOKEN]);
+        let built = build_long(DEVICE_INDEX, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL, &[0x00, 0x00, PING_TOKEN]);
         assert_eq!(built, want, "getProtocolVersion request must be byte-identical to the golden");
     }
 
@@ -723,9 +821,9 @@ mod tests {
         // Scripted: ping reply (major 0x04 = HID++ 2.0, echo 0x5A), then getFeature replies giving
         // battery feature index 0x06 and DPI feature index 0x07.
         let mock = MockHidpp::with_replies(vec![
-            frame(&[0x11, 0xFF, 0x00, 0x1A, 0x04, 0x02, PING_TOKEN]), // getProtocolVersion reply
-            frame(&[0x11, 0xFF, 0x00, 0x0A, 0x06]), // getFeature(0x1000) → index 6
-            frame(&[0x11, 0xFF, 0x00, 0x0A, 0x07]), // getFeature(0x2201) → index 7
+            frame(&[0x11, 0xFF, 0x00, 0x1C, 0x04, 0x02, PING_TOKEN]), // getProtocolVersion reply
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x06]), // getFeature(0x1000) → index 6
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x07]), // getFeature(0x2201) → index 7
         ]);
         let report = probe_report(&mock).expect("valid 2.0 ping");
         assert_eq!(report.protocol_major, 0x04);
@@ -735,20 +833,100 @@ mod tests {
         // The FIRST thing written must be the exact ping golden.
         let first = mock.writes.lock().unwrap()[0].clone();
         assert_eq!(first.len(), LONG_LEN, "probe emits a full advertised LONG output report");
-        assert_eq!(first[..7], [0x11, 0xFF, 0x00, 0x1A, 0x00, 0x00, PING_TOKEN]);
+        assert_eq!(first[..7], [0x11, 0xFF, 0x00, 0x1C, 0x00, 0x00, PING_TOKEN]);
     }
 
     #[test]
     fn error_report_maps_to_error_with_code() {
-        // exec for feature 0x06 fn 0; the device answers with a 0x8F error, code 0x02 (InvalidArgument).
-        let mock = MockHidpp::with_replies(vec![vec![
-            0x10, 0xFF, ERR_HIDPP10, 0x06, func_swid(0x00), 0x02, 0,
-        ]]);
+        // exec for feature 0x06 fn 0; the device answers with a 2.0 error, code 0x02 (InvalidArgument).
+        let mock = MockHidpp::with_replies(vec![frame(&[
+            0x11, 0xFF, ERR_HIDPP20, 0x06, func_swid(0x00), 0x02,
+        ])]);
         let err = HidppDialect
             .exec(&mock, 0x00, 0x06, 0x00, 0x00, &[RESHAPE_NONE])
             .expect_err("an error report must map to Err");
         let msg = format!("{err}");
         assert!(msg.contains("InvalidArgument"), "error names the code: {msg}");
+    }
+
+    #[test]
+    fn hidpp10_errors_use_their_own_names() {
+        // 1.0 code 0x08 is UnknownDevice; the 2.0 table would call it Busy.
+        let mock = MockHidpp::with_replies(vec![vec![
+            0x10, 0xFF, ERR_HIDPP10, 0x06, func_swid(0x00), 0x08, 0,
+        ]]);
+        let msg = format!("{}", HidppDialect.exec(&mock, 0, 0x06, 0x00, 0, &[RESHAPE_NONE]).unwrap_err());
+        assert!(msg.contains("UnknownDevice"), "{msg}");
+    }
+
+    #[test]
+    fn another_clients_error_is_not_ours() {
+        // G HUB (swId 0x0D) gets an error just ahead of our reply on the same device.
+        let foreign = frame(&[0x11, 0xFF, ERR_HIDPP20, 0x06, 0x0D, 0x08]);
+        let ours = frame(&[0x11, 0xFF, 0x07, func_swid(0x02), 0x00, 0x03, 0x20]);
+        let mock = MockHidpp::with_replies(vec![foreign, ours]);
+        let out = HidppDialect.exec(&mock, 0, 0x07, 0x02, 0, &[RESHAPE_DPI]).expect("our reply");
+        assert_eq!(&out[1..3], &[0x03, 0x20]);
+    }
+
+    #[test]
+    fn bluetooth_reply_on_index_zero_is_accepted() {
+        let mock = MockHidpp::with_replies(vec![frame(&[0x11, 0x00, 0x07, func_swid(0x02), 0x00, 0x03, 0x20])]);
+        assert!(HidppDialect.exec(&mock, 0, 0x07, 0x02, 0, &[RESHAPE_DPI]).is_ok());
+    }
+
+    #[test]
+    fn notifications_ahead_of_the_reply_do_not_end_the_wait() {
+        // Eleven notifications (swId 0) ahead of our reply: a frame count would give up first.
+        let mut frames: Vec<Vec<u8>> = (0..11).map(|_| frame(&[0x11, 0xFF, 0x04, 0x00, 0x55])).collect();
+        frames.push(frame(&[0x11, 0xFF, 0x07, func_swid(0x02), 0x00, 0x03, 0x20]));
+        let mock = MockHidpp::with_replies(frames);
+        assert!(HidppDialect.exec(&mock, 0, 0x07, 0x02, 0, &[RESHAPE_DPI]).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_battery_level_is_not_zero_percent() {
+        let mock = MockHidpp::with_replies(vec![frame(&[0x11, 0xFF, 0x06, func_swid(0x00), 0, 0, 0])]);
+        let err = HidppDialect.exec(&mock, 0, 0x06, 0x00, 0, &[RESHAPE_BATTERY]).unwrap_err();
+        assert!(format!("{err}").contains("unknown"), "{err}");
+    }
+
+    #[test]
+    fn a_mouse_with_only_the_newer_features_still_gets_battery_and_dpi() {
+        // ping, 0x1000 absent, 0x1004 at index 8, 0x2201 absent, 0x2202 at index 9; then the reads.
+        let mock = MockHidpp::with_replies(vec![
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_PROTOCOL), 0x04, 0x02, PING_TOKEN]),
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x00]),
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x08]),
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x00]),
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x09]),
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x00]),
+            frame(&[0x11, 0xFF, 0x08, func_swid(FN_UNIFIED_GET_STATUS), 64, 0x04, 0x00]),
+            frame(&[0x11, 0xFF, 0x09, func_swid(FN_EXTENDED_GET_SENSOR_DPI), 0x00, 0x06, 0x40, 0x03, 0x20, 0x03, 0x20]),
+        ]);
+        let s = HidppDialect.probe(&mock, &hidpp_ctx("Logitech G Pro X Superlight")).expect("adopted");
+        let bat = s.def.command("battery_level").expect("battery from 0x1004");
+        assert_eq!((bat.class, bat.id), (0x08, FN_UNIFIED_GET_STATUS));
+        let dpi = s.def.command("dpi").expect("dpi from 0x2202");
+        assert_eq!((dpi.class, dpi.id), (0x09, FN_EXTENDED_GET_SENSOR_DPI));
+        let out = HidppDialect.exec(&mock, 0, bat.class, bat.id, 0, &bat.args).unwrap();
+        assert_eq!((u32::from(out[1]) * 100 + 127) / 255, 64, "64% charge");
+        let out = HidppDialect.exec(&mock, 0, dpi.class, dpi.id, 0, &dpi.args).unwrap();
+        assert_eq!(&out[1..5], &[0x06, 0x40, 0x03, 0x20], "X 1600, Y 800 read separately");
+        let sent = mock.writes.lock().unwrap();
+        assert_eq!(sent.last().unwrap()[4], 0x00, "the DPI read asks sensor 0");
+    }
+
+    #[test]
+    fn a_single_axis_extended_dpi_reads_y_as_x() {
+        let out = reshape(RESHAPE_DPI_XY, &[0x00, 0x03, 0x20, 0x03, 0x20, 0x00, 0x00]);
+        assert_eq!(&out[1..5], &[0x03, 0x20, 0x03, 0x20]);
+    }
+
+    #[test]
+    fn webcams_are_never_claimed() {
+        let cam = HidDeviceInfo { pid: 0x085E, ..info(HIDPP_VID, LONG_LEN as u16, LONG_LEN as u16) };
+        assert!(!HidppDialect.claims(&cam));
     }
 
     #[test]
@@ -817,19 +995,46 @@ mod tests {
     }
 
     #[test]
-    fn claims_excludes_receivers_but_stays_interested() {
-        // A Unifying receiver (0xC52B) with a picture-perfect bidirectional HID++ shape is still NOT
-        // claimable: it answers on HID++ 1.0 registers / paired slots, not the 0xFF 2.0 endpoint the
-        // probe pings. It stays INTERESTED so it surfaces as unclaimed inventory, never as a claimed-
-        // but-unresponsive device row.
-        let recv = info_pid(HIDPP_VID, 0xC52B, LONG_LEN as u16, LONG_LEN as u16);
-        assert!(!HidppDialect.claims(&recv), "a receiver pid is never claimed, even with a perfect HID++ shape");
-        assert!(HidppDialect.interested(&recv), "but the receiver still surfaces on the unclaimed ledger");
-        // Bolt (0xC548) and a Lightspeed (0xC545) receiver likewise excluded.
-        assert!(!HidppDialect.claims(&info_pid(HIDPP_VID, 0xC548, LONG_LEN as u16, LONG_LEN as u16)), "Bolt receiver not claimed");
-        assert!(!HidppDialect.claims(&info_pid(HIDPP_VID, 0xC545, LONG_LEN as u16, LONG_LEN as u16)), "Lightspeed receiver not claimed");
-        // The exclusion is pid-scoped: a DIRECT-attached mouse pid with the same shape IS claimed.
-        assert!(HidppDialect.claims(&info_pid(HIDPP_VID, 0xC088, LONG_LEN as u16, LONG_LEN as u16)), "a direct-attached mouse pid with a HID++ shape is claimed");
+    fn receivers_are_claimed_and_reached_through_their_pairing_slots() {
+        for pid in [0xC52B, 0xC548, 0xC545] {
+            assert!(HidppDialect.claims(&info_pid(HIDPP_VID, pid, LONG_LEN as u16, LONG_LEN as u16)), "{pid:04x}");
+        }
+        // Slot 1 is empty (the receiver answers a 1.0 error), slot 2 holds a mouse that names itself.
+        let ping_fn = func_swid(IROOT_FN_GET_PROTOCOL);
+        let feat_fn = func_swid(IROOT_FN_GET_FEATURE);
+        let mut name = vec![0x11, 0x02, 0x05, func_swid(FN_NAME_FRAGMENT)];
+        name.extend_from_slice(b"G502 X LIGHTSPEED");
+        let mock = MockHidpp::with_replies(vec![
+            vec![0x10, 0x01, ERR_HIDPP10, IROOT_FEATURE, ping_fn, 0x08, 0x00],
+            frame(&[0x11, 0x02, 0x00, ping_fn, 0x04, 0x02, PING_TOKEN]),
+            frame(&[0x11, 0x02, 0x00, feat_fn, 0x06]), // 0x1000
+            frame(&[0x11, 0x02, 0x00, feat_fn, 0x07]), // 0x2201
+            frame(&[0x11, 0x02, 0x00, feat_fn, 0x05]), // 0x0005 DeviceName at index 5
+            frame(&[0x11, 0x02, 0x05, func_swid(FN_NAME_COUNT), 17]),
+            frame(&name[..LONG_LEN.min(name.len())]),
+            frame(&[0x11, 0x02, 0x05, func_swid(FN_NAME_FRAGMENT), b'D']),
+            frame(&[0x11, 0x02, 0x06, func_swid(FN_GET_BATTERY_STATUS), 50]),
+        ]);
+        let ctx = crate::synth::SynthCtx { pid: 0xC547, product: "USB Receiver".into(), ..hidpp_ctx("") };
+        let s = HidppDialect.probe(&mock, &ctx).expect("adopted through slot 2");
+        assert_eq!(s.def.transaction_id, 2, "the def carries the slot");
+        assert_eq!(s.def.name, "G502 X LIGHTSPEED", "named by the device, not the receiver");
+        let bat = s.def.command("battery_level").unwrap();
+        let out = HidppDialect.exec(&mock, s.def.transaction_id, bat.class, bat.id, 0, &bat.args).unwrap();
+        assert_eq!((u32::from(out[1]) * 100 + 127) / 255, 50);
+        let sent = mock.writes.lock().unwrap();
+        assert_eq!(sent[0][1], 0x01, "slot 1 asked first");
+        assert!(sent[1..].iter().all(|w| w[1] == 0x02), "everything after addresses slot 2");
+    }
+
+    #[test]
+    fn a_receiver_with_nothing_awake_is_not_adopted_yet() {
+        let ping_fn = func_swid(IROOT_FN_GET_PROTOCOL);
+        let errs = (1..=6).map(|slot| vec![0x10, slot, ERR_HIDPP10, IROOT_FEATURE, ping_fn, 0x09, 0x00]).collect();
+        let mock = MockHidpp::with_replies(errs);
+        let ctx = crate::synth::SynthCtx { pid: 0xC548, ..hidpp_ctx("") };
+        assert!(HidppDialect.probe(&mock, &ctx).is_none());
+        assert_eq!(mock.writes.lock().unwrap().len(), 6, "one ping per slot");
     }
 
     /// A minimal hidpp-tagged `DeviceDef` with a chosen control usage pair (`feature_report_len` is
@@ -891,6 +1096,7 @@ mod tests {
             usage: 0x0002,
             feature_len: 0, // HID++ has no feature reports; matching rides claims()
             product: String::from(product),
+            keyboard: false,
         }
     }
 
@@ -900,9 +1106,10 @@ mod tests {
         // Scripted: 2.0 ping, battery feature idx 6, DPI feature idx 7, then a battery reply for the
         // exec below (the mock inbox is FIFO — probe drains the first three, exec drains the fourth).
         let mock = MockHidpp::with_replies(vec![
-            frame(&[0x11, 0xFF, 0x00, 0x1A, 0x04, 0x02, PING_TOKEN]), // getProtocolVersion → 4.2
-            frame(&[0x11, 0xFF, 0x00, 0x0A, 0x06]),                   // getFeature(0x1000) → idx 6
-            frame(&[0x11, 0xFF, 0x00, 0x0A, 0x07]),                   // getFeature(0x2201) → idx 7
+            frame(&[0x11, 0xFF, 0x00, 0x1C, 0x04, 0x02, PING_TOKEN]), // getProtocolVersion → 4.2
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x06]),                   // getFeature(0x1000) → idx 6
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x07]),                   // getFeature(0x2201) → idx 7
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x00]),                   // getFeature(0x0005) → absent
             frame(&[0x11, 0xFF, 0x06, func_swid(FN_GET_BATTERY_STATUS), 85]), // battery: 85%
         ]);
         let s = HidppDialect
@@ -946,9 +1153,10 @@ mod tests {
         use crate::registry::DeviceDef;
         // Probe (no exec this time, so three replies suffice), emit, and parse the file back.
         let mock = MockHidpp::with_replies(vec![
-            frame(&[0x11, 0xFF, 0x00, 0x1A, 0x04, 0x02, PING_TOKEN]),
-            frame(&[0x11, 0xFF, 0x00, 0x0A, 0x06]),
-            frame(&[0x11, 0xFF, 0x00, 0x0A, 0x07]),
+            frame(&[0x11, 0xFF, 0x00, 0x1C, 0x04, 0x02, PING_TOKEN]),
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x06]),
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x07]),
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x00]),
         ]);
         let s = HidppDialect.probe(&mock, &hidpp_ctx("Logitech G Pro")).unwrap();
         let text = crate::synth::emit_toml(&s);
@@ -977,9 +1185,9 @@ mod tests {
         assert!(raw[3..].iter().all(|b| *b == 0), "OS envelope bytes are not protocol payload");
 
         let mut probe = MockHidpp::with_replies(vec![
-            frame(&[0x10, 0xFF, 0, 0x1A, 2, 0, PING_TOKEN]),
-            frame(&[0x10, 0xFF, 0, 0x0A, 6, 0, 0]),
-            frame(&[0x10, 0xFF, 0, 0x0A, 7, 0, 0]),
+            frame(&[0x10, 0xFF, 0, 0x1C, 2, 0, PING_TOKEN]),
+            frame(&[0x10, 0xFF, 0, 0x0C, 6, 0, 0]),
+            frame(&[0x10, 0xFF, 0, 0x0C, 7, 0, 0]),
         ]);
         probe.padded = true;
         let report = probe_report(&probe).unwrap();
@@ -992,24 +1200,24 @@ mod tests {
         let mut short = [0u8; SHORT_LEN as usize];
         short[..4].copy_from_slice(&[REPORT_ID_SHORT, DEVICE_INDEX, 7, func_swid(2)]);
         assert!(valid_report_shape(&short));
-        assert!(matches_reply(&short, 7, 2));
-        assert!(!matches_reply(&short[..SHORT_LEN as usize - 1], 7, 2));
+        assert!(matches_reply(&short, DEVICE_INDEX, 7, 2));
+        assert!(!matches_reply(&short[..SHORT_LEN as usize - 1], DEVICE_INDEX, 7, 2));
 
         let mut long = [0u8; LONG_LEN];
         long[..4].copy_from_slice(&[REPORT_ID_LONG, DEVICE_INDEX, 7, func_swid(2)]);
         assert!(valid_report_shape(&long));
-        assert!(matches_reply(&long, 7, 2));
-        assert!(!matches_reply(&long[..LONG_LEN - 1], 7, 2));
-        assert!(!matches_reply(&long[..4], 7, 2));
+        assert!(matches_reply(&long, DEVICE_INDEX, 7, 2));
+        assert!(!matches_reply(&long[..LONG_LEN - 1], DEVICE_INDEX, 7, 2));
+        assert!(!matches_reply(&long[..4], DEVICE_INDEX, 7, 2));
 
         let truncated_error = [REPORT_ID_LONG, DEVICE_INDEX, ERR_HIDPP20, 0, 0, 9];
-        assert_eq!(error_code(&truncated_error), None);
+        assert_eq!(error_for(&truncated_error, DEVICE_INDEX, 0, 0), None);
     }
 
     // ---- Property tests (EXPERIMENTAL dialect — see module doc: spec-implemented, zero
     // hardware verification). These properties pin the STRUCTURAL contracts that follow from the
     // code as written — reshape's `.unwrap_or(0)`/`.get(..)` semantics, the fixed 80-byte output
-    // shape, the length guards on `error_code`/`matches_reply`, and the wire-length constants —
+    // shape, the length guards on `error_for`/`matches_reply`, and the wire-length constants —
     // not the truth of the underlying Logitech spec, which nothing here can hardware-verify.
     mod props {
         use super::*;
@@ -1077,7 +1285,7 @@ mod tests {
             /// and arbitrary unknown tags, since they share the same `_` arm.
             #[test]
             fn none_and_unknown_tag_reshape_copies_payload_left_aligned_and_zero_pads(
-                tag in any::<u8>().prop_filter("not a recognized tag", |t| *t != RESHAPE_BATTERY && *t != RESHAPE_DPI),
+                tag in any::<u8>().prop_filter("not a recognized tag", |t| ![RESHAPE_BATTERY, RESHAPE_DPI, RESHAPE_DPI_XY].contains(t)),
                 payload in proptest::collection::vec(any::<u8>(), 0..64),
             ) {
                 let out = reshape(tag, &payload);
@@ -1086,11 +1294,11 @@ mod tests {
                 prop_assert!(out[n..].iter().all(|&b| b == 0), "bytes past the payload stay zero-padded");
             }
 
-            /// (c) `error_code`/`matches_reply` accept only complete HID++ report shapes:
+            /// (c) `error_for`/`matches_reply` accept only complete HID++ report shapes:
             /// short 0x10 reports are 7 bytes and long 0x11 reports are 20 bytes. Arbitrary
             /// slices must remain length-safe and cannot be mistaken for a complete reply.
             #[test]
-            fn error_code_and_matches_reply_are_length_safe(
+            fn error_for_and_matches_reply_are_length_safe(
                 full in proptest::collection::vec(any::<u8>(), 0..24),
                 cut_at in 0usize..24,
                 feature_idx in any::<u8>(),
@@ -1099,9 +1307,9 @@ mod tests {
                 let cut = cut_at.min(full.len());
                 let buf = &full[..cut];
 
-                let ec = error_code(buf); // must not panic
+                let ec = error_for(buf, DEVICE_INDEX, feature_idx, fn_id); // must not panic
 
-                let mr = matches_reply(buf, feature_idx, fn_id); // must not panic
+                let mr = matches_reply(buf, DEVICE_INDEX, feature_idx, fn_id); // must not panic
                 if !valid_report_shape(buf) {
                     prop_assert_eq!(ec, None, "truncated or overlong frames are not error reports");
                     prop_assert!(!mr, "truncated or overlong frames are not normal replies");
@@ -1120,7 +1328,7 @@ mod tests {
                 fn_id in any::<u8>(),
                 params in proptest::collection::vec(any::<u8>(), 0..64),
             ) {
-                let req = build_long(feature_idx, fn_id, &params);
+                let req = build_long(DEVICE_INDEX, feature_idx, fn_id, &params);
                 prop_assert_eq!(req.len(), LONG_LEN, "build_long's frame is pinned at the LONG_LEN wire limit");
                 prop_assert!((SHORT_LEN as usize) <= LONG_LEN, "SHORT_LEN must never exceed LONG_LEN");
                 // Header bytes are exactly as build_long documents, for every input.
