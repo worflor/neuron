@@ -525,6 +525,11 @@ pub(crate) fn lighting_opcodes() -> Vec<(u8, u8)> {
 /// `None` when the pipe never answers the firmware getter (not a talking `razer_report` pipe —
 /// e.g. a secondary collection that enumerates with the right shape but stays mute).
 pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
+    synthesize_explained(t, ctx).ok()
+}
+
+/// [`synthesize`], saying why a pipe was refused.
+pub fn synthesize_explained(t: &dyn Transport, ctx: &SynthCtx) -> Result<Synthesis, Refusal> {
     use crate::atlas::Class;
 
     let atlas = crate::atlas::lookup(ctx.vid, ctx.pid);
@@ -542,7 +547,8 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     let probe_tx = cohort_order(&atlas_tx).into_iter().enumerate().find_map(|(i, tx)| {
         let polls = if i == 0 { QUALIFY_POLLS } else { PROBE_POLLS };
         timed_exec(t, tx, 0x00, 0x81, 0x02, &[], polls).map(|_| tx)
-    })?;
+    })
+    .ok_or(Refusal::Silent)?;
 
     // PARROT CANARY. `timed_exec` believes the reply's STATUS byte, which is the only signal the
     // wire gives — but a board that answers SUCCESS-with-an-empty-body to *everything* (observed;
@@ -553,7 +559,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     //
     // Getter-shaped (id >= 0x80) so the canary itself honours the module's no-writes rule.
     if timed_exec(t, probe_tx, CANARY.0, CANARY.1, CANARY.2, &[], PROBE_POLLS).is_some() {
-        return None;
+        return Err(Refusal::Parrot);
     }
 
     // Measure the link: median of three firmware round-trips.
@@ -802,7 +808,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         buttons: Vec::new(),
         custody: None,
     };
-    Some(Synthesis {
+    Ok(Synthesis {
         def,
         serial,
         roundtrip_ms,
@@ -1221,8 +1227,77 @@ pub struct Adopted {
 pub struct Adoption {
     pub adopted: Vec<Adopted>,
     pub skipped: Vec<String>,
+    /// Why each key this pass tried was not adopted, one per key.
+    pub refused: Vec<(AdoptKey, Refusal)>,
     /// Outdated generated files moved aside (their backup paths) so this pass could rebuild them.
     pub retired: Vec<PathBuf>,
+}
+
+/// Why a pipe was not adopted, in words its device row can show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Nothing answered the identity read: asleep, out of range, or busy with another app.
+    Silent,
+    /// It answered a command no device implements, so none of its answers can be trusted.
+    Parrot,
+    /// A learned file for it exists but does not load.
+    BrokenFile(PathBuf),
+    /// The collection could not be opened.
+    OpenFailed(String),
+    /// The learned file could not be written.
+    WriteFailed(String),
+    /// A raw HID collection that is not on a keyboard; VIA questions go only to keyboards.
+    NotKeyboard,
+}
+
+impl Refusal {
+    /// Could asking again change the answer?
+    #[must_use]
+    pub fn transient(&self) -> bool {
+        matches!(self, Refusal::Silent | Refusal::OpenFailed(_) | Refusal::WriteFailed(_))
+    }
+
+    /// Which of two reasons for the same key says more.
+    fn rank(&self) -> u8 {
+        match self {
+            Refusal::Silent => 0,
+            Refusal::OpenFailed(_) => 1,
+            Refusal::NotKeyboard => 2,
+            Refusal::WriteFailed(_) => 3,
+            Refusal::Parrot => 4,
+            Refusal::BrokenFile(_) => 5,
+        }
+    }
+
+    /// The reason as a device row says it.
+    #[must_use]
+    pub fn words(&self) -> String {
+        match self {
+            Refusal::Silent => "not answering yet".into(),
+            Refusal::Parrot => "answers everything the same, so neuron can't tell what it does".into(),
+            Refusal::BrokenFile(_) => "its learned file doesn't load".into(),
+            Refusal::OpenFailed(_) => "couldn't be opened; another app may be holding it".into(),
+            Refusal::WriteFailed(_) => "learned, but its file couldn't be saved".into(),
+            Refusal::NotKeyboard => "not a keyboard".into(),
+        }
+    }
+}
+
+/// Keep one refusal per key, the most telling, and none for a key the pass adopted.
+fn settle_refusals(out: &mut Adoption) {
+    let adopted: Vec<AdoptKey> = out.adopted.iter().map(|a| (a.dialect, a.pid)).collect();
+    let mut best: Vec<(AdoptKey, Refusal)> = Vec::new();
+    for (k, r) in out.refused.drain(..) {
+        if adopted.contains(&k) {
+            continue;
+        }
+        match best.iter_mut().find(|(bk, _)| *bk == k) {
+            Some(slot) if r.rank() > slot.1.rank() => slot.1 = r,
+            Some(_) => {}
+            None => best.push((k, r)),
+        }
+    }
+    out.refused = best;
 }
 
 /// Bumped when synthesis changes the bytes it emits for hardware it may already have adopted.
@@ -1395,6 +1470,7 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
                         i.pid,
                         file.display()
                     ));
+                    out.refused.push((key, Refusal::WriteFailed(e.to_string())));
                     continue;
                 }
             }
@@ -1408,6 +1484,7 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
                 i.pid,
                 file.display()
             ));
+            out.refused.push((key, Refusal::BrokenFile(file.clone())));
             continue;
         }
         // Several collections share one pid; probe pipes until one talks. Only a talking
@@ -1415,17 +1492,28 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
         let synth = if d.id() == "razer" {
             // Every collection of this unit was just probed; another pass would repeat it.
             tried.push(key);
-            razer_best_pipe(d, &infos, i)
+            razer_best_pipe(&infos, i)
         } else {
             let mut ctx = SynthCtx::from_info(i);
             let unit = transport::unit_key(i);
             ctx.keyboard = infos.iter().any(|s| {
                 s.pid == i.pid && (s.usage_page, s.usage) == (0x0001, 0x0006) && transport::unit_key(s) == unit
             });
-            transport::open_path(&i.path).ok().and_then(|t| d.probe(&*t, &ctx))
+            if d.id() == "via" && !ctx.keyboard {
+                Err(Refusal::NotKeyboard)
+            } else {
+                match transport::open_path(&i.path) {
+                    Ok(t) => d.probe(&*t, &ctx).ok_or(Refusal::Silent),
+                    Err(e) => Err(Refusal::OpenFailed(e.to_string())),
+                }
+            }
         };
-        let Some(mut synth) = synth else {
-            continue;
+        let mut synth = match synth {
+            Ok(s) => s,
+            Err(r) => {
+                out.refused.push((key, r));
+                continue;
+            }
         };
         // Family identity is OWNED by this loop, not trusted from the probe: the file name and
         // the def's `dialect` field both derive from the claiming dialect's `d.id()`, so they
@@ -1447,11 +1535,13 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
                 name: synth.def.name.clone(),
                 path: file,
             }),
-            Err(e) => out
-                .skipped
-                .push(format!("pid {:04x}: writing {} failed: {e}", i.pid, file.display())),
+            Err(e) => {
+                out.skipped.push(format!("pid {:04x}: writing {} failed: {e}", i.pid, file.display()));
+                out.refused.push((key, Refusal::WriteFailed(e.to_string())));
+            }
         }
     }
+    settle_refusals(&mut out);
     // A learned keyboard keeps a read-only lighting probe beside its file, so a device report can
     // carry what the board answered without anyone running a command. After the pass, so the probe
     // never delays another device's adoption.
@@ -1469,11 +1559,8 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
 /// collection of the unit is probed, the atlas's collections first, and the first whose synthesis
 /// carries lighting wins; otherwise the first that talks. When the chosen collection's shape
 /// repeats on another interface, the def pins its interface so the device opens the same one.
-fn razer_best_pipe(
-    d: &dyn crate::dialect::Dialect,
-    infos: &[HidDeviceInfo],
-    first: &HidDeviceInfo,
-) -> Option<Synthesis> {
+fn razer_best_pipe(infos: &[HidDeviceInfo], first: &HidDeviceInfo) -> Result<Synthesis, Refusal> {
+    let d = crate::dialect::by_id("razer").ok_or(Refusal::Silent)?;
     let unit = transport::unit_key(first);
     let siblings: Vec<&HidDeviceInfo> =
         infos.iter().filter(|i| i.pid == first.pid && transport::unit_key(i) == unit).collect();
@@ -1494,13 +1581,28 @@ fn razer_best_pipe(
     }
     let mut fallback: Option<(Synthesis, &HidDeviceInfo)> = None;
     let mut chosen: Option<(Synthesis, &HidDeviceInfo)> = None;
+    let mut why = Refusal::Silent;
+    let mut opened = false;
     for &i in &pipes {
-        let Ok(t) = transport::open_path(&i.path) else {
-            continue;
+        let t = match transport::open_path(&i.path) {
+            Ok(t) => t,
+            Err(e) => {
+                if !opened {
+                    why = Refusal::OpenFailed(e.to_string());
+                }
+                continue;
+            }
         };
+        opened = true;
         let ctx = SynthCtx { keyboard, ..SynthCtx::from_info(i) };
-        let Some(s) = d.probe(&*t, &ctx) else {
-            continue;
+        let s = match synthesize_explained(&*t, &ctx) {
+            Ok(s) => s,
+            Err(r) => {
+                if r.rank() > why.rank() || matches!(why, Refusal::OpenFailed(_)) {
+                    why = r;
+                }
+                continue;
+            }
         };
         if s.def.lighting.is_some() {
             chosen = Some((s, i));
@@ -1510,14 +1612,15 @@ fn razer_best_pipe(
             fallback = Some((s, i));
         }
     }
-    let (mut s, info) = chosen.or(fallback)?;
+
+    let (mut s, info) = chosen.or(fallback).ok_or(why)?;
     let twins = pipes.iter().filter(|p| {
         (p.usage_page, p.usage, p.feature_len) == (info.usage_page, info.usage, info.feature_len)
     });
     if twins.count() > 1 {
         s.def.control_interface.interface = info.interface();
     }
-    Some(s)
+    Ok(s)
 }
 
 /// Are there connected control pipes SOME dialect claims but the registry doesn't recognize?
@@ -2446,7 +2549,11 @@ mod tests {
                             }
                         } else {
                             prop_assert_eq!(l.led_id, 0x04);
-                            prop_assert_eq!((l.rows, l.cols), if mouse { (1, 2) } else { (6, 22) });
+                            let mouse_dims = crate::atlas::lookup_mouse(RAZER_VID, pid)
+                                .filter(|_| atlas.is_none())
+                                .and_then(|m| m.dims().preferred())
+                                .filter(|&(r, c)| r > 0 && c > 0);
+                            prop_assert_eq!((l.rows, l.cols), if mouse { mouse_dims.unwrap_or((1, 2)) } else { (6, 22) });
                         }
                     }
                 }

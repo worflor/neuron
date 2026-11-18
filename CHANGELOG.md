@@ -9,7 +9,8 @@ more devices that just work, and lighting layers that help you out.
 - **Logitech.** mice and keyboards, plugged in or on a receiver, with their name, battery and DPI.
 - **custom keyboards.** QMK boards with VIA turned on, brightness included.
 - **layers that help.** neuron spots a layer hiding another and offers a fix you can preview.
-- **tell me what works.** a ready-to-send report for any device neuron learned on its own.
+- **plug in and go.** devices show up when you plug them in, no scan. one that can't be learned says why on its row.
+- **check any device.** a button on its row asks it what works, shows the answers right there, and turns them into a report you can copy or send.
 
 ### better
 - **Razer keyboards.** more of them light up, and stay lit on animated effects. (#33, #23)

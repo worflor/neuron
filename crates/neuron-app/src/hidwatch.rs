@@ -207,6 +207,8 @@ pub fn start() {
                     neuron::hid_haptics::hid_topology_changed();
                 }
                 topology = Some(next);
+                // a device came or went: the device list and adoption follow without a scan press
+                crate::glue::request_device_scan();
             }
         }
         // Recomputed EVERY pass, never captured once: the pid set is derived from the registry, and

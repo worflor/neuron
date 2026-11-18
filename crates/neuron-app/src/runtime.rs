@@ -133,6 +133,8 @@ pub fn await_lighting_stop(tokens: &[Arc<AtomicBool>]) -> Result<(), String> {
 /// watch-timer gate) uses to decide a retry is coming due — so a silent unknown device keeps the
 /// timer alive just long enough to rescan once per window and adopt within ~a minute of waking.
 const SYNTH_RETRY: std::time::Duration = std::time::Duration::from_mins(1);
+/// The longest wait between adoption tries for a device that stays silent.
+const SYNTH_RETRY_MAX: std::time::Duration = std::time::Duration::from_mins(30);
 
 /// The resident runtime state. UI-thread owned (held in an `Rc<RefCell<_>>` by the glue).
 pub struct AppRuntime {
@@ -186,6 +188,9 @@ pub struct AppRuntime {
     /// that leaves enumeration is forgotten immediately (unplug → replug = the natural instant
     /// retry), which also resets its strikes.
     synth_attempted: HashMap<AdoptKey, (std::time::Instant, u32)>,
+    /// Why each attempted key's last adoption failed, written by the adoption worker. Drives the
+    /// placeholder row's words and whether, and when, the key is tried again.
+    synth_refused: Arc<std::sync::Mutex<HashMap<AdoptKey, neuron::synth::Refusal>>>,
     /// [`AdoptKey`]s whose adoption probe is RUNNING right now (inserted before the thread spawns,
     /// cleared by the thread when it finishes). Drives the transient "learning device…" row so
     /// a new device is visible the instant it's plugged in, not after the multi-second probe.
@@ -317,6 +322,7 @@ impl AppRuntime {
             light_fps: Arc::new(AtomicU32::new(30)),
             gaming_mode,
             synth_attempted: HashMap::new(),
+            synth_refused: Arc::new(std::sync::Mutex::new(HashMap::new())),
             synth_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             synth_running: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             synth_dirty: Arc::new(AtomicBool::new(false)),
@@ -456,8 +462,17 @@ impl AppRuntime {
         //   (a) STRIKE rows — pids some dialect CLAIMED but whose probe never answered after
         //       UNRESPONSIVE_STRIKES retries. The attempted-ledger retains ONLY live+unrecognized
         //       pids, so an entry here is guaranteed still on the bus — no separate liveness check.
+        let refused = self.synth_refused.lock().map(|r| r.clone()).unwrap_or_default();
         for (&(family, pid), &(_, strikes)) in &self.synth_attempted {
-            if strikes < UNRESPONSIVE_STRIKES {
+            let why = refused.get(&(family, pid));
+            // A silent device may be waking, so it gets a few tries before it shows; a definite
+            // reason shows at once, and a raw HID collection that isn't a keyboard isn't a device.
+            let show = match why {
+                Some(neuron::synth::Refusal::NotKeyboard) => false,
+                Some(r) if !r.transient() => true,
+                _ => strikes >= UNRESPONSIVE_STRIKES,
+            };
+            if !show {
                 continue;
             }
             // The key already CARRIES the claiming family (`key.0`), so the label no longer
@@ -474,7 +489,7 @@ impl AppRuntime {
                 name,
                 pid,
                 format!("unresponsive-{pid:04x}"),
-                format!("unresponsive · claimed by {family}, never answered"),
+                why.map_or_else(|| "not answering yet".to_string(), neuron::synth::Refusal::words),
                 // The plane's family is the claiming dialect (`key.0`) — a placeholder row carries
                 // it like a real row so its selection identity is complete even while inert.
                 family.to_string(),
@@ -528,6 +543,9 @@ impl AppRuntime {
         // Retain iff some enumerated pipe STILL yields this exact key AND the registry can't resolve
         // its pid — key-qualified so a twin family's pipe on the same pid can't keep a stale entry
         // alive (both parts preserved from the bare-pid retain: same-key liveness + still-unknown).
+        if let Ok(mut refused) = self.synth_refused.lock() {
+            refused.retain(|key, _| self.synth_attempted.contains_key(key));
+        }
         self.synth_attempted.retain(|key, _| {
             // Still-unknown is a FAMILY question (key.0 = the claiming dialect): a stale retry entry
             // survives only while a pipe still maps to this exact key AND that family is unadopted.
@@ -575,7 +593,7 @@ impl AppRuntime {
                 }
                 // A key that stayed silent retries on the slow cadence — WITHOUT the
                 // "learning…" row, so a never-answering pipe doesn't flash UI every minute.
-                Some((at, _strikes)) if now.duration_since(*at) >= SYNTH_RETRY => unknown.push(key),
+                Some((at, strikes)) if self.retry_due(key, *at, *strikes, now) => unknown.push(key),
                 Some(_) => {}
             }
         }
@@ -603,6 +621,7 @@ impl AppRuntime {
         running.extend(unknown.iter().copied());
         drop(running);
         let dirty = self.synth_dirty.clone();
+        let refused_sink = self.synth_refused.clone();
         let inflight = self.synth_inflight.clone();
         let running = self.synth_running.clone();
         let release_keys = unknown.clone(); // the worker consumes `unknown`; the guard needs its own
@@ -633,12 +652,36 @@ impl AppRuntime {
                     for b in &a.retired {
                         eprintln!("[adopt] set aside an outdated generated file: {}", b.display());
                     }
+                    if let Ok(mut refused) = refused_sink.lock() {
+                        for k in &unknown {
+                            refused.remove(k);
+                        }
+                        refused.extend(a.refused.iter().cloned());
+                    }
+                    if !a.refused.is_empty() {
+                        dirty.store(true, Ordering::SeqCst);
+                    }
                     if !a.adopted.is_empty() {
                         dirty.store(true, Ordering::SeqCst);
                     }
                 }
             }
         });
+    }
+
+    /// Is a failed key due another adoption try? Silence backs off from [`SYNTH_RETRY`] up to half an
+    /// hour; a reason another try can't change (a parrot board, a broken file) waits for a replug,
+    /// which forgets the key.
+    fn retry_due(&self, key: AdoptKey, at: std::time::Instant, strikes: u32, now: std::time::Instant) -> bool {
+        let definite = self
+            .synth_refused
+            .lock()
+            .is_ok_and(|r| r.get(&key).is_some_and(|why| !why.transient()));
+        if definite {
+            return false;
+        }
+        let wait = SYNTH_RETRY.saturating_mul(1 << strikes.saturating_sub(1).min(5)).min(SYNTH_RETRY_MAX);
+        now.duration_since(at) >= wait
     }
 
     /// Is an auto-adoption in flight, or its result not yet folded into the device list? The
@@ -665,8 +708,8 @@ impl AppRuntime {
         self.adoption_active()
             || self
                 .synth_attempted
-                .values()
-                .any(|(at, _strikes)| at.elapsed() >= SYNTH_RETRY)
+                .iter()
+                .any(|(key, (at, strikes))| self.retry_due(*key, *at, *strikes, std::time::Instant::now()))
     }
 
     /// Open the currently-selected device (or the first recognized one).
@@ -1212,7 +1255,10 @@ impl AppRuntime {
                                 if let Some((pending, hint)) = scene.pending.take() { live.handle().publish(pending, hint)?; }
                                 scene.handle = Some(live.handle());
                             }
-                            let lights = Lights::new(&d, ldef);
+                            let health = Arc::new(neuron::lighting::StreamHealth::default());
+                            let lit_pid = i.pid;
+                            health.on_change(move |refused| crate::glue::set_light_refused(lit_pid, refused));
+                            let lights = Lights::new(&d, ldef).with_health(health);
                             let streamed = lights
                                 .animate_frames(
                                     || fps_src.load(Ordering::Relaxed),
@@ -1226,6 +1272,7 @@ impl AppRuntime {
                                     },
                                 )
                                 .map_err(|e| format!("animate: {e}"));
+                            crate::glue::set_light_refused(lit_pid, false);
                             // CUSTODY RELEASE (the DPI-16000 trap): streaming lighting holds this board
                             // in driver mode (every write flips it via ensure_custody), which defers its
                             // onboard buttons/FN to software AND orphans the wake-reassert duty. Driver

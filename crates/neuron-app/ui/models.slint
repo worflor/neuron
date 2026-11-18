@@ -80,6 +80,22 @@ export struct DeviceRow {
     learned: bool,
     // how a learned device's lighting settled: 0 not yet, 1 checked, 2 a fix waits, 3 unconfirmed
     lighting-trust: int,
+    // its live lighting stream is being refused: most rows it sends never land
+    light-refused: bool,
+}
+
+// One transaction id's answer on one collection in a device check: 0 silent, 1 answered,
+// 2 refused, 3 unclear (another app's traffic or an error).
+export struct CheckCell {
+    tx: string,
+    state: int,
+}
+
+// One control collection in a device check.
+export struct CheckLine {
+    label: string,
+    in-use: bool,
+    cells: [CheckCell],
 }
 
 export struct ChromaDeviceRow {

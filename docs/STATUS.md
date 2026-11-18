@@ -36,7 +36,7 @@ reports from people trying neuron on hardware i don't have. each one is how a de
 | BlackWidow V4 X (wired) | [@shinobun33t](https://github.com/worflor/neuron/issues/23), 2026-10-15 | detected; lighting and M keys didn't work | v0.1.7 fixes the M keys on a keyboard picked up after launch and the lighting region its generated file used. on `main`, lighting goes to the backlight LED in openrazer's packet layout and adoption checks every control collection for the one that answers lighting. not yet retried on a V4 X |
 | BlackWidow V3 (wired) | [@kurakanai](https://github.com/worflor/neuron/issues/33), 2026-11-01 | hardware game mode worked; lighting and macros didn't; on 0.1.7 and 0.1.8 Neuron said no device supports brightness | macros work on 0.1.8. on `main`, adoption asks for the board's lighting at each transaction id (openrazer reads this board at 0x3F, Neuron asked only at 0x1F) and on each control collection, and rebuilds the old generated file. not yet retried on a V3; `neuron compat lighting --pid 024e` shows what it answers |
 
-got one of these, or something else? [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml). on `main` (not in v0.1.8), a device neuron learned on its own shows **learned · tell me what works** on its row, which opens that report with the device filled in.
+got one of these, or something else? [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml). on `main` (not in v0.1.8), every device row has a **check**: a read-only look at what the device answers, with buttons to copy it or open that report with the device and the check filled in.
 
 ## Feature status
 

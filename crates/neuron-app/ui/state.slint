@@ -14,7 +14,7 @@
 import {
     LightingStackRow,
     LightingFix,
-    DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
+    DeviceRow, CheckLine, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTileMeta, EffectParam,
     SpectrumStop, SpectrumFrame, GradientPreset, PairChip, AssistOffer, StopDoubt,
@@ -984,6 +984,15 @@ export global State {
     callback open-config-dir();
     callback open-repo();                             // neuron's GitHub page, from the SYSTEM nameplate
     callback report-device(string, string);           // (name, link mode) -> the device report form, filled in
+    // DEVICE CHECK — the read-only questions put to one row's device, answered in a drawer on that row.
+    in-out property <string> check-id;                // the row id whose drawer is open; "" none
+    in-out property <bool> check-busy;
+    in-out property <[CheckLine]> check-lines;
+    in-out property <[string]> check-notes;
+    in-out property <string> check-said;              // what the last copy or report did
+    callback check-device(string, string, string, string); // (row id, dialect, pid hex, name)
+    callback check-copy();
+    callback check-report(string, string);            // (name, link mode)
 
     // PURGE SYNAPSE — kill every Razer Synapse process + demote its respawning services to manual.
     // Razer's slopware is a hydra (Synapse 3 esp.); this button sets the SYSTEM services to demand-start

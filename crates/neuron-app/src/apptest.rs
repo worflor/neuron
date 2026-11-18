@@ -2689,6 +2689,7 @@ fn learned_device_ask_and_star_key_draw_and_fit() {
         icon: "keyboard".into(),
         kind: "keyboard".into(),
         id: "unit-1".into(),
+        dialect: "razer".into(),
         connected: true,
         learned: true,
         ..Default::default()
@@ -2728,7 +2729,7 @@ fn learned_device_ask_and_star_key_draw_and_fit() {
         settle(&app, &format!("wordmark-drift-{width}"));
         app.window().dispatch_event(WindowEvent::PointerExited);
         settle(&app, &format!("wordmark-after-{width}"));
-        let (ax, ay, aw, ah) = crate::uifit::rect_of(app.window(), "AskWhatWorks").expect("the ask is on the learned row");
+        let (ax, ay, aw, ah) = crate::uifit::rect_of(app.window(), "CheckLink").expect("the check is on the learned row");
         for x in [ax + 2.0, ax + aw / 2.0, ax + aw - 2.0] {
             app.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(x, ay + ah / 2.0) });
             snap(&app).expect("a hovered ask frame is drawn");
@@ -2739,8 +2740,51 @@ fn learned_device_ask_and_star_key_draw_and_fit() {
             let lamped = DeviceRow { lighting_trust: trust, ..base.clone() };
             st.set_devices(slint::ModelRc::new(slint::VecModel::from(vec![lamped])));
             settle(&app, &format!("learned-row-lamp{trust}-{width}"));
-            crate::uifit::rect_of(app.window(), "AskWhatWorks").expect("the ask keeps its lamp on the row");
+            crate::uifit::rect_of(app.window(), "CheckLink").expect("the check keeps its lamp on the row");
         }
+        // a refused stream says so on the row, and a placeholder row can be checked
+        let refused = DeviceRow { light_refused: true, ..base.clone() };
+        let stuck = DeviceRow {
+            name: "Razer Huntsman V3 Pro Tenkeyless".into(),
+            pid: "02a7".into(),
+            mode: "answers everything the same, so neuron can't tell what it does".into(),
+            id: "unit-9".into(),
+            adopting: true,
+            learned: false,
+            connected: false,
+            ..base.clone()
+        };
+        st.set_devices(slint::ModelRc::new(slint::VecModel::from(vec![refused, stuck])));
+        settle(&app, &format!("device-row-refused-{width}"));
+        crate::uifit::rect_of(app.window(), "CheckLink").expect("a refused stream keeps its check on the row");
+        // the drawer: asking, then each collection's lamps, the notes and the actions
+        st.set_check_id("unit-1".into());
+        st.set_check_busy(true);
+        settle(&app, &format!("check-asking-{width}"));
+        let cell = |tx: &str, state: i32| crate::ui::CheckCell { tx: tx.into(), state };
+        let line = |label: &str, in_use: bool, states: [i32; 4]| crate::ui::CheckLine {
+            label: label.into(),
+            in_use,
+            cells: slint::ModelRc::new(slint::VecModel::from(
+                ["1F", "3F", "9F", "FF"].iter().zip(states).map(|(tx, st)| cell(tx, st)).collect::<Vec<_>>(),
+            )),
+        };
+        st.set_check_lines(slint::ModelRc::new(slint::VecModel::from(vec![
+            line("if0 01/0006", false, [0, 0, 0, 0]),
+            line("if2 0C/0001", false, [2, 3, 0, 0]),
+            line("if3 0C/0001", true, [1, 1, 0, 0]),
+        ])));
+        st.set_check_notes(slint::ModelRc::new(slint::VecModel::from(vec![
+            slint::SharedString::from("another app was talking to it during the check"),
+            slint::SharedString::from("Windows Dynamic Lighting can take its lights"),
+        ])));
+        st.set_check_said("opened a report with this check".into());
+        st.set_check_busy(false);
+        settle(&app, &format!("check-open-{width}"));
+        crate::uifit::rect_of(app.window(), "CheckDrawer").expect("the drawer is drawn under its row");
+        st.set_check_id("unit-9".into());
+        settle(&app, &format!("check-placeholder-{width}"));
+        st.set_check_id("".into());
         st.set_devices(slint::ModelRc::new(slint::VecModel::from(vec![base.clone()])));
 
         st.set_page(3);

@@ -1261,6 +1261,54 @@ pub struct Lights<'a> {
     /// host control on this handle, so every render path can call it unconditionally and only the
     /// first call pays the round-trip.
     controlled: std::cell::Cell<bool>,
+    /// Where a stream reports how its writes fare, when someone is watching.
+    health: Option<std::sync::Arc<StreamHealth>>,
+}
+
+/// How a lighting stream's writes are faring over its recent sends. A board that refuses most of
+/// them is dark however healthy the stream looks; one that leaves rows unanswered still lights.
+/// The watcher hears only a change of verdict, never each send.
+#[derive(Default)]
+pub struct StreamHealth {
+    recent: std::sync::Mutex<std::collections::VecDeque<crate::dialect::Sent>>,
+    refused: std::sync::atomic::AtomicBool,
+    on_change: std::sync::OnceLock<Box<dyn Fn(bool) + Send + Sync>>,
+}
+
+impl StreamHealth {
+    const WINDOW: usize = 30;
+    /// Sends seen before a verdict is given, so one bad first frame is not a dark board.
+    const SAMPLE: usize = 8;
+
+    /// Call `f` with the new verdict whenever it changes. Set once.
+    pub fn on_change(&self, f: impl Fn(bool) + Send + Sync + 'static) {
+        let _ = self.on_change.set(Box::new(f));
+    }
+
+    /// Is the board refusing most of what the stream sends?
+    #[must_use]
+    pub fn refused(&self) -> bool {
+        self.refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn record(&self, sent: crate::dialect::Sent) {
+        let Ok(mut recent) = self.recent.lock() else { return };
+        recent.push_back(sent);
+        if recent.len() > Self::WINDOW {
+            recent.pop_front();
+        }
+        if recent.len() < Self::SAMPLE {
+            return;
+        }
+        let lost = recent.iter().filter(|s| **s == crate::dialect::Sent::Lost).count();
+        let now = lost * 2 > recent.len();
+        drop(recent);
+        if self.refused.swap(now, std::sync::atomic::Ordering::Relaxed) != now {
+            if let Some(f) = self.on_change.get() {
+                f(now);
+            }
+        }
+    }
 }
 
 // ── animate-loop helpers: pure, testable row-dedup + deadline pacing ──────────────────────
@@ -1338,7 +1386,14 @@ pub fn pace(
 impl<'a> Lights<'a> {
     #[must_use]
     pub fn new(dev: &'a crate::device::Device, def: LightingDef) -> Self {
-        Lights { dev, def, controlled: std::cell::Cell::new(false) }
+        Lights { dev, def, controlled: std::cell::Cell::new(false), health: None }
+    }
+
+    /// Report how streamed writes fare to `health`.
+    #[must_use]
+    pub fn with_health(mut self, health: std::sync::Arc<StreamHealth>) -> Self {
+        self.health = Some(health);
+        self
     }
     pub fn def(&self) -> &LightingDef {
         &self.def
@@ -1499,7 +1554,11 @@ impl<'a> Lights<'a> {
             for &row in &changed {
                 if stop() { frame_complete = false; lost = true; break; }
                 if let Some(rep) = self.def.row_report(&frame, row) {
-                    match self.dev.send_lighting_fast(&rep) {
+                    let sent = self.dev.send_lighting_fast(&rep);
+                    if let Some(h) = &self.health {
+                        h.record(sent);
+                    }
+                    match sent {
                         Sent::Taken => {}
                         Sent::Unconfirmed => frame_complete = false,
                         Sent::Lost => {
@@ -1511,8 +1570,14 @@ impl<'a> Lights<'a> {
                     sent_any = true;
                 }
             }
-            if sent_any && !lost && (stop() || self.dev.send_lighting_fast(&display) != Sent::Taken) {
-                frame_complete = false;
+            if sent_any && !lost {
+                let latched = if stop() { Sent::Unconfirmed } else { self.dev.send_lighting_fast(&display) };
+                if let Some(h) = &self.health {
+                    h.record(latched);
+                }
+                if latched != Sent::Taken {
+                    frame_complete = false;
+                }
             }
 
             // An incomplete drain leaves device state uncertain; resend the next frame.
@@ -1957,6 +2022,43 @@ mod tests {
         let trace = reports.lock().unwrap();
         assert_eq!(trace.iter().filter(|r| r[8] == 0x03).count(), 2, "rows taken on busy are not resent");
         assert_eq!(trace.iter().filter(|r| r[8] == 0x02).count(), 1, "the frame is latched");
+    }
+
+    #[test]
+    fn a_board_that_refuses_its_rows_is_reported_once() {
+        use std::sync::{Arc, Mutex};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::cell::Cell;
+        struct Refusing(Arc<Mutex<Vec<Vec<u8>>>>, u8);
+        impl crate::transport::Transport for Refusing {
+            fn set_feature(&self, bytes: &[u8]) -> anyhow::Result<()> { self.0.lock().unwrap().push(bytes.to_vec()); Ok(()) }
+            fn get_feature(&self, bytes: &mut [u8]) -> anyhow::Result<usize> {
+                let trace = self.0.lock().unwrap();
+                let raw: [u8; crate::protocol::BUF_LEN] = trace.last().unwrap().as_slice().try_into().unwrap();
+                let mut reply = crate::protocol::Report::from_buf(&raw);
+                reply.status = if raw[8] == 0x03 { self.1 } else { 0x02 };
+                bytes.copy_from_slice(&reply.to_buf()); Ok(bytes.len())
+            }
+        }
+        let run = |row_status: u8| {
+            let def: crate::registry::DeviceDef = toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml")).unwrap();
+            let device = crate::device::Device::with_transport(def, 0x0226, Box::new(Refusing(Arc::new(Mutex::new(Vec::new())), row_status)));
+            let mut grid = matrix_def(); grid.rows = 2;
+            let health = Arc::new(StreamHealth::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            health.on_change(move |_| { seen.fetch_add(1, Ordering::SeqCst); });
+            let lights = Lights::new(&device, grid).with_health(health.clone());
+            lights.controlled.set(true);
+            let tick = Cell::new(0);
+            lights.animate_frames(|| 30, |_, _| {
+                tick.set(tick.get() + 1);
+                Ok(vec![Rgb::new(50, 60, 70); 4].into())
+            }, 2, || tick.get() >= 12).unwrap();
+            (health.refused(), calls.load(Ordering::SeqCst))
+        };
+        assert_eq!(run(0x03), (true, 1), "a board failing every row is refused, said once");
+        assert_eq!(run(0x02), (false, 0), "a healthy board never trips it");
     }
 
     #[test]

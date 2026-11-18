@@ -130,7 +130,7 @@ pub fn protocol_version(t: &dyn Transport) -> Option<u16> {
 }
 
 /// The first QMK lighting channel that answers a brightness read.
-fn lighting_channel(t: &dyn Transport) -> Option<u8> {
+pub(crate) fn lighting_channel(t: &dyn Transport) -> Option<u8> {
     LIGHTING_CHANNELS
         .into_iter()
         .find(|&ch| matches!(ask(t, CMD_CUSTOM_GET_VALUE, &[ch, VALUE_BRIGHTNESS]), Answer::Reply(_)))

@@ -185,29 +185,34 @@ component FeelTile inherits Rectangle {
     }
 }
 
-// The ask on a device neuron learned on its own: one click opens the device report with this
-// device already filled in.
-component AskWhatWorks inherits Rectangle {
+// The way into a row's device check. A learned device leads with how its lighting settled, a
+// refused stream with a consequence lamp; a curated device shows it only while its row is pointed at.
+component CheckLink inherits Rectangle {
+    in property <DeviceRow> d;
+    in property <bool> open;
     callback clicked();
-    // how its lighting settled on the device: 0 not yet, 1 its writes landed, 2 a correction waits
-    // on a hand-edited file, 3 no write was seen to land
-    in property <int> trust;
     // it gives way before the row does: in a narrow column it elides and the row keeps its width
     horizontal-stretch: 0;
     min-width: 0;
     preferred-width: row.preferred-width;
     clip: true;
+    property <bool> refused: root.d.light-refused;
+    property <int> trust: root.d.learned ? root.d.lighting-trust : 0;
     row := HorizontalLayout {
         spacing: 6px;
-        if root.trust > 0 : Lamp {
-            signal: root.trust == 1 ? Signal.live : root.trust == 2 ? Signal.provisional : Signal.consequence;
+        if root.refused || root.trust > 0 : Lamp {
+            signal: root.refused || root.trust == 3 ? Signal.consequence
+                : root.trust == 1 ? Signal.live : Signal.provisional;
         }
         Text {
             horizontal-stretch: 1;
             min-width: 0;
             overflow: elide;
-            text: "learned · tell me what works";
-            color: ta.has-hover ? Theme.accent : Theme.accent-dim;
+            text: root.open ? "close check"
+                : root.refused ? "lights not landing · check"
+                : root.d.adopting ? "check"
+                : root.d.learned ? "learned · check" : "check";
+            color: ta.has-hover || root.open ? Theme.accent : Theme.accent-dim;
             font-size: Theme.fs-small;
             font-family: Theme.mono;
             vertical-alignment: center;
@@ -217,6 +222,72 @@ component AskWhatWorks inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: MouseCursor.pointer;
         clicked => { root.clicked(); }
+    }
+}
+
+// The device check, under its row: each control collection with a lamp per transaction id
+// (lit = answered, a square = refused, half = unclear, dark = silent), the notes the lamps can't
+// carry, and the result to copy or send.
+component CheckDrawer inherits Rectangle {
+    in property <DeviceRow> d;
+    property <bool> open: State.check-id != "" && State.check-id == root.d.id;
+    height: root.open ? body.preferred-height : 0px;
+    clip: true;
+    animate height { duration: Theme.quick; easing: ease-out; }
+    body := VerticalLayout {
+        y: 0px;
+        height: self.preferred-height;
+        padding-left: 18px; padding-right: 14px; padding-top: 6px; padding-bottom: 12px;
+        spacing: 6px;
+        if State.check-busy : HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            Lamp { signal: Signal.listening; }
+            Mono { text: "asking"; font-size: Theme.fs-small; color: Theme.text-faint; }
+        }
+        if !State.check-busy : VerticalLayout {
+            spacing: 6px;
+            for line in State.check-lines : HorizontalLayout {
+                spacing: 12px;
+                alignment: start;
+                Mono {
+                    width: 96px;
+                    overflow: elide;
+                    text: line.label;
+                    font-size: Theme.fs-small;
+                    color: line.in-use ? Theme.text-mid : Theme.text-faint;
+                }
+                for c in line.cells : HorizontalLayout {
+                    spacing: 4px;
+                    Lamp {
+                        lit: c.state != 0;
+                        signal: c.state == 1 ? Signal.live : c.state == 2 ? Signal.consequence : Signal.provisional;
+                    }
+                    Mono { text: c.tx; font-size: Theme.fs-small; color: Theme.text-faint; }
+                }
+            }
+            for n in State.check-notes : Mono {
+                min-width: 0;
+                overflow: elide;
+                text: n;
+                font-size: Theme.fs-small;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                Button { text: "copy"; clicked => { State.check-copy(); } }
+                Button { text: "report"; clicked => { State.check-report(root.d.name, root.d.mode); } }
+                Button { text: "again"; clicked => { State.check-device(root.d.id, root.d.dialect, root.d.pid, root.d.name); } }
+                Mono {
+                    min-width: 0;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                    text: State.check-said;
+                    font-size: Theme.fs-small;
+                    color: Theme.text-faint;
+                }
+            }
+        }
     }
 }
 
@@ -313,6 +384,7 @@ component DeviceLine inherits Rectangle {
         : transparent;
     animate background, border-color, opacity { duration: Theme.quick; }
     property <bool> sheen-live: root.d.connected && ta.has-hover;
+    property <bool> check-open: State.check-id != "" && State.check-id == root.d.id;
     // When firmware is the ONLY readout this device would show, a one-key data strip is an orphan —
     // a lone two-line "FW / v1.01" block breaking the list's name-plus-meta rhythm. Fold it into the
     // meta line instead ("pid 0221 · wired · fw v1.01") and suppress the strip.
@@ -399,10 +471,20 @@ component DeviceLine inherits Rectangle {
                             weight: 400;
                             tracking: 0px;
                         }
-                        // a device neuron learned on its own asks, right here, what works on it
-                        if root.d.learned && !root.d.adopting : AskWhatWorks {
-                            trust: root.d.lighting-trust;
-                            clicked => { State.report-device(root.d.name, root.d.mode); }
+                        // every device can be asked, right here, what answers on it; a learning row's
+                        // probe owns the pipe until it lands
+                        if root.d.pid != "" && root.d.dialect != "" && root.d.codename != "learning"
+                            && (root.d.learned || root.d.adopting || root.d.light-refused || root.selected
+                                || ta.has-hover || root.check-open) : CheckLink {
+                            d: root.d;
+                            open: root.check-open;
+                            clicked => {
+                                if root.check-open {
+                                    State.check-id = "";
+                                } else {
+                                    State.check-device(root.d.id, root.d.dialect, root.d.pid, root.d.name);
+                                }
+                            }
                         }
                     }
                 }
@@ -1132,8 +1214,8 @@ export component DevicePanel inherits VerticalLayout {
                     alignment: start;   // top-pack the channel cards
                     if State.devices.length == 0 : VerticalLayout {
                         padding-top: 24px; spacing: 6px;
-                        Mono { text: "no recognized Razer devices"; color: Theme.text-dim; }
-                        Mono { text: "plug one in and press scan"; }
+                        Mono { text: "no devices yet"; color: Theme.text-dim; }
+                        Mono { text: "plug one in"; }
                     }
                     // The cards stack in a plain VerticalLayout that stretches every card to one column width: a
                     // DeviceLine reports ~0 preferred width (its data strip is a clipped Rectangle), so no
@@ -1141,11 +1223,14 @@ export component DevicePanel inherits VerticalLayout {
                     // into the deck). The list scrolls by the wheel in the Flickable above.
                     VerticalLayout {
                         spacing: 5px;
-                        for d[i] in State.devices : DeviceLine {
-                            d: d;
-                            selected: i == State.selected-device;
-                            clicked => { State.select-device(i); }
-                            backup => { State.backup-device(d.id); }
+                        for d[i] in State.devices : VerticalLayout {
+                            DeviceLine {
+                                d: d;
+                                selected: i == State.selected-device;
+                                clicked => { State.select-device(i); }
+                                backup => { State.backup-device(d.id); }
+                            }
+                            CheckDrawer { d: d; }
                         }
                     }
                     // Unclaimed vendor pipes are an INVENTORY fact, not device channels — their functional
