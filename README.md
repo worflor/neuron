@@ -17,7 +17,7 @@ i don't run Synapse anymore. neuron handles my Naga V2 Pro and BlackWidow Chroma
 | | |
 |---|---|
 | **status** | Windows beta, daily-driven on the Naga V2 Pro and BlackWidow Chroma V2. got other Razer gear? [help test it](#help-neuron-on-your-hardware) |
-| **platforms** | Windows 10/11 download. Linux app and CLI build from source, but Razer hardware control is unverified there; macOS has no backend yet |
+| **platforms** | Windows 10/11 download. Linux builds from source and hasn't run on Razer hardware yet. no macOS backend |
 | **under the hood** | shared trigger → action engine; verified hardware reads/writes; an [evidence ledger](crates/neuron-core/protocol/ledger.toml) for the protocol |
 | **docs** | [features (GDD)](docs/GDD.md) · [architecture (TDD)](docs/TDD.md) · [project status](docs/STATUS.md) |
 | **license** | mostly GPL-3.0-or-later with an exception; some research components have separate community-source terms. [details](LICENSE.md) |
@@ -64,7 +64,7 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 | **[spellweaving & radial](docs/GDD.md#spellweaving)** | draw a glyph or flick a wheel to trigger the same actions as a button. teleport windows, summon tools, even draw on your screen. |
 | **[macros & beacons](docs/GDD.md#macros--beacons)** | Python macros, a visual block editor, persistent state and on-screen questions from your scripts. BOUND by default, RAW when you want full Python. |
 | **[audio & other actions](docs/reference/CLI.md#triggers-and-actions)** | bind mic mute/gain, output switching, clipboard cleanup, screenshots, undo and window actions to your controls. |
-| **[games & RGB tools](docs/reference/PROTOCOL-HOST.md)** | opt-in Chroma and OpenRGB connections let games paint through neuron alongside your own lighting, with a Chroma lab to isolate, recolour, hide or react to game effects. early, and still being tested across games. |
+| **[games & RGB tools](docs/reference/PROTOCOL-HOST.md)** | opt-in Chroma and OpenRGB connections let games paint through neuron alongside your own lighting, with a Chroma lab to isolate, recolour, hide or react to game effects. tuned on one game so far. |
 | **[life after Synapse](docs/GDD.md#life-after-synapse)** | import supported Synapse exports, clean up its Windows services, and investigate unfamiliar devices. |
 | **[gamepads](docs/GDD.md#controllers-and-anything-else-with-buttons)** | buttons, sticks and triggers can become binds. aim the radial with a stick and use rumble where it's been verified on Windows. |
 | **[app & CLI](docs/reference/CLI.md)** | use the app to set things up, or the CLI to change the same settings by hand. configs stay on disk as plain TOML. |
@@ -230,7 +230,7 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 [the full status page](docs/STATUS.md) tracks feature maturity and hardware testing; the [protocol ledger](crates/neuron-core/protocol/ledger.toml) holds the byte-level evidence.
 
-linux builds from source but still needs native Razer hardware testing. [OpenRazer](https://github.com/openrazer/openrazer) is the mature Linux option for now; [OpenRGB](https://openrgb.org) covers broader RGB hardware. neuron's Logitech HID++ discovery is experimental and read-only.
+on linux, [OpenRazer](https://github.com/openrazer/openrazer) is the mature option, and [OpenRGB](https://openrgb.org) covers broader RGB hardware.
 
 | capability | status |
 |---|---|

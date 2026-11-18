@@ -1,5 +1,29 @@
 # changelog
 
+## unreleased
+more devices that just work, and lighting layers that help you out.
+![the stack names Tidepool hidden under Wildlife and offers fixes, while the keyboard previews Wildlife at 50%](docs/media/release-layers-fix.webp)
+![the fix kept: Wildlife at 50% over Tidepool, and the warning gone](docs/media/release-layers-kept.webp)
+
+### new
+- **Logitech.** mice and keyboards, plugged in or on a receiver, with their name, battery and DPI.
+- **custom keyboards.** QMK boards with VIA turned on, brightness included.
+- **layers that help.** neuron spots a layer hiding another and offers a fix you can preview.
+- **tell me what works.** a ready-to-send report for any device neuron learned on its own.
+
+### better
+- **Razer keyboards.** more of them light up, and stay lit on animated effects. (#33, #23)
+- **Razer mice.** the ones neuron learns light every LED, paced for their receiver.
+
+### fixed
+- **a crash.** opening the window after neuron had been running a while.
+- **closing neuron.** your devices are left as neuron found them.
+- **HyperPolling.** only shows a rate your device has confirmed.
+- **small fixes.** in the colour picker, guides, the Python editor and lighting tiles.
+
+### thanks
+thanks to @kurakanai (#33) and @shinobun33t (#23) for their BlackWidow reports.
+
 ## 0.1.8 · 2026-11-14
 the colour picker grew a brain: Luma-T, a real-time colour model that edits with you. neuron updates itself now, plus a pile of everyday fixes.
 ![picker v2 with Luma-T's first idea drafted on a stop, contour rings around where it fits](docs/media/picker-v2-suggest.webp)

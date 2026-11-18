@@ -78,7 +78,7 @@ Windows installer and source builds: `%LOCALAPPDATA%\neuron`. a marked portable 
 
 ### which hardware is supported?
 
-neuron is a **Windows beta** with device controls tested on the **Naga V2 Pro** and **BlackWidow Chroma V2**, and a PowerA gamepad tested for input and rumble. other Razer devices are often detected and partly work; detected isn't the same as tested, so [the status page](STATUS.md) shows what's been checked on what. got something else? [help test it](#my-device-isnt-recognized-what-should-i-do).
+neuron is a **Windows beta** with device controls tested on the **Naga V2 Pro** and **BlackWidow Chroma V2**, and a PowerA gamepad tested for input and rumble. neuron learns most other Razer devices on its own, and [the status page](STATUS.md) says what's been checked on real hardware. got something else? [help test it](#my-device-isnt-recognized-what-should-i-do).
 
 ### my device isn't recognized. what should i do?
 
@@ -98,7 +98,7 @@ security issues should be [reported privately](https://github.com/worflor/neuron
 
 ### does it work on Linux or macOS?
 
-Windows is the downloadable release. Linux builds the app and CLI from source, but its live input and hardware support haven't been tested on native Razer hardware yet, and there's no Linux release asset. macOS has no backend. [current platform status](STATUS.md).
+Windows is the downloadable release. Linux builds the app and CLI from source but hasn't run on Razer hardware yet, and has no download. macOS has no backend. [current platform status](STATUS.md).
 
 ### is it free? can i read the source?
 
