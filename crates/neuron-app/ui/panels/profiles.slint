@@ -3,7 +3,7 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 import { Theme } from "../theme.slint";
-import { SectionTitle, Button, Field, Picker, Pill, Mono, Divider, PanelHead, SelectTick, IconButton } from "../widgets/controls.slint";
+import { SectionTitle, Button, Field, Picker, Pill, Mono, Divider, PanelHead, SelectTick, IconButton, ConfirmButton } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { ProfileRow, AppRuleRow } from "../models.slint";
 
@@ -126,14 +126,14 @@ component ProfileMenuRow inherits Rectangle {
                             width: root.armed ? 58px : 22px;
                             height: 22px;
                             border-radius: Theme.radius-sm;
-                            background: root.armed ? Theme.danger.with-alpha(0.15) : (dta.has-hover ? Theme.well : transparent);
+                            background: root.armed ? Theme.danger : (dta.has-hover ? Theme.well : transparent);
                             border-width: Theme.hair;
                             border-color: root.armed ? Theme.danger : transparent;
                             animate width, background, border-color { duration: Theme.quick; }
                             Text {
                                 text: root.armed ? "delete?" : "\u{00d7}";
                                 // faint at rest, danger on hover / while armed — the shared faint↔danger fade.
-                                color: (root.armed || dta.has-hover) ? Theme.danger : Theme.text-faint;
+                                color: root.armed ? Theme.danger.darker(0.9) : dta.has-hover ? Theme.danger : Theme.text-faint;
                                 font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
                                 horizontal-alignment: center; vertical-alignment: center;
                                 animate color { duration: Theme.quick; }
@@ -314,17 +314,26 @@ export component ProfilesMenu inherits VerticalLayout {
                 // (the `changed effective-name` handler above answers the overwrite check — typing
                 // updates new-profile-name → effective-name → that handler, so no per-edit call here)
                 accepted(t) => {
-                    if (root.effective-name != "") {
+                    if (root.effective-name != "" && !State.profile-name-exists) {
                         State.save-current-profile(root.effective-name);
                         root.new-profile-name = "";
                         State.profile-name-edited(root.effective-name); // re-check vs the now-updated list
                     }
                 }
             }
-            Button {
-                text: State.profile-name-exists ? "overwrite" : "capture";
-                primary: !State.profile-name-exists;
-                danger: State.profile-name-exists;
+            if State.profile-name-exists : ConfirmButton {
+                text: "overwrite";
+                confirm-text: "overwrite?";
+                enabled: root.effective-name != "";
+                confirmed => {
+                    State.save-current-profile(root.effective-name);
+                    root.new-profile-name = "";
+                    State.profile-name-edited(root.effective-name); // re-check vs the now-updated list
+                }
+            }
+            if !State.profile-name-exists : Button {
+                text: "capture";
+                primary: true;
                 enabled: root.effective-name != "";
                 clicked => {
                     State.save-current-profile(root.effective-name);

@@ -450,10 +450,10 @@ export component UpdateDrawer inherits Rectangle {
             scroll := Flickable {
                 width: parent.width;
                 height: parent.height;
-                viewport-width: self.width;
-                viewport-height: notes.preferred-height;
+                content-width: self.width;
+                content-height: notes.preferred-height;
                 notes := NotesView {
-                    width: parent.viewport-width;
+                    width: parent.content-width;
                     height: self.preferred-height;
                     rows: State.update-notes;
                     media: State.update-media;
@@ -466,7 +466,7 @@ export component UpdateDrawer inherits Rectangle {
                 width: parent.width;
                 height: 18px;
                 background: @linear-gradient(180deg, Theme.bg-2 0%, Theme.bg-2.with-alpha(0) 100%);
-                opacity: scroll.viewport-y < -2px ? 1 : 0;
+                opacity: scroll.content-y < -2px ? 1 : 0;
                 animate opacity { duration: Theme.settle; }
             }
             // more below: the notes fade into the drawer
@@ -475,7 +475,7 @@ export component UpdateDrawer inherits Rectangle {
                 width: parent.width;
                 height: 32px;
                 background: @linear-gradient(180deg, Theme.bg-2.with-alpha(0) 0%, Theme.bg-2 100%);
-                opacity: scroll.viewport-height + scroll.viewport-y > scroll.height + 2px ? 1 : 0;
+                opacity: scroll.content-height + scroll.content-y > scroll.height + 2px ? 1 : 0;
                 animate opacity { duration: Theme.settle; }
             }
         }

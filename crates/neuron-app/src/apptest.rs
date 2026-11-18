@@ -671,52 +671,10 @@ fn perf_controls_honor_paused_gate() {
     assert!(st.get_perf_status().to_string().contains("paused"));
     st.invoke_apply_idle(120.0);
     assert!(st.get_perf_status().to_string().contains("paused"));
-    st.invoke_apply_ingame_polling(1000.0, 1000.0);
+    st.invoke_apply_ingame_polling(1000.0);
     assert!(st.get_perf_status().to_string().contains("paused"));
     // un-pause to leave clean state.
     st.invoke_toggle_writes_paused();
-}
-
-/// The OUTPUT (render) audio controls are wired — the mirror of the mic controls (headphone /
-/// sound-card volume + mute). This drives the READ-ONLY `refresh-out` callback only: it must exist,
-/// run end-to-end through core's `resolve_render`, and populate the out-name readout. We deliberately
-/// do NOT invoke `set-out-gain`/`toggle-out-mute` here — those mutate the user's LIVE output device
-/// (changing speaker volume / muting them), which a test must never do. Their wiring is covered by
-/// the editor's `build_action` unit tests + the manual-run path; this asserts the panel reads live.
-#[test]
-#[ignore = "run by gui_tests_in_fresh_processes"]
-fn output_audio_controls_are_wired() {
-    let Some(app) = try_window() else { return };
-    let _shared = glue::install(&app);
-    let st = app.global::<State>();
-    // refresh populates the output name (a device name, "(no output device)", or similar) — never
-    // the placeholder dash, proving the callback ran end-to-end through resolve_render.
-    st.invoke_refresh_out();
-    assert!(
-        !st.get_out_name().is_empty(),
-        "out-name must be set by refresh-out"
-    );
-    // the mute + gain properties are real bool/float the panel binds (no mutation fired).
-    let _ = st.get_out_muted();
-    let _ = st.get_out_gain();
-}
-
-/// The mic controls are likewise wired (the capture side), kept beside the output test so a
-/// regression in either audio direction is caught. READ-ONLY: refresh only — `set-mic-gain` /
-/// `toggle-mic-mute` mutate the user's live mic and must not fire in a test.
-#[test]
-#[ignore = "run by gui_tests_in_fresh_processes"]
-fn mic_audio_controls_are_wired() {
-    let Some(app) = try_window() else { return };
-    let _shared = glue::install(&app);
-    let st = app.global::<State>();
-    st.invoke_refresh_mic();
-    assert!(
-        !st.get_mic_name().is_empty(),
-        "mic-name must be set by refresh-mic"
-    );
-    let _ = st.get_mic_muted();
-    let _ = st.get_mic_gain();
 }
 
 /// The Action palette carries the OUTPUT audio entries (out-gain / out-mute) so a binding / radial /
@@ -769,7 +727,6 @@ fn beacon_state_is_inert_and_defer_pref_persists() {
         "no beacon may be active at install"
     );
     assert_eq!(st.get_beacon_count(), 0, "no asks may be queued at install");
-    assert!(st.get_beacon_text().is_empty());
 }
 
 /// The surfaced perf controls each have a reachable callback (DPI stages, scroll stages, idle,
@@ -1241,7 +1198,7 @@ fn hero_publication_rejects_wrong_units_and_preserves_then_releases_paint_drafts
     let desired = DesiredSurfaceState { active: true, hero: true, dims: (1, 2), content_rev: 42,
         target: Target { pid: 0x0226, unit: "first".into(), epoch: 5 }, ..Default::default() };
     let frame = |target: Target, content_rev: u64, color: Rgb| CompletedFrame {
-        id: SurfaceId::Hero, target, content_rev, dims: (1, 2), layout_generation: 0,
+        id: SurfaceId::Hero, target, content_rev, dims: (1, 2),
         rgb: vec![color; 2].into(), swatch: None, overlay: None, requested: std::time::Instant::now(), render_time: std::time::Duration::ZERO,
     };
     let red = Rgb::new(255, 0, 0);
@@ -1327,7 +1284,6 @@ fn layer_stack_controls_preserve_identity_and_draw_a_large_scrollable_stack() {
     let ids = shared.borrow().light_layers.iter().map(|l| l.id).collect::<Vec<_>>();
     let rows = st.get_light_stack_rows();
     assert_eq!(rows.row_data(0).unwrap().index, 1, "topmost layer is first");
-    assert_eq!(st.get_light_cover_index(), 1);
     st.invoke_select_stack(1);
     st.invoke_set_layer_blend(1);
     st.invoke_set_layer_opacity(37.0);
@@ -1352,7 +1308,8 @@ fn layer_stack_controls_preserve_identity_and_draw_a_large_scrollable_stack() {
     st.set_sel_can_light(true); st.set_grid_rows(1); st.set_grid_cols(2);
     st.set_page(1); st.set_window_shown(true); st.set_light_stack_count(1000);
     st.set_light_stack_rows(ModelRc::new(VecModel::from((0..1000).rev().map(|index| LightingStackRow {
-        index, name: format!("Layer {index}").into(), summary: "screen · 37% · full board".into(), enabled: true,
+        index, name: format!("Layer {index}").into(), blend: "screen".into(), amount: "37%".into(), place: "".into(), ducks: true,
+        enabled: true, focus: ModelRc::default(), wide: false, tier: -1,
     }).collect::<Vec<_>>())));
     app.window().set_size(slint::LogicalSize::new(1000.0, 1400.0));
     app.show().unwrap();
@@ -1361,6 +1318,503 @@ fn layer_stack_controls_preserve_identity_and_draw_a_large_scrollable_stack() {
         st.set_selected_layer(index);
         snap(&app).expect("selection scrolls into view without binding loops");
     }
+}
+
+/// Stack sense end to end: over a full-board wave, an opaque Wildlife keeps the wave's light from the
+/// board, so pointing at the wave's row shows it lost, and Wildlife's shows it burying the wave. The
+/// trouble and its fixes sit in a strip above the rows; resting on a fix plays it on the board and
+/// changes nothing else, leaving puts the board back exactly, and a click keeps it as an ordinary
+/// lighting edit the status bar can undo. A setting chosen by hand is not second-guessed, and a look
+/// added over a full-board one lands so the one beneath still shows.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn stack_sense_names_the_trouble_and_offers_fixes() {
+    use slint::Model;
+    let _cwd = crate::testsupport::cwd_guard("stack_sense");
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
+    st.set_sel_can_light(true); st.set_grid_rows(6); st.set_grid_cols(22);
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers = vec![neuron::pattern::preset_layer("wave").unwrap(), neuron::pattern::preset_layer("wildlife").unwrap()];
+        state.light_layers[1].blend = neuron::effects::Blend::Normal;
+        state.light_layers[1].opacity = 1.0;
+        state.selected_layer = 0;
+    }
+    glue::refresh_layers(&app, &shared);
+    // the board's focus for a row: how many cells reach the board, are lost, and are marked troubled
+    let count = |row: &crate::ui::LightingStackRow, bit: i32| row.focus.iter().filter(|m| m & bit != 0).count();
+    // rows are topmost first: Wildlife, then Wave
+    let rows = st.get_light_stack_rows();
+    let (wildlife, wave) = (rows.row_data(0).unwrap(), rows.row_data(1).unwrap());
+    assert_eq!(wave.focus.row_count(), 6 * 22, "one focus cell per key");
+    assert!(count(&wave, 1) * 4 < 6 * 22, "the buried wave reaches little of the board");
+    assert_eq!(count(&wave, 2), 0, "lost nearly everywhere, the dimming says so without a ring on every key");
+    assert!(count(&wildlife, 1) > count(&wildlife, 2), "Wildlife reaches it");
+    assert!(wildlife.wide && count(&wildlife, 4) == 0, "Wildlife buries the wave everywhere: the board's frame says so, not every key");
+    assert!(!wave.wide && count(&wave, 4) == 0, "the harm is marked on the layer doing it");
+    let owners = st.get_light_cell_owner();
+    assert_eq!(owners.row_count(), 6 * 22);
+    assert!(owners.iter().filter(|&o| o == 1).count() > owners.iter().filter(|&o| o == 0).count(), "Wildlife shows on most keys");
+    assert_eq!(st.get_light_sense_trouble().as_str(), "Wave hidden under Wildlife", "an opaque Wildlife leaves nothing of the wave");
+    assert_eq!(st.get_light_sense_tier(), 2, "so it's an error, not a warning");
+    assert_eq!(wildlife.tier, 2, "and Wildlife's marks on the board say so in the same ink");
+    let offers: Vec<i32> = st.get_light_sense_offers().iter().map(|o| o.offer).collect();
+    assert!(!offers.is_empty(), "a trouble comes with something to do about it");
+    assert!(st.get_light_opacity_zoned(), "the opacity rail has its temperature");
+    assert_eq!(st.get_light_blend_previews().row_count(), 5, "one preview per blend");
+
+    // resting on a fix plays it on the board and changes nothing else; leaving puts the board back
+    let offer = offers[0];
+    let before = shared.borrow().light_layers.clone();
+    let board = |st: &State| st.get_grid_px().iter().collect::<Vec<_>>();
+    st.set_grid_px(slint::ModelRc::new(slint::VecModel::from(vec![slint::Color::from_rgb_u8(0x0c, 0x0d, 0x10); 6 * 22])));
+    let resting = board(&st);
+    let offers_before: Vec<_> = st.get_light_sense_offers().iter().collect();
+    st.invoke_light_sense_preview(offer);
+    assert_ne!(board(&st), resting, "the fix plays on the board");
+    assert_eq!(shared.borrow().light_layers, before, "and nothing else changes: not the layers");
+    assert_eq!(st.get_light_stack_rows().row_data(0).unwrap().amount, wildlife.amount, "not the rows");
+    assert_eq!(st.get_light_sense_offers().iter().collect::<Vec<_>>(), offers_before, "not the strip under the pointer");
+    st.invoke_light_sense_preview(-1);
+    assert_eq!(board(&st), resting, "leaving puts the board back exactly");
+    assert_eq!(shared.borrow().light_layers, before);
+
+    // a click keeps it, and the status bar's undo can take it back
+    st.invoke_light_sense_preview(offer);
+    st.invoke_light_sense_accept(offer);
+    let kept = shared.borrow().light_layers.clone();
+    assert_ne!(kept, before, "the fix was kept");
+    match neuron::session_undo::peek().map(|r| r.entry) {
+        Some(neuron::session_undo::Entry::Lighting { before: was, applied, .. }) => {
+            assert_eq!(was, before);
+            assert_eq!(applied, kept);
+        }
+        other => panic!("a kept fix is journaled as a lighting edit: {other:?}"),
+    }
+
+    // a blend chosen by hand is not offered back, and nothing else is lost with it
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.clone_from(&before);
+        state.selected_layer = 1;
+    }
+    glue::refresh_layers(&app, &shared);
+    let blends = ["normal", "screen", "add", "multiply", "cutout"];
+    let wildlife_blend = |f: &crate::ui::LightingFix| blends.iter().any(|b| f.text.as_str() == format!("Wildlife → {b}"));
+    assert!(st.get_light_sense_offers().iter().any(|f| wildlife_blend(&f)), "untouched, Wildlife's blend is offered");
+    let others: Vec<String> = st.get_light_sense_offers().iter().filter(|f| !wildlife_blend(f)).map(|f| f.text.to_string()).collect();
+    st.invoke_set_layer_blend(1);
+    st.invoke_set_layer_blend(0);
+    assert_eq!(shared.borrow().light_layers, before, "the stack is as it was, with its blend chosen by hand");
+    assert!(st.get_light_sense_offers().iter().all(|f| !wildlife_blend(&f)), "Normal was chosen by hand, so Wildlife's blend isn't second-guessed");
+    let now: Vec<String> = st.get_light_sense_offers().iter().map(|f| f.text.to_string()).collect();
+    assert!(others.iter().all(|f| now.contains(f)), "every other fix is still offered: {others:?} -> {now:?}");
+
+    // adding Wildlife over a wave: its default (opaque Normal) would bury the wave under its dim
+    // habitat; it lands in whatever look lets both read
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.clone_from(&before);
+        state.light_layers.truncate(1);
+        state.selected_layer = 0;
+    }
+    glue::refresh_layers(&app, &shared);
+    st.invoke_stack_tile("wildlife".into(), true);
+    let added = shared.borrow().light_layers[1].clone();
+    assert_eq!(added.pattern, before[1].pattern);
+    assert!(!(added.blend == neuron::effects::Blend::Normal && added.opacity >= 1.0), "the wave must still show under it: {:?} {}", added.blend, added.opacity);
+
+    // and it all draws, at the narrowest window and a roomy one, from either layer's side
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.clone_from(&before);
+        state.selected_layer = 0;
+    }
+    glue::refresh_layers(&app, &shared);
+    st.set_page(1); st.set_window_shown(true);
+    app.show().unwrap();
+    // no renderer runs here, so the board is given the stack as it is, composited a moment in
+    let paint_board = || {
+        let layers = shared.borrow().light_layers.clone();
+        let frame = neuron::pattern::Compositor::from_defs(&layers).render(6, 22, 1.5);
+        st.set_grid_px(slint::ModelRc::new(slint::VecModel::from(
+            frame.iter().map(|c| slint::Color::from_rgb_u8(c.r.max(0x0c), c.g.max(0x0d), c.b.max(0x10))).collect::<Vec<_>>(),
+        )));
+    };
+    paint_board();
+    let save = |frame: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, name: String| {
+        if let Some(dir) = std::env::var_os("NEURON_INSPECTOR_SHOTS") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            image::save_buffer(dir.join(format!("{name}.png")), frame.as_bytes(), frame.width(), frame.height(), image::ColorType::Rgba8).unwrap();
+        }
+    };
+    for selected in [0, 1] {
+        st.invoke_select_stack(selected);
+        for width in [900.0, 1240.0] {
+            // tall enough that the inspector's STACK section is on screen
+            app.window().set_size(slint::LogicalSize::new(width, 2400.0));
+            let frame = snap(&app).expect("stack sense draws without binding loops");
+            save(&frame, format!("stack-sense-{selected}-{width}"));
+        }
+    }
+    // pointing at a row opens its other fixes (hover-gated bindings only show a loop when drawn
+    // hovered), and resting on a fix keeps it open
+    use slint::platform::WindowEvent;
+    let lowest = |name: &str| crate::uifit::rects_of(app.window(), name).into_iter().max_by(|a, b| a.1.total_cmp(&b.1));
+    let (_, py, _, _) = lowest("Picker").expect("the blend picker is drawn");
+    for (i, (rx, ry, _, rh)) in crate::uifit::rects_of(app.window(), "StackRow").into_iter().filter(|r| r.1 > py).enumerate() {
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(rx + 30.0, ry + rh * 0.3) });
+        // let the board's focus settle in
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        slint::platform::update_timers_and_animations();
+        save(&snap(&app).expect("a pointed-at row draws"), format!("stack-sense-hover-row{i}"));
+        // rows are topmost first, so the first row down is the top layer
+        assert_eq!(st.get_light_focus_layer(), 1 - i as i32, "pointing at a row shows its layer on the board");
+    }
+    let quiet = board(&st);
+    for (i, (fx, fy, fw, fh)) in crate::uifit::rects_of(app.window(), "FixText").into_iter().enumerate() {
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(fx + fw / 2.0, fy + fh / 2.0) });
+        // the fix plays after a short beat
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        slint::platform::update_timers_and_animations();
+        save(&snap(&app).expect("a pointed-at fix draws"), format!("stack-sense-hover-fix{i}"));
+        assert_eq!(shared.borrow().light_layers, before, "a fix on show changes no layer");
+    }
+    assert_ne!(board(&st), quiet, "the last fix rested on plays");
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    snap(&app).expect("and lets go");
+    slint::platform::update_timers_and_animations();
+    assert_eq!(board(&st), quiet, "leaving the strip puts the board back exactly");
+    paint_board();
+    assert_eq!(st.get_light_focus_layer(), -1, "and the board lets go of the layer");
+    assert_eq!(shared.borrow().light_layers, before, "and the stack is back as it was");
+
+    // nothing can leave a fix playing on the board: whatever takes the strip from under a resting
+    // pointer puts the board back exactly as it was (the page going, the stack changing, a new
+    // reading), and the next live frame paints over it
+    let rest_on_fix = || {
+        let (fx, fy, fw, fh) = crate::uifit::rects_of(app.window(), "FixText").into_iter().next().expect("an offer to rest on");
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(fx + fw / 2.0, fy + fh / 2.0) });
+        snap(&app).expect("a pointed-at fix draws");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        slint::platform::update_timers_and_animations();
+        snap(&app).expect("the fix plays");
+    };
+    // past any page transition, so the frame checked is the one that stays
+    let settle = || {
+        slint::platform::update_timers_and_animations();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        slint::platform::update_timers_and_animations();
+        snap(&app).expect("the board settles");
+        slint::platform::update_timers_and_animations();
+    };
+    let resting = board(&st);
+    rest_on_fix();
+    assert_ne!(board(&st), resting, "the fix plays");
+    st.set_page(0);
+    settle();
+    assert_eq!(board(&st), resting, "leaving the page stops it");
+    st.set_page(1);
+    settle();
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    settle();
+    rest_on_fix();
+    assert_ne!(board(&st), resting, "the fix plays again");
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.truncate(1);
+        state.selected_layer = 0;
+    }
+    glue::refresh_layers(&app, &shared);
+    settle();
+    assert_eq!(board(&st), resting, "the stack changing under it stops it");
+    assert_eq!(st.get_light_sense_trouble().as_str(), "", "and with nothing buried the strip is gone");
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    settle();
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.clone_from(&before);
+        state.selected_layer = 0;
+    }
+    glue::refresh_layers(&app, &shared);
+    paint_board();
+    settle();
+    // and once the strip is back, resting on a fix still waits its beat before playing
+    let (fx, fy, fw, fh) = crate::uifit::rects_of(app.window(), "FixText").into_iter().next().expect("the strip is back");
+    let quiet = board(&st);
+    app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(fx + fw / 2.0, fy + fh / 2.0) });
+    slint::platform::update_timers_and_animations();
+    snap(&app).expect("a fix rested on draws");
+    assert_eq!(board(&st), quiet, "nothing plays before the beat");
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    settle();
+
+    // pointing at a key lights the row of the layer that shows there
+    let (bx, by, bw, bh) = crate::uifit::rects_of(app.window(), "field").into_iter().min_by(|a, b| a.1.total_cmp(&b.1)).expect("the board's keys are drawn");
+    // across a row of keys in small steps the pointer crosses keys and the gaps between them; only a
+    // key points at something
+    let mut seen = (false, false);
+    for step in 0..40 {
+        let x = bx + bw * (0.2 + 0.6 * step as f32 / 40.0);
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(x, by + bh * 0.4) });
+        snap(&app).expect("a pointed-at board draws");
+        let cell = st.get_light_pointed_cell();
+        seen = (seen.0 || cell >= 0, seen.1 || cell < 0);
+        if cell >= 0 && !seen.1 {
+            save(&snap(&app).expect("a pointed-at key draws"), "stack-sense-key".into());
+        }
+    }
+    assert!(seen.0, "the board says which key is pointed at");
+    assert!(seen.1, "and a gap between keys points at nothing");
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    snap(&app).expect("and lets go of the key");
+    assert_eq!(st.get_light_pointed_cell(), -1);
+
+    // one layer burying several says so once, naming them all as the rows read (topmost first), and
+    // one with a count where the names don't fit
+    {
+        let mut state = shared.borrow_mut();
+        let mut wildlife = before[1].clone();
+        wildlife.id = Some(neuron::pattern::LayerInstanceId(903));
+        let mut starlight = neuron::pattern::preset_layer("starlight").unwrap();
+        starlight.id = Some(neuron::pattern::LayerInstanceId(901));
+        let mut tidepool = neuron::pattern::preset_layer("tidepool").unwrap();
+        tidepool.id = Some(neuron::pattern::LayerInstanceId(902));
+        state.light_layers = vec![starlight, tidepool, wildlife];
+        state.selected_layer = 2;
+    }
+    glue::refresh_layers(&app, &shared);
+    paint_board();
+    let (full, short) = (st.get_light_sense_trouble(), st.get_light_sense_trouble_short());
+    assert!(full.starts_with("Tidepool and Starlight ") && full.ends_with(" under Wildlife"), "{full}");
+    assert!(short.starts_with("Tidepool and 1 more "), "{short}");
+    for width in [900.0, 1240.0] {
+        app.window().set_size(slint::LogicalSize::new(width, 2400.0));
+        save(&snap(&app).expect("a trouble with many layers draws"), format!("stack-sense-many-{width}"));
+    }
+    app.window().set_size(slint::LogicalSize::new(1240.0, 2400.0));
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.clone_from(&before);
+        state.selected_layer = 1;
+    }
+    glue::refresh_layers(&app, &shared);
+
+    // a lighter Wildlife only buries the wave in part: the line drops a tier
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.clone_from(&before);
+        state.light_layers[1].opacity = 0.7;
+    }
+    glue::refresh_layers(&app, &shared);
+    paint_board();
+    save(&snap(&app).expect("a lesser trouble draws"), format!("stack-sense-tier{}", st.get_light_sense_tier()));
+    assert!(st.get_light_sense_tier() < 2 || st.get_light_sense_trouble().is_empty(), "{}", st.get_light_sense_trouble());
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers.clone_from(&before);
+    }
+    glue::refresh_layers(&app, &shared);
+
+    // ducking: a ducking layer's row says so, and the word turns it off
+    st.invoke_set_layer_duck(1, true);
+    assert!(shared.borrow().light_layers[1].duck);
+    assert!(st.get_light_stack_rows().row_data(0).unwrap().ducks, "the row's settings say it ducks");
+    save(&snap(&app).expect("a ducking layer draws"), "stack-sense-ducks".into());
+    st.invoke_set_layer_duck(1, false);
+    assert!(!shared.borrow().light_layers[1].duck);
+    assert!(!st.get_light_stack_rows().row_data(0).unwrap().ducks);
+}
+
+/// The stack under a random run of everything a person can do to it: rest on a fix, leave, keep
+/// one, change a layer's blend, opacity or ducking, pick, hide, move, add and remove layers,
+/// point at rows, leave the page. After every step what stack sense promises still holds: resting on
+/// a fix never changes a layer, leaving puts the board back exactly, nothing keeps playing once the
+/// stack changes, every fix on show can be played and kept, a kept fix is journaled for undo as itself, and every
+/// map it hands the board fits the board and names real layers.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn stack_sense_survives_random_sequences() {
+    use slint::Model;
+    let _cwd = crate::testsupport::cwd_guard("stack_sense_random");
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    st.set_selected_device(0); st.set_selected_device_name("Fixture".into());
+    st.set_sel_can_light(true); st.set_grid_rows(4); st.set_grid_cols(12);
+    let cells = 4 * 12;
+    let looks = ["wave", "wildlife", "starlight", "tidepool", "fire", "static", "audiometer"];
+    {
+        let mut state = shared.borrow_mut();
+        state.light_layers = ["wave", "wildlife", "starlight"].iter().map(|l| neuron::pattern::preset_layer(l).unwrap()).collect();
+        state.light_layers[1].blend = neuron::effects::Blend::Normal;
+        state.selected_layer = 0;
+    }
+    glue::refresh_layers(&app, &shared);
+    st.set_page(1); st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(1000.0, 1300.0));
+    app.show().unwrap();
+    st.set_grid_px(slint::ModelRc::new(slint::VecModel::from(vec![slint::Color::from_rgb_u8(0x0c, 0x0d, 0x10); cells])));
+    // readings land a step after they're asked for, as the worker's do
+    glue::stacksense::defer_readings();
+    let board = || st.get_grid_px().iter().collect::<Vec<_>>();
+    let layers = || shared.borrow().light_layers.clone();
+
+    // xorshift: the same sequence on every run, so a failure replays
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n.max(1)
+    };
+    // the board as it was when the fix on show started playing
+    let mut quiet: Option<Vec<slint::Color>> = None;
+    let mut kinds = [0usize; 14];
+    for step in 0..250 {
+        let before = layers();
+        let n = before.len() as u64;
+        let offers: Vec<i32> = st.get_light_sense_offers().iter().map(|o| o.offer).collect();
+        let op = next(14);
+        kinds[op as usize] += 1;
+        let what = match op {
+            0 | 1 => {
+                let shown = !offers.is_empty() && next(4) > 0;
+                let i = if shown { offers[next(offers.len() as u64) as usize] } else { next(6) as i32 - 1 };
+                if quiet.is_none() {
+                    quiet = Some(board());
+                }
+                st.invoke_light_sense_preview(i);
+                assert_eq!(layers(), before, "step {step}: resting on fix {i} changed a layer");
+                if shown {
+                    assert!(glue::stacksense::previewing(), "step {step}: offer {i} is on show but can't be played");
+                }
+                if !glue::stacksense::previewing() {
+                    assert_eq!(Some(board()), quiet.take(), "step {step}: a fix that didn't play left the board changed");
+                }
+                format!("preview {i}")
+            }
+            2 => {
+                st.invoke_light_sense_preview(-1);
+                if let Some(was) = quiet.take() {
+                    assert_eq!(board(), was, "step {step}: leaving didn't put the board back");
+                }
+                "leave".into()
+            }
+            3 if !offers.is_empty() => {
+                let i = offers[next(offers.len() as u64) as usize];
+                st.invoke_light_sense_accept(i);
+                quiet = None;
+                let kept = layers();
+                assert_ne!(kept, before, "step {step}: keeping offer {i} changed nothing");
+                // the status bar's undo (refused here: tests never arm input) takes back exactly this
+                match neuron::session_undo::peek().map(|r| r.entry) {
+                    Some(neuron::session_undo::Entry::Lighting { before: was, applied, .. }) => {
+                        assert_eq!((was, applied), (before.clone(), kept), "step {step}: offer {i} journaled as something else");
+                    }
+                    other => panic!("step {step}: a kept fix is journaled as a lighting edit: {other:?}"),
+                }
+                format!("keep {i}")
+            }
+            4 => { let v = next(101) as f32; st.invoke_set_layer_opacity(v); format!("opacity {v}") }
+            5 => { let b = next(5) as i32; st.invoke_set_layer_blend(b); format!("blend {b}") }
+            6 => { let i = next(n) as i32; st.invoke_select_stack(i); format!("select {i}") }
+            7 => { let i = next(n) as i32; st.invoke_toggle_stack(i); format!("toggle {i}") }
+            8 => { let (i, d) = (next(n) as i32, if next(2) == 0 { -1 } else { 1 }); st.invoke_move_stack(i, d); format!("move {i} {d}") }
+            9 => { let (i, on) = (next(n) as i32, next(2) == 0); st.invoke_set_layer_duck(i, on); format!("duck {i} {on}") }
+            10 if n < 6 => {
+                let (look, above) = (looks[next(looks.len() as u64) as usize], next(2) == 0);
+                st.invoke_stack_tile(look.into(), above);
+                format!("add {look}")
+            }
+            11 if n > 1 => { let i = next(n) as i32; st.invoke_remove_stack(i); format!("remove {i}") }
+            13 => {
+                // the page's own handlers run as the window draws, once it's past the page fade
+                let settle = || {
+                    slint::platform::update_timers_and_animations();
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    slint::platform::update_timers_and_animations();
+                    snap(&app).expect("the page settles");
+                };
+                st.set_page(0);
+                settle();
+                assert!(!glue::stacksense::previewing(), "step {step}: a fix kept playing with the page gone");
+                if let Some(was) = quiet.take() {
+                    assert_eq!(board(), was, "step {step}: leaving the page didn't put the board back");
+                }
+                st.set_page(1);
+                settle();
+                "page".into()
+            }
+            _ => { let i = next(n + 1) as i32 - 1; st.set_light_focus_layer(i); format!("point at row {i}") }
+        };
+        let after = layers();
+        if after != before {
+            // before its reading lands: nothing may go on playing over a stack it wasn't measured on
+            assert!(!glue::stacksense::previewing(), "step {step} ({what}): the stack changed and a fix is still playing");
+            quiet = None;
+        }
+        // the strip under the pointer only ever offers what the stack on show can take (now and
+        // then, and not over a fix playing, so most steps act on whatever is on show)
+        let offers_now: Vec<_> = if step % 10 == 0 && !glue::stacksense::previewing() { st.get_light_sense_offers().iter().collect() } else { Vec::new() };
+        for o in offers_now {
+            st.invoke_light_sense_preview(o.offer);
+            let plays = glue::stacksense::previewing();
+            st.invoke_light_sense_preview(-1);
+            assert!(plays || after != before, "step {step} ({what}): {} is offered for this stack but can't play", o.text);
+        }
+        if let Some(was) = quiet.take() {
+            if glue::stacksense::previewing() {
+                quiet = Some(was);
+            } else {
+                assert_eq!(board(), was, "step {step} ({what}): a fix stopped without putting the board back");
+            }
+        }
+        glue::stacksense::land_readings();
+        slint::platform::update_timers_and_animations();
+        let count = after.len() as i32;
+        // identity and the rows
+        let mut ids: Vec<_> = after.iter().map(|d| d.id.expect("every layer has an identity")).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), after.len(), "step {step} ({what}): two layers share an identity");
+        let rows = st.get_light_stack_rows();
+        assert_eq!(rows.row_count(), after.len(), "step {step} ({what}): a row per layer");
+        for r in rows.iter() {
+            assert!(r.focus.row_count() == 0 || r.focus.row_count() == cells, "step {step} ({what}): a focus map the size of the board");
+            assert!((-1..=2).contains(&r.tier), "step {step} ({what}): tier {}", r.tier);
+        }
+        assert!((-1..count).contains(&st.get_light_focus_layer()), "step {step} ({what}): the board focuses a layer that isn't there");
+        let owners = st.get_light_cell_owner();
+        assert!(owners.row_count() == 0 || owners.row_count() == cells, "step {step} ({what})");
+        assert!(owners.iter().all(|o| (-1..count).contains(&o)), "step {step} ({what}): a key owned by a layer that isn't there");
+        // the strip
+        let trouble = st.get_light_sense_trouble();
+        if trouble.is_empty() {
+            assert_eq!(st.get_light_sense_offers().row_count(), 0, "step {step} ({what}): fixes with no trouble");
+        } else {
+            assert!((0..=2).contains(&st.get_light_sense_tier()), "step {step} ({what})");
+            let short = st.get_light_sense_trouble_short();
+            assert!(!short.is_empty() && short.len() <= trouble.len(), "step {step} ({what}): {trouble} / {short}");
+        }
+        assert!(st.get_light_sense_offers().row_count() <= neuron::stacksense::OFFERS, "step {step} ({what})");
+        if step % 25 == 0 {
+            snap(&app).expect("the stack draws whatever it's been through");
+        }
+    }
+    st.invoke_light_sense_preview(-1);
+    assert!(!glue::stacksense::previewing());
+    // a sequence that never reached a kind of step proves nothing about it
+    assert!(kinds.iter().all(|&k| k > 0), "every kind of step ran: {kinds:?}");
 }
 
 /// The second picker and its suggestion row, end to end: an edit draws offers, resting on one shows
@@ -1697,8 +2151,7 @@ fn second_picker_offers_preview_accept_and_undo() {
         capture("picker-v2-rolled");
         st.invoke_roll();
         snap(&app).unwrap();
-        assert!(st.get_assist_offers().iter().take_while(|o| o.rolled).count() == 2, "rolls stack, newest first");
-        // the x at a pointed-at roll's right end waves it off
+        assert!(st.get_assist_offers().iter().take_while(|o| o.rolled).count() == 2, "rolls stack, newest first");        // the x at a pointed-at roll's right end waves it off
         {
             use slint::platform::{PointerEventButton, WindowEvent};
             let (ox, oy, _, _) = crate::uifit::rect_of(app.window(), "SenseOffers").expect("the row is drawn");
@@ -2240,6 +2693,7 @@ fn learned_device_ask_and_star_key_draw_and_fit() {
         learned: true,
         ..Default::default()
     };
+    let base = row.clone();
     st.set_devices(slint::ModelRc::new(slint::VecModel::from(vec![row])));
     st.set_selected_device(0);
     st.set_app_version("0.1.8".into());
@@ -2261,12 +2715,33 @@ fn learned_device_ask_and_star_key_draw_and_fit() {
         app.show().expect("show the window");
         st.set_page(0);
         settle(&app, &format!("learned-row-{width}"));
+        // the NEURON wordmark drifts the accent through its letters under the pointer, and settles
+        // back to plain ink once it leaves
+        let (wx, wy, ww, wh) = crate::uifit::rect_of(app.window(), "RampName").expect("the wordmark is drawn");
+        assert!(wy < 60.0, "the first RampName is the header wordmark");
+        for x in [wx + 2.0, wx + ww / 2.0, wx + ww - 2.0] {
+            app.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(x, wy + wh / 2.0) });
+            std::thread::sleep(std::time::Duration::from_millis(330));
+            slint::platform::update_timers_and_animations();
+            snap(&app).expect("a hovered wordmark frame is drawn");
+        }
+        settle(&app, &format!("wordmark-drift-{width}"));
+        app.window().dispatch_event(WindowEvent::PointerExited);
+        settle(&app, &format!("wordmark-after-{width}"));
         let (ax, ay, aw, ah) = crate::uifit::rect_of(app.window(), "AskWhatWorks").expect("the ask is on the learned row");
         for x in [ax + 2.0, ax + aw / 2.0, ax + aw - 2.0] {
             app.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(x, ay + ah / 2.0) });
             snap(&app).expect("a hovered ask frame is drawn");
         }
         app.window().dispatch_event(WindowEvent::PointerExited);
+        // each lamp settling can draw beside the ask
+        for trust in 1..=3 {
+            let lamped = DeviceRow { lighting_trust: trust, ..base.clone() };
+            st.set_devices(slint::ModelRc::new(slint::VecModel::from(vec![lamped])));
+            settle(&app, &format!("learned-row-lamp{trust}-{width}"));
+            crate::uifit::rect_of(app.window(), "AskWhatWorks").expect("the ask keeps its lamp on the row");
+        }
+        st.set_devices(slint::ModelRc::new(slint::VecModel::from(vec![base.clone()])));
 
         st.set_page(3);
         settle(&app, "system-top");
@@ -2294,6 +2769,243 @@ fn learned_device_ask_and_star_key_draw_and_fit() {
         app.window().dispatch_event(WindowEvent::PointerExited);
         settle(&app, &format!("star-after-{width}"));
     }
+
+    // the dotless status surfaces: a dropped device's name, gated capability heads, the paused-writes
+    // pill, the capture prompt and a guide popup
+    let rows = vec![
+        DeviceRow {
+            name: "Razer Viper V2 Pro".into(), pid: "00a5".into(), mode: "wired".into(), icon: "mouse".into(), kind: "mouse".into(), id: "unit-2".into(), connected: true,
+            cap_dpi: true, cap_poll: true, cap_bright: true, cap_light: true, cap_scroll: true, cap_store: true, cap_idle: true,
+            dpi: "1600".into(), polling: "1000 Hz".into(), brightness: "80%".into(), firmware: "1.04".into(),
+            battery: "86%".into(), battery_frac: 0.86, storage: "5 profiles".into(),
+            ..Default::default()
+        },
+        DeviceRow { name: "Razer BlackWidow V4 X".into(), pid: "02a5".into(), mode: "wired".into(), icon: "keyboard".into(), kind: "keyboard".into(), id: "unit-3".into(), connected: false, ..Default::default() },
+    ];
+    st.set_devices(slint::ModelRc::new(slint::VecModel::from(rows)));
+    st.set_selected_device(0);
+    st.set_writes_paused(true);
+    st.set_active_profile("gaming".into());
+    st.set_profile_degraded_count(2);
+    st.set_page(0);
+    for width in [900.0, 1240.0] {
+        app.window().set_size(slint::LogicalSize::new(width, 900.0));
+        settle(&app, &format!("device-dotless-{width}"));
+    }
+    st.set_writes_paused(false);
+    st.set_capture_prompt("press the control you want to bind".into());
+    st.set_capture_active(true);
+    settle(&app, "capture-dotless");
+    st.set_capture_active(false);
+    for guide in ["spectrum", "macros"] {
+        st.set_guide_active_id(guide.into());
+        st.set_guide_x(320.0);
+        st.set_guide_y(160.0);
+        st.set_guide_sticky(true);
+        st.set_guide_open(true);
+        settle(&app, &format!("guide-{guide}"));
+        if guide == "macros" {
+            // the wheel scrolls the guide wherever it is over the card, a code cell included
+            let before = snap(&app).expect("the guide draws");
+            for _ in 0..3 {
+                app.window().dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(520.0, 500.0), delta_x: 0.0, delta_y: -120.0 });
+            }
+            settle(&app, "guide-macros-scrolled");
+            let after = snap(&app).expect("the scrolled guide draws");
+            assert_ne!(before.as_bytes(), after.as_bytes(), "the wheel scrolls the guide");
+        }
+        st.set_guide_open(false);
+    }
+}
+
+/// More devices and audio endpoints than the minimum window's list can show: the list scrolls by the
+/// wheel, and every row keeps its readouts whole at the narrowest list width.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn device_list_scrolls_with_many_rows() {
+    use crate::ui::DeviceRow;
+    use slint::platform::WindowEvent;
+    use slint::LogicalPosition;
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let st = app.global::<State>();
+    let device = |n: usize| DeviceRow {
+        name: format!("Razer Viper V2 Pro {n}").into(), pid: format!("00a{n}").into(), mode: "wired".into(), icon: "mouse".into(), kind: "mouse".into(),
+        id: format!("unit-{n}").into(), connected: true,
+        cap_dpi: true, cap_poll: true, cap_bright: true, cap_light: true, cap_scroll: true, cap_store: true, cap_idle: true,
+        dpi: "1600".into(), polling: "1000 Hz".into(), brightness: "80%".into(), firmware: "1.04".into(),
+        battery: "86%".into(), battery_frac: 0.86, storage: "5 profiles".into(),
+        ..Default::default()
+    };
+    let audio = |name: &str, kind: &str, n: usize| DeviceRow {
+        name: name.into(), pid: String::new().into(), icon: kind.into(), kind: kind.into(), id: format!("audio-{n}").into(), connected: true,
+        detail: "default endpoint".into(),
+        ..Default::default()
+    };
+    let mut rows: Vec<DeviceRow> = (0..7).map(device).collect();
+    rows.push(audio("Razer Seiren V3 Chroma microphone", "mic", 0));
+    rows.push(audio("Speakers (Realtek High Definition Audio)", "output", 1));
+    st.set_devices(slint::ModelRc::new(slint::VecModel::from(rows)));
+    st.set_selected_device(0);
+    st.set_page(0);
+    st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(900.0, 560.0));
+    app.show().expect("show the window");
+    let shots = std::env::var_os("NEURON_INSPECTOR_SHOTS").map(std::path::PathBuf::from);
+    let frame = |name: &str| {
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(70));
+            slint::platform::update_timers_and_animations();
+        }
+        let f = snap(&app).expect("the device list draws");
+        if let Some(dir) = &shots {
+            std::fs::create_dir_all(dir).unwrap();
+            image::save_buffer(dir.join(format!("{name}.png")), f.as_bytes(), f.width(), f.height(), image::ColorType::Rgba8).unwrap();
+        }
+        f
+    };
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    frame("device-many-top");
+    let (_, first_y, _, _) = crate::uifit::rect_of(app.window(), "DeviceLine").expect("the first row is drawn");
+    let at = LogicalPosition::new(200.0, 300.0);
+    app.window().dispatch_event(WindowEvent::PointerMoved { position: at });
+    for _ in 0..80 {
+        app.window().dispatch_event(WindowEvent::PointerScrolled { position: at, delta_x: 0.0, delta_y: -120.0 });
+    }
+    app.window().dispatch_event(WindowEvent::PointerExited);
+    let _bottom = frame("device-many-bottom");
+    let (_, scrolled_y, _, _) = crate::uifit::rect_of(app.window(), "DeviceLine").expect("the first row is drawn");
+    // the first row drawn is no longer row 0 once the list has scrolled its end into view
+    assert!(scrolled_y < first_y, "the wheel scrolls the device list ({first_y} -> {scrolled_y})");
+}
+
+/// The macro carousel pans under the wheel while it can move, and hands the wheel to the page once
+/// it is at its end.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn macro_carousel_hands_the_wheel_to_the_page_at_its_end() {
+    use crate::ui::MacroCard;
+    use slint::platform::WindowEvent;
+    use slint::LogicalPosition;
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let st = app.global::<State>();
+    let cards: Vec<MacroCard> = (0..12)
+        .map(|n| MacroCard {
+            name: format!("macro-{n}").into(), summary: "types a line".into(), steps: 3, options: 0,
+            mode: "BOUND".into(), trigger: "(unbound)".into(),
+        })
+        .collect();
+    st.set_macro_catalog(slint::ModelRc::new(slint::VecModel::from(cards)));
+    st.set_page(2);
+    st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(900.0, 520.0));
+    app.show().expect("show the window");
+    let settle = || {
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            slint::platform::update_timers_and_animations();
+        }
+        snap(&app).expect("the input page draws");
+    };
+    let wheel = |at: LogicalPosition, dy: f32| {
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: at });
+        app.window().dispatch_event(WindowEvent::PointerScrolled { position: at, delta_x: 0.0, delta_y: dy });
+    };
+    settle();
+    // the page has to be scrolled until the carousel is in view; the wheel lands on the page itself
+    let mut band = crate::uifit::rect_of(app.window(), "::carousel");
+    for _ in 0..80 {
+        if matches!(band, Some((_, y, _, h)) if y + h < 480.0) {
+            break;
+        }
+        wheel(LogicalPosition::new(450.0, 200.0), -120.0);
+        settle();
+        band = crate::uifit::rect_of(app.window(), "::carousel");
+    }
+    let (cx, cy, cw, ch) = band.unwrap_or_else(|| panic!("the carousel is drawn: {:?}", crate::uifit::drawn_as(app.window(), "carousel")));
+    let over = LogicalPosition::new(cx + cw / 2.0, cy + ch / 2.0);
+    // a card is named like the carousel that holds it; it is the one drawn 248px wide
+    let card_x = || {
+        crate::uifit::rects_of(app.window(), "::carousel").into_iter().find(|r| (r.2 - 248.0).abs() < 0.5).map(|r| r.0).expect("a card is drawn")
+    };
+    let (x0, y0) = (card_x(), cy);
+    wheel(over, -120.0);
+    settle();
+    let (x1, y1) = (card_x(), crate::uifit::rect_of(app.window(), "::carousel").unwrap().1);
+    assert!(x1 < x0, "the wheel pans the carousel ({x0} -> {x1})");
+    assert_eq!(y1, y0, "the page stays put while the carousel can pan");
+    for _ in 0..80 {
+        wheel(over, -120.0);
+    }
+    settle();
+    let (x2, y2) = (card_x(), crate::uifit::rect_of(app.window(), "::carousel").unwrap().1);
+    assert!(x2 < x1, "the carousel kept panning to its end ({x1} -> {x2})");
+    wheel(over, -120.0);
+    settle();
+    let x3 = card_x();
+    assert_eq!(x3, x2, "at its end the carousel does not move");
+    let y3 = crate::uifit::rect_of(app.window(), "::carousel").unwrap().1;
+    assert!(y3 < y2 || y2 + ch < 520.0, "at its end the wheel scrolls the page ({y2} -> {y3})");
+}
+
+/// The code editor's view follows the caret although a drag selects instead of flicking it.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn code_editor_view_follows_the_caret() {
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use slint::LogicalPosition;
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let st = app.global::<State>();
+    let mut text = String::new();
+    for n in 0..40 {
+        use std::fmt::Write as _;
+        let _ = writeln!(text, "    step_{n}()");
+    }
+    text.push_str(&"x".repeat(160));
+    st.set_macro_code_view(true);
+    st.set_macro_source(text.into());
+    st.set_page(2);
+    st.set_window_shown(true);
+    app.window().set_size(slint::LogicalSize::new(900.0, 900.0));
+    app.show().expect("show the window");
+    let settle = || {
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            slint::platform::update_timers_and_animations();
+        }
+        snap(&app).expect("the editor draws");
+    };
+    settle();
+    let area = crate::uifit::rect_of(app.window(), "CodeArea").expect("the code area is drawn");
+    let field = || crate::uifit::rect_of(app.window(), "CodeArea::ti").expect("the text field is drawn");
+    let (x0, y0, _, _) = field();
+    let at = LogicalPosition::new(area.0 + 40.0, area.1 + 20.0);
+    app.window().dispatch_event(WindowEvent::PointerMoved { position: at });
+    app.window().dispatch_event(WindowEvent::PointerPressed { position: at, button: PointerEventButton::Left });
+    app.window().dispatch_event(WindowEvent::PointerReleased { position: at, button: PointerEventButton::Left });
+    let press = |k: Key| {
+        let t: slint::SharedString = k.into();
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: t.clone() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: t });
+    };
+    for _ in 0..45 {
+        press(Key::DownArrow);
+    }
+    press(Key::End);
+    let typed: slint::SharedString = "Z".into();
+    app.window().dispatch_event(WindowEvent::KeyPressed { text: typed.clone() });
+    app.window().dispatch_event(WindowEvent::KeyReleased { text: typed });
+    settle();
+    assert!(st.get_macro_source().ends_with(&format!("{}Z", "x".repeat(160))), "the caret reached the end of the text");
+    let (x1, y1, _, h1) = field();
+    assert!(y1 < y0, "the view follows the caret down ({y0} -> {y1}): {:?}", crate::uifit::drawn_as(app.window(), "ti"));
+    assert!(x1 < x0, "the view follows the caret along a long line ({x0} -> {x1})");
+    assert!(y1 + h1 <= area.1 + area.3 + 14.0, "the last line is in view");
 }
 
 /// Every SYSTEM group, jumped to from the page's index and drawn with long data, at the window's
@@ -2445,7 +3157,6 @@ fn lighting_enum_picker_simulates_options_collapsed_and_expanded() {
         target: target.clone(),
         dims: PARAM_PREVIEW_DIMS,
         content_rev,
-        layout_generation: 0,
         rgb: vec![Rgb::new(r, g, b); usize::from(PARAM_PREVIEW_DIMS.0) * usize::from(PARAM_PREVIEW_DIMS.1)].into(),
         swatch: None,
         overlay: Some(make_overlay(r, g, b)),

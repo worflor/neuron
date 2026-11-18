@@ -6,12 +6,32 @@
 // types closely enough that the Rust glue is a thin map (Profile, Rule, DeviceDef, LightingDef)
 // — no serde-over-IPC, just direct field copies into Slint models.
 
+// A change stack sense would make, in the STACK's suggestion strip: its words ("Wildlife → screen")
+// and `offer`, what to preview/keep.
+export struct LightingFix {
+    text: string,
+    offer: int,
+}
+
 // Inspector rows carry authored bottom-to-top indices, independent of their display order.
 export struct LightingStackRow {
     index: int,
     name: string,
-    summary: string,
+    // the layer's presentation, one token each: "normal", "100%", "placed" ("" on the full board)
+    blend: string,
+    amount: string,
+    place: string,
+    ducks: bool,
     enabled: bool,
+    // what the board shows while the row is pointed at, per cell (row-major): bit 0 the layer's light
+    // reaches it, bit 1 the layer lights it but it's lost, bit 2 it keeps another layer's light out
+    // there; `wide` when that harm covers most of the layer, so the whole board is marked instead.
+    // Empty when stack sense hasn't read the stack.
+    focus: [int],
+    wide: bool,
+    // the worst tier of a trouble this layer causes (-1 none, 0 note, 1 warning, 2 error): the ink
+    // of its marks on the board
+    tier: int,
 }
 
 // One enumerated device on the Device panel.
@@ -58,6 +78,8 @@ export struct DeviceRow {
     adopting: bool,
     // its definition was synthesized on this machine, not curated: what works on it is unconfirmed
     learned: bool,
+    // how a learned device's lighting settled: 0 not yet, 1 checked, 2 a fix waits, 3 unconfirmed
+    lighting-trust: int,
 }
 
 export struct ChromaDeviceRow {
@@ -492,7 +514,7 @@ export struct MacroBlock {
 // section lists these so a beacon-using macro is visible at a glance, and a "test" mock-fires it so
 // the real ask appears with none of the macro's real-world actions. `asks` is its question(s),
 // " · "-joined and verbatim. Whether a row is firing right now is derived in the view (the live
-// beacon-text names the macro), never stored here.
+// beacon-macro names the macro), never stored here.
 export struct BeaconMacro {
     name: string,
     asks: string,

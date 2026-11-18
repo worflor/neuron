@@ -110,7 +110,7 @@ export global GuideContent {
                         {
                             head: "Give it a memory",
                             blocks: [
-                                { code: false, text: "store and load persist per macro across restarts, atomic on disk. forget() wipes, stored() shows everything. Toggles and counters fall out." },
+                                { code: false, text: "store and load persist per macro across restarts, atomic on disk. forget() wipes, stored() shows everything. Use them for toggles and counters." },
                                 { code: true, text: "def macro(ctx):             # a DPI toggle\n    on = not neuron.load(\"on\", False)\n    neuron.store(\"on\", on)\n    neuron.dpi(3200 if on else 800)\n    neuron.notify(\"on\" if on else \"off\")" },
                             ],
                         },
@@ -120,7 +120,7 @@ export global GuideContent {
                                 { code: false, text: "Each macro's store is its own, so shared state is a macro that owns the data. Siblings invoke() it: kwargs arrive as its options, and its return value comes back." },
                                 { code: true, text: "def macro(ctx):          # counter.py\n    if neuron.option(\"op\") == \"add\":\n        n = neuron.load(\"n\", 0) + 1\n        neuron.store(\"n\", n)\n    return neuron.load(\"n\", 0)" },
                                 { code: true, text: "def macro(ctx):          # anywhere else\n    n = neuron.invoke(\"counter\", op=\"add\")\n    neuron.notify(f\"count: {n}\")" },
-                                { code: false, text: "invoke runs the sibling inline and waits; wait=False queues it and moves on. A failed invoke returns None instead of raising, and nesting stops at 16 deep. Small macros, wired together, is the whole style." },
+                                { code: false, text: "invoke runs the sibling inline and waits; wait=False queues it and moves on. A failed invoke returns None instead of raising, and nesting stops at 16 deep. Small macros, wired together." },
                             ],
                         },
                         {
@@ -135,8 +135,9 @@ export global GuideContent {
                         {
                             head: "Drive OBS, and let OBS drive you",
                             blocks: [
-                                { code: false, text: "With CONNECTIONS + obs on (SYSTEM page), OBS is bindable with no code at all: the action picker's obs entry does stream, record, pause, replay (\"clip that!\"), scene switches, and input mute from any key, wedge, or gesture. Macros get the same verbs and more: obs_scene(name), obs_stream(), obs_record(), obs_replay(), obs_mute(), and obs_request() for anything else in the obs-websocket API. Reads: obs_scene_name(), obs_streaming(), obs_recording(), obs_connected()." },
-                                { code: false, text: "It runs the other way too. Name a macro on_obs_scene, on_obs_stream, or on_obs_record and Neuron fires it whenever OBS changes that state. Going live can set your profile, your DPI, and your mic in one motion:" },
+                                { code: false, text: "Turn on CONNECTIONS + obs on the SYSTEM page. The action picker's obs entry binds streaming, recording, pause, replay, scene switches, and input mute to any key, wedge, or gesture." },
+                                { code: false, text: "Macros use obs_scene(name), obs_stream(), obs_record(), obs_replay(), and obs_mute(). Read state with obs_scene_name(), obs_streaming(), obs_recording(), and obs_connected(); obs_request() calls the rest of the obs-websocket API." },
+                                { code: false, text: "Name a macro on_obs_scene, on_obs_stream, or on_obs_record to run it when OBS changes that state. Going live can switch your profile and unmute your mic:" },
                                 { code: true, text: "def macro(ctx):          # on_obs_stream.py\n    if neuron.obs_streaming():\n        neuron.profile(\"streaming\")\n        neuron.mic_mute(\"off\")\n    else:\n        neuron.profile(\"default\")" },
                             ],
                         },
@@ -160,7 +161,7 @@ export global GuideContent {
                             ],
                         },
                         {
-                            head: "A do-not-disturb switch",
+                            head: "A mic-mute toggle",
                             blocks: [
                                 { code: false, text: "The same toggle-and-remember shape as the DPI toggle a tab over, aimed at your mic instead. One key for on, the same key for off." },
                                 { code: true, text: "def macro(ctx):\n    on = not neuron.load(\"dnd\", False)\n    neuron.store(\"dnd\", on)\n    neuron.mic_mute(\"on\" if on else \"off\")\n    msg = \"dnd on\" if on else \"dnd off\"\n    neuron.notify(msg)" },
@@ -174,16 +175,16 @@ export global GuideContent {
                             ],
                         },
                         {
-                            head: "Warn yourself before the battery dies",
+                            head: "Check your battery",
                             blocks: [
-                                { code: false, text: "battery() reads percent and charging state straight off the device, so a macro can watch a wireless mouse without you ever opening a settings page." },
+                                { code: false, text: "battery() reads percent and charging state from the device. Check your wireless mouse with one press." },
                                 { code: true, text: "def macro(ctx):\n    b = neuron.battery()\n    if b is None:\n        neuron.notify(\"battery unreadable\")\n    elif b[\"percent\"] < 20 and not b[\"charging\"]:\n        neuron.dpi(800)\n        neuron.notify(\"battery low\")\n    else:\n        neuron.notify(f\"{b['percent']}%\")" },
                             ],
                         },
                         {
                             head: "POST to a webhook, with a body",
                             blocks: [
-                                { code: false, text: "The weather example a tab over only reads. Sending is the same urllib, just with a body and a Request object standing in for a bare URL. Add a Content-Type header too if the endpoint you're hitting is picky about it." },
+                                { code: false, text: "The weather example a tab over only reads. Sending is the same urllib, just with a body and a Request object standing in for a bare URL. Add a Content-Type header too if the endpoint requires it." },
                                 { code: true, text: "# neuron: raw\ndef macro(ctx):\n    import urllib.request as u, json\n    data = json.dumps({\"ok\": 1}).encode()\n    url = \"https://your-webhook-url\"\n    with u.urlopen(u.Request(url, data=data),\n                   timeout=10) as r:\n        r.read()" },
                             ],
                         },
@@ -228,7 +229,7 @@ export global GuideContent {
                             blocks: [
                                 { code: false, text: "Every weave starts the same way: hold the cast trigger and draw. What comes back depends entirely on what you actually drew." },
                                 { code: false, text: "Neuron checks your stroke against the glyphs you've taught first: a shape you've taught always wins over a directional guess, and radial only happens once glyph recognition comes up empty." },
-                                { code: false, text: "Barely move and the hold just cancels, quietly: no message, no cost. Move plenty but nothing matches and no direction reads clean, and you get a fizzle instead, with the status line always saying why." },
+                                { code: false, text: "Barely move and the hold cancels without a message. Move plenty but nothing matches and no direction reads clean, and you get a fizzle instead, with the status line always saying why." },
                             ],
                         },
                         {
@@ -236,14 +237,14 @@ export global GuideContent {
                             blocks: [
                                 { code: false, text: "Press Record glyph, hold the trigger, and draw. A live \"\u{2248} name \u{00b7} NN%\" readout tracks what your stroke is closest to becoming as you go, so you always know where it's headed. Release, and it lands in the vault unbound, ready to name and bind to any action." },
                                 { code: false, text: "Shift+Record does something else: it captures the same kind of stroke with real timing preserved and writes it to a research file instead of teaching the vault. Reach for it when you want to study your own strokes afterward." },
-                                { code: false, text: "Every glyph in the vault can be renamed, rebound, or deleted on its own, and renaming or deleting cleans up after itself: a binding never points at a shape that's gone. Clear vault wipes shapes and bindings together for the same reason, since a stray leftover binding could silently fire on a name you reuse later." },
+                                { code: false, text: "Rename or delete a glyph and its bindings update with it. Clear vault removes every glyph and its bindings." },
                                 { code: false, text: "There's one vault for the whole install, shared across every device and lighting profile, and switching profiles never touches it." },
                             ],
                         },
                         {
                             head: "The radial: quick flicks",
                             blocks: [
-                                { code: false, text: "The radial wheel reads the same held stroke as a direction instead of a shape: north is sector 0, counting clockwise from there. WEDGES sets how many slices exist, capped at however many slices your hand can reliably aim between before a flick's natural jitter starts landing on the wrong one." },
+                                { code: false, text: "The radial wheel reads the same held stroke as a direction instead of a shape: north is sector 0, counting clockwise from there. WEDGES sets the slice count. More slices give you more actions, but demand more precise flicks." },
                                 { code: false, text: "Click a slice to bind it, the same action picker as everywhere else in this app. Test wheel lets you try the live layout without flicking blind." },
                                 { code: false, text: "HyperShift radial adds a second wheel, same slice count, that takes over only while you're holding the HyperShift layer. Turn it on and a base \u{21c4} HYPER flip appears so you can author both sets from the one wheel. Leave it off and HyperShift falls through to your base wheel, so switching it on never blanks anything out." },
                             ],
@@ -251,7 +252,7 @@ export global GuideContent {
                         {
                             head: "Assist: how forgiving a near miss is",
                             blocks: [
-                                { code: false, text: "When you draw, Neuron scores how close your stroke is to each glyph you've taught. Assist is how far past the strict gate a near miss can sit and still snap to the closest one." },
+                                { code: false, text: "When you draw, Neuron scores how close your stroke is to each glyph you've taught. Assist lets a near miss count when one glyph is a clear winner." },
                                 { code: false, text: "At 0 (off), only a clean match fires. Turn it up and a slightly-off stroke can still land, but only when one glyph is a clear winner: if two glyphs are close, it won't guess between them, no matter how high assist is set." },
                                 { code: false, text: "Higher is more forgiving, with more risk of the wrong glyph firing. Lower is stricter, with more misses. A cast that only landed because assist helped says so." },
                             ],
@@ -298,8 +299,9 @@ export global GuideContent {
                             blocks: [
                                 { code: false, lead: ["L", "u", "m", "a", "-", "T"], lead-split: 0.7, text: "Neuron's generative colour model: 662,635 parameters, running on this computer in real time. A 592k-parameter core proposes colours and a 70k-parameter taste head picks the ones worth showing you. Both were designed and trained from scratch for Neuron, on curated synthetic palettes, Creative Commons artwork, and public datasets of people's colour choices." },
                                 { code: false, text: "It edits with you. It can finish a move you've started, carry a change through the rest of the palette, tidy the stops around it, colour a stop you've just added, or build a whole palette around the colours you hold. It learns your taste from what you keep and pass over, on this computer." },
-                                { code: false, text: "Its ideas appear as dots in the colour square and pills under the picker. Point to preview, click to keep. Tab takes the first idea, ask brings more, and roll makes a whole new palette." },
+                                { code: false, text: "Its ideas appear as dots in the colour square and pills under the picker. Point to preview, click to keep. Tab takes the first idea, ask brings more, and roll creates a whole new palette." },
                                 { code: false, text: "Squiggles, rings and hills show what it thinks. Hold a stop to keep it out of the suggestions." },
+                                { code: false, text: "Layers get suggestions too, measured from what each one really shows on your board. When one buries another, a line above the stack says so, amber or red by how much is lost, with fixes you preview and keep the same way. Point at a layer's row to see where it reads." },
                             ],
                         },
                     ],

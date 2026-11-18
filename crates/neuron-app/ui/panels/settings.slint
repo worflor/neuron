@@ -1224,7 +1224,7 @@ export component SettingsPanel inherits VerticalLayout {
                             edited(v) => { State.host-obs-password = v; }
                             accepted(v) => { State.set-host-obs-password(v); }
                         }
-                        Button { text: "save"; clicked => { State.set-host-obs-password(State.host-obs-password); } }
+                        Button { text: "save"; primary: true; clicked => { State.set-host-obs-password(State.host-obs-password); } }
                         Rectangle {}
                     }
                 }

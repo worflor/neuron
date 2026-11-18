@@ -13,6 +13,7 @@
 
 import {
     LightingStackRow,
+    LightingFix,
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, BadgeView, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, ClipboardVariable, ClipboardOperationRow, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTileMeta, EffectParam,
@@ -26,12 +27,7 @@ export global State {
     in-out property <bool> writes-paused: false;     // the device-write safety gate switch
     in-out property <bool> input-armed: false;       // SAFE-MODE gate: real SendInput is a no-op unless ARMED
     in-out property <string> arm-held;                // why an armed stance is waiting on button custody; empty = not waiting
-    // ARM STANCE — one selector over the two gates above (the header pills still read the bools live):
-    // 0 OBSERVE (paused + safe) · 1 DEVICE (writes on, safe) · 2 INPUT (synth on, paused) · 3 LIVE (both).
-    in-out property <int> arm-stance: 0;
-    callback set-arm-stance(int);
     in-out property <bool> hypershift-on: false;     // software hold-layer active
-    in-out property <bool> runtime-active: false;    // the LIVE dispatch loop is running
     in-out property <string> active-profile: "—";
     in-out property <int> profile-degraded-count: 0;
     in-out property <string> profile-degraded-detail: "";
@@ -61,9 +57,7 @@ export global State {
 
     // ── BEACON (two-part macros: a python macro is asking yes/no) ────────
     in-out property <bool> beacon-active: false;      // a prompt is presented at the cursor
-    in-out property <string> beacon-text: "";         // "macro · question"
     in-out property <string> beacon-macro: "";        // the id of the macro presenting right now ("" = none)
-    in-out property <string> beacon-hint: "";         // the answer gesture, spelled out
     in-out property <int> beacon-count: 0;            // presented + queued prompts
     // the macros whose source calls neuron.ask — the SYSTEM panel's live BEACONS registry. Refreshed
     // at startup + after a macro save. `test-beacon` MOCK-fires one (real ask, no real-world effects).
@@ -234,10 +228,10 @@ export global State {
     in-out property <string> idle-readout: "—";       // live read of the current device value
     callback idle-edited(string);
     callback apply-idle(float);
-    // IN-GAME polling (wired/dongle split). Verify-gated (NEURON_INGAME_POLL_WRITE).
-    in-out property <float> ingame-wired-hz: 1000;
-    in-out property <float> ingame-dongle-hz: 1000;
-    callback apply-ingame-polling(float, float);
+    // HYPERPOLLING rate. 0 = unknown (nothing read it, no profile carries one). Verify-gated
+    // (NEURON_INGAME_POLL_WRITE).
+    in-out property <float> ingame-wired-hz: 0;
+    callback apply-ingame-polling(float);
     // GAMING MODE / disable-alt-tab (host-side LL hook, no device write).
     // KEY GUARD — a multi-select of OS chords to swallow mid-game (one control, grows by chord, not
     // by a new toggle each time). Each bool is one chip; `apply-gaming-mode` rebuilds the live policy.
@@ -265,8 +259,6 @@ export global State {
     in-out property <int> lod-lift: 8;                 // lift-off level 2..26 (async mode)
     in-out property <int> lod-land: 8;                 // landing level 1..25 (async mode)
     callback apply-lod-async(int, int);
-    // DEBOUNCE — honest hardware-pending stub (greyed, [gated]); no opcode known.
-    in-out property <bool> debounce-supported: false;
     in-out property <string> perf-status: "";          // last perf-control result line
 
     // ── Lighting ─────────────────────────────────────────────────────────
@@ -282,8 +274,6 @@ export global State {
     in-out property <int> grid-cols: 0;
     in-out property <[color]> grid-px;               // rows*cols, row-major
     in-out property <string> grid-kind: "";          // registry icon hint ("keyboard"/"mouse"/…)
-    in-out property <bool> light-paint-mode: false;  // EFFECTS (live render) vs PAINT (per-LED)
-    in-out property <bool> animating: false;
     callback preview-tick();                         // mirror the applied effect onto the render
     callback apply-effect(int);                      // effect index -> set on device
     callback stop-animation();
@@ -352,12 +342,37 @@ export global State {
     callback move-stack(int, int);                     // reorder layer `i` in the stack (dir -1 down / +1 up)
     callback set-layer-blend(int);
     callback set-layer-opacity(float);
+    callback set-layer-duck(int, bool);                 // layer `i` ducks what's beneath it, or stops
     callback toggle-stack(int);
     in-out property <int> light-layer-blend: 0;
     in-out property <float> light-layer-opacity: 100;
     in-out property <[LightingStackRow]> light-stack-rows;
-    in-out property <int> light-cover-index: -1;
-    in-out property <string> light-cover-name;
+    // STACK SENSE — the stack read the way the eye sees it (glue/stacksense.rs). A trouble in the stack
+    // ("Wave buried under Wildlife", "" for none) and what would fix it sit in a strip above the rows;
+    // each row carries what the board shows while it's pointed at (see LightingStackRow); `blend` is
+    // the blend the selected layer's fixes suggest, marked in the picker's list (-1: none).
+    in-out property <string> light-sense-trouble;
+    in-out property <string> light-sense-trouble-short;  // the same, one layer named and the rest counted
+    in-out property <int> light-sense-tier: 0;          // how bad it is: 0 note, 1 warning, 2 error
+    in-out property <[LightingFix]> light-sense-offers;
+    in-out property <int> light-sense-blend: -1;
+    // the layer whose row is pointed at (authored index, -1: none): the board shows its `focus`
+    in-out property <int> light-focus-layer: -1;
+    // per cell, the layer that shows there (authored index, -1: nothing lit), and the cell the pointer
+    // is over on the board (-1: none): pointing at a key lights the row of the layer it shows
+    in-out property <[int]> light-cell-owner;
+    in-out property <int> light-pointed-cell: -1;
+    callback light-sense-preview(int);                  // play offer `i` on the board, changing nothing; -1 stops
+    // bumped whenever a reading lands or the stack moves under a fix playing: the strip lets go of it
+    in-out property <int> light-sense-epoch: 0;
+    callback light-sense-accept(int);                   // keep offer `i`
+    // the opacity rail's temperature: per opacity, how unseen (cold), clear (warm) and buried-or-
+    // washed (hot) the selected layer's stack is; white-on-alpha strips the theme tints
+    in-out property <bool> light-opacity-zoned: false;
+    in-out property <image> light-opacity-cold;
+    in-out property <image> light-opacity-warm;
+    in-out property <image> light-opacity-hot;
+    in-out property <[image]> light-blend-previews;     // the stack under each blend, in the picker's order
     // PAINT — a brush you pick up ON the render (not a top-level mode). Off = effects play; on = your
     // pointer paints cells in the brush colour over the current frame.
     in-out property <bool> light-brush-on: false;     // is the per-key brush picked up?
@@ -615,21 +630,7 @@ export global State {
     callback begin-edit-rule(int, bool);               // (row, hyper) open the inline editor for that rule
     callback commit-edit-rule();                        // save the in-place edit (trigger + action)
     callback cancel-edit-rule();                         // close the inline editor without saving
-    // mic gain/mute are surfaced here as Actions (no longer a top-level Audio panel)
-    in-out property <string> mic-name: "—";
-    // Gain and mute readings belong to the last opened endpoint only while this is true.
-    in-out property <bool> mic-reading-valid: false;
-    in-out property <float> mic-gain: 100;
-    in-out property <bool> mic-muted: false;
-    callback refresh-mic();
-    // OUTPUT (render) side — headphones / sound card / speakers volume + mute (Core Audio, generic).
-    // The matching bindable Actions are out-gain / out-mute in the palette.
-    in-out property <string> out-name: "—";
-    // Endpoint loss invalidates both readings before a replacement is opened.
-    in-out property <bool> out-reading-valid: false;
-    in-out property <float> out-gain: 100;
-    in-out property <bool> out-muted: false;
-    callback refresh-out();
+    // mic gain/mute are surfaced as Actions (no top-level Audio panel)
     // macro authoring: source is runtime truth. New source is BOUND; one compiler line opts into RAW
     // full-power CPython. The UI toggle edits that line rather than storing a second preference.
     in-out property <string> macro-name: "";          // the macro's name (file stem + registry id)

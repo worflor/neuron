@@ -341,7 +341,6 @@ impl LiveRuntime {
         if let Some(app) = weak.upgrade() {
             let st = app.global::<State>();
             st.set_input_armed(actual_armed);
-            st.set_arm_stance(crate::glue::arm_stance(neuron::writes::writes_paused(), actual_armed));
             if let Some(e) = restore_error {
                 st.set_status_line(format!("input disarmed; button stock restore failed: {e}").into());
             }
@@ -361,11 +360,6 @@ impl LiveRuntime {
             stop,
             handle,
         }
-    }
-
-    /// Is the worker thread still alive?
-    pub fn running(&self) -> bool {
-        self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// Signal the worker to stop and join it. Disarms input and is idempotent.
@@ -1861,7 +1855,6 @@ fn post_status(weak: &slint::Weak<AppWindow>, status: &Arc<Mutex<LiveStatus>>) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(app) = weak.upgrade() {
             let st = app.global::<State>();
-            st.set_runtime_active(true);
             st.set_hypershift_on(!snap.held_layers.is_empty());
             if !snap.focused_app.is_empty() {
                 st.set_focused_app(snap.focused_app.clone().into());

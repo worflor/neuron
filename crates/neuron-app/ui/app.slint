@@ -20,7 +20,7 @@
 import { Theme, Signal } from "theme.slint";
 import { State } from "state.slint";
 import { GuideContent } from "guides.slint";
-import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, LumaInk, Label, Lamp } from "widgets/controls.slint";
+import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, LumaInk, Label, RampName } from "widgets/controls.slint";
 import { UpdatePill, UpdateDrawer } from "widgets/update.slint";
 
 import { DevicePanel } from "panels/device.slint";
@@ -114,11 +114,11 @@ component PanelPage inherits Flickable {
     // scroll. `interactive: false` drops the drag gesture; the mouse wheel still scrolls (Slint exempts
     // Wheel events from this gate), which is the right primary on a mouse-driven desktop anyway.
     interactive: false;
-    viewport-width: self.width;
-    viewport-height: max(self.height, body.preferred-height);
+    content-width: self.width;
+    content-height: max(self.height, body.preferred-height);
     body := VerticalLayout {
-        width: parent.viewport-width;
-        height: parent.viewport-height;
+        width: parent.content-width;
+        height: parent.content-height;
         @children
     }
 }
@@ -202,25 +202,22 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         horizontal-stretch: 0;
                         alignment: center;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Lamp { lit: State.runtime-active; }
-                            Text {
-                                text: "NEURON";
-                                color: Theme.text;
-                                font-size: Theme.fs-title;
-                                font-family: Theme.mono;
-                                font-weight: 700;
-                                letter-spacing: Theme.track-5;
-                                vertical-alignment: center;
-                            }
+                        // plain ink at rest; on hover the accent drifts through the letters, the
+                        // same RampName the lighting side rail paints effect names with
+                        RampName {
+                            quiet: true;
+                            chars: ["N", "E", "U", "R", "O", "N"];
+                            ramp: [Theme.text, Theme.accent, Theme.text, Theme.accent];
+                            rest-ink: Theme.text;
+                            size: Theme.fs-title;
+                            weight: 700;
+                            tracking: Theme.track-5;
                         }
                     }
                     Rectangle {}  // push the right cluster over
                     // The right cluster is ONE affordance, not a row of tags: the PROFILE sheet
                     // trigger (plus a quiet "shift" word while a layer is held — a state, not a
-                    // badge). The link lamp is the wordmark dot; gate/paused/beacon live on the
-                    // scope strip below, where modes belong.
+                    // badge). Gate/paused/beacon live on the scope strip below, where modes belong.
                     VerticalLayout {
                         horizontal-stretch: 0;
                         alignment: center;
@@ -230,7 +227,7 @@ export component AppWindow inherits Window {
                             // show WHICH layer(s) are held when the runtime names them, not a static
                             // word. A FIXED-WIDTH slot (sized to the longest expected label) always
                             // reserves its space so the PROFILE pill never slides when a layer is held
-                            // — the same lamp-gutter doctrine the atoms follow (reserve, don't reflow).
+                            // — reserve the space, don't reflow.
                             // The word right-anchors against the pill and only paints while shifted.
                             Rectangle {
                                 width: 68px;
@@ -258,6 +255,8 @@ export component AppWindow inherits Window {
                                     : State.profile-degraded-count > 0 ? State.active-profile + " · DEGRADED " + State.profile-degraded-count
                                     : State.active-profile;
                                 live: State.active-profile != "—";
+                                // degraded is a warning, not a healthy live profile
+                                signal: State.profile-degraded-count > 0 ? Signal.provisional : Signal.live;
                                 clickable: true;
                                 clicked => { State.refresh-profile-suggestion(); State.profile-sheet-open = true; }
                             }
@@ -328,13 +327,13 @@ export component AppWindow inherits Window {
                         // "author a macro" (SYSTEM→BEACONS) lands here: once INPUT→DIRECT is active,
                         // defer one frame (so the panel has laid out + macro-y is valid), then scroll
                         // the page to the MACRO editor and clear the request. One-shot — clearing the
-                        // flag stops the timer, and viewport-y is set imperatively (not bound), so the
+                        // flag stops the timer, and content-y is set imperatively (not bound), so the
                         // wheel still scrolls freely afterwards.
                         Timer {
                             interval: 16ms;
                             running: State.macro-jump-pending && State.page == 2 && State.input-view == 0;
                             triggered => {
-                                bp_page.viewport-y = -max(0px, min(bp.macro-y, bp_page.viewport-height - bp_page.height));
+                                bp_page.content-y = -max(0px, min(bp.macro-y, bp_page.content-height - bp_page.height));
                                 State.macro-jump-pending = false;
                             }
                         }
@@ -342,7 +341,7 @@ export component AppWindow inherits Window {
                             interval: 16ms;
                             running: State.system-jump-target != "" && State.page == 3;
                             triggered => {
-                                system_page.viewport-y = -max(0px, min(sp.anchor-y(State.system-jump-target), system_page.viewport-height - system_page.height));
+                                system_page.content-y = -max(0px, min(sp.anchor-y(State.system-jump-target), system_page.content-height - system_page.height));
                                 State.system-jump-target = "";
                             }
                         }
@@ -358,7 +357,7 @@ export component AppWindow inherits Window {
                             interval: 16ms;
                             running: root.rules-jump-pending && State.page == 2 && State.input-view == 0;
                             triggered => {
-                                bp_page.viewport-y = -max(0px, min(bp.rules-y - 16px, bp_page.viewport-height - bp_page.height));
+                                bp_page.content-y = -max(0px, min(bp.rules-y - 16px, bp_page.content-height - bp_page.height));
                                 root.rules-jump-pending = false;
                             }
                         }
@@ -374,7 +373,7 @@ export component AppWindow inherits Window {
                             interval: 16ms;
                             running: root.wire-jump-pending && State.page == 2 && State.input-view == 0;
                             triggered => {
-                                bp_page.viewport-y = -max(0px, min(bp.wire-y - 24px, bp_page.viewport-height - bp_page.height));
+                                bp_page.content-y = -max(0px, min(bp.wire-y - 24px, bp_page.content-height - bp_page.height));
                                 root.wire-jump-pending = false;
                             }
                         }
@@ -453,8 +452,8 @@ export component AppWindow inherits Window {
                         }
 
                         // WRITES PAUSED: the global device-write kill-switch — click = go to its gate.
-                        // The lamp makes it read as a THROWN switch, not inert text. Provisional, not
-                        // consequence: it is paused on purpose and nothing is broken.
+                        // The provisional ink makes it read as a THROWN switch, not inert text. Provisional,
+                        // not consequence: it is paused on purpose and nothing is broken.
                         if State.writes-paused : HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
@@ -480,14 +479,13 @@ export component AppWindow inherits Window {
                         }
 
                         // THE GATE: armed/safe. SAFE -> ARMED takes a confirming second click (real
-                        // keystrokes are consequential); ARMED -> SAFE disarms instantly. The lamp makes
-                        // the gate read as a physical switch, not inert text — live=armed, provisional=arm?,
-                        // a dim dot=safe.
+                        // keystrokes are consequential); ARMED -> SAFE disarms instantly. The word carries
+                        // the state — live ink=armed, provisional=arm?, dim=safe.
                         HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
                             // lit in either loud state — live when ARMED, provisional when ARM?; SAFE is the
-                            // unlit gutter (StatusLamp draws lamp-off + the text-dim ink, hover→text-mid).
+                            // unlit text-dim ink, hover→text-mid.
                             StatusLamp {
                                 text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : State.arm-held != "" ? "arming" : "safe";
                                 lit: State.input-armed || root.arm-confirm || State.arm-held != "";
@@ -589,8 +587,8 @@ export component AppWindow inherits Window {
             TouchArea {}   // swallow clicks inside — only the backdrop closes
             Flickable {
                 interactive: false;   // wheel-only, like the panels
-                viewport-width: self.width;
-                viewport-height: menu.preferred-height;
+                content-width: self.width;
+                content-height: menu.preferred-height;
                 // `menu`'s own height must tie back to the viewport (the same convention PanelPage's
                 // `body` uses above). Left unbound, the VerticalLayout sizes itself independently of
                 // the number this Flickable's viewport (and the card's opaque background, sized off
@@ -598,7 +596,7 @@ export component AppWindow inherits Window {
                 // hair apart, and the sliver of content past the background's edge renders over the
                 // translucent scrim instead of the opaque card, i.e. the panel behind bleeds through
                 // the sheet's own lower edge.
-                menu := ProfilesMenu { width: parent.viewport-width; height: parent.viewport-height; }
+                menu := ProfilesMenu { width: parent.content-width; height: parent.content-height; }
             }
         }
     }
@@ -665,7 +663,7 @@ export component AppWindow inherits Window {
             // a comfortable readable height, capped to 70% of the glass. NOT derived from the inner
             // content's preferred-height: that lives inside the Flickable, whose geometry doesn't
             // propagate out to this ancestor binding (it reads ~0 and collapses the card). The body
-            // Flickable FILLS this height and scrolls its content via viewport-height instead.
+            // Flickable FILLS this height and scrolls its content via content-height instead.
             height: min(420px, parent.height * 0.7);
             opacity: State.guide-open ? 1.0 : 0.0;
             background: Theme.bg-2;
@@ -678,6 +676,9 @@ export component AppWindow inherits Window {
             property <length> grab-x;
             property <length> grab-y;
             property <bool> tb-down: false;
+            // a new guide or tab opens at its top, not where the last one was scrolled to
+            property <string> scroll-key: State.guide-active-id + ":" + State.guide-active-tab;
+            changed scroll-key => { gflick.content-y = 0px; }
             // whether a band of the guide's body is in view, so its Luma-T ink animates only then
             // and the window rests while it is scrolled away
             pure function shows(top: length, h: length) -> bool {
@@ -731,20 +732,6 @@ export component AppWindow inherits Window {
                         padding-left: 12px;
                         padding-right: 6px;
                         spacing: 9px;
-                        // a faint grip affordance — two columns of dots
-                        VerticalLayout {
-                            alignment: center;
-                            HorizontalLayout {
-                                spacing: 2px;
-                                for gxc in [0, 1] : VerticalLayout {
-                                    spacing: 2px;
-                                    for gyc in [0, 1, 2] : Rectangle {
-                                        width: 2px; height: 2px; border-radius: 1px;
-                                        background: Theme.text-faint;
-                                    }
-                                }
-                            }
-                        }
                         // the active guide's title (only the matching guide renders)
                         VerticalLayout {
                             alignment: center;
@@ -777,16 +764,17 @@ export component AppWindow inherits Window {
                 Rectangle { height: Theme.hair; background: Theme.line; }
                 // ── CONTENT — the active guide's sections, scrollable (wheel-only, like the panels) ──
                 // The Flickable absorbs the card's remaining height (the VBox stretches it past the
-                // fixed title bar + hairline). viewport-height = the REAL content height (the inner
+                // fixed title bar + hairline). content-height = the REAL content height (the inner
                 // body VBox's preferred-height, measured INSIDE the Flickable where it's valid — the
                 // PanelPage pattern), so it scrolls when the guide outgrows the card.
-                Flickable {
-                    interactive: true;   // capture the wheel HERE so scrolling the popup never scrolls the page behind it
-                    viewport-width: self.width;
-                    viewport-height: body.preferred-height;   // the REAL content height → scrolls when the guide outgrows the card
+                gflick := Flickable {
+                    // wheel only: a vertical drag that starts in a code cell selects its text instead of flicking
+                    interactive: false;
+                    content-width: self.width;
+                    content-height: body.preferred-height;   // the REAL content height → scrolls when the guide outgrows the card
                     body := VerticalLayout {
-                        width: parent.viewport-width;
-                        height: parent.viewport-height;
+                        width: parent.content-width;
+                        height: parent.content-height;
                         alignment: start;   // pack sections from the top; slack (if any) sits at the bottom
                         padding: 16px;
                         spacing: 0px;
@@ -802,7 +790,7 @@ export component AppWindow inherits Window {
                             // of just an empty popup.
                             if g.id == State.guide-active-id && g.tabs.length > 0 : activetab := VerticalLayout {
                                 spacing: 18px;
-                                padding-bottom: g.tabs.length > 1 ? 36px : 0px;
+                                padding-bottom: g.tabs.length > 1 ? 44px : 0px;
                                 // the tab this guide is showing, clamped in case a stale index ever
                                 // outlives its guide (guide-toggle already resets it to 0 on open).
                                 property <int> tab-idx: clamp(State.guide-active-tab, 0, g.tabs.length - 1);
@@ -842,16 +830,40 @@ export component AppWindow inherits Window {
                                                 // a READ-ONLY TextInput (not a Text): renders identical to the
                                                 // editor's CodeArea, but the snippet is now SELECTABLE (drag /
                                                 // Ctrl-C) and is the clipboard source the copy button drives.
-                                                codeti := TextInput {
-                                                    text: b.text;
-                                                    read-only: true;
-                                                    color: Theme.text;
-                                                    font-family: Theme.mono;
-                                                    font-size: Theme.fs-data;
-                                                    single-line: false;
-                                                    wrap: no-wrap;   // preserve indentation + comment alignment
+                                                // A wide line scrolls sideways (wheel only, so a drag still
+                                                // selects text) instead of overflowing the cell.
+                                                hscroll := Flickable {
+                                                    min-width: 0px;
+                                                    preferred-width: 0px;
+                                                    horizontal-stretch: 1;
+                                                    preferred-height: codeti.preferred-height;
+                                                    interactive: false;
+                                                    content-width: codeti.width;
+                                                    content-height: codeti.preferred-height;
+                                                    codeti := TextInput {
+                                                        x: 0px;
+                                                        y: 0px;
+                                                        height: self.preferred-height;
+                                                        width: max(hscroll.width, self.preferred-width);
+                                                        text: b.text;
+                                                        read-only: true;
+                                                        color: Theme.text;
+                                                        font-family: Theme.mono;
+                                                        font-size: Theme.fs-data;
+                                                        single-line: false;
+                                                        wrap: no-wrap;   // preserve indentation + comment alignment
+                                                    }
                                                 }
-                                                Rectangle {}   // soak leftover width so the cell spans the card
+                                            }
+                                            // a cut line trails off under a fade (the RampName edge) rather than
+                                            // stopping mid-letter; gone once scrolled to the end
+                                            if codeti.width > hscroll.width + 0.5px
+                                                && hscroll.content-x > hscroll.width - codeti.width + 0.5px : Rectangle {
+                                                x: parent.width - self.width - 1px;
+                                                y: 1px;
+                                                width: min(44px, parent.width / 4);
+                                                height: parent.height - 2px;
+                                                background: @linear-gradient(90deg, Theme.well.with-alpha(0) 0%, Theme.well 72%, Theme.well 100%);
                                             }
                                             // ── floating COPY button — pinned top-right, painted OVER the cell
                                             // (declared after the layout). The snippet literally says "paste it";
@@ -903,6 +915,7 @@ export component AppWindow inherits Window {
                                                     commands: "M5 13 L9 17 L19 6";
                                                 }
                                                 cta := TouchArea {
+                                                    enabled: State.guide-open && gcard.opacity > 0.5;
                                                     mouse-cursor: MouseCursor.pointer;
                                                     clicked => {
                                                         codeti.select-all();
@@ -926,76 +939,84 @@ export component AppWindow inherits Window {
                     }
                 }
             }
-            // ── TAB DOCK — a genuinely FLOATING island, absolutely overlaid on the card instead of
-            // living in its own reserved footer row. The old reserved strip read as a permanent black
-            // chin under the guide even when nothing needed it; this way the body keeps the card's
-            // full height (the scrollable content runs right underneath, and the last inch of a long
-            // guide simply scrolls in behind the pill) and the pill only ever costs the screen space
-            // it actually occupies. Surfaces only when this guide has more than one tab.
+            // ── TAB DOCK — a floating island overlaid on the card, not a reserved footer row, so the
+            // body keeps the card's full height. A fade to the card colour sits behind it so scrolling
+            // text never shows around the pill, and the body's bottom padding lets the last line
+            // scroll fully above it. Only when this guide has more than one tab.
             for g in GuideContent.guides : Rectangle {
-                if g.id == State.guide-active-id && g.tabs.length > 1 : HorizontalLayout {
+                if g.id == State.guide-active-id && g.tabs.length > 1 : Rectangle {
                     x: 0;
-                    y: gcard.height - self.height - 10px;
+                    y: 0;
                     width: gcard.width;
-                    height: 30px;
-                    alignment: center;
-                    // the pill itself: fixed-width cells (the labels are short curated words, not
-                    // arbitrary text), so the active mark can glide as ONE piece between them by
-                    // simple arithmetic instead of measuring neighbours. A soft drop-shadow lifts it
-                    // off whatever's scrolling underneath instead of reading flush with the card.
-                    dock := Rectangle {
-                        property <length> cell-w: 80px;
-                        property <int> tab-idx: clamp(State.guide-active-tab, 0, g.tabs.length - 1);
+                    height: gcard.height;
+                    Rectangle {
+                        x: 0;
+                        y: gcard.height - self.height;
+                        width: gcard.width;
+                        height: 58px;
+                        background: @linear-gradient(180deg, Theme.bg-2.with-alpha(0) 0%, Theme.bg-2 62%, Theme.bg-2 100%);
+                    }
+                    HorizontalLayout {
+                        x: 0;
+                        y: gcard.height - self.height - 10px;
+                        width: gcard.width;
                         height: 30px;
-                        width: dock.cell-w * g.tabs.length;
-                        border-radius: self.height / 2;
-                        // a hair short of opaque — enough that a scrolling line of code underneath
-                        // never fights the tab labels for legibility, but still a whisper glassy
-                        // rather than a flat opaque slab pretending it isn't floating over content.
-                        background: Theme.bg-2.with-alpha(0.94);
-                        border-width: Theme.hair;
-                        border-color: Theme.line;
-                        drop-shadow-color: Theme.bg.with-alpha(0.8);
-                        drop-shadow-blur: 16px;
-                        drop-shadow-offset-y: 4px;
-                        // the MARK — one capsule that glides + settles under the active label, instead
-                        // of N cells each independently cross-fading their own fill (which read as a
-                        // static swap, not a slide). Inset 4px on every side — clear of the dock's own
-                        // rounded ends, so the two radii never collide into a mismatched-corner seam.
-                        mark := Rectangle {
-                            y: 4px;
-                            height: dock.height - 8px;
-                            width: dock.cell-w - 8px;
-                            x: dock.tab-idx * dock.cell-w + 4px;
+                        alignment: center;
+                        dock := Rectangle {
+                            property <length> cell-w: 80px;
+                            property <int> tab-idx: clamp(State.guide-active-tab, 0, g.tabs.length - 1);
+                            height: 30px;
+                            width: dock.cell-w * g.tabs.length;
                             border-radius: self.height / 2;
-                            background: Theme.accent-glow;
+                            // a hair short of opaque — enough that a scrolling line of code underneath
+                            // never fights the tab labels for legibility, but still a whisper glassy
+                            // rather than a flat opaque slab pretending it isn't floating over content.
+                            background: Theme.bg-2.with-alpha(0.94);
                             border-width: Theme.hair;
-                            border-color: Theme.accent-line;
-                            // a decisive glide that settles without overshoot (the app's motion rule:
-                            // mechanical, not bouncy) — quick departure, soft arrival.
-                            animate x { duration: 260ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
-                        }
-                        HorizontalLayout {
-                            for t[i] in g.tabs : cell := Rectangle {
-                                property <bool> on: dock.tab-idx == i;
-                                width: dock.cell-w;
-                                Text {
-                                    text: t.label;
-                                    width: min(self.preferred-width, parent.width);
-                                    overflow: elide;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    color: cell.on ? Theme.accent
-                                        : (tabta.has-hover ? Theme.text-mid : Theme.text-dim);
-                                    font-family: Theme.mono;
-                                    font-size: Theme.fs-small;
-                                    font-weight: 700;
-                                    letter-spacing: Theme.track-2;
-                                    animate color { duration: Theme.quick; }
-                                }
-                                tabta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { State.guide-active-tab = i; }
+                            border-color: Theme.line;
+                            drop-shadow-color: Theme.bg.with-alpha(0.8);
+                            drop-shadow-blur: 16px;
+                            drop-shadow-offset-y: 4px;
+                            // the MARK — one capsule that glides + settles under the active label, instead
+                            // of N cells each independently cross-fading their own fill (which read as a
+                            // static swap, not a slide). Inset 4px on every side — clear of the dock's own
+                            // rounded ends, so the two radii never collide into a mismatched-corner seam.
+                            mark := Rectangle {
+                                y: 4px;
+                                height: dock.height - 8px;
+                                width: dock.cell-w - 8px;
+                                x: dock.tab-idx * dock.cell-w + 4px;
+                                border-radius: self.height / 2;
+                                background: Theme.accent-glow;
+                                border-width: Theme.hair;
+                                border-color: Theme.accent-line;
+                                // a decisive glide that settles without overshoot (the app's motion rule:
+                                // mechanical, not bouncy) — quick departure, soft arrival.
+                                animate x { duration: 260ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            }
+                            HorizontalLayout {
+                                for t[i] in g.tabs : cell := Rectangle {
+                                    property <bool> on: dock.tab-idx == i;
+                                    width: dock.cell-w;
+                                    Text {
+                                        text: t.label;
+                                        width: min(self.preferred-width, parent.width);
+                                        overflow: elide;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        color: cell.on ? Theme.accent
+                                            : (tabta.has-hover ? Theme.text-mid : Theme.text-dim);
+                                        font-family: Theme.mono;
+                                        font-size: Theme.fs-small;
+                                        font-weight: 700;
+                                        letter-spacing: Theme.track-2;
+                                        animate color { duration: Theme.quick; }
+                                    }
+                                    tabta := TouchArea {
+                                        enabled: State.guide-open && gcard.opacity > 0.5;
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => { State.guide-active-tab = i; }
+                                    }
                                 }
                             }
                         }

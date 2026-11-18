@@ -47,7 +47,7 @@ anyhow.workspace = true
 # graphics support. NEURON_RENDERER=software selects the latter explicitly. Slint's
 # selector can fall back during backend construction, but graphics initialization can
 # fail later when the window opens, so selection is not a driver compatibility test.
-slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg", "renderer-software"] }
+slint = { version = "=1.19.0", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg", "renderer-software"] }
 # webp/jpeg: release-notes images (docs/media is webp), decoded off the UI thread.
 image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "jpeg"] }
 cpal.workspace = true
@@ -102,7 +102,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [build-dependencies]
-slint-build = "1.16"
+slint-build = "=1.19.0"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1" # Embed neuron's mark as the executable's icon.
@@ -112,7 +112,7 @@ default = []
 # A Steam build: Steam updates the app, so the self-updater stays off.
 steam = []
 # Opt-in experimental WGPU UI renderer; layered overlays and materials remain CPU paths.
-wgpu-renderer = ["slint/renderer-femtovg-wgpu", "slint/unstable-wgpu-28"]
+wgpu-renderer = ["slint/renderer-femtovg-wgpu", "slint/unstable-wgpu-29"]
 
 [dev-dependencies]
 proptest = "1"

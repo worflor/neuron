@@ -2116,14 +2116,9 @@ fn present(
 
 /// Mirror the presented prompt (or its absence) into the UI: the header pill + the readout.
 fn mirror_active(weak: &slint::Weak<AppWindow>, shared: &Shared, p: Option<&Prompt>) {
-    let (active, text, hint, who) = match p {
-        Some(p) => (
-            true,
-            format!("{} \u{00b7} {}", p.macro_id, p.text),
-            "hold the cast trigger\n\u{2192} yes \u{00b7} \u{2190} no \u{00b7} \u{2195} pass".to_string(),
-            p.macro_id.clone(),
-        ),
-        None => (false, String::new(), String::new(), String::new()),
+    let (active, who) = match p {
+        Some(p) => (true, p.macro_id.clone()),
+        None => (false, String::new()),
     };
     let queued = {
         let (q, _) = &**shared;
@@ -2135,8 +2130,6 @@ fn mirror_active(weak: &slint::Weak<AppWindow>, shared: &Shared, p: Option<&Prom
         if let Some(app) = w.upgrade() {
             let st = app.global::<State>();
             st.set_beacon_active(active);
-            st.set_beacon_text(text.into());
-            st.set_beacon_hint(hint.into());
             st.set_beacon_macro(who.into());
             st.set_beacon_count(queued as i32);
             if active {
@@ -2170,8 +2163,6 @@ fn mirror_count(weak: &slint::Weak<AppWindow>, shared: &Shared) {
             st.set_beacon_count(queued as i32);
             if queued == 0 {
                 st.set_beacon_active(false);
-                st.set_beacon_text("".into());
-                st.set_beacon_hint("".into());
                 st.set_beacon_macro("".into());
             }
         }

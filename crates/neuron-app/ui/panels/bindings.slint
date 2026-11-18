@@ -3,7 +3,7 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 import { Theme, Signal } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, InputHead, GuideButton, SplitToggle, SplitButton, TriggerWell, Lamp, FaderRow, DeviceEmblem, DeviceBadge } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, InputHead, GuideButton, SplitToggle, SplitButton, TriggerWell, FaderRow, DeviceEmblem, DeviceBadge } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { RuleRow, PocketCard, MacroBlock, MacroCard } from "../models.slint";
 
@@ -71,9 +71,9 @@ component PocketCardEl inherits Rectangle {
             }
             Rectangle {
                 width: 36px; height: 18px; border-radius: Theme.radius-sm;
-                background: forget-hit.has-hover ? Theme.well : transparent;
+                background: root.forget-armed ? Theme.danger : forget-hit.has-hover ? Theme.well : transparent;
                 border-width: Theme.hair; border-color: root.forget-armed ? Theme.danger : Theme.line;
-                Text { text: root.forget-armed ? "sure?" : "×"; color: root.forget-armed ? Theme.danger : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; horizontal-alignment: center; vertical-alignment: center; }
+                Text { text: root.forget-armed ? "sure?" : "×"; color: root.forget-armed ? Theme.danger.darker(0.9) : forget-hit.has-hover ? Theme.danger : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; horizontal-alignment: center; vertical-alignment: center; }
                 forget-hit := TouchArea {
                     mouse-cursor: MouseCursor.pointer;
                     clicked => {
@@ -211,7 +211,7 @@ component MacroCardEl inherits Rectangle {
                     // U+00D7 (×) — the app's proven close glyph; the dingbat U+2715 (✕) isn't in the mono
                     // font (renders blank). Matches the guide-popup X.
                     text: "\u{00d7}";
-                    color: root.armed ? Theme.text : (xta.has-hover ? Theme.danger : Theme.text-faint);
+                    color: root.armed ? Theme.danger.darker(0.9) : (xta.has-hover ? Theme.danger : Theme.text-faint);
                     font-family: Theme.mono;
                     font-size: Theme.fs-data;
                     horizontal-alignment: center;
@@ -283,11 +283,8 @@ component WireEditor inherits Card {
     VerticalLayout {
         padding: 13px;
         spacing: Theme.gap;
-        // header — a provisional lamp (the wire is a draft until saved) + which layer/mode this
-        // wire is, close at the edge
+        // header — which layer/mode this wire is, close at the edge
         HorizontalLayout {
-            spacing: 8px;
-            VerticalLayout { alignment: center; Lamp { signal: Signal.provisional; } }
             VerticalLayout { alignment: center; Mono { text: (root.editing ? "edit binding · on " : "bind a control · on ") + (root.hyper ? "HYPERSHIFT" : "BASE"); color: Theme.text; } }
             Rectangle {}
             VerticalLayout { alignment: center; Button { text: "close"; clicked => { root.close(); } } }
@@ -1609,13 +1606,19 @@ export component BindingsPanel inherits VerticalLayout {
                             property <length> scroll: 0px;
                             pan := TouchArea {
                                 scroll-event(e) => {
-                                    carousel.scroll = clamp(carousel.scroll + e.delta-y + e.delta-x, carousel.floor, 0px);
+                                    // pans while it can move that way; at an end the page scrolls as usual
+                                    let from = clamp(carousel.scroll, carousel.floor, 0px);
+                                    let to = clamp(from + e.delta-y + e.delta-x, carousel.floor, 0px);
+                                    if (to == from) {
+                                        return reject;
+                                    }
+                                    carousel.scroll = to;
                                     return accept;
                                 }
                             }
                             for c[i] in State.macro-catalog : MacroCardEl {
                                 c: c;
-                                x: i * carousel.step + carousel.scroll;
+                                x: i * carousel.step + clamp(carousel.scroll, carousel.floor, 0px);
                                 width: 248px;
                                 height: parent.height;
                             }

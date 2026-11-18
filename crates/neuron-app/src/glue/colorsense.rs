@@ -552,7 +552,24 @@ fn show(app: &AppWindow, rows: &[Row], chosen: usize, pins: &[bool], doubts: &[O
         }
     }).collect();
     st.set_assist_prime(rows.iter().position(|row| row.num == 1).map_or(-1, |i| i as i32));
-    update_value_model(st.get_assist_offers(), rows, |model| st.set_assist_offers(model));
+    patch_offers(st.get_assist_offers(), rows, |model| st.set_assist_offers(model));
+}
+
+/// Bring the offers model to `rows` in place, so a change in count keeps the surviving dots' items
+/// (and their fade) alive; only a model that is not ours is replaced.
+fn patch_offers(existing: ModelRc<AssistOffer>, rows: Vec<AssistOffer>, install: impl FnOnce(ModelRc<AssistOffer>)) {
+    use slint::Model as _;
+    let Some(model) = existing.as_any().downcast_ref::<VecModel<AssistOffer>>() else {
+        install(ModelRc::new(VecModel::from(rows)));
+        return;
+    };
+    let common = model.row_count().min(rows.len());
+    let mut rows = rows.into_iter();
+    for (index, row) in (0..common).zip(rows.by_ref()) {
+        if model.row_data(index).as_ref() != Some(&row) { model.set_row_data(index, row); }
+    }
+    while model.row_count() > common { model.remove(model.row_count() - 1); }
+    for row in rows { model.push(row); }
 }
 
 /// The dot at plane point (`x`, `y`) of a plane `w` by `h` pixels: the nearest within reach.
@@ -756,11 +773,12 @@ fn roll_now(app: &AppWindow, sh: &SharedRt) {
     });
     let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
     let seed = clock ^ count.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    // a roll that lands on the palette as it is would look like nothing happened
-    let Some(stops) = (0..4u64)
-        .map(|attempt| roll::roll(model.as_deref(), &roll::Roll { stops: &palette.stops, held: &held, selected: chosen, library: &others, mode, wild, seed: seed.wrapping_add(attempt) }))
-        .find(|stops| !roll::same(stops, &palette.stops))
-    else {
+    // a roll that lands on the palette as it is would look like nothing happened, and one equal to a
+    // roll already in the row would be waved off together with it
+    let kept: Vec<Vec<Stop>> = SENSE.with(|sense| sense.borrow().rolls.iter().map(|(_, offer)| offer.stops.clone()).collect());
+    let attempts = (0..4u64)
+        .map(|attempt| roll::roll(model.as_deref(), &roll::Roll { stops: &palette.stops, held: &held, selected: chosen, library: &others, mode, wild, seed: seed.wrapping_add(attempt) }));
+    let Some(stops) = first_new_roll(attempts, &palette.stops, &kept) else {
         return;
     };
     let title = match mode {
@@ -779,6 +797,11 @@ fn roll_now(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     preview(app, sh, 0);
     st.set_assist_keyed(0);
+}
+
+/// The first candidate that differs from the palette as it is and from every roll already kept.
+fn first_new_roll(candidates: impl Iterator<Item = Vec<Stop>>, palette: &[Stop], kept: &[Vec<Stop>]) -> Option<Vec<Stop>> {
+    candidates.into_iter().find(|stops| !roll::same(stops, palette) && !kept.iter().any(|kept| roll::same(stops, kept)))
 }
 
 /// Hold the selected stop against every offer, or let it go.
@@ -1117,4 +1140,25 @@ pub(super) fn install(app: &AppWindow, sh: &SharedRt) {
             refresh(&app, &sh);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stops(cols: &[(u8, u8, u8)]) -> Vec<Stop> {
+        let n = cols.len().max(2) - 1;
+        cols.iter().enumerate().map(|(i, &(r, g, b))| Stop { at: i as f32 / n as f32, col: Rgb { r, g, b } }).collect()
+    }
+
+    #[test]
+    fn a_roll_never_repeats_the_palette_or_a_kept_roll() {
+        let palette = stops(&[(10, 10, 10), (200, 0, 0)]);
+        let kept = vec![stops(&[(0, 200, 0), (0, 0, 200)])];
+        let fresh = stops(&[(90, 90, 0), (0, 90, 90)]);
+        let candidates = vec![palette.clone(), kept[0].clone(), fresh.clone()];
+        assert_eq!(first_new_roll(candidates.into_iter(), &palette, &kept), Some(fresh));
+        let only_repeats = vec![palette.clone(), kept[0].clone()];
+        assert_eq!(first_new_roll(only_repeats.into_iter(), &palette, &kept), None);
+    }
 }

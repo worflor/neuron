@@ -139,6 +139,9 @@ export component SensePicker inherits VerticalLayout {
                     let row = State.assist-option(Math.round(e.text.to-float()));
                     if (row >= 0) {
                         if (State.assist-keyed == row) { State.assist-accept(row); } else { self.draft(row); }
+                    } else if (!State.assist-tab-held) {
+                        // no such option: leave the digit to the window's page shortcuts
+                        return reject;
                     }
                     self.chord = State.assist-tab-held;
                     return accept;

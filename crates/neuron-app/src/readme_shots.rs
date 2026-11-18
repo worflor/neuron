@@ -9,6 +9,9 @@
 //! `NEURON_SHOT_SCENE=<device|lighting|input|weave|system|profiles> NEURON_SHOT_OUT=<png>
 //! cargo test -p neuron-app --bin neuron-app -- --ignored --exact readme_shots::shot`.
 //! `NEURON_SHOT_GRADIENT=1` renders a three-stop Uniform palette in the lighting scene.
+//! The `layers` scene is the lighting page with Wildlife buried over Tidepool; `NEURON_SHOT_LAYERS`
+//! picks the moment: `before` (the trouble and its fixes), `preview` (the first fix playing on the
+//! board) or `after` (that fix kept).
 //! `overlay_radial`, `overlay_glyph` and `notif_cards` dump the real overlay renderer's frames into the
 //! directory named by `NEURON_SHOT_OUT`. Seeded state is demo data; devices are phantoms. The
 //! `docs/media` images are these renders composed over a wallpaper crop with Pillow (not committed).
@@ -34,7 +37,11 @@ fn mock_bus() {
     naga.info.usage_page = 0x0001;
     naga.info.usage = 0x0002;
     bus.with(naga);
-    let mut kb = MockDevice::razer(0x0221, "Razer BlackWidow Chroma V2").answering(0x00, 0x81, &[2, 0]);
+    // the board neuron holds in driver mode, as the real one answers (ledger razer/00/84, razer/00/04)
+    let mut kb = MockDevice::razer(0x0221, "Razer BlackWidow Chroma V2")
+        .answering(0x00, 0x81, &[2, 0])
+        .answering(0x00, 0x84, &[0x03, 0x00])
+        .answering(0x00, 0x04, &[0x03, 0x00]);
     kb.info.usage_page = 0x0001;
     kb.info.usage = 0x0002;
     bus.with(kb);
@@ -80,7 +87,9 @@ fn shot() {
     let weak = app.as_weak();
     slint::Timer::single_shot(Duration::from_millis(300), move || {
         let app = weak.upgrade().unwrap();
-        std::mem::forget(crate::glue::install(&app));
+        let shared = crate::glue::install(&app);
+        SHARED.with(|s| *s.borrow_mut() = Some(shared.clone()));
+        std::mem::forget(shared);
         app.global::<State>().invoke_refresh_devices();
         let weak2 = app.as_weak();
         let scene2 = scene.clone();
@@ -121,6 +130,35 @@ fn shot() {
     app.run().unwrap();
 }
 
+thread_local! {
+    static SHARED: std::cell::RefCell<Option<crate::glue::SharedRt>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Wildlife at full strength over Tidepool, as a look added by hand might sit: stack sense finds
+/// Tidepool buried and offers fixes.
+fn seed_layers(app: &AppWindow, moment: &str) {
+    let st = app.global::<State>();
+    let Some(shared) = SHARED.with(|s| s.borrow().clone()) else { return };
+    {
+        let mut state = shared.borrow_mut();
+        let mut wildlife = neuron::pattern::preset_layer("wildlife").unwrap();
+        wildlife.blend = neuron::effects::Blend::Normal;
+        wildlife.opacity = 1.0;
+        state.light_layers = vec![neuron::pattern::preset_layer("tidepool").unwrap(), wildlife];
+        state.selected_layer = 1;
+    }
+    crate::glue::refresh_layers(app, &shared);
+    let offer = st.get_light_sense_offers().row_data(0).map(|o| o.offer);
+    match (moment, offer) {
+        ("preview", Some(o)) => st.invoke_light_sense_preview(o),
+        ("after", Some(o)) => {
+            st.invoke_light_sense_preview(o);
+            st.invoke_light_sense_accept(o);
+        }
+        _ => {}
+    }
+}
+
 fn save_snapshot(app: &AppWindow, path: &str) {
     if env("NEURON_SHOT_SCENE").as_deref() == Some("lighting") && env("NEURON_SHOT_GRADIENT").is_some() {
         let st = app.global::<State>();
@@ -146,17 +184,18 @@ fn select_and_open(app: &AppWindow, scene: &str) {
     let st = app.global::<State>();
     let (page, view) = match scene {
         "device" | "profiles" => (0, 0),
-        "lighting" => (1, 0),
+        "lighting" | "layers" => (1, 0),
         "input" | "macro" | "controllers" => (2, 0),
         "weave" => (2, 1),
         "system" => (3, 0),
         _ => (scene.parse().unwrap_or(0), 0),
     };
-    let dev = if scene == "lighting" { "BlackWidow" } else { "Naga" };
+    let lit = matches!(scene, "lighting" | "layers");
+    let dev = if lit { "BlackWidow" } else { "Naga" };
     st.invoke_select_device(device_index(app, dev));
     st.set_page(page);
     st.set_input_view(view);
-    if scene == "lighting" {
+    if lit {
         st.set_window_shown(true);
         let gradient = env("NEURON_SHOT_GRADIENT").is_some();
         st.invoke_pick_tile(if gradient { "static" } else { "aurora" }.into());
@@ -243,6 +282,9 @@ fn seed_picker(app: &AppWindow, moment: &str) {
 
 fn finish_seed(app: &AppWindow, scene: &str) {
     let st = app.global::<State>();
+    if scene == "layers" {
+        seed_layers(app, &env("NEURON_SHOT_LAYERS").unwrap_or_else(|| "before".into()));
+    }
     if scene == "lighting" {
         if let Some(moment) = env("NEURON_SHOT_PICKER") {
             seed_picker(app, &moment);
@@ -296,7 +338,7 @@ fn finish_seed(app: &AppWindow, scene: &str) {
     let sel = st.get_selected_device();
     st.set_devices(model(keep));
     st.set_selected_device(sel.clamp(0, 1));
-    if scene != "lighting" {
+    if !matches!(scene, "lighting" | "layers") {
         st.set_dpi(1600.0);
         st.set_polling_hz(1000.0);
         st.set_brightness(75.0);

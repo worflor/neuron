@@ -14,6 +14,7 @@
 //   * MONOSPACE-FORWARD — data is the hero. The default font is the mono; prose is the exception.
 //   * FOUR SIGNAL LAMPS, each answering one question about the thing it sits on; everything else is
 //     monochrome ink on black. See `Signal` below. Never decoration.
+//     A Lamp draws the shape; pills and the status bar draw no lamp and ink their text in the hue.
 //   * Motion MECHANICAL not bouncy — controls settle (short, linear-ish); nothing animates AT you.
 //   * Dense but breathing — hairlines and negative space do the structuring, not boxes.
 
@@ -79,8 +80,7 @@ export global Theme {
         if (s == Signal.consequence) { return root.danger; }
         return root.text-mid;
     }
-    // an UNLIT lamp — the visible "off" dot every lamp gutter shows so labels never slide when a
-    // signal toggles (Pill's idiom, now named for the rails/strips that draw their own lamps)
+    // an UNLIT lamp: the visible "off" dot, so labels never slide when a signal toggles
     out property <color> lamp-off:     #353b4480;   // text-faint at half strength
     // the dim poured behind a modal overlay (one value for every sheet — was d8 vs cc)
     out property <color> scrim:       #000000d8;
@@ -133,7 +133,7 @@ export global Theme {
     out property <length> row-h-sm:  28px;
     out property <length> seg-h:     26px;
     out property <length> dot:       5px;    // the phosphor lamp dot (a live contact)
-    out property <length> dot-lg:    6px;    // the larger station / wordmark lamp
+    out property <length> dot-lg:    6px;    // the default Lamp size
     out property <length> modal-inset: 70px; // a modal card's margin from the window edge
     out property <float>  dim-gated: 0.55;   // an inactive / gated section's opacity
     out property <float>  battery-low-frac: 0.2;  // charge fraction below which a cell gauge reads WARN (not a magic 0.2)

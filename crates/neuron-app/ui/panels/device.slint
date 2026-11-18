@@ -3,7 +3,7 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 import { Theme, Signal } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead, SplitButton, SplitToggle, LampRail, Disclosure, SelectTick, Lamp, SheenText } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead, SplitButton, SplitToggle, LampRail, Disclosure, SelectTick, SheenText, Lamp } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { DeviceRow } from "../models.slint";
 
@@ -118,7 +118,8 @@ component CapHead inherits HorizontalLayout {
             alignment: center;
             Text {
                 text: root.term;
-                color: Theme.text-dim;
+                // a verify-gated hardware write wears its term in warn ink
+                color: root.gated ? Theme.warn.with-alpha(0.85) : Theme.text-dim;
                 font-size: Theme.fs-small;
                 font-family: Theme.mono;
                 font-weight: 700;
@@ -147,13 +148,6 @@ component CapHead inherits HorizontalLayout {
             vertical-alignment: center;
             overflow: elide;
         }
-    }
-    // marks a verify-gated hardware write with the same provisional lamp as the card's
-    // "verify-gated" pill; a lamp rather than a second pill, since the header already carries the
-    // legend.
-    if root.gated : VerticalLayout {
-        alignment: center;
-        Lamp { signal: Signal.provisional; tint: Theme.warn.with-alpha(0.6); }
     }
 }
 
@@ -195,26 +189,104 @@ component FeelTile inherits Rectangle {
 // device already filled in.
 component AskWhatWorks inherits Rectangle {
     callback clicked();
+    // how its lighting settled on the device: 0 not yet, 1 its writes landed, 2 a correction waits
+    // on a hand-edited file, 3 no write was seen to land
+    in property <int> trust;
     // it gives way before the row does: in a narrow column it elides and the row keeps its width
     horizontal-stretch: 0;
     min-width: 0;
-    preferred-width: lbl.preferred-width;
+    preferred-width: row.preferred-width;
     clip: true;
-    lbl := Text {
-        width: parent.width;
-        height: parent.height;
-        overflow: elide;
-        text: "learned · tell me what works";
-        color: ta.has-hover ? Theme.accent : Theme.accent-dim;
-        font-size: Theme.fs-small;
-        font-family: Theme.mono;
-        vertical-alignment: center;
-        animate color { duration: ta.has-hover ? Theme.hover-in : Theme.hover-out; }
+    row := HorizontalLayout {
+        spacing: 6px;
+        if root.trust > 0 : Lamp {
+            signal: root.trust == 1 ? Signal.live : root.trust == 2 ? Signal.provisional : Signal.consequence;
+        }
+        Text {
+            horizontal-stretch: 1;
+            min-width: 0;
+            overflow: elide;
+            text: "learned · tell me what works";
+            color: ta.has-hover ? Theme.accent : Theme.accent-dim;
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+            vertical-alignment: center;
+            animate color { duration: ta.has-hover ? Theme.hover-in : Theme.hover-out; }
+        }
     }
     ta := TouchArea {
         mouse-cursor: MouseCursor.pointer;
         clicked => { root.clicked(); }
     }
+}
+
+// The BATT cell: the shared key-over-value Readout rhythm with the drawn cell gauge appended after the
+// value, so the strip keeps one baseline (value leads the second row, the gauge trails it).
+component BattReadout inherits VerticalLayout {
+    in property <DeviceRow> d;
+    alignment: center; spacing: 3px;
+    Text {
+        text: "BATT";
+        color: Theme.text-faint;
+        font-size: Theme.fs-small;
+        font-family: Theme.mono;
+        letter-spacing: Theme.track-3;
+    }
+    HorizontalLayout {
+        spacing: 6px;
+        // value first — matches Readout's fs-data/600 value line (the shared baseline)
+        Text {
+            text: root.d.battery;
+            color: root.d.charging ? Theme.accent : Theme.text-mid;
+            animate color { duration: Theme.quick; }
+            font-size: Theme.fs-data;
+            font-weight: 600;
+            font-family: Theme.mono;
+            vertical-alignment: center;
+        }
+        if root.d.charging : Text {
+            text: "CHG";
+            color: Theme.accent;
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+            letter-spacing: Theme.track-2;
+            vertical-alignment: center;
+        }
+        // the drawn cell gauge, appended after the value — a level is a gauge, not a string
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 30px; height: 8px;
+                border-width: Theme.hair;
+                border-color: Theme.line;
+                border-radius: 1px;
+                Rectangle {
+                    x: 1px; y: 1px;
+                    height: parent.height - 2px;
+                    width: max(0px, (parent.width - 2px) * max(0.0, root.d.battery-frac));
+                    background: root.d.charging ? Theme.accent
+                        : root.d.battery-frac < Theme.battery-low-frac ? Theme.warn
+                        : Theme.text-dim;
+                    animate background { duration: Theme.quick; }
+                }
+            }
+        }
+    }
+}
+
+// The strip's always-first readouts, most-glanced first: DPI · POLL · BATT · LIGHT · PLATE. Each shows
+// only where the descriptor says it is real — a keyboard never prints "DPI —".
+component DeviceStripCore inherits HorizontalLayout {
+    in property <DeviceRow> d;
+    spacing: 13px;
+    if root.d.cap-dpi : Readout { key: "DPI"; value: root.d.dpi; }
+    if root.d.cap-poll : Readout { key: "POLL"; value: root.d.polling; }
+    if root.d.battery != "" : BattReadout { d: root.d; }
+    // LIGHT keys on the brightness GETTER, not the lighting block, so an incomplete custom definition
+    // never leaves a permanently unreadable value in the UI.
+    if root.d.cap-bright : Readout { key: "LIGHT"; value: root.d.brightness; }
+    // SIDE PLATE is push-only: shown once a plate has been reported, so it is never a lie.
+    if root.d.cap-plate && root.d.plate != "" : Readout { key: "PLATE"; value: root.d.plate; }
 }
 
 // One device channel — flat strip; a phosphor index tick marks the selected one.
@@ -223,7 +295,8 @@ component DeviceLine inherits Rectangle {
     in property <bool> selected;
     callback clicked();
     callback backup();
-    height: 84px;
+    // the identity header (~34px) + spacing + the 30px strip needs more than the strip-less row's 84px
+    height: root.has-strip ? 100px : 84px;
     clip: true;
     border-radius: Theme.radius;
     // A placeholder (adopting) row is an ANNOTATION, not a device: dim the whole row and suppress
@@ -246,6 +319,20 @@ component DeviceLine inherits Rectangle {
     property <bool> lone-fw: !root.d.cap-dpi && !root.d.cap-poll && root.d.battery == ""
         && !root.d.cap-bright && root.d.storage == ""
         && !(root.d.cap-plate && root.d.plate != "");
+    property <bool> has-strip: root.d.pid != "" && !root.d.adopting && !root.lone-fw;
+    property <length> sto-x: core-m.preferred-width + 13px;
+    property <length> fw-x: (root.d.storage != "" ? root.sto-x + sto-m.preferred-width : core-m.preferred-width) + 13px;
+    // Natural widths of the strip's droppable tail, measured off the same cells the strip draws.
+    core-m := DeviceStripCore { d: root.d; visible: false; x: 0px; y: 0px; width: 0px; height: 0px; }
+    sto-m := Readout { key: "ONBOARD"; value: root.d.storage; visible: false; x: 0px; y: 0px; width: 0px; height: 0px; }
+    fw-m := Readout { key: "FW"; value: root.d.firmware; visible: false; x: 0px; y: 0px; width: 0px; height: 0px; }
+    pure function show-sto(room: length) -> bool {
+        return root.d.storage != "" && room >= core-m.preferred-width + 13px + sto-m.preferred-width;
+    }
+    pure function show-fw(room: length) -> bool {
+        return room >= core-m.preferred-width + (root.d.storage != "" ? 13px + sto-m.preferred-width : 0px)
+            + 13px + fw-m.preferred-width;
+    }
     // A wireless mouse that hasn't spoken yet shows "—" for every live readout while the FEEL panel
     // confidently shows its CONFIG values — two halves of one screen disagreeing about whether the
     // device is connected. The strip earns a one-line explanation instead of four bare dashes.
@@ -261,7 +348,7 @@ component DeviceLine inherits Rectangle {
     // `backup` (the trailing child) flush-right against the card's ACTUAL laid-out width — there is no
     // parent.width arithmetic that can diverge from the rendered width (the flaw that put `backup`
     // ~50px past the card border in every absolute-positioned attempt). `main` (stretch:1) eats the
-    // slack so `backup` lands at one identical x; the data strip is a preferred-0 Flickable (min 0,
+    // slack so `backup` lands at one identical x; the data strip is a clipped Rectangle (min 0,
     // preferred 0) so it can neither push `backup` nor inflate the card, and the header elides — so the
     // card's intrinsic width stays tiny and the deck VBox stretches every card to the uniform column
     // width. Same shape as the profiles app-rule rows (flow list, trailing action at one x).
@@ -284,22 +371,16 @@ component DeviceLine inherits Rectangle {
             horizontal-stretch: 1;
             alignment: center;
             spacing: 9px;
-            // header: a persistent connection LAMP + name + pid/link mode. The hover sheen stays a
-            // flourish, but at REST a connected row now reads at a glance (accent dot) vs a dropped one
-            // (dark lamp-off gutter) — before, rest-state connected and disconnected rendered identically.
+            // header: name + pid/link mode. A dropped device's name rests in faint ink.
             HorizontalLayout {
-                spacing: 8px;
-                VerticalLayout {
-                    alignment: center;
-                    Lamp { lit: root.d.connected; }
-                }
                 VerticalLayout {
                     alignment: center; spacing: 3px;
                     horizontal-stretch: 1;
                     SheenText {
                         value: root.d.name;
                         live: root.sheen-live;
-                        ink: root.selected ? Theme.text : Theme.text-mid;
+                        ink: !root.d.connected ? Theme.text-faint
+                            : root.selected ? Theme.text : Theme.text-mid;
                         size: Theme.fs-data;
                         weight: 700;
                         tracking: Theme.track-1;
@@ -320,103 +401,49 @@ component DeviceLine inherits Rectangle {
                         }
                         // a device neuron learned on its own asks, right here, what works on it
                         if root.d.learned && !root.d.adopting : AskWhatWorks {
+                            trust: root.d.lighting-trust;
                             clicked => { State.report-device(root.d.name, root.d.mode); }
                         }
                     }
                 }
             }
-            // data strip — most-glanced first: DPI · POLL · BATT · LIGHT · ONBOARD · FW. A preferred-0
-            // Flickable: it neither pushes `backup` (min 0) nor inflates the card (preferred 0); it clips
-            // the trailing (least-glanced) readouts when the card is tight. The PAGE owns scrolling.
+            // data strip — most-glanced first: DPI · POLL · BATT · LIGHT · ONBOARD · FW. A clipped
+            // Rectangle reports no width of its own, so it neither pushes `backup` nor inflates the
+            // card (and, unlike a Flickable, it does not swallow the list's wheel). The trailing
+            // (least-glanced) readouts are dropped whole when the card is tight.
             // Gated on !adopting too: a placeholder has all caps false + empty battery/storage, so
             // only "FW —" would render — a dead readout on a row that isn't a device. Suppress the
             // strip entirely so a placeholder is just its name + mode line.
-            if root.d.pid != "" && !root.d.adopting && !root.lone-fw : Flickable {
+            if root.has-strip : Rectangle {
                 height: 30px;
-                interactive: false;
-                // NO viewport-width binding: the content lays out at its natural width and the Flickable
-                // CLIPS it at its own (main-allocated) width. Binding viewport-width to self.width made
-                // the Flickable's preferred track its content, so a readout-heavy device leaked ~360px
-                // into `main` and squeezed the trailing `backup` button (its label overflowed its box).
-                    HorizontalLayout {
-                        spacing: 13px;
-                    // capability-gated readouts — a keyboard never prints "DPI —", a lightless mouse
-                    // never prints "LIGHT —"; each key shows only where the descriptor says it's real.
-                    if root.d.cap-dpi : Readout { key: "DPI"; value: root.d.dpi; }
-                    if root.d.cap-poll : Readout { key: "POLL"; value: root.d.polling; }
-                    // BATT rides the SAME key-over-value Readout rhythm as DPI/POLL (identical label row),
-                    // with the drawn cell gauge APPENDED after the value — so the vitals strip shares one
-                    // baseline: the value leads the second row, the gauge trails it as a graphic footnote.
-                    if root.d.battery != "" : VerticalLayout {
-                        alignment: center; spacing: 3px;
-                        Text {
-                            text: "BATT";
-                            color: Theme.text-faint;
-                            font-size: Theme.fs-small;
-                            font-family: Theme.mono;
-                            letter-spacing: Theme.track-3;
-                        }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            // value first — matches Readout's fs-data/600 value line (the shared baseline)
-                            Text {
-                                text: root.d.battery;
-                                color: root.d.charging ? Theme.accent : Theme.text-mid;
-                                animate color { duration: Theme.quick; }
-                                font-size: Theme.fs-data;
-                                font-weight: 600;
-                                font-family: Theme.mono;
-                                vertical-alignment: center;
-                            }
-                            if root.d.charging : Text {
-                                text: "CHG";
-                                color: Theme.accent;
-                                font-size: Theme.fs-small;
-                                font-family: Theme.mono;
-                                letter-spacing: Theme.track-2;
-                                vertical-alignment: center;
-                            }
-                            // …then the drawn cell gauge, appended after the value — a level is a gauge, not a string
-                            VerticalLayout {
-                                alignment: center;
-                                Rectangle {
-                                    width: 30px; height: 8px;
-                                    border-width: Theme.hair;
-                                    border-color: Theme.line;
-                                    border-radius: 1px;
-                                    Rectangle {
-                                        x: 1px; y: 1px;
-                                        height: parent.height - 2px;
-                                        width: max(0px, (parent.width - 2px) * max(0.0, root.d.battery-frac));
-                                        background: root.d.charging ? Theme.accent
-                                            : root.d.battery-frac < Theme.battery-low-frac ? Theme.warn
-                                            : Theme.text-dim;
-                                        animate background { duration: Theme.quick; }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // LIGHT keys on the brightness GETTER, not the lighting block. An incomplete
-                    // custom definition must not leave a permanently unreadable value in the UI.
-                    if root.d.cap-bright : Readout { key: "LIGHT"; value: root.d.brightness; }
-                    if root.d.storage != "" : Readout { key: "ONBOARD"; value: root.d.storage; }
-                    // SIDE PLATE — push-only readout under the mouse it belongs to (capability-gated,
-                    // shown only once a plate has actually been reported, so it's never a lie).
-                    if root.d.cap-plate && root.d.plate != "" : Readout { key: "PLATE"; value: root.d.plate; }
-                    Readout { key: "FW"; value: root.d.firmware; }
-                    // the strip-level explanation for a sleeping wireless device — one quiet clause
-                    // instead of a row of dashes that contradicts the FEEL panel's config values.
-                    if root.asleep : VerticalLayout {
-                        alignment: center;
-                        Text {
-                            text: "asleep · readouts return when it moves";
-                            color: Theme.text-faint;
-                            font-size: Theme.fs-small;
-                            font-family: Theme.mono;
-                        }
-                    }
-                    Rectangle {}
+                clip: true;
+                min-width: 0px;
+                preferred-width: 0px;
+                // Placed by arithmetic, not by a layout: which readouts show depends on this width, so
+                // their placement cannot also feed the row's own layout.
+                DeviceStripCore { d: root.d; x: 0px; width: core-m.preferred-width; height: parent.height; }
+                Readout {
+                    visible: root.show-sto(parent.width);
+                    x: root.sto-x; width: sto-m.preferred-width; height: parent.height;
+                    key: "ONBOARD"; value: root.d.storage;
+                }
+                Readout {
+                    visible: root.show-fw(parent.width);
+                    x: root.fw-x; width: fw-m.preferred-width; height: parent.height;
+                    key: "FW"; value: root.d.firmware;
+                }
+                // the strip-level explanation for a sleeping wireless device — one quiet clause
+                // instead of a row of dashes that contradicts the FEEL panel's config values.
+                if root.asleep : Text {
+                    x: root.show-fw(parent.width) ? root.fw-x + fw-m.preferred-width + 13px
+                        : root.show-sto(parent.width) ? root.sto-x + sto-m.preferred-width + 13px
+                        : core-m.preferred-width + 13px;
+                    height: parent.height;
+                    text: "asleep · readouts return when it moves";
+                    color: Theme.text-faint;
+                    font-size: Theme.fs-small;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
                 }
             }
         }
@@ -1010,7 +1037,7 @@ export component DevicePanel inherits VerticalLayout {
     // happen. Opening now scrolls its own content into view.
     //
     // WHY A TIMER rather than scrolling in the click handler: the drawer's height eases open over
-    // `Theme.settle`, and i-slint-core's Flickable clamps `viewport-y` against the extent it has
+    // `Theme.settle`, and i-slint-core's Flickable clamps `content-y` against the extent it has
     // RIGHT NOW (`ensure_in_bound`, items/flickable.rs) — and its re-clamp handler only ever pulls
     // an OUT-of-bounds viewport back in, never re-scrolls one that is already legal. Scroll on the
     // click and you are clamped to the pre-growth bottom, which then stays "in bounds" forever as
@@ -1028,7 +1055,7 @@ export component DevicePanel inherits VerticalLayout {
         triggered => {
             // most-negative legal offset == the Flickable's own lower bound (h - vh), floored at 0
             // so a drawer that already fits can't scroll a short column upward.
-            insp.viewport-y = min(0px, insp.height - insp.viewport-height);
+            insp.content-y = min(0px, insp.height - insp.content-height);
             root.reveal-ticks += 1;
             if (root.reveal-ticks >= 8) { self.running = false; }   // 320ms ≈ 3x Theme.settle
         }
@@ -1081,46 +1108,56 @@ export component DevicePanel inherits VerticalLayout {
 
         // ── device channels ───────────────────────────────────────────────
         VerticalLayout {
-            spacing: 8px;
             horizontal-stretch: 2;
             preferred-width: 440px;
-            alignment: start;   // top-pack the channel cards (the column now fills the height)
             // a width FLOOR for the list. The cards now report ~0 preferred width (their content lives
-            // in a preferred-0 Flickable so it can't inflate the column), which is what stops the row
+            // in a clipped Rectangle so it can't inflate the column), which is what stops the row
             // overflowing into FEEL — but it also means the column would otherwise collapse toward
             // FEEL's larger preferred. This floor keeps the list wide: 420 + FEEL's 410 + the 24
             // gutter = 854, inside the 856 work area at the 900px-min window.
             min-width: 420px;
-            if State.devices.length == 0 : VerticalLayout {
-                padding-top: 24px; spacing: 6px;
-                Mono { text: "no recognized Razer devices"; color: Theme.text-dim; }
-                Mono { text: "plug one in and press scan"; }
-            }
-            // The cards stack in a plain VerticalLayout (the page-level PanelPage Flickable owns the
-            // vertical scroll). The trick that makes this work where every prior attempt failed: a
-            // DeviceLine's children are ABSOLUTELY positioned (the identity/data clip + the geometry-
-            // pinned backup, both keyed off parent.width), so the card imposes NO min-width of its own
-            // → it reports 0 → the VerticalLayout stretches EVERY card to the identical column width
-            // with zero overflow. No explicit card width (that was circular: card.width = deck.width fed
-            // the card's own width back into the deck and inflated the row past its slot). Same shape as
-            // the profiles app-rule rows — a flow list with a trailing action that sits at one x.
-            VerticalLayout {
-                spacing: 5px;
-                for d[i] in State.devices : DeviceLine {
-                    d: d;
-                    selected: i == State.selected-device;
-                    clicked => { State.select-device(i); }
-                    backup => { State.backup-device(d.id); }
+            // Wheel-only like `insp`: many devices plus audio endpoints can outgrow the minimum window.
+            Flickable {
+                interactive: false;
+                // bounded by the column, not by its rows: the rows are what scrolls
+                min-height: 0px;
+                preferred-height: 0px;
+                vertical-stretch: 1;
+                content-width: self.width;
+                content-height: max(self.height, lbody.preferred-height);
+                lbody := VerticalLayout {
+                    width: parent.content-width;
+                    height: parent.content-height;
+                    spacing: 8px;
+                    alignment: start;   // top-pack the channel cards
+                    if State.devices.length == 0 : VerticalLayout {
+                        padding-top: 24px; spacing: 6px;
+                        Mono { text: "no recognized Razer devices"; color: Theme.text-dim; }
+                        Mono { text: "plug one in and press scan"; }
+                    }
+                    // The cards stack in a plain VerticalLayout that stretches every card to one column width: a
+                    // DeviceLine reports ~0 preferred width (its data strip is a clipped Rectangle), so no
+                    // card inflates the row. No explicit card width (card.width = deck.width would feed back
+                    // into the deck). The list scrolls by the wheel in the Flickable above.
+                    VerticalLayout {
+                        spacing: 5px;
+                        for d[i] in State.devices : DeviceLine {
+                            d: d;
+                            selected: i == State.selected-device;
+                            clicked => { State.select-device(i); }
+                            backup => { State.backup-device(d.id); }
+                        }
+                    }
+                    // Unclaimed vendor pipes are an INVENTORY fact, not device channels — their functional
+                    // faces (the audio endpoint rows) already list above; a row per pipe double-listed real
+                    // hardware (live complaint 2026-07-07). One dim line answers "why isn't my device a
+                    // channel" without pretending the pipe is one.
+                    if State.unclaimed-note != "" : Mono {
+                        text: State.unclaimed-note;
+                        color: Theme.text-faint;
+                        overflow: elide;
+                    }
                 }
-            }
-            // Unclaimed vendor pipes are an INVENTORY fact, not device channels — their functional
-            // faces (the audio endpoint rows) already list above; a row per pipe double-listed real
-            // hardware (live complaint 2026-07-07). One dim line answers "why isn't my device a
-            // channel" without pretending the pipe is one.
-            if State.unclaimed-note != "" : Mono {
-                text: State.unclaimed-note;
-                color: Theme.text-faint;
-                overflow: elide;
             }
         }
 
@@ -1142,13 +1179,13 @@ export component DevicePanel inherits VerticalLayout {
                 // once it had scrolled, while working fine maximized (nothing to scroll). `interactive:
                 // false` drops the drag gesture; the mouse wheel still scrolls.
                 interactive: false;
-                viewport-width: self.width;
-                viewport-height: max(self.height, ibody.preferred-height);
+                content-width: self.width;
+                content-height: max(self.height, ibody.preferred-height);
                 ibody := VerticalLayout {
-                    width: parent.viewport-width;
+                    width: parent.content-width;
                     // fill the viewport (match PanelPage's body) so the scroll geometry is exact; cards
                     // still sit at NATURAL size, top-packed (alignment:start) — no stretch / empty-gap.
-                    height: parent.viewport-height;
+                    height: parent.content-height;
                     alignment: start;
                     // a little breathing room under the last element at max-scroll.
                     padding-bottom: 18px;
@@ -1397,6 +1434,7 @@ export component DevicePanel inherits VerticalLayout {
                                         SplitButton {
                                             left-text: "re-capture";
                                             right-text: "unbind";
+                                            right-danger: true;
                                             left-clicked => { State.capture-sniper-button(); }
                                             right-clicked => { State.unbind-sniper(); }
                                         }
@@ -1663,11 +1701,17 @@ export component DevicePanel inherits VerticalLayout {
                         // separate HyperPolling Wireless Dongle / Viper-8K-class hardware; the Naga's stock
                         // dongle is legacy-capped at 1000Hz. When the selected device CAN'T reach the
                         // extended tiers we show an honest line instead of fake 2000–8000Hz chips.
-                        if root.adv-sensor : VerticalLayout {
+                        if root.adv-sensor : hp := VerticalLayout {
+                            // the rate picked here, kept apart from the confirmed one so the readout
+                            // never shows a rate the device hasn't echoed back; 0 = nothing picked
+                            property <int> pick: 0;
+                            changed pick-for => { self.pick = 0; }
+                            property <string> pick-for: State.selected-device-name;
                             spacing: 9px;
                             CapHead {
                                 term: "HYPERPOLLING";
-                                readout: State.sel-can-hyperpoll ? round(State.ingame-wired-hz) + " Hz" : "1000 Hz max";
+                                readout: !State.sel-can-hyperpoll ? "1000 Hz max"
+                                    : State.ingame-wired-hz > 0 ? round(State.ingame-wired-hz) + " Hz" : "—";
                                 gated: State.sel-can-hyperpoll;
                             }
                             if !State.sel-can-hyperpoll : GateNote {
@@ -1678,16 +1722,16 @@ export component DevicePanel inherits VerticalLayout {
                             }
                             if State.sel-can-hyperpoll : ContactRow {
                                 options: [1000, 2000, 4000, 8000];
-                                value: round(State.ingame-wired-hz);
+                                value: hp.pick > 0 ? hp.pick : round(State.ingame-wired-hz);
                                 enabled: !State.writes-paused;
-                                picked(hz) => { State.ingame-wired-hz = hz; }
+                                picked(hz) => { hp.pick = hz; }
                             }
                             if State.sel-can-hyperpoll : HorizontalLayout {
                                 Rectangle { horizontal-stretch: 1; }
                                 Button {
                                     text: "apply";
-                                    enabled: !State.writes-paused;
-                                    clicked => { State.apply-ingame-polling(State.ingame-wired-hz, State.ingame-dongle-hz); }
+                                    enabled: !State.writes-paused && hp.pick > 0;
+                                    clicked => { State.apply-ingame-polling(hp.pick); }
                                 }
                             }
                         }

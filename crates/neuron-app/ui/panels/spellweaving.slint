@@ -159,8 +159,9 @@ export component SpellweavingPanel inherits VerticalLayout {
                     VerticalLayout { alignment: center;
                         Button {
                             text: State.recording-activation ? "perform…" : "record";
-                            enabled: !State.recording-activation && !State.capturing-gesture;
-                            clicked => { State.record-activation(); }
+                            signal: State.recording-activation ? Signal.listening : Signal.idle;
+                            enabled: !State.capturing-gesture;
+                            clicked => { if (!State.recording-activation) { State.record-activation(); } }
                         }
                     }
                 }
@@ -488,6 +489,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                                 }
                                 Button {
                                     text: "rename";
+                                    primary: root.rename-to != "";
                                     enabled: root.rename-to != "";
                                     clicked => {
                                         State.rename-gesture(State.gesture-bind-target, root.rename-to);

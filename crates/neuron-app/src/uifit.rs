@@ -501,6 +501,21 @@ pub(crate) fn rect_of(window: &slint::Window, name: &str) -> Option<(f32, f32, f
     scan(window).into_iter().find(|n| n.path.ends_with(name) && shown(n)).map(|n| (n.rect.x, n.rect.y, n.rect.w, n.rect.h))
 }
 
+/// Where every element whose path ends with `name` is laid out (cut off or not), in drawing order.
+pub(crate) fn rects_of(window: &slint::Window, name: &str) -> Vec<(f32, f32, f32, f32)> {
+    scan(window).into_iter().filter(|n| n.path.ends_with(name)).map(|n| (n.rect.x, n.rect.y, n.rect.w, n.rect.h)).collect()
+}
+
+/// Every element whose path ends with `name`, as "path @ x,y wxh (shown)": for a test message that
+/// says what was drawn when an element it looks for is missing.
+pub(crate) fn drawn_as(window: &slint::Window, name: &str) -> Vec<String> {
+    scan(window)
+        .into_iter()
+        .filter(|n| n.path.ends_with(name))
+        .map(|n| format!("{} @ {},{} {}x{} (shown: {})", n.path, n.rect.x, n.rect.y, n.rect.w, n.rect.h, shown(&n)))
+        .collect()
+}
+
 /// How much of the window blinks across three frames taken a moment apart with nothing done in
 /// between: pixels that change and then change back (a and c alike, b different). A hover fade
 /// or a running animation moves one way and does not count; a flicker does. 0..1 of the window.

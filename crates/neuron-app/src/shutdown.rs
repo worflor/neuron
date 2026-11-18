@@ -132,9 +132,15 @@ mod platform {
     }
 
     fn same_image_path(left: &OsStr, right: &OsStr) -> bool {
-        let left = normalize_path(left);
-        let right = normalize_path(right);
-        equal_utf16_ignore_case(&left, &right)
+        if equal_utf16_ignore_case(&normalize_path(left), &normalize_path(right)) {
+            return true;
+        }
+        // Windows reports a running image at its resolved path, while a copy started through a
+        // junction or symlink knows itself by the path it was started from: compare where both lead.
+        match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => equal_utf16_ignore_case(&normalize_path(left.as_os_str()), &normalize_path(right.as_os_str())),
+            _ => false,
+        }
     }
 
     fn select_target_pids(
@@ -280,6 +286,26 @@ mod platform {
         use std::ffi::OsString;
         use std::os::windows::ffi::OsStringExt;
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn a_copy_started_through_a_junction_is_the_same_image() {
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("neuron-junction-{stamp}"));
+            let real = root.join("real");
+            std::fs::create_dir_all(&real).unwrap();
+            std::fs::write(real.join("neuron-app.exe"), b"").unwrap();
+            let link = root.join("link");
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"]).arg(&link).arg(&real)
+                .output().is_ok_and(|out| out.status.success());
+            if made {
+                assert!(same_image_path(link.join("neuron-app.exe").as_os_str(), real.join("neuron-app.exe").as_os_str()));
+                assert!(!same_image_path(link.join("neuron-app.exe").as_os_str(), root.join("other.exe").as_os_str()));
+                let _ = std::fs::remove_dir(&link);
+            }
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(made, "mklink /J is available without elevation");
+        }
 
         #[test]
         fn selection_requires_the_same_image_and_excludes_self() {

@@ -513,8 +513,6 @@ fn main() {
         };
         let st = app.global::<State>();
         st.set_input_armed(armed);
-        st.set_arm_stance(glue::arm_stance(neuron::writes::writes_paused(), armed));
-        st.set_runtime_active(input_supported);
         st.set_status_line(
             if !input_supported {
                 "device settings and lighting are available; live remaps need a Linux input backend"
@@ -763,15 +761,6 @@ fn main() {
                     }
                 }
 
-                // LINK lamp: lights only while the live loop is alive.
-                if slow_due {
-                    if let Some(live) = r.live.as_ref() {
-                        let running = input_supported && live.running();
-                        if st.get_runtime_active() != running {
-                            st.set_runtime_active(running);
-                        }
-                    }
-                }
                 // RELIABILITY panel: repaint uptime / organ heartbeats / crash record ~1s (a readout that
                 // doesn't age is a lie — the flight recorder is live, so the panel must breathe with it).
                 if slow_due {
@@ -845,7 +834,6 @@ fn main() {
                     let armed_now = neuron::action::input_armed();
                     if st.get_input_armed() != armed_now {
                         st.set_input_armed(armed_now);
-                        st.set_arm_stance(glue::arm_stance(neuron::writes::writes_paused(), armed_now));
                         neuron::macros::macro_host().set_armed(armed_now); // keep the macro sidecar's gate honest
                     }
                 }

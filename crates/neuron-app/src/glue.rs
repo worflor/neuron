@@ -106,7 +106,24 @@ fn update_param_model(st: &State, mut rows: Vec<EffectParam>, target: Option<(cr
         existing.row_data(i).is_some_and(|old| old.key == row.key && old.kind == row.kind)
     });
     if !same_schema {
-        forget_param_previews();
+        // An `only_when` param appearing or vanishing changes the row count; the rows that stay keep
+        // their option previews so the picker thumbnails do not flash blank.
+        let mut kept: Vec<String> = Vec::new();
+        if same_target {
+            for row in &mut rows {
+                let old = (0..existing.row_count()).filter_map(|i| existing.row_data(i)).find(|old| {
+                    old.key == row.key && old.kind == row.kind
+                        && old.options.row_count() == row.options.row_count()
+                        && (0..old.options.row_count()).all(|j| old.options.row_data(j) == row.options.row_data(j))
+                });
+                if let Some(old) = old {
+                    row.options = old.options;
+                    row.previews = old.previews;
+                    kept.push(row.key.to_string());
+                }
+            }
+        }
+        forget_param_previews(&kept);
         st.set_light_params(ModelRc::new(VecModel::from(rows)));
         return;
     }
@@ -122,19 +139,64 @@ fn update_param_model(st: &State, mut rows: Vec<EffectParam>, target: Option<(cr
         }
     }
     if fresh {
-        forget_param_previews();
+        forget_param_previews(&[]);
     }
     update_value_model(existing, rows, |model| st.set_light_params(model));
 }
 
 /// Blank preview images are about to replace the option previews on screen: forget which frames
 /// they last showed, so the next frame of each option is drawn even when it matches the last one.
-fn forget_param_previews() {
+/// Options of the params in `keep` still hold their images and are left alone.
+fn forget_param_previews(keep: &[String]) {
     LIGHT_PREVIEW.with(|p| {
         if let Ok(mut p) = p.try_borrow_mut() {
-            p.last_rgb.retain(|id, _| !matches!(id, crate::light_render::SurfaceId::ParamOption(..)));
+            p.last_rgb.retain(|id, _| match id {
+                crate::light_render::SurfaceId::ParamOption(key, _) => keep.contains(key),
+                _ => true,
+            });
         }
     });
+}
+
+/// The colour stops of the ColorPicker prism's horizontal gradient, evenly spaced; the twin of the
+/// `@linear-gradient` stops on the prism in `ui/widgets/controls.slint`. Keep the two in step.
+const PRISM_STOPS: [[u8; 3]; 8] = [
+    [0xff, 0x3b, 0x5c], [0xff, 0x8f, 0x1f], [0xff, 0xd6, 0x0a], [0x34, 0xd6, 0x5a],
+    [0x20, 0xc9, 0xd6], [0x2f, 0x7b, 0xff], [0x8a, 0x5c, 0xff], [0xff, 0x3b, 0x5c],
+];
+
+/// The hex (bare RRGGBB) of the prism pixel at `hue` across and `bright` up (both 0..1): the gradient
+/// at x, darkened by the prism's brightness wash (clear down to 42% of the height, then to 60% black
+/// at the bottom; the `#00000099` stop in `controls.slint`).
+fn prism_hex(hue: f32, bright: f32) -> String {
+    let x = hue.clamp(0.0, 1.0) * (PRISM_STOPS.len() - 1) as f32;
+    let i = (x.floor() as usize).min(PRISM_STOPS.len() - 2);
+    let f = x - i as f32;
+    let down = 1.0 - bright.clamp(0.0, 1.0);
+    let dark = 0.6 * ((down - 0.42) / 0.58).clamp(0.0, 1.0);
+    let channel = |c: usize| {
+        let base = f32::from(PRISM_STOPS[i][c]) * (1.0 - f) + f32::from(PRISM_STOPS[i + 1][c]) * f;
+        (base * (1.0 - dark)).round().clamp(0.0, 255.0) as u8
+    };
+    format!("{:02x}{:02x}{:02x}", channel(0), channel(1), channel(2))
+}
+
+#[cfg(test)]
+mod prism_tests {
+    use super::{prism_hex, PRISM_STOPS};
+
+    #[test]
+    fn prism_picks_the_colour_it_draws() {
+        for (i, stop) in PRISM_STOPS.iter().enumerate() {
+            let hex = prism_hex(i as f32 / (PRISM_STOPS.len() - 1) as f32, 1.0);
+            assert_eq!(hex, format!("{:02x}{:02x}{:02x}", stop[0], stop[1], stop[2]), "stop {i}");
+        }
+        // halfway between two stops, and the top 42% of the pad is not darkened
+        assert_eq!(prism_hex(0.5 / 7.0, 1.0), "ff653e");
+        assert_eq!(prism_hex(0.0, 0.58), "ff3b5c");
+        // the bottom edge is the stop at 40% brightness
+        assert_eq!(prism_hex(0.0, 0.0), "661825");
+    }
 }
 
 /// The app's weak handle, installed ONCE at startup — the reach-back a non-UI subsystem
@@ -222,14 +284,14 @@ fn endpoint_mute_writable(endpoint_name: &str) -> bool {
 
 /// Bridge a device-pushed hardware mute event (see `hidwatch::bridge_mic_mute`) onto the UI thread —
 /// SOURCE-AWARE: `product` is the USB product string of the mic that pushed the tap. The device panel
-/// (and the `mic-muted` pill) update ONLY when the SELECTED endpoint IS that same device, matched by
+/// updates ONLY when the SELECTED endpoint IS that same device, matched by
 /// the SAME shared identity predicate (`neuron::audio::endpoint_matches_product`) `bridge_mic_mute`
 /// resolves the OS endpoint with — one predicate on both sides, so the OS write and the UI mirror can
 /// never disagree about which device an event belongs to (the predicate also refuses an empty
 /// product, so a nameless event can never claim the selected row). Without the match, a tap on mic A
 /// would flip mic B's panel + row detail when B is the selected hardware mic — a wrong-device UI
 /// readout. This push IS how the panel learns of an out-of-band tap (there is no poll any more — see
-/// the deleted `refresh_selected_audio_mute`). The global default-mic `mic-muted` state stays owned
+/// the deleted `refresh_selected_audio_mute`). The global default-mic mute baseline stays owned
 /// by the dispatch loop's Core-Audio mic-tap (device-correct for the default mic), so it isn't
 /// force-set here from an arbitrary source.
 pub fn notify_hardware_mute(product: &str, muted: bool) {
@@ -276,20 +338,18 @@ pub(crate) fn mic_tap_baseline() -> Option<bool> {
     *MIC_TAP_BASELINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// THE single authoritative writer of `State.mic-muted` — every mic-state source (the launch
+/// THE single authoritative recorder of the default mic's mute — every mic-state source (the launch
 /// `mic_mute` reconcile unit, `hidwatch`'s hardware-mute bridge via [`notify_hardware_mute`], the
-/// dispatch mic-tap poll, and a manual "refresh mic") funnels through here; nothing else may call
-/// `set_mic_muted`. No selection gate, no delta gate — it always publishes the CURRENT truth, which
-/// is what fixes the launch-seeding bug (`mic::refresh`'s old too-early read raced hidwatch's
-/// hardware bridge and nothing unconditional ever corrected it before this).
+/// dispatch mic-tap poll, and a manual "refresh mic") funnels through here. No selection gate, no
+/// delta gate — it always records the CURRENT truth.
 ///
-/// Also seeds [`MIC_TAP_BASELINE`] so THIS publish can never later read, on dispatch's own next
+/// Seeds [`MIC_TAP_BASELINE`] so THIS publish can never later read, on dispatch's own next
 /// sample, as a phantom edge it must react to.
 pub fn publish_mic_state(muted: bool) {
-    // Idempotent: if the pill already shows this exact value there is nothing to do — skip the UI
-    // post AND the flight trace, so the dispatch poll (which calls this every ~50ms) can't spam the
-    // flight ring or the event loop with no-op republishes. Only a genuine change (or the first
-    // seed, when the baseline is still None) falls through.
+    // Idempotent: if the baseline already holds this exact value there is nothing to do — skip the
+    // flight trace, so the dispatch poll (which calls this every ~50ms) can't spam the flight ring
+    // with no-op republishes. Only a genuine change (or the first seed, when the baseline is still
+    // None) falls through.
     {
         let mut base = MIC_TAP_BASELINE
             .lock()
@@ -300,13 +360,6 @@ pub fn publish_mic_state(muted: bool) {
         *base = Some(muted);
     }
     crate::flight::trace("reconcile", "mic published", u64::from(muted));
-    let Some(weak) = UI.get() else { return };
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(app) = weak.upgrade() {
-            app.global::<State>().set_mic_muted(muted);
-        }
-    });
 }
 
 /// Register every reconcile unit this app owns + start the worker. Called once from `main`, after
@@ -451,17 +504,6 @@ fn current_action(st: &State) -> (String, String) {
         .get_action_choices()
         .row_data(idx).map_or_else(|| "noop".into(), |c| c.id.to_string());
     (id, st.get_action_param().to_string())
-}
-
-/// The ARM stance (0 OBSERVE · 1 DEVICE · 2 INPUT · 3 LIVE) from the two live gates: writes-paused +
-/// input-armed. The segmented selector and the two header pills both reflect this one truth.
-pub(crate) fn arm_stance(paused: bool, armed: bool) -> i32 {
-    match (paused, armed) {
-        (true, false) => 0,
-        (false, false) => 1,
-        (true, true) => 2,
-        (false, true) => 3,
-    }
 }
 
 /// Derive the LAUNCH mode (0 Manual · 1 Boot-to-tray · 2 Boot-with-window) from the two real truths:
@@ -2106,8 +2148,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // startup's auto-selected device gets the same async live-readout sweep a click gets
     // (no lighting resume — restore_lighting owns the first stream).
     seed_perf_async(app, &shared, false);
-    mic::refresh(app);
-    mic::refresh_output(app);
+    mic::refresh();
     st.set_brush_color(rgb_to_color(brush(app)));
     // the cast hold-trigger label comes from cast.toml — never a hardcoded button name.
     sync_cast_trigger(&st, shared.borrow().rt.cast.trigger);
@@ -2349,7 +2390,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_report_device(move |name, mode| {
-            open_external(&neuron::report::device_report_url(&name, &mode, env!("CARGO_PKG_VERSION")));
+            // What Neuron learned about the device, kept beside its generated file.
+            let evidence = neuron::report::DeviceEvidence::for_name(&name);
+            open_external(&neuron::report::device_report_url_with(&name, &mode, env!("CARGO_PKG_VERSION"), &evidence));
             if let Some(app) = w.upgrade() {
                 app.global::<State>().set_status_line(format!("opened a device report for {name}").into());
             }
@@ -2408,7 +2451,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let applied = st.get_applied_effect();
                         if sel >= 0
                             && sel == applied
-                            && !st.get_animating()
                             && !st.get_writes_paused()
                         {
                             let uses = st
@@ -2460,7 +2502,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         None => ("no effect".into(), false),
                     }
                 };
-                st.set_animating(false);
                 // the accent marks what the device is ACTUALLY running — only on success.
                 if ok {
                     st.set_applied_effect(idx);
@@ -2480,7 +2521,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 };
                 sh.borrow_mut().rt.stop_animation(pid, &unit);
                 let st = app.global::<State>();
-                st.set_animating(false);
                 st.set_applied_effect(-1);
                 st.set_status_line("animation stopped".into());
             }
@@ -2930,6 +2970,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let w = app.as_weak();
             let sh = sh.clone();
             colorsense::install(app, &sh);
+            stacksense::install(app, &sh);
             app.global::<State>().on_set_stop_color(move |idx, hex| {
                 if let (Some(app), Some(c)) = (w.upgrade(), Rgb::parse(hex.as_str())) {
                     colorsense::note_edit(&app, &sh, idx.max(0) as usize);
@@ -3315,8 +3356,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 } else { neuron::pattern::preset_layer(slug).map(|layer| vec![layer]) };
                 let Some(mut incoming) = incoming.filter(|layers| !layers.is_empty()) else { return; };
                 for layer in &mut incoming { layer.id = None; }
-                incoming[0].blend = neuron::effects::Blend::Screen;
-                {
+                // the look's own default blend (a readout's cutout) is where placement starts from; a
+                // saved effect keeps the presentation it was saved with
+                let preferred = incoming[0].blend;
+                let placed = incoming.len() == 1 && !slug.starts_with(USER_TILE_PREFIX);
+                let (position, defs) = {
                     let mut s = sh.borrow_mut();
                     let position = if s.light_layers.is_empty() { 0 } else {
                         s.selected_layer.min(s.light_layers.len() - 1) + usize::from(above)
@@ -3325,6 +3369,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     s.light_layers.splice(position..position, incoming);
                     s.active_frame = 0;
                     s.layers_rev = s.layers_rev.wrapping_add(1);
+                    (position, s.light_layers.clone())
+                };
+                // layering is the person's call; how the new layer lands on the rest is neuron's
+                if placed && defs.len() >= 2 {
+                    let look = stacksense::place(&app, &defs, position, preferred);
+                    if let Some(layer) = sh.borrow_mut().light_layers.get_mut(position) {
+                        layer.blend = look.blend;
+                        layer.opacity = look.opacity;
+                        layer.duck = look.duck;
+                    }
                 }
                 app.global::<State>().set_light_user_effect("".into());
                 app.global::<State>().set_light_sel_stop(0);
@@ -3452,6 +3506,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         if let Some(layer) = s.light_layers.get_mut(sel) {
                             if layer.blend == mode { return; }
                             layer.blend = mode; s.layers_rev += 1;
+                            stacksense::hand_set(&s, s.light_layers[sel].id, stacksense::Setting::Blend);
                         }
                     }
                     refresh_layers(&app, &sh);
@@ -3469,7 +3524,25 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             let opacity = percent.clamp(0.0, 100.0) / 100.0;
                             if layer.opacity.to_bits() == opacity.to_bits() { return; }
                             layer.opacity = opacity; s.layers_rev += 1;
+                            stacksense::hand_set(&s, s.light_layers[sel].id, stacksense::Setting::Opacity);
                         }
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak(); let sh = sh.clone();
+            app.global::<State>().on_set_layer_duck(move |index, on| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let Some(layer) = usize::try_from(index).ok().and_then(|i| s.light_layers.get_mut(i)) else { return; };
+                        if layer.duck == on { return; }
+                        layer.duck = on;
+                        let id = layer.id;
+                        s.layers_rev += 1;
+                        stacksense::hand_set(&s, id, stacksense::Setting::Duck);
                     }
                     refresh_layers(&app, &sh);
                 }
@@ -4449,7 +4522,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                                 s.active_frame = 0;
                                                 s.layers_rev += 1;
                                             }
-                                            st.set_light_paint_mode(false);
                                             // suppress the edit-debounce: this path streams EXPLICITLY just
                                             // below, so a redundant 250ms re-stream on top of it is wasteful.
                                             {
@@ -5499,25 +5571,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
         });
     });
 
-    // ── Audio ────────────────────────────────────────────────────────────
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_refresh_mic(move || {
-            if let Some(app) = w.upgrade() {
-                mic::refresh(&app);
-            }
-        });
-    });
-    // OUTPUT (render) audio — headphone / sound-card volume re-read.
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_refresh_out(move || {
-            if let Some(app) = w.upgrade() {
-                mic::refresh_output(&app);
-            }
-        });
-    });
-
     // ── Settings ─────────────────────────────────────────────────────────
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
@@ -5543,9 +5596,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 neuron::macros::macro_host().set_armed(armed);
                 st.set_writes_paused(paused);
                 st.set_input_armed(armed);
-                st.set_arm_stance(arm_stance(paused, armed));
                 if stopped_anim {
-                    st.set_animating(false);
                     st.set_applied_effect(-1);
                     st.set_compositing(false); // streams stopped — the board is no longer live
                 }
@@ -5592,77 +5643,12 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     });
                 }
                 st.set_input_armed(armed);
-                st.set_arm_stance(arm_stance(neuron::writes::writes_paused(), armed));
                 let status = if armed {
                     "INPUT ARMED — remaps + macros now fire real keystrokes".to_string()
                 } else if let Some(e) = restore_error {
                     format!("input disarmed; button stock restore failed: {e}")
                 } else {
                     "safe-mode — input disarmed (simulate only)".to_string()
-                };
-                st.set_status_line(status.into());
-            }
-        });
-    });
-    // ARM STANCE — the segmented selector: one move sets BOTH gates (writes + input) to the chosen
-    // posture. The header pills + the two flags stay the truth; this just drives them together.
-    bind(app, &shared, |app, sh| {
-        let w = app.as_weak();
-        let sh = sh.clone();
-        app.global::<State>().on_set_arm_stance(move |m| {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                let m = if cfg!(windows) { m } else { match m { 2 => 0, 3 => 1, _ => m } };
-                let mode = match m {
-                    1 => neuron::safety::RuntimeMode::Device,
-                    2 => neuron::safety::RuntimeMode::Input,
-                    3 => neuron::safety::RuntimeMode::Live,
-                    _ => neuron::safety::RuntimeMode::Observe,
-                };
-                let safety = mode.state();
-                let paused = safety.writes_paused;
-                let armed = safety.input_armed;
-                let was_paused = neuron::writes::writes_paused(); // the gate BEFORE this stance move
-                let stopped_anim = {
-                    let mut s = sh.borrow_mut();
-                    let stop = paused && s.rt.any_animating();
-                    if stop {
-                        s.rt.stop_all_animation();
-                    }
-                    stop
-                };
-                let restore_error = crate::buttonfw::set_stance(armed, paused).err();
-                let armed = neuron::action::input_armed();
-                neuron::macros::macro_host().set_armed(armed);
-                if armed {
-                    crate::worker::spawn_detached("neuron-macro-warm", || {
-                        let _ = neuron::macros::macro_host().ensure_warm();
-                    });
-                }
-                if stopped_anim {
-                    st.set_animating(false);
-                    st.set_applied_effect(-1);
-                    st.set_compositing(false); // streams stopped — the board is no longer live
-                }
-                st.set_writes_paused(paused);
-                st.set_input_armed(armed);
-                st.set_arm_stance(arm_stance(paused, armed));
-                // AUTO-APPLY: crossing paused → armed RESUMES every configured board's stack once (parity
-                // with the writes-pause toggle; the manual apply button is gone). A global stop cleared
-                // them all, so restore them all, not just the selected one. No-op on empty stacks.
-                if was_paused && !paused {
-                    reapply_all_boards(&app, &sh);
-                }
-                let status = if let Some(e) = restore_error {
-                    format!("button stock restore failed: {e}")
-                } else {
-                    match m {
-                        1 => "arm → DEVICE (device writes on, input safe)",
-                        2 => "arm → INPUT (remaps + macros fire, writes paused)",
-                        3 => "arm → LIVE (device writes + input synthesis)",
-                        _ => "arm → OBSERVE (read-only: nothing fires)",
-                    }
-                    .to_string()
                 };
                 st.set_status_line(status.into());
             }
@@ -5774,24 +5760,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_preview_hue(move |hue, bright| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                // HSV → RGB at a fixed, phosphor-ish saturation; brightness rides a usable band (never
-                // pure black) so the strip always yields a real accent.
-                let h = hue.clamp(0.0, 1.0) * 6.0;
-                let s = 0.82_f32;
-                let v = 0.32 + 0.63 * bright.clamp(0.0, 1.0);
-                let i = h.floor();
-                let f = h - i;
-                let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
-                let (r, g, b) = match (i as i32).rem_euclid(6) {
-                    0 => (v, t, p),
-                    1 => (q, v, p),
-                    2 => (p, v, t),
-                    3 => (p, q, v),
-                    4 => (t, p, v),
-                    _ => (v, p, q),
-                };
-                let c8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let hex = format!("{:02x}{:02x}{:02x}", c8(r), c8(g), c8(b));
+                let hex = prism_hex(hue, bright);
                 st.set_hex_preview_col(accent_color(&hex));
                 st.set_hex_preview_ok(true);
                 st.set_hex_preview_bad(false);
@@ -6907,10 +6876,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
     st.set_launch_mode(launch_mode_now());
     st.set_writes_paused(neuron::writes::writes_paused());
     st.set_input_armed(neuron::action::input_armed());
-    st.set_arm_stance(arm_stance(
-        neuron::writes::writes_paused(),
-        neuron::action::input_armed(),
-    ));
     // APPEARANCE — paint the saved accents into the live theme + the customiser controls at startup,
     // so a relaunch comes up in the user's colours (the UI accent recolours the whole instrument).
     {
@@ -7002,8 +6967,6 @@ fn init_perf_controls(app: &AppWindow) {
         None => st.set_sniper_button("—".into()),
     }
     sync_stage_nums(&st);
-    // debounce still has no derivable opcode -> unsupported.
-    st.set_debounce_supported(false);
     // The LIVE readouts (idle timeout, DPI stage table, LOD) land asynchronously — see
     // `seed_perf_async`, which the select path drives so the click renders immediately.
 }
@@ -7127,31 +7090,34 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
     );
 }
 
-/// FIRST-LIGHT TX SELF-HEAL hook (DIALECT-RND wave 2b). Decides on the UI thread (cheaply), then
-/// does the device work on a worker thread. Gate: the selected def is AUTO (only synthesized config
-/// may be rewritten in place — a curated/builtin board's board-verified bytes are never touched),
-/// has a lighting block, and this physical unit hasn't been first-light-checked yet this run (the
-/// heal is a probe cost, not a per-apply cost — `healed_units` is the once-per-unit-per-run guard).
+/// FIRST-LIGHT TX SELF-HEAL hook (DIALECT-RND wave 2b) for the selected board. Decides on the UI
+/// thread (cheaply), then does the device work on a worker thread. Gate: the def is AUTO (only
+/// synthesized config may be rewritten in place — a curated/builtin board's board-verified bytes are
+/// never touched), has a lighting block, and this physical unit hasn't been first-light-checked yet
+/// this run (the heal is a probe cost, not a per-apply cost — `healed_units` is the
+/// once-per-unit-per-run guard). [`reapply_all_boards`] runs the same hook for every other board.
 ///
-/// On a HEAL (a cohort tx verified that differs from the def's current one): rewrite the auto file
-/// via `synth::heal_auto_tx` and set the SAME `synth_dirty` flag the adoption worker sets — the next
-/// `scan_devices` reloads the registry, bumps `registry_gen`, and the seeded-key machinery re-seeds
-/// every downstream panel automatically. That reload chain is the payoff of the wave-2 design: the
-/// heal writes ONE file and the whole app picks it up with no bespoke plumbing. A verified-as-is tx
-/// does nothing (no rewrite, no status noise); only an actual heal posts a status line.
-fn maybe_first_light_heal(app: &AppWindow, sh: &SharedRt, pid: u16, unit: &str) {
+/// The worker runs `calibrate::settle`: brightness calibration (collection, tx, LED) then the
+/// first-light heal (effect tx). When either moves the def it rewrites the auto file and sets the
+/// SAME `synth_dirty` flag the adoption worker sets — the next `scan_devices` reloads the registry,
+/// bumps `registry_gen`, and the seeded-key machinery re-seeds every downstream panel. A def that
+/// verifies as-is does nothing (no rewrite, no status noise).
+fn maybe_first_light_heal(_app: &AppWindow, sh: &SharedRt, pid: u16, unit: &str) {
+    maybe_settle(sh, pid, unit, true);
+}
+
+/// The settle hook for one unit; `selected` resolves the def through the selection.
+fn maybe_settle(sh: &SharedRt, pid: u16, unit: &str, selected: bool) {
     // Honour the writes-paused kill-switch: the heal issues ACK'd probe WRITES (not just reads), so
     // it must freeze with every other write path when the user has paused writes. (The streaming
     // apply this rides is already gated the same way in `apply_current_lighting`.)
-    if neuron::writes::writes_paused() {
+    if neuron::writes::writes_paused() || sh.borrow().rt.healed_units.contains(unit) {
         return;
     }
-    // The def behind the current selection — enumerates once (device-switch/restore only, never per
-    // frame). Bail unless it's an AUTO def carrying lighting (the only thing worth/allowed to heal).
-    let def = match sh.borrow().rt.selected_def() {
-        Some(d) => d,
-        None => return,
-    };
+    // Enumerates once per unit (device-switch/restore only, never per frame). Bail unless it's an
+    // AUTO def carrying lighting (the only thing worth/allowed to heal).
+    let def = if selected { sh.borrow().rt.selected_def() } else { sh.borrow().rt.def_at(pid, unit) };
+    let Some(def) = def else { return };
     if def.origin != neuron::registry::DefOrigin::Auto || def.lighting.is_none() {
         return;
     }
@@ -7160,59 +7126,20 @@ fn maybe_first_light_heal(app: &AppWindow, sh: &SharedRt, pid: u16, unit: &str) 
         return;
     }
     let dirty = sh.borrow().rt.synth_dirty_handle();
-    let current_tx = def.transaction_id;
-    let dialect = def.dialect;
     let unit = unit.to_string();
-    let w = app.as_weak();
     // `healed_units` above is a permanent once-per-unit-per-run marker, not a busy latch — nothing
     // clears it on any path, so a spawn refusal just means this unit's heal is skipped for the
     // run (identical in effect to the def already being verified-as-is). Nothing else to report.
     crate::worker::spawn_detached("neuron-glue-txheal", move || {
-        // Own registry + own device handle (the UI's AppRuntime is !Send), mirroring
-        // `read_perf_snapshot`'s worker: reload the registry, enumerate, open THIS unit's control
-        // interface with the two-pass unit-precise-then-pid-only rule. `io_gate` parks the HOST
-        // lighting writer for our ACK'd probe writes. The anim stream may still write concurrently
-        // on its own handle — the SAME accepted pre-existing second-handle race every getter worker
-        // rides; the heal's read-backs tolerate an interleaved frame exactly as the vitals reads do.
-        let reg = neuron::registry::shared();
-        let Ok(infos) = neuron::transport::enumerate() else {
+        // `io_gate` parks the host lighting writer for the ACK'd calibration and heal writes. The
+        // anim stream may still write on its own handle; the read-backs re-send through it.
+        let _gate = crate::host::io_gate(pid);
+        let Ok(Some(_)) = neuron::calibrate::settle(&def, pid, &unit) else {
             return;
         };
-        let _gate = crate::host::io_gate(pid);
-        for relaxed in [false, true] {
-            for i in &infos {
-                // find_for_pipe: the def that DRIVES this control pipe (family-aware), so a
-                // two-family unit heals each pipe under the family that can frame it.
-                let Some(def) = reg.find_for_pipe(i) else {
-                    continue;
-                };
-                if (pid != 0 && i.pid != pid)
-                    || !(relaxed || unit.is_empty() || i.instance() == unit)
-                {
-                    continue;
-                }
-                let Ok(d) = neuron::device::Device::open_path(def.clone(), i.pid, &i.path) else {
-                    continue;
-                };
-                // Walk the tx cohort with read-backs; None = nothing verified (asleep / no getter),
-                // leave the def alone. Some(tx) == current = verified as-is (no rewrite). Some(tx)
-                // != current = a real heal: rewrite the auto file and flag the reload.
-                if let Some(tx) = neuron::writes::first_light_heal(&d, def) {
-                    if tx != current_tx && neuron::synth::heal_auto_tx(&dialect, pid, def, tx).is_ok()
-                    {
-                        dirty.store(true, std::sync::atomic::Ordering::SeqCst);
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(app) = w.upgrade() {
-                                app.global::<State>().set_status_line(
-                                    format!("lighting tx healed -> 0x{tx:02X} · def updated").into(),
-                                );
-                            }
-                        });
-                    }
-                }
-                return; // this unit is handled (verified or healed) — done for the run
-            }
-        }
+        // A reload re-applies the user's lighting over the heal's test frame and redraws the row's
+        // lamp from the new settle record.
+        dirty.store(true, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
@@ -7487,10 +7414,16 @@ fn install_perf_callbacks(app: &AppWindow, shared: &SharedRt) {
         let w = app.as_weak();
         let sh = sh.clone();
         app.global::<State>()
-            .on_apply_ingame_polling(move |wired, dongle| {
+            .on_apply_ingame_polling(move |hz| {
+                let mut pid = 0;
                 perf(&w, &sh, |rt| {
-                    rt.apply_ingame_polling(wired as u32, dongle as u32)
+                    pid = rt.selected_pid;
+                    rt.apply_ingame_polling(hz as u32)
                 });
+                if let Some(app) = w.upgrade() {
+                    let known = neuron::writes::verified_in_game_polling(pid).unwrap_or(0);
+                    app.global::<State>().set_ingame_wired_hz(known as f32);
+                }
             });
     });
     // SNAP TAP (MECHANICAL ADVANTAGES) — perf-gated like the device writes. The UI passes the
@@ -7868,7 +7801,6 @@ pub fn note_live_profile(app: &AppWindow, name: &str) {
             s.active_frame = 0;
             s.layers_rev += 1;
         }
-        st.set_light_paint_mode(false);
         {
             let _suppress = SuppressApply::new();
             refresh_layers(app, sh);
@@ -7966,6 +7898,7 @@ fn audio_rows() -> Vec<DeviceRow> {
                 plate: "".into(), // audio endpoints have no plate
                 adopting: false,  // audio endpoints are never HID-adopted
                 learned: false,
+                lighting_trust: 0,
             });
         }
     }
@@ -8121,6 +8054,9 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     // HyperPolling Wireless Dongle + Viper-8K-class. The Naga's stock dongle (0x00A8) is legacy-capped
     // at 1000Hz, so its card shows an honest "use REPORT RATE" note instead of fake 2000–8000Hz chips.
     st.set_sel_can_hyperpoll(pid_supports_hyperpoll(pid));
+    // The 0x00/0xC0 getter is graded below `capture` in the ledger, so the readout shows only a rate
+    // this device confirmed after a write; 0 reads as unknown in the UI.
+    st.set_ingame_wired_hz(neuron::writes::verified_in_game_polling(pid).unwrap_or(0) as f32);
     let kind = row.kind.to_string();
     if kind == "mic" || kind == "output" {
         // load the SELECTED endpoint's live volume + mute (not the system default).
@@ -8734,6 +8670,7 @@ fn apply_scanned_devices(
             },
             adopting: d.adopting,
             learned: d.learned,
+            lighting_trust: d.lighting_trust,
         })
         .collect();
     // 2) EMERGENT audio endpoints appended — mic + every output, generic over any hardware.
@@ -8768,7 +8705,7 @@ fn apply_scanned_devices(
                 .collect();
             let noun = if ledger.len() == 1 { "pipe" } else { "pipes" };
             format!(
-                "{} more razer {noun} neuron sees but doesn't speak yet: {}",
+                "{} more {noun} neuron sees but doesn't speak yet: {}",
                 ledger.len(),
                 names.join(" · ")
             )
@@ -9960,7 +9897,8 @@ fn reapply_all_boards(app: &AppWindow, sh: &SharedRt) -> String {
                 .light_fps
                 .store(saved.fps.clamp(1, 30), std::sync::atomic::Ordering::Relaxed);
         }
-        let _ = stream_board(app, sh, pid, unit, saved.layers, neuron::pattern::TransitionHint::Switch);
+        let _ = stream_board(app, sh, pid, unit.clone(), saved.layers, neuron::pattern::TransitionHint::Switch);
+        maybe_settle(sh, pid, &unit, false);
     }
     sh.borrow()
         .rt
@@ -10391,7 +10329,7 @@ fn apply_imported_lighting(app: &AppWindow, sh: &SharedRt, result: Result<neuron
                     s.layers_rev += 1;
                 }
                 if let Some(cells) = custom_cells {
-                    // paint the custom frame onto the canvas + enter paint mode.
+                    // paint the custom frame onto the canvas.
                     let (rows, cols) = (st.get_grid_rows(), st.get_grid_cols());
                     let count = (rows.max(0) * cols.max(0)) as usize;
                     let mut px: Vec<slint::Color> = cells
@@ -10403,9 +10341,6 @@ fn apply_imported_lighting(app: &AppWindow, sh: &SharedRt, result: Result<neuron
                         px.push(GRID_OFF);
                     }
                     st.set_grid_px(ModelRc::new(VecModel::from(px)));
-                    st.set_light_paint_mode(true);
-                } else {
-                    st.set_light_paint_mode(false);
                 }
                 refresh_layers(app, sh);
                 st.set_status_line(format!("imported {n} layer(s)").into());
@@ -10598,6 +10533,8 @@ fn refresh_live_base(app: &AppWindow, sh: &SharedRt) {
         if p.last_rgb.contains_key(&crate::light_render::SurfaceId::Hero)
             && p.live_seen.as_ref().is_some_and(|old| old.0 == identity.0 && old.1 == identity.1 && old.2 >= identity.2) { return; }
         let id = crate::light_render::SurfaceId::Hero;
+        // a stack-sense fix playing on the board holds it until it stops
+        if stacksense::previewing() { return; }
         if p.last_rgb.get(&id).is_none_or(|old| **old != *frame.pixels) {
             update_grid_model(&st, frame.pixels.iter().map(|c| grid_display(c.r, c.g, c.b)).collect());
             p.last_rgb.insert(id, frame.pixels.clone());
@@ -10758,10 +10695,13 @@ fn apply_light_frames(app: &AppWindow, frames: Vec<crate::light_render::Complete
             if frame.dims != p.desired.dims { continue; }
             let hero = frame.id == crate::light_render::SurfaceId::Hero;
             if hero {
-                if live_owner || !p.desired.hero || st.get_light_brush_on() || frame.content_rev != p.desired.content_rev { continue; }
+                if live_owner || !p.desired.hero || st.get_light_brush_on() || frame.content_rev != p.desired.content_rev
+                    || stacksense::previewing() { continue; }
             } else {
                 let Some(tile) = p.desired.tiles.iter().find(|t| t.id == frame.id) else { continue; };
-                if frame.content_rev != p.desired.content_rev || frame.layout_generation != p.desired.layout_generation || !p.desired.demand[tile.shelf].warm(tile.row) && !p.desired.demand[tile.shelf].visible(tile.row) { continue; }
+                // The tile is re-resolved by id above and demand is checked now, so a frame rendered under an
+                // older layout generation (every scroll bumps it) still lands on the right row.
+                if frame.content_rev != p.desired.content_rev || !p.desired.demand[tile.shelf].warm(tile.row) && !p.desired.demand[tile.shelf].visible(tile.row) { continue; }
             }
             acknowledged = Some(acknowledged.map_or(frame.requested, |old| old.max(frame.requested)));
             if p.last_rgb.get(&frame.id).is_some_and(|rgb| **rgb == *frame.rgb) { continue; }
@@ -11004,7 +10944,7 @@ fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
         st.set_light_is_readout(false); // no selection → not a readout (the RATE control always applies now)
         st.set_light_stack_count(0);
         st.set_light_stack_rows(ModelRc::new(VecModel::from(Vec::<LightingStackRow>::new())));
-        st.set_light_cover_index(-1);
+        stacksense::refresh(app, sh);
         st.set_light_stack_labels(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
         project_placement(app, &[], 0, 0); // no layer → full-board readout, no outline
         clear_spectrum_surface(app);
@@ -11017,18 +10957,7 @@ fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
         neuron::effects::Blend::Add => 2, neuron::effects::Blend::Multiply => 3, neuron::effects::Blend::Cut => 4,
     });
     st.set_light_layer_opacity(active.opacity * 100.0);
-    let rows = defs.iter().enumerate().rev().map(|(index, layer)| LightingStackRow {
-        index: index as i32, name: layer_label(layer).into(), enabled: layer.enabled,
-        summary: format!("{} · {}% · {}", if layer.blend == neuron::effects::Blend::Cut { "cutout" } else { layer.blend.as_str() },
-            (layer.opacity * 100.0).round() as u32, if layer.region.is_empty() { "full board" } else { "placed" }).into(),
-    }).collect();
-    update_value_model(st.get_light_stack_rows(), rows, |model| st.set_light_stack_rows(model));
-    let cover = defs.iter().enumerate().skip(sel + 1).rev().find(|(_, layer)| {
-        layer.enabled && layer.opacity >= 1.0 && layer.blend == neuron::effects::Blend::Normal
-            && (layer.region.is_empty() || (!active.region.is_empty() && active.region.iter().all(|cell| layer.region.contains(cell))))
-    });
-    st.set_light_cover_index(cover.map_or(-1, |(index, _)| index as i32));
-    st.set_light_cover_name(cover.map_or_else(SharedString::default, |(_, layer)| layer_label(layer).into()));
+    update_value_model(st.get_light_stack_rows(), stacksense::rows(&defs), |model| st.set_light_stack_rows(model));
     st.set_light_effect(tile_slug_for_layer(active).into());
     // the selected layer's honesty flag: a READOUT (vitals) is a live device gauge, not a tunable light
     // show — the inspector swaps the tunable-effect knobs for a short "what this is" note. Registry-driven
@@ -11060,6 +10989,8 @@ fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
     } else {
         clear_spectrum_surface(app);
     }
+    // last, so a reading that lands at once (tests read inline) projects over the rows above
+    stacksense::refresh(app, sh);
 }
 
 /// Clear the spectrum-editor surface (no stops / no sequence) — used for data + full-colour Screen layers.
@@ -11205,6 +11136,7 @@ pub(crate) fn widest_pair(pairs: &ModelRc<PairChip>) -> slint::SharedString {
 }
 
 pub(crate) mod colorsense;
+pub(crate) mod stacksense;
 
 fn selected_layer_pattern(sh: &SharedRt) -> String {
     let s = sh.borrow();

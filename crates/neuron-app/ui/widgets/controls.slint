@@ -119,7 +119,9 @@ export component LumaInk inherits HorizontalLayout {
         property <float> wob: self.light || !root.live ? 0 : 0.035 * Math.sin((root.tick * 0.004 + i * 1.7) * 1rad);
         property <float> edge: self.light ? 0.06 : 0.18;
         property <float> reach: clamp((root.front + self.wob - self.at) / self.edge + 0.5, 0, 1);
-        property <float> fill: self.reach * self.reach * (3 - 2 * self.reach) * (1 - root.drain);
+        // the soft edge reaches the first letters before the front has left 0: the front gates it, so
+        // rest and the wrap from the end of one cycle to the start of the next are exactly plain ink
+        property <float> fill: self.reach * self.reach * (3 - 2 * self.reach) * (1 - root.drain) * clamp(root.front / 0.02, 0, 1);
         // purple, turning to yellow just past the split
         property <color> hue: #a56ef0.mix(#f5c542, 1 - clamp((self.at - root.split) * 6, 0, 1));
         // the yellow's front burns white as it passes
@@ -217,18 +219,18 @@ export component Contact inherits Rectangle {
     }
 }
 
-// A small status pill — a contact lamp. Monochrome (hairline outline) by default; pass `live` to
-// light it phosphor. It MEANS something is on — never decoration. A `clickable` pill is a real
-// control: it grows to the 24px hit floor, signals at rest, and shows a pointer cursor.
+// A small status pill. Monochrome (hairline outline) by default; pass `live` to light it in the
+// hue of its `signal`. The label carries the state through its ink. It MEANS something is on —
+// never decoration. A `clickable` pill is a real control: it grows to the 24px hit floor,
+// signals at rest, and shows a pointer cursor.
 export component Pill inherits Rectangle {
     in property <string> text;
     in property <color> tint: Theme.text-dim;
-    in property <bool> live: false;        // a STATUS LAMP — lit phosphor when on, dark gutter when off
-    in property <bool> selected: false;    // a CHOSEN CHIP — lights its whole body, never a reflowing dot
+    in property <bool> live: false;        // a STATUS — label and frame take `live-tint` when on, `tint` when off
+    in property <bool> selected: false;    // a CHOSEN CHIP — lights its whole body
     in property <bool> clickable: false;   // when true, the pill is a button (reports `clicked`)
     in property <bool> enabled: true;      // when false: dimmed ink + inert (mirrors Button's disabled state)
-    // which lamp this pill wears: its shape, and the default lit hue. `tint` still inks the unlit
-    // label and gutter, so an unlit signalled pill (WRITES PAUSED) sets both.
+    // selects the default lit hue; `tint` inks the unlit label.
     in property <Signal> signal: Signal.live;
     in property <color> live-tint: Theme.hue(root.signal);
     callback clicked();
@@ -239,9 +241,9 @@ export component Pill inherits Rectangle {
     // HUG THE LABEL — a pill is a badge, not a fill. Without this it balloons to share leftover row space
     // (a stretchy row hands extra width to whatever can expand), stranding the label left with dead space.
     // Cap the pill at its content: the label's glyph-measured preferred-width + the box's own chrome —
-    // 8px×2 padding, plus the lamp + 5px gutter on a non-clickable status pill. min-width stays low
-    // (the label keeps min-width:0 + elide), so a genuinely tight row can still shrink and truncate it.
-    max-width: lbl.preferred-width + (root.clickable ? 16px : 21px + Theme.dot-lg);
+    // 8px×2 padding. min-width stays low (the label keeps min-width:0 + elide), so a genuinely
+    // tight row can still shrink and truncate it.
+    max-width: lbl.preferred-width + 16px;
     border-radius: Theme.radius-sm;
     background: lit ? root.live-tint.with-alpha(0.1) : (root.clickable && pill-ta.has-hover ? Theme.well : transparent);
     border-width: Theme.hair;
@@ -257,16 +259,6 @@ export component Pill inherits Rectangle {
     HorizontalLayout {
         padding-left: 8px;
         padding-right: 8px;
-        spacing: 5px;
-        // The lamp gutter — a status pill (non-clickable) ALWAYS reserves the 5px dot so its label
-        // never slides when the signal toggles (ONLINE↔ASLEEP): dark when off, phosphor when live. A
-        // clickable chip has no lamp — its whole body lights when `selected`, so it never grows.
-        // UNLIT = the pill's own ink at half strength, still shaped — a visible "off" lamp, NOT
-        // transparent. A same-as-background dot reads as an empty gap and skews the label off-centre.
-        if !root.clickable : Lamp {
-            signal: root.signal;
-            tint: root.live ? root.live-tint : root.tint.with-alpha(0.5);
-        }
         lbl := Text {
             text: root.text;
             // No horizontal-stretch: a child's stretch propagates up to its container, which would re-arm
@@ -341,14 +333,14 @@ export component LoadingRim inherits Rectangle {
 // Push button — a labelled key. Flat, tight, mono. `signal` says what pressing it does: idle = ink on
 // a hairline; any other signal = its hue outlined, filling faintly on hover. `primary` and `danger`
 // are shorthands for live and consequence. The label travels 1px on press (a real key has throw), and
-// `busy` swaps in a working lamp + disables.
+// `busy` swaps in a travelling rim + disables.
 export component Button inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
     in property <bool> enabled: true;
     in property <bool> danger: false;
     in property <Signal> signal: root.primary ? Signal.live : root.danger ? Signal.consequence : Signal.idle;
-    in property <bool> busy: false;        // an async op is in flight — lamp on, contact open
+    in property <bool> busy: false;        // an async op is in flight — rim running, contact open
     property <color> hue: Theme.hue(root.signal);
     property <bool> signalled: root.signal != Signal.idle;
     // the pointer is on a usable button, for a caller that shows what pressing it would do
@@ -504,6 +496,13 @@ export component Slider inherits Rectangle {
     in property <float> home: 0;
     in property <int> decimals: 0;
     in property <bool> dirty: false;
+    // A rail that knows where it's good, for a value whose good range depends on its surroundings (a
+    // layer's opacity on its stack): white-on-alpha strips over the range tint the rail cold (unseen),
+    // warm (reads well) and hot (too much). Off by default; nothing else draws it.
+    in property <bool> zoned: false;
+    in property <image> zone-cold;
+    in property <image> zone-warm;
+    in property <image> zone-hot;
     out property <bool> dragging: ta.pressed;
     callback changed(float);
     callback released(float);
@@ -594,6 +593,16 @@ export component Slider inherits Rectangle {
                 width: parent.width; height: 3px;
                 y: (parent.height - self.height) / 2;
                 background: Theme.line;
+            }
+            // the rail's temperature, on the rail itself. Shown or not, never faded: an opacity layer
+            // is cached offscreen and would keep drawing its first strips after the images change.
+            Rectangle {
+                width: rail.width; height: rail.height;
+                y: rail.y;
+                visible: root.zoned && root.enabled;
+                Image { width: parent.width; height: parent.height; image-fit: fill; source: root.zone-cold; colorize: Theme.text-faint; }
+                Image { width: parent.width; height: parent.height; image-fit: fill; source: root.zone-warm; colorize: Theme.accent; }
+                Image { width: parent.width; height: parent.height; image-fit: fill; source: root.zone-hot; colorize: Theme.warn; }
             }
             // detent ticks — the instrument marks its own stops (only where real data exists)
             for d in root.detents : Rectangle {
@@ -756,6 +765,10 @@ export component FaderRow inherits HorizontalLayout {
     in property <bool> has-home: false;
     in property <float> home: 0;
     in property <[int]> detents: [];
+    in property <bool> zoned: false;
+    in property <image> zone-cold;
+    in property <image> zone-warm;
+    in property <image> zone-hot;
     callback changed(float);
     callback released(float);
     spacing: 8px;
@@ -770,6 +783,7 @@ export component FaderRow inherits HorizontalLayout {
             minimum: root.minimum; maximum: root.maximum; step: root.step; value: root.value;
             wheel: root.wheel; enabled: root.enabled; detents: root.detents;
             has-home: root.has-home; home: root.home;
+            zoned: root.zoned; zone-cold: root.zone-cold; zone-warm: root.zone-warm; zone-hot: root.zone-hot;
             changed(v) => { root.changed(v); }
             released(v) => { root.released(v); }
         }
@@ -1035,7 +1049,9 @@ export component CodeArea inherits Rectangle {
     border-color: ti.has-focus ? Theme.accent.with-alpha(0.6) : Theme.line;
     animate border-color { duration: Theme.quick; }
     clip: true;
-    Flickable {
+    fl := Flickable {
+        // wheel only: a drag selects text instead of flicking the view
+        interactive: false;
         VerticalLayout {
             padding: 11px;
             ti := TextInput {
@@ -1046,6 +1062,23 @@ export component CodeArea inherits Rectangle {
                 single-line: false;
                 wrap: no-wrap;
                 edited => { root.edited(self.text); }
+                // the input is as large as its text, so the Flickable never scrolls to the caret by
+                // itself: bring the caret's line and column into view
+                cursor-position-changed(pos) => {
+                    let line = self.font-size * 1.5;
+                    let top = self.y + pos.y;
+                    let left = self.x + pos.x;
+                    if (top + fl.content-y < 0px) {
+                        fl.content-y = -top;
+                    } else if (top + line + fl.content-y > fl.height) {
+                        fl.content-y = fl.height - top - line;
+                    }
+                    if (left + fl.content-x < 12px) {
+                        fl.content-x = 12px - left;
+                    } else if (left + fl.content-x > fl.width - 12px) {
+                        fl.content-x = fl.width - 12px - left;
+                    }
+                }
             }
         }
     }
@@ -1096,6 +1129,12 @@ export component Picker inherits Rectangle {
     // when false: dimmed ink + inert TouchArea (mirrors SplitToggle's disabled state) so a gated
     // selector never has to be hand-rolled at the call site.
     in property <bool> enabled: true;
+    // An option worth trying (-1: none): its label in the open list wears the accent.
+    in property <int> suggest: -1;
+    // whether the closed control wears its value's preview behind the label (the open list always does)
+    in property <bool> face-preview: true;
+    property <bool> suggesting: root.enabled && root.suggest >= 0 && root.suggest < root.options.length
+        && root.suggest != root.index;
     callback changed(int);
     callback preview-active-changed(bool);
     property <int> hovered-row: -1;
@@ -1196,7 +1235,7 @@ export component Picker inherits Rectangle {
                         }
                         Text {
                             text: opt;
-                            color: i == root.index ? Theme.text : Theme.text-mid;
+                            color: i == root.index ? Theme.text : (root.suggesting && i == root.suggest) ? Theme.accent : Theme.text-mid;
                             font-size: Theme.fs-body;
                             font-family: Theme.mono;
                             vertical-alignment: center;
@@ -1210,7 +1249,7 @@ export component Picker inherits Rectangle {
     // shrinks, so a picker sitting beside a button (the app-rule add row) can't push that button
     // off the edge. Caught on screen with a 51-character profile name clipping "+ add rule".
     min-width: 120px;
-    if root.index >= 0 && root.index < root.previews.length : Rectangle {
+    if root.face-preview && root.index >= 0 && root.index < root.previews.length : Rectangle {
         x: 1px;
         y: 1px;
         width: parent.width - 2px;
@@ -1230,7 +1269,7 @@ export component Picker inherits Rectangle {
         }
     }
     HorizontalLayout {
-        padding-left: 11px; padding-right: 9px; spacing: 8px;
+        padding-left: 11px; padding-right: 9px; spacing: 0px;
         Text {
             text: (root.index >= 0 && root.index < root.options.length) ? root.options[root.index] : "—";
             color: root.enabled ? Theme.text : Theme.text-faint;
@@ -1241,6 +1280,7 @@ export component Picker inherits Rectangle {
             overflow: elide;
             horizontal-stretch: 1;
         }
+        Rectangle { width: 8px; }
         Text {
             text: "▾";
             color: root.enabled ? Theme.text-dim : Theme.text-faint;
@@ -1260,6 +1300,43 @@ export component Picker inherits Rectangle {
         // NO scroll-nudge on the closed control: it silently changed the selection (e.g. re-routed
         // an app-rule's profile) just by scrolling the PAGE over it, and trapped the wheel. Click to
         // open the popup and pick — explicit, not incidental.
+    }
+}
+
+// A 22px ICON CHIP — a bare glyph key (the × close, the layer-delete ×). Unifies the hand-rolled 22×22
+// chips scattered across the app (app.slint's X-close, the lighting layer-×). Transparent at rest, a
+// Theme.well on hover; the glyph is dim ink at rest and brightens to text (or danger ink on a `danger`
+// chip) under the cursor. Disabled = faint + inert. A pointer cursor, motion settles.
+export component IconButton inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    // a delete chip awaiting its confirming second click: solid danger fill, near-black glyph
+    in property <bool> armed: false;
+    // the pointer is on the chip, for a parent whose own hover the chip takes over
+    out property <bool> hot: ta.has-hover;
+    callback clicked();
+    width: 22px; height: 22px;
+    border-radius: Theme.radius-sm;
+    background: root.armed ? Theme.danger : (root.enabled && ta.has-hover) ? Theme.well : transparent;
+    animate background { duration: ta.has-hover ? Theme.hover-in : Theme.hover-out; }
+    Text {
+        text: root.glyph;
+        color: !root.enabled ? Theme.text-faint
+            : root.armed ? Theme.danger.darker(0.9)
+            : ta.has-hover ? (root.danger ? Theme.danger : Theme.text)
+            : Theme.text-dim;
+        font-family: Theme.mono;
+        font-size: Theme.fs-data;
+        width: 100%; height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        animate color { duration: Theme.quick; }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
     }
 }
 
@@ -1293,9 +1370,9 @@ export component ClipboardTransformEditor inherits VerticalLayout {
         spacing: 4px;
         Text { text: (index + 1) + ". " + operation; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
         if State.clipboard-operation-rows[index].editable : Button { text: State.clipboard-editing-index == index ? "editing" : "edit"; clicked => { State.edit-clipboard-operation(index); } }
-        Button { text: "↑"; clicked => { State.move-clipboard-operation(index, -1); } }
-        Button { text: "↓"; clicked => { State.move-clipboard-operation(index, 1); } }
-        Button { text: "×"; clicked => { State.remove-clipboard-operation(index); } }
+        Button { text: "↑"; enabled: index > 0; clicked => { State.move-clipboard-operation(index, -1); } }
+        Button { text: "↓"; enabled: index < State.clipboard-operations.length - 1; clicked => { State.move-clipboard-operation(index, 1); } }
+        VerticalLayout { alignment: center; IconButton { glyph: "×"; danger: true; clicked => { State.remove-clipboard-operation(index); } } }
     }
     if State.clipboard-operations.length > 0 : HorizontalLayout {
         spacing: 6px;
@@ -1333,7 +1410,7 @@ export component ClipboardTransformEditor inherits VerticalLayout {
         Text { text: variable.kind; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
         if variable.kind == "until-delimiter" : Text { text: "before " + variable.delimiter; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; }
         Button { text: "${" + variable.name + "}"; clicked => { State.clipboard-replacement-input += "${" + variable.name + "}"; State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
-        Button { text: "×"; clicked => { State.remove-clipboard-variable(index, State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
+        VerticalLayout { alignment: center; IconButton { glyph: "×"; danger: true; clicked => { State.remove-clipboard-variable(index, State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } } }
         Rectangle { height: 1px; horizontal-stretch: 1; background: Theme.line; }
     }
     HorizontalLayout {
@@ -1347,7 +1424,7 @@ export component ClipboardTransformEditor inherits VerticalLayout {
         Button { text: State.clipboard-raw-mode ? "raw" : "sample"; clicked => { State.clipboard-raw-mode = !State.clipboard-raw-mode; State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
         if State.clipboard-raw-mode : Field { text <=> State.clipboard-pattern-input; placeholder: "Rust regex"; field-width: 260px; edited(value) => { State.preview-clipboard-example(State.clipboard-sample, value, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
         Button { text: "preview"; clicked => { State.preview-clipboard-example(State.clipboard-sample, State.clipboard-pattern-input, State.clipboard-replacement-input, State.clipboard-raw-mode); } }
-        Button { text: State.clipboard-editing-index >= 0 ? "save regex" : "add regex"; clicked => { State.save-clipboard-operation(State.clipboard-editing-index, State.clipboard-pattern, State.clipboard-replacement-input); } }
+        Button { text: State.clipboard-editing-index >= 0 ? "save regex" : "add regex"; primary: true; clicked => { State.save-clipboard-operation(State.clipboard-editing-index, State.clipboard-pattern, State.clipboard-replacement-input); } }
         Text { text: State.clipboard-pattern; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
     }
     HorizontalLayout {
@@ -1487,7 +1564,7 @@ export component ActionPicker inherits VerticalLayout {
     // ONE place the filter changes (the rail mark and the group header both call it): re-narrowing
     // to the same group widens back to all. The callers reset the viewport themselves — a Flickable
     // does not re-clamp when its content shrinks under a scroll (same reason device.slint clamps
-    // viewport-y by hand), and a narrowed list must start at its own header.
+    // content-y by hand), and a narrowed list must start at its own header.
     callback toggle-filter(int);
     toggle-filter(i) => {
         root.filter = (root.filter == i) ? -1 : i;
@@ -1572,7 +1649,7 @@ export component ActionPicker inherits VerticalLayout {
             x: 0;
             width: parent.width - root.rail-w;
             height: parent.height;
-            viewport-width: self.width;
+            content-width: self.width;
             VerticalLayout {
                 padding: 4px;
                 for c[i] in State.action-choices : Rectangle {
@@ -1588,9 +1665,9 @@ export component ActionPicker inherits VerticalLayout {
                     // the list, where nothing straddles). A hidden row is 0 tall and can never
                     // straddle, so it never claims the rail.
                     property <bool> hovered: cta.has-hover || hta.has-hover;
-                    property <bool> at-top: palette.viewport-y == 0px ? i == 0
-                        : self.y + palette.viewport-y < 0px
-                            && self.y + self.height + palette.viewport-y > 0px;
+                    property <bool> at-top: palette.content-y == 0px ? i == 0
+                        : self.y + palette.content-y < 0px
+                            && self.y + self.height + palette.content-y > 0px;
                     changed hovered => {
                         root.hover-group = self.hovered ? c.group
                             : (root.hover-group == c.group ? "" : root.hover-group);
@@ -1625,7 +1702,7 @@ export component ActionPicker inherits VerticalLayout {
                         mouse-cursor: c.header ? MouseCursor.pointer : MouseCursor.default;
                         clicked => {
                             root.toggle-filter(i);
-                            if (root.filter >= 0) { palette.viewport-y = 0px; }
+                            if (root.filter >= 0) { palette.content-y = 0px; }
                         }
                     }
                     // a header is structure: a small tracked-out title above its group, and how many
@@ -1786,7 +1863,7 @@ export component ActionPicker inherits VerticalLayout {
                         mouse-cursor: c.header ? MouseCursor.pointer : MouseCursor.default;
                         clicked => {
                             root.toggle-filter(i);
-                            if (root.filter >= 0) { palette.viewport-y = 0px; }
+                            if (root.filter >= 0) { palette.content-y = 0px; }
                         }
                     }
                 }
@@ -1810,8 +1887,8 @@ export component ActionPicker inherits VerticalLayout {
             width: parent.width;
             height: parent.height;
             interactive: false;                      // wheel-only, like the page (no drag-hijack)
-            viewport-width: chiprow.preferred-width;
-            viewport-height: self.height;
+            content-width: chiprow.preferred-width;
+            content-height: self.height;
             chiprow := HorizontalLayout {
                 spacing: 4px;
                 for s in State.param-suggestions : Rectangle {
@@ -1949,8 +2026,7 @@ export component CaptureOverlay inherits Rectangle {
         VerticalLayout {
             padding: 24px; spacing: 14px; alignment: center;
             HorizontalLayout {
-                spacing: 8px; alignment: center;
-                Lamp { signal: Signal.listening; size: 8px; }
+                alignment: center;
                 Text {
                     text: "PRESS-TO-BIND";
                     color: Theme.listen; font-family: Theme.mono; font-weight: 700;
@@ -1986,7 +2062,7 @@ export component PanelHead inherits HorizontalLayout {
             // a short accent index tick before the label — the "channel armed" mark.
             // SANCTIONED ACCENT EXCEPTION (audit-ruled, do not relitigate): the accent rule bars
             // decoration, but this tick is not decoration — it MARKS the lit instrument face ("this
-            // panel is the live surface"), kin to the wordmark lamp. It stays accent by design.
+            // panel is the live surface"). It stays accent by design.
             Rectangle {
                 width: 3px; height: 14px; border-radius: 1px;
                 y: 1px;
@@ -2116,7 +2192,7 @@ export component SplitButton inherits Rectangle {
     // wears the disabled ink + inert contact (never a live-looking key that silently no-ops).
     in property <bool> left-enabled: true;
     in property <bool> right-enabled: true;
-    // an async op is in flight (e.g. an import parse) — a working lamp lights on the commit half and
+    // an async op is in flight (e.g. an import parse) — a travelling rim runs on the commit half and
     // BOTH halves go inert so the deck can't fire twice mid-op. Mirrors Button's `busy`.
     in property <bool> busy: false;
     property <bool> l-on: root.enabled && root.left-enabled && !root.busy;
@@ -2598,8 +2674,7 @@ export component ColorPicker inherits VerticalLayout {
 // chord swallows) or where cells carry different signal tints (LIVE phosphor vs MUTED warn). It unifies
 // the LIVE/MUTED + KEY-GUARD banks the panels hand-rolled cell-by-cell. `on[i]` lights cell i; `tints[i]`
 // recolours it (falls back to the accent, array length guarded); `toggled(i)` reports the clicked index —
-// the CALLER owns what "on" means (it holds the state). The lamp is a Theme.dot CIRCLE (the Pill idiom),
-// not the square-ish 1px lamps the hand-rolled banks drew — the circle is the unification.
+// the CALLER owns what "on" means (it holds the state). The lamp is a Theme.dot circle.
 export component LampRail inherits Rectangle {
     in property <[string]> options;
     in property <[bool]> on;
@@ -2659,38 +2734,6 @@ export component LampRail inherits Rectangle {
     }
 }
 
-// A 22px ICON CHIP — a bare glyph key (the × close, the layer-delete ×). Unifies the hand-rolled 22×22
-// chips scattered across the app (app.slint's X-close, the lighting layer-×). Transparent at rest, a
-// Theme.well on hover; the glyph is dim ink at rest and brightens to text (or danger ink on a `danger`
-// chip) under the cursor. Disabled = faint + inert. A pointer cursor, motion settles.
-export component IconButton inherits Rectangle {
-    in property <string> glyph;
-    in property <bool> danger: false;
-    in property <bool> enabled: true;
-    callback clicked();
-    width: 22px; height: 22px;
-    border-radius: Theme.radius-sm;
-    background: (root.enabled && ta.has-hover) ? Theme.well : transparent;
-    animate background { duration: ta.has-hover ? Theme.hover-in : Theme.hover-out; }
-    Text {
-        text: root.glyph;
-        color: !root.enabled ? Theme.text-faint
-            : ta.has-hover ? (root.danger ? Theme.danger : Theme.text)
-            : Theme.text-dim;
-        font-family: Theme.mono;
-        font-size: Theme.fs-data;
-        width: 100%; height: 100%;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        animate color { duration: Theme.quick; }
-    }
-    ta := TouchArea {
-        enabled: root.enabled;
-        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
-        clicked => { root.clicked(); }
-    }
-}
-
 // The micro SUB-HEADER atom — the tier BELOW SectionTitle: a small tracked-out mono legend over a
 // cluster ("GATES", "FEEL", "VOICE"…), hand-written ~15× before this. Dim by default; overridable at
 // the call site like Mono (set `text`, restyle a property if a site truly needs to).
@@ -2703,11 +2746,10 @@ export component SubLabel inherits Text {
     vertical-alignment: center;
 }
 
-// A STATUS LAMP — the borderless lamp + label readout the status strip hand-builds three ways (beacon,
-// writes-paused, the arm gate). A bare row of a Theme.dot CIRCLE lamp + a mono label — NO chip body or
-// border (that's Pill's job); it sits directly on the strip. `lit` lights the lamp AND the label in
-// `tint`; `ink` is the unlit label colour. A `clickable` lamp is a real control: pointer cursor + a
-// hover brighten on the (unlit) ink, so a thrown switch invites its click.
+// A STATUS READOUT — the borderless label the status strip uses for its state words (beacon,
+// writes-paused, undo, the arm gate): a mono label with NO chip body or border (that's Pill's job);
+// it sits directly on the strip. `lit` colours the word in `tint`; `ink` is the unlit colour. A
+// `clickable` readout is a real control: pointer cursor + a hover brighten on the (unlit) ink.
 export component StatusLamp inherits Rectangle {
     in property <string> text;
     in property <bool> lit: false;
@@ -2717,18 +2759,10 @@ export component StatusLamp inherits Rectangle {
     in property <bool> clickable: false;
     callback clicked();
     HorizontalLayout {
-        spacing: 6px;
-        // chip-less by design, so a press has no fill to flash — the lamp itself gives the tactile
-        // click: an unlit clickable lamp half-lights under the finger, then settles back.
-        Lamp {
-            signal: root.signal;
-            lit: root.lit || (root.clickable && lta.pressed);
-            tint: root.lit ? root.tint : root.tint.with-alpha(0.5);
-        }
         Text {
             text: root.text;
-            // ...and the label ink jumps to full-bright on press (above the hover text-mid) — the
-            // borderless readout's stand-in for a pressed well.
+            // chip-less by design, so a press has no fill to flash — the ink jumps to full-bright
+            // on press (above the hover text-mid) as the borderless readout's stand-in for a pressed well.
             color: root.lit ? root.tint
                 : (root.clickable && lta.pressed) ? Theme.text
                 : (root.clickable && lta.has-hover) ? Theme.text-mid
@@ -2739,7 +2773,7 @@ export component StatusLamp inherits Rectangle {
             animate color { duration: Theme.quick; }
         }
     }
-    // covers the whole readout (lamp + label) only when clickable — else inert, so a bare readout
+    // covers the whole readout only when clickable — else inert, so a bare readout
     // never eats a click meant for the strip beneath it.
     lta := TouchArea {
         enabled: root.clickable;
@@ -2756,7 +2790,7 @@ export component StatusLamp inherits Rectangle {
 // It draws its OWN key (rather than composing Button) for two reasons the audit called out:
 //   * IN-PLACE RELABEL — the key reserves the width of the WIDER of its two labels (both are laid out,
 //     the idle one at opacity 0), so arming swaps "clear vault"↔"erase N glyphs?" without resizing and
-//     shoving its neighbours (the lamp-gutter doctrine, applied to a label).
+//     shoving its neighbours.
 //   * ESCALATION WITHIN THE DANGER HUE — rest is quiet danger ink on a well; ARMED fills solid danger
 //     with near-black ink (Button-primary's accent-fill idiom, in danger). One hue, rising commitment —
 //     armed no longer reads identical to rest.
@@ -2766,6 +2800,8 @@ export component ConfirmButton inherits Rectangle {
     in property <bool> enabled: true;
     callback confirmed();
     property <bool> armed: false;
+    // a bare "×" key rests dim like every list row's ×, and reddens on hover
+    property <bool> glyph-only: root.text == "×";
     // hug the CURRENT label (+ Button's 13px×2 side padding), like Button — not the wider of the two,
     // which left a short idle glyph (the beacon row's bare "×") sitting in a box sized for "delete?".
     // The width animates through the same escalation the fill/border already animate on, so the grow-
@@ -2817,8 +2853,10 @@ export component ConfirmButton inherits Rectangle {
                 horizontal-alignment: center; vertical-alignment: center;
                 font-size: Theme.fs-body; font-family: Theme.mono;
                 font-weight: 500; letter-spacing: Theme.track-1;
-                color: root.enabled ? Theme.danger : Theme.text-faint;
-                animate opacity { duration: Theme.quick; }
+                color: !root.enabled ? Theme.text-faint
+                    : (root.glyph-only && !touch.has-hover) ? Theme.text-dim
+                    : Theme.danger;
+                animate opacity, color { duration: Theme.quick; }
             }
             // ui-lint: allow(loose-text) both labels size the button through label-w
             conf := Text {
@@ -3174,6 +3212,66 @@ export component TriggerWell inherits Rectangle {
         mouse-cursor: root.clickable ? MouseCursor.pointer : MouseCursor.default;
         clicked => { root.clicked(); }
     }
+}
+
+// A name painted in a palette's own colours — one Mono per character, character i sampling the
+// mirrored ramp at (i/n + phase) so the wrap is seamless; hovering lets the gradient drift through
+// the letters and settle back. Without a ramp (a layer with no spectrum) it falls back to the plain
+// `text` in faint ink: a name can only wear a palette its effect actually has. `quiet` is the
+// plate variant: the letters rest in plain `rest-ink` and the ramp fades in only while hovered.
+// ONE component for every painted name so the instances can't drift.
+export component RampName inherits Rectangle {
+    in property <string> text: "";        // the plain-ink fallback when no ramp is loaded
+    in property <[string]> chars;         // the name, one string per character
+    in property <[color]> ramp;           // the palette sampled forward-then-back (a seamless loop)
+    in property <string> prefix: "";      // lead-in ink inside the hover area (the spectrum line's dash)
+    in property <bool> quiet: false;
+    in property <color> rest-ink: Theme.text;
+    in property <length> size: Theme.fs-body;
+    in property <int> weight: 400;
+    in property <length> tracking: 0px;
+    property <bool> painted: root.chars.length > 0 && root.ramp.length >= 2;
+    // The name gives way before whatever shares its row: short of room it keeps its own width and
+    // is cut by this box under a fade, rather than pushing its neighbours out of the column.
+    min-width: 0px;
+    preferred-width: row.preferred-width;
+    max-width: row.preferred-width;
+    preferred-height: row.preferred-height;
+    clip: true;
+    property <bool> cut: row.preferred-width > root.width + 0.5px;
+    row := HorizontalLayout {
+        x: 0px;
+        width: self.preferred-width;
+        height: root.height;
+        spacing: 0px;
+        if root.prefix != "" : Mono { text: root.prefix; color: Theme.text-faint; }
+        if !root.painted : Mono { text: root.text; color: Theme.text-faint; overflow: elide; }
+        if root.painted : ramped := HorizontalLayout {
+            property <int> m: root.ramp.length;
+            spacing: 0px;
+            for ch[i] in root.chars : Mono {
+                property <float> pos: mod((i / max(root.chars.length, 1) * 0.5 + root.phase) * ramped.m, ramped.m);
+                property <int> j: Math.floor(self.pos);
+                color: root.ramp[self.j].mix(root.ramp[mod(self.j + 1, ramped.m)], 1 - (self.pos - self.j)).mix(root.rest-ink, root.amount);
+                text: ch;
+                font-size: root.size;
+                font-weight: root.weight;
+                letter-spacing: root.tracking;
+            }
+        }
+    }
+    // a long fade, solid before the edge: a cut name trails off instead of stopping mid-letter
+    if root.cut : Rectangle {
+        x: root.width - self.width;
+        width: min(44px, root.width);
+        height: root.height;
+        background: @linear-gradient(90deg, Theme.bg.with-alpha(0) 0%, Theme.bg 72%, Theme.bg 100%);
+    }
+    property <float> phase: rta.has-hover ? 0.5 : 0.0;
+    animate phase { duration: 1400ms; easing: ease-in-out; }
+    property <float> amount: (root.quiet && !rta.has-hover) ? 0.0 : 1.0;
+    animate amount { duration: 500ms; easing: ease-in-out; }
+    rta := TouchArea { x: 0px; y: 0px; width: root.width; height: root.height; }
 }
 
 // SheenText — an invisible moving clip window reveals an accent duplicate of the exact
