@@ -59,6 +59,9 @@ component LayerVisibility inherits Rectangle {
 // on the board); a click keeps it.
 component FixText inherits Text {
     in property <int> offer;
+    // how far the pointer target reaches past the words, above and below; stacked fixes reach half
+    // their spacing so no two targets overlap
+    in property <length> reach: 8px;
     callback hovered(bool);
     callback kept();
     color: fta.has-hover ? Theme.accent : Theme.accent-dim;
@@ -68,7 +71,7 @@ component FixText inherits Text {
     animate color { duration: fta.has-hover ? Theme.hover-in : Theme.hover-out; }
     // ui-lint: allow(bleed) a pointer target a little larger than the words; it draws nothing
     fta := TouchArea {
-        x: -4px; y: -8px; width: parent.width + 8px; height: parent.height + 16px;
+        x: -4px; y: -root.reach; width: parent.width + 8px; height: parent.height + root.reach * 2;
         mouse-cursor: MouseCursor.pointer;
         changed has-hover => { root.hovered(self.has-hover); }
         clicked => { root.kept(); }
@@ -1504,8 +1507,8 @@ export component LightingPanel inherits VerticalLayout {
                         }
                     }
                     if State.light-stack-count > 0 : HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout { alignment: center; Mono { text: "blend"; color: Theme.text-dim; } }
+                        spacing: 9px;
+                        VerticalLayout { width: 78px; alignment: center; Mono { text: "blend"; color: Theme.text-dim; } }
                         Picker {
                             horizontal-stretch: 1;
                             options: ["Normal", "Screen", "Add", "Multiply", "Cutout"];
@@ -1519,7 +1522,7 @@ export component LightingPanel inherits VerticalLayout {
                     }
                     if State.light-stack-count > 0 : VerticalLayout {
                         FaderRow {
-                            label: "opacity"; label-w: 55px; readout-w: 40px;
+                            label: "opacity"; label-w: 78px; readout-w: 52px; spacing: 9px;
                             value: State.light-layer-opacity; unit: "%";
                             zoned: State.light-opacity-zoned;
                             zone-cold: State.light-opacity-cold;
@@ -1567,17 +1570,37 @@ export component LightingPanel inherits VerticalLayout {
                                         overflow: elide;
                                     }
                                 }
-                                // the fixes share the line, each shortened when they don't all fit, so none
-                                // is ever cut off out of reach
-                                HorizontalLayout {
-                                    alignment: start;
-                                    spacing: 14px;
-                                    for offer in State.light-sense-offers : FixText {
-                                        text: offer.text; offer: offer.offer;
-                                        min-width: 24px;
-                                        overflow: elide;
-                                        hovered(on) => { stack-sec.sense-hover(self.offer, on); }
-                                        kept => { stack-sec.sense-keep(self.offer); }
+                                // the fixes share a line when they all fit whole, else take a line each, so
+                                // every one stays legible. Switched by `visible`, never by a model that
+                                // depends on a measured width (that re-enters the renderer's text measuring)
+                                Rectangle {
+                                    property <bool> fits: fix-row.preferred-width <= self.width;
+                                    height: self.fits ? fix-row.preferred-height : fix-col.preferred-height;
+                                    min-width: 0px;
+                                    clip: true;
+                                    fix-row := HorizontalLayout {
+                                        visible: parent.fits;
+                                        x: 0px; width: self.preferred-width;
+                                        alignment: start;
+                                        spacing: 14px;
+                                        for offer in State.light-sense-offers : FixText {
+                                            text: offer.text; offer: offer.offer;
+                                            hovered(on) => { stack-sec.sense-hover(self.offer, on); }
+                                            kept => { stack-sec.sense-keep(self.offer); }
+                                        }
+                                    }
+                                    fix-col := VerticalLayout {
+                                        visible: !parent.fits;
+                                        height: self.preferred-height;
+                                        spacing: 6px;
+                                        for offer in State.light-sense-offers : FixText {
+                                            text: offer.text; offer: offer.offer;
+                                            min-width: 24px;
+                                            overflow: elide;
+                                            reach: 3px;
+                                            hovered(on) => { stack-sec.sense-hover(self.offer, on); }
+                                            kept => { stack-sec.sense-keep(self.offer); }
+                                        }
                                     }
                                 }
                             }

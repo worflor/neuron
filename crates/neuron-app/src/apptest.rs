@@ -1646,6 +1646,31 @@ fn stack_sense_names_the_trouble_and_offers_fixes() {
         app.window().set_size(slint::LogicalSize::new(width, 2400.0));
         save(&snap(&app).expect("a trouble with many layers draws"), format!("stack-sense-many-{width}"));
     }
+    // three long fixes don't share a line in the narrow inspector: each takes its own, whole
+    let shown_offers = st.get_light_sense_offers();
+    st.set_light_sense_offers(slint::ModelRc::new(slint::VecModel::from(
+        ["Wildlife \u{2192} add", "Tidepool \u{2191} above Wildlife", "Wildlife \u{2193} below Tidepool"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| crate::ui::LightingFix { text: t.into(), offer: i as i32 })
+            .collect::<Vec<_>>(),
+    )));
+    for width in [900.0, 1240.0] {
+        app.window().set_size(slint::LogicalSize::new(width, 2400.0));
+        snap(&app).expect("long fixes draw");
+        // the strip grows to its new height
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        slint::platform::update_timers_and_animations();
+        save(&snap(&app).expect("long fixes draw"), format!("stack-sense-long-fixes-{width}"));
+        let fixes = crate::uifit::shown_rects_of(app.window(), "FixText");
+        assert_eq!(fixes.len(), 3, "{:?}", crate::uifit::drawn_as(app.window(), "FixText"));
+        let rows: std::collections::BTreeSet<i64> = fixes.iter().map(|f| f.1.round() as i64).collect();
+        assert!(rows.len() == 1 || rows.len() == 3, "the fixes share one line or take one each: {fixes:?}");
+        for w in fixes.windows(2) {
+            assert!(w[0].1 + w[0].3 <= w[1].1 + 0.5 || w[0].0 + w[0].2 <= w[1].0 + 0.5, "fixes overlap: {fixes:?}");
+        }
+    }
+    st.set_light_sense_offers(shown_offers);
     app.window().set_size(slint::LogicalSize::new(1240.0, 2400.0));
     {
         let mut state = shared.borrow_mut();
