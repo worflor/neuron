@@ -85,6 +85,7 @@ retry with other values.
 
 | symptom | try |
 |---|---|
-| `list` shows no devices | is Razer Synapse running? neuron and Synapse can't share a device. Is the device plugged in? |
+| `list` shows no devices | is Razer Synapse running? neuron and Synapse can't share a device. Is the device plugged in? In the app, a device neuron couldn't learn gets a row saying why |
+| a device is listed but stays dark or ignores a setting | its DEVICE row's **check** shows what it answers; **report** there opens a filled-in device report |
 | a setting doesn't stick after unplugging | check whether the write was volatile; volatile settings reset on power-cycle |
 | an error you don't understand | see [answers.md](answers.md) for where to look, or the bug report steps there |

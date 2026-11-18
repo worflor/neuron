@@ -4,7 +4,7 @@ neuron started with the hardware on my desk. i'd like to get it working on a lot
 
 ## got hardware i don't have?
 
-try neuron on it, or just help investigate where support is missing. tell me the model, whether it's wired/dongle/Bluetooth, and what actually happened. "lighting works, buttons don't" is useful information. [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) or [start a discussion](https://github.com/worflor/neuron/discussions) if you're not sure yet.
+try neuron on it, or just help investigate where support is missing. press **check** on the device's row on DEVICE, then **report**: a device report opens with the device, your system and the check filled in. add what actually happened; "lighting works, buttons don't" is useful information. no row for it? [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) by hand, or [start a discussion](https://github.com/worflor/neuron/discussions) if you're not sure yet.
 
 want to go beyond a short report? [Compatibility Lab](docs/reference/COMPATIBILITY-LAB.md#try-it-yourself) explains how to collect read-only device information and prepare a shareable bundle from the CLI. review it before attaching anything. you can do the whole thing yourself, including filing the issue.
 
@@ -58,7 +58,7 @@ The CI build jobs are configured for code changes; docs-only changes skip them.
 
 the three hard invariants (tests may never arm input; no guessing at hardware; more, never bloat) are spelled out in [AGENTS.md](AGENTS.md#the-invariants-spelled-out). a passing mock test isn't physical verification, and new unverified commands need a gate or an explicit ledger exception.
 
-the SYSTEM diagnostics bench is the quickest read-only check when a device is on your desk. it's evidence, not a guarantee that every control works.
+with a device on your desk, its row's **check** shows what that device answers, and the SYSTEM diagnostics bench runs nine read-only probes across the stack. both are read-only evidence, not a guarantee that every control works.
 
 ## building it (windows gotchas)
 

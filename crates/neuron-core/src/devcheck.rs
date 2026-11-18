@@ -47,13 +47,15 @@ pub struct DeviceCheck {
 /// The questions' wait per reply; long enough for a receiver.
 const WINDOW: Duration = Duration::from_millis(120);
 
-/// Check one device by the family that speaks to it and its product id. Read-only.
+/// Check one device by the family that speaks to it, its product id and, when known, its unit
+/// (`HidDeviceInfo::instance`, the row's id), so a same-pid device of another vendor or a twin
+/// isn't asked in its place. Read-only.
 #[must_use]
-pub fn check(dialect: &str, pid: u16, name: &str) -> DeviceCheck {
+pub fn check(dialect: &str, pid: u16, unit: &str, name: &str) -> DeviceCheck {
     let mut out = match dialect {
         "razer" => razer(pid),
-        "hidpp" => hidpp(pid),
-        "via" => via(pid),
+        "hidpp" => hidpp(pid, unit),
+        "via" => via(pid, unit),
         _ => DeviceCheck::default(),
     };
     if out.lines.is_empty() && out.notes.is_empty() {
@@ -160,8 +162,10 @@ fn razer(pid: u16) -> DeviceCheck {
         out.notes.push("not connected".into());
     } else {
         out.summary = crate::lightprobe::summary(&units);
-        // A learned device's later reports carry its latest probe.
-        if crate::synth::auto_def_path("razer", pid).exists() {
+        // A learned device's later reports carry its latest clean probe; one taken while another
+        // app talked to it, or with nothing answering, doesn't replace a better one.
+        let clean = out.notes.is_empty() && out.lines.iter().any(|l| l.cells.iter().any(|c| c.1 == TxState::Answered));
+        if clean && crate::synth::auto_def_path("razer", pid).exists() {
             let _ = std::fs::write(crate::lightprobe::evidence_path("razer", pid), &out.summary);
         }
     }
@@ -175,18 +179,25 @@ fn push_once(notes: &mut Vec<String>, n: &str) {
     }
 }
 
-/// The device's claimed control pipe for `dialect`, opened.
-fn open_claimed(dialect: &str, pid: u16) -> Option<Box<dyn crate::transport::Transport>> {
+/// The device's claimed control pipe for `dialect`, opened: on `unit` when one is named.
+fn open_claimed(dialect: &str, pid: u16, unit: &str) -> Option<Box<dyn crate::transport::Transport>> {
     let infos = crate::transport::enumerate().ok()?;
+    let claimed = |i: &&crate::transport::HidDeviceInfo| {
+        i.pid == pid && crate::dialect::claimed_by(i).is_some_and(|d| d.id() == dialect)
+    };
+    // The row's id names the pipe it was built from; a row built from a sibling collection falls
+    // back to the pid's first claimed pipe.
     let i = infos
         .iter()
-        .find(|i| i.pid == pid && crate::dialect::claimed_by(i).is_some_and(|d| d.id() == dialect))?;
+        .filter(claimed)
+        .find(|i| i.instance() == unit)
+        .or_else(|| infos.iter().find(claimed))?;
     crate::transport::open_path(&i.path).ok()
 }
 
-fn hidpp(pid: u16) -> DeviceCheck {
+fn hidpp(pid: u16, unit: &str) -> DeviceCheck {
     let mut out = DeviceCheck::default();
-    let Some(t) = open_claimed("hidpp", pid) else {
+    let Some(t) = open_claimed("hidpp", pid, unit) else {
         out.notes.push("not connected".into());
         return out;
     };
@@ -207,9 +218,9 @@ fn hidpp(pid: u16) -> DeviceCheck {
     out
 }
 
-fn via(pid: u16) -> DeviceCheck {
+fn via(pid: u16, unit: &str) -> DeviceCheck {
     let mut out = DeviceCheck::default();
-    let Some(t) = open_claimed("via", pid) else {
+    let Some(t) = open_claimed("via", pid, unit) else {
         out.notes.push("not connected".into());
         return out;
     };
@@ -263,10 +274,10 @@ mod tests {
     #[test]
     fn a_check_with_no_device_says_so_and_names_what_it_asked() {
         let _deny = crate::transport::deny_hardware();
-        let c = check("razer", 0x02a5, "a board");
+        let c = check("razer", 0x02a5, "", "a board");
         assert!(!c.notes.is_empty(), "a check always says something");
         assert!(c.text.contains("device check · razer 02a5 · a board"), "{}", c.text);
-        let unknown = check("lumen", 0x0001, "a lamp");
+        let unknown = check("lumen", 0x0001, "", "a lamp");
         assert_eq!(unknown.notes, ["nothing neuron can safely ask this device yet"]);
     }
 }

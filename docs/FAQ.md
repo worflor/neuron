@@ -24,7 +24,7 @@ neuron can import supported plaintext Synapse exports. encrypted cloud-only prof
 
 ### do i need Razer gear?
 
-not for a lot of it. gamepads, spellweaving and the radial, app-aware profile switching, clipboard pockets and transforms, window, audio and screenshot actions, and macros run on ordinary Windows input, so they don't care what brand your gear is. device settings like DPI and polling, and per-key lighting, need supported Razer hardware.
+not for a lot of it. gamepads, spellweaving and the radial, app-aware profile switching, clipboard pockets and transforms, window, audio and screenshot actions, and macros run on ordinary Windows input, so they don't care what brand your gear is. device settings like DPI and polling, and per-key lighting, need supported Razer hardware. Logitech mice and keyboards and QMK boards with VIA get a few readings and brightness, early and not yet run on real ones.
 
 ### does it work with anti-cheat?
 
@@ -78,17 +78,17 @@ Windows installer and source builds: `%LOCALAPPDATA%\neuron`. a marked portable 
 
 ### which hardware is supported?
 
-neuron is a **Windows beta** with device controls tested on the **Naga V2 Pro** and **BlackWidow Chroma V2**, and a PowerA gamepad tested for input and rumble. neuron learns most other Razer devices on its own, and [the status page](STATUS.md) says what's been checked on real hardware. got something else? [help test it](#my-device-isnt-recognized-what-should-i-do).
+neuron is a **Windows beta** with device controls tested on the **Naga V2 Pro** and **BlackWidow Chroma V2**, and a PowerA gamepad tested for input and rumble. neuron learns most other Razer devices on its own when you plug them in, and [the status page](STATUS.md) says what's been checked on real hardware. got something else? [help test it](#my-device-isnt-recognized-or-stays-dark-what-should-i-do).
 
-### my device isn't recognized. what should i do?
+### my device isn't recognized, or stays dark. what should i do?
 
-first check that it's connected and Synapse isn't holding onto it. in neuron, run the read-only diagnostics on **SYSTEM**. from PowerShell in neuron's install folder, `.\neuron.exe list` shows recognized devices and `.\neuron.exe compat --help` shows the hardware-report tools.
+neuron picks a device up when it's plugged in; there's nothing to scan. if neuron can't learn it, its row on **DEVICE** says why (another app holding it is a common one: quit Synapse and other RGB tools). a board whose lighting isn't taking says **lights not landing · check**.
 
-then [report your device](https://github.com/worflor/neuron/issues/new?template=device_report.yml): model, wired, dongle or Bluetooth, what you tried and what happened. no PID or coding needed. want to send more? [Compatibility Lab has a walkthrough](reference/COMPATIBILITY-LAB.md#try-it-yourself).
+either way, press **check** on the device's row. it asks the device a few read-only questions and shows what answered. press **report** under it and a [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) opens with the device, your system and the check filled in; add what you tried and what happened. no row at all? fill the report in by hand. want to send more? [Compatibility Lab has a walkthrough](reference/COMPATIBILITY-LAB.md#try-it-yourself).
 
-### will the compatibility tools change my hardware or upload anything?
+### will the check or the compatibility tools change my hardware or upload anything?
 
-no. `neuron compat collect` reads OS and HID metadata; it doesn't send control commands or change settings. what it collects stays on your machine, and you choose what to export, review and attach. the local dossier can contain identifiers, so keep that one to yourself; the default shareable export leaves out raw input and identifiers, and raw input capture asks separately. [details](reference/COMPATIBILITY-LAB.md#evidence-contract).
+no. a row's check only sends read-only questions. `neuron compat collect` reads OS and HID metadata; it doesn't send control commands or change settings. what it collects stays on your machine, and you choose what to export, review and attach. the local dossier can contain identifiers, so keep that one to yourself; the default shareable export leaves out raw input and identifiers, and raw input capture asks separately. [details](reference/COMPATIBILITY-LAB.md#evidence-contract).
 
 ### something broke. where do i report it?
 

@@ -1,14 +1,14 @@
 name: Device compatibility report
-description: Tried Neuron on your hardware? Tell me what worked, even if nothing did.
+description: Tried neuron on your hardware? Tell me what worked, even if nothing did.
 title: "[device] "
 labels: [enhancement, needs-triage, "area:device"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for trying Neuron! Just tell me what you saw, even if nothing worked.
-        Neuron is a Windows beta; Linux source builds haven't had native Razer HID testing.
-        Diagnostics are optional. You can [collect a reviewable bundle yourself](https://github.com/worflor/neuron/blob/main/docs/reference/COMPATIBILITY-LAB.md#try-it-yourself) if you want to help with deeper support.
+        thanks for trying neuron. the quickest way here is from the app: on the DEVICE page, press **check** on the device's row, then **report**. this form opens with the device, your system and the check filled in, so you only add what worked.
+
+        no row for it, or an older neuron? fill it in by hand. a short report is fine.
   - type: input
     id: device
     attributes:
@@ -30,8 +30,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: OS and Neuron version (if you know them)
-      placeholder: "e.g. Windows 11, Neuron v0.1.5"
+      label: OS and neuron version (if you know them)
+      placeholder: "e.g. Windows 11, neuron v0.1.8"
   - type: dropdown
     id: result
     attributes:
@@ -48,29 +48,33 @@ body:
     id: tried
     attributes:
       label: What did you try, and what happened?
-      description: Even one setting is useful. Say what worked and what didn't; no need to test everything.
-      placeholder: "DPI worked. The mouse was detected, but side buttons didn't remap..."
+      description: even one setting is useful. say what worked and what didn't; no need to test everything.
+      placeholder: "DPI worked. the mouse was detected, but side buttons didn't remap..."
     validations:
       required: true
   - type: dropdown
     id: dynamic-lighting
     attributes:
       label: Is Windows Dynamic Lighting on?
-      description: Windows 11 › Settings › Personalization › Dynamic Lighting. On newer boards Windows can hold the lights, so this matters for lighting problems.
+      description: Windows 11 › Settings › Personalization › Dynamic Lighting. on newer boards Windows can hold the lights, so this matters for lighting problems.
       options:
         - Not sure
         - "On"
         - "Off"
         - Not Windows 11
   - type: textarea
-    id: device-file
-    attributes:
-      label: Neuron's device file (optional)
-      description: |
-        If Neuron detected the device but something didn't work, paste the contents of its file from the `devices\auto` folder next to Neuron's settings (usually `%LOCALAPPDATA%\neuron\devices\auto`), named after the product id, such as `razer-0293.toml`. It's what Neuron learned about the device. Delete its `# Probed unit serial` line first if it has one.
-  - type: textarea
     id: evidence
     attributes:
-      label: Diagnostics or anything else (optional)
-      description: Share a reviewed summary or compatibility bundle if you have one. Don't paste raw serial numbers, device paths, tokens or private data.
-      placeholder: "Optional diagnostics, steps to reproduce, or what you wish the device could do"
+      label: Device check (optional)
+      description: the app's **report** fills this in. by hand, press **copy** in the row's check and paste it here. don't paste serial numbers, device paths or private data.
+  - type: textarea
+    id: device-file
+    attributes:
+      label: What neuron learned (optional)
+      description: |
+        the app's **report** fills this in for a device neuron learned. by hand, paste the device's file from `%LOCALAPPDATA%\neuron\devices\auto`, named after its family and product id (like `razer-0293.toml`), and delete its `# Probed unit serial` line first.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else (optional)
+      description: steps to reproduce, a [Compatibility Lab](https://github.com/worflor/neuron/blob/main/docs/reference/COMPATIBILITY-LAB.md#try-it-yourself) bundle you've reviewed, or what you wish the device could do.

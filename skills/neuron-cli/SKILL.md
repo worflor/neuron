@@ -181,7 +181,7 @@ not loop on it.
   (`feel stages --active`, `feel scroll STAGE`) count from 1.
 - `neuron status` says `app running: yes, on another run root` when an app is up but not on your
   `NEURON_RUN_DIR`. Edits there are not signalled (`"live": "other-root"`); the app is untouched.
-- `neuron list` never writes: a new device shows as ``new device NAME: run `neuron adopt` ``. With several
+- `neuron list` never writes: a new device shows as ``new device NAME (pid PID): run `neuron adopt` to learn it``; a running app learns it on its own when it's plugged in. With several
   devices `info` takes `--pid`.
 - Device verbs are `neuron feel dpi|polling|stages|scroll|lod|brightness|game-mode|idle|sniper`; the
   top-level spellings still work but are hidden. Import a Synapse export with `neuron import FILE`.

@@ -2411,7 +2411,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let w = app.as_weak();
         app.global::<State>().on_check_copy(move || {
             let Some(app) = w.upgrade() else { return };
-            let text = LAST_CHECK.lock().ok().and_then(|l| l.as_ref().map(|(_, _, c)| c.text.clone()));
+            let text = open_check(&app.global::<State>()).map(|(_, _, c)| c.text);
             let said = match text {
                 Some(t) if !cfg!(test) && neuron::pocket::copy_text(&t) => "copied",
                 Some(_) => "the clipboard was busy",
@@ -2424,11 +2424,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let w = app.as_weak();
         app.global::<State>().on_check_report(move |name, mode| {
             let Some(app) = w.upgrade() else { return };
-            let evidence = LAST_CHECK
-                .lock()
-                .ok()
-                .and_then(|l| l.as_ref().map(|(dialect, pid, c)| c.evidence(dialect, *pid)))
-                .unwrap_or_else(|| neuron::report::DeviceEvidence::for_name(&name));
+            let evidence = open_check(&app.global::<State>()).map_or_else(
+                || neuron::report::DeviceEvidence::for_name(&name),
+                |(dialect, pid, c)| c.evidence(&dialect, pid),
+            );
             open_external(&neuron::report::device_report_url_with(&name, &mode, env!("CARGO_PKG_VERSION"), &evidence));
             app.global::<State>().set_check_said("opened a report with this check".into());
         });
@@ -8566,28 +8565,29 @@ pub fn request_device_scan() {
     let _ = slint::invoke_from_event_loop(move || spawn_background_scan(&w));
 }
 
-/// The pids whose live lighting stream is being refused, so a rebuilt row keeps its lamp.
-static LIGHT_REFUSED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+/// The units (row ids) whose live lighting stream is being refused, so a rebuilt row keeps its lamp.
+static LIGHT_REFUSED: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-fn light_refused(pid: u16) -> bool {
-    LIGHT_REFUSED.lock().is_ok_and(|s| s.contains(&pid))
+fn light_refused(unit: &str) -> bool {
+    LIGHT_REFUSED.lock().is_ok_and(|s| s.contains(unit))
 }
 
-/// A lighting stream started or stopped being refused: patch that device's rows in place.
-pub fn set_light_refused(pid: u16, refused: bool) {
-    let changed = LIGHT_REFUSED.lock().is_ok_and(|mut s| if refused { s.insert(pid) } else { s.remove(&pid) });
+/// A unit's lighting stream started or stopped being refused: patch its row in place.
+pub fn set_light_refused(unit: &str, refused: bool) {
+    let changed =
+        LIGHT_REFUSED.lock().is_ok_and(|mut s| if refused { s.insert(unit.to_string()) } else { s.remove(unit) });
     if !changed {
         return;
     }
     let Some(w) = UI.get().cloned() else { return };
+    let unit = unit.to_string();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(app) = w.upgrade() else { return };
         let rows = app.global::<State>().get_devices();
-        let hex = format!("{pid:04x}");
         for i in 0..rows.row_count() {
             if let Some(mut r) = rows.row_data(i) {
-                if r.pid == hex.as_str() && !r.dialect.is_empty() && r.light_refused != refused {
+                if r.id == unit.as_str() && !r.dialect.is_empty() && r.light_refused != refused {
                     r.light_refused = refused;
                     rows.set_row_data(i, r);
                 }
@@ -8598,8 +8598,19 @@ pub fn set_light_refused(pid: u16, refused: bool) {
 
 /// The newest device check, so a slower earlier one can't overwrite it.
 static CHECK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The newest check's result, for copy and report.
-static LAST_CHECK: std::sync::Mutex<Option<(String, u16, neuron::devcheck::DeviceCheck)>> = std::sync::Mutex::new(None);
+/// The newest check's result and the row it belongs to, for copy and report.
+static LAST_CHECK: std::sync::Mutex<Option<(String, String, u16, neuron::devcheck::DeviceCheck)>> =
+    std::sync::Mutex::new(None);
+
+/// The open drawer's check, once it has landed.
+fn open_check(st: &State) -> Option<(String, u16, neuron::devcheck::DeviceCheck)> {
+    let id = st.get_check_id();
+    LAST_CHECK.lock().ok().and_then(|l| {
+        l.as_ref()
+            .filter(|(row, ..)| id.as_str() == row)
+            .map(|(_, dialect, pid, c)| (dialect.clone(), *pid, c.clone()))
+    })
+}
 
 fn show_check(st: &State, c: &neuron::devcheck::DeviceCheck) {
     use neuron::devcheck::TxState;
@@ -8638,11 +8649,13 @@ fn start_device_check(app: &AppWindow, id: &str, dialect: &str, pid_hex: &str, n
     st.set_check_id(id.into());
     st.set_check_busy(true);
     st.set_check_said("".into());
+    st.set_check_lines(ModelRc::default());
+    st.set_check_notes(ModelRc::default());
     let seq = CHECK_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let w = app.as_weak();
-    let (dialect, name) = (dialect.to_string(), name.to_string());
+    let (row, dialect, name) = (id.to_string(), dialect.to_string(), name.to_string());
     let spawned = crate::worker::spawn_detached("neuron-device-check", move || {
-        let c = neuron::devcheck::check(&dialect, pid, &name);
+        let c = neuron::devcheck::check(&dialect, pid, &row, &name);
         let _ = slint::invoke_from_event_loop(move || {
             if CHECK_SEQ.load(std::sync::atomic::Ordering::SeqCst) != seq {
                 return;
@@ -8650,7 +8663,7 @@ fn start_device_check(app: &AppWindow, id: &str, dialect: &str, pid_hex: &str, n
             let Some(app) = w.upgrade() else { return };
             show_check(&app.global::<State>(), &c);
             if let Ok(mut last) = LAST_CHECK.lock() {
-                *last = Some((dialect, pid, c));
+                *last = Some((row, dialect, pid, c));
             }
         });
     });
@@ -8687,6 +8700,10 @@ fn spawn_background_scan(w: &slint::Weak<AppWindow>) {
         let scanned = std::panic::catch_unwind(crate::runtime::scan_hardware);
         let Ok(Some((infos, devs))) = scanned else {
             drop(slot); // no result will ever apply — free the slot for the next tick
+            // A device that arrived during this scan still gets its scan.
+            if RESCAN_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                request_device_scan();
+            }
             return;
         };
         // Hop back to the UI thread to touch Slint state / AppRuntime — neither is
@@ -8808,7 +8825,7 @@ fn apply_scanned_devices(
             adopting: d.adopting,
             learned: d.learned,
             lighting_trust: d.lighting_trust,
-            light_refused: light_refused(d.pid),
+            light_refused: light_refused(&d.instance),
         })
         .collect();
     // 2) EMERGENT audio endpoints appended — mic + every output, generic over any hardware.

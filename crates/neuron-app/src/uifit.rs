@@ -506,6 +506,15 @@ pub(crate) fn rects_of(window: &slint::Window, name: &str) -> Vec<(f32, f32, f32
     scan(window).into_iter().filter(|n| n.path.ends_with(name)).map(|n| (n.rect.x, n.rect.y, n.rect.w, n.rect.h)).collect()
 }
 
+/// [`rects_of`], only the elements on show (a hidden twin layout's copy is left out).
+pub(crate) fn shown_rects_of(window: &slint::Window, name: &str) -> Vec<(f32, f32, f32, f32)> {
+    scan(window)
+        .into_iter()
+        .filter(|n| n.path.ends_with(name) && shown(n))
+        .map(|n| (n.rect.x, n.rect.y, n.rect.w, n.rect.h))
+        .collect()
+}
+
 /// Every element whose path ends with `name`, as "path @ x,y wxh (shown)": for a test message that
 /// says what was drawn when an element it looks for is missing.
 pub(crate) fn drawn_as(window: &slint::Window, name: &str) -> Vec<String> {

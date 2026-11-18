@@ -31,8 +31,9 @@ Use the linked evidence to answer for the user's version and hardware.
   Other devices need their own checks; don't promise compatibility from detection alone.
   Synapse and Neuron shouldn't control the same device at once. (`README.md`, `docs/STATUS.md`)
 - **Which devices work?** Check `docs/STATUS.md` for verified hardware and feature grades.
-  To help test another device, use the [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml)
-  or the optional [`neuron-compat` skill](../neuron-compat/SKILL.md).
+  To help test another device, press **check** on its DEVICE row, then **report** (it opens the
+  [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) filled in),
+  or use the optional [`neuron-compat` skill](../neuron-compat/SKILL.md).
 - **Linux or Mac?** Windows is the released platform. Linux app and CLI build from source,
   but have no released package or native Razer HID verification; macOS has no backend.
 - **Why does Windows warn when I run it?** The Windows builds are unsigned. Check the

@@ -8,7 +8,7 @@ i don't run Synapse anymore. neuron handles my Naga V2 Pro and BlackWidow Chroma
 
 **more than a replacement.** layered reactive lighting, Python macros, app-aware binds, radial menus and gesture controls. it's the Synapse stuff i needed, plus the things i always wanted.
 
-**not just for Razer.** gamepads, the radial, spellweaving, app-aware profiles, clipboard tools and window actions run on ordinary Windows input, so they don't care what brand your mouse, keyboard or pad is. Razer hardware gets device controls and lighting on top. [here's what works on what](docs/STATUS.md).
+**not just for Razer.** gamepads, the radial, spellweaving, app-aware profiles, clipboard tools and window actions run on ordinary Windows input, so they don't care what brand your mouse, keyboard or pad is. Razer hardware gets device controls and lighting on top. Logitech mice and keyboards and QMK boards with VIA are learned too. [here's what works on what](docs/STATUS.md).
 
 **[download for Windows](https://github.com/worflor/neuron/releases/latest)** · [FAQ & manual help](docs/FAQ.md) · [check device support](docs/STATUS.md) · [help test yours](#help-neuron-on-your-hardware)
 
@@ -200,7 +200,7 @@ feel      feel (show · timing · sniper · dpi · polling · stages · scroll �
 input     bind · control · action · trigger · cast · gesture · radial · macro · pocket ·
           run [--safe] · watch · pads · rumble · audio · twin
 lighting  lighting (catalog · stack · fps · apply · effect · …)
-setup     profile · config · dump · apply · reload · status · catalog · import
+setup     profile · config · dump · apply · reload · status · catalog · import · report · update
 gui       neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 ```
 
@@ -210,7 +210,7 @@ clipboard tools live on the same `Trigger → Action` path: ordered bounded text
 
 ## help neuron on your hardware
 
-i can't own every Razer mouse and keyboard, so this is where you come in. try neuron on yours and tell me what works, what doesn't, and whether it's wired, on a dongle or Bluetooth. a partial result is still useful. [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml).
+i can't own every Razer mouse and keyboard, so this is where you come in. plug yours in, press **check** on its row, then **report**: a device report opens with the device, your system and the check filled in. add what worked and what didn't. a partial result is still useful. no row for it? [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) by hand.
 
 want to dig deeper? [Compatibility Lab](docs/reference/COMPATIBILITY-LAB.md#try-it-yourself) walks you through read-only steps that inspect your device and export a report you can read before you share it. nothing uploads on its own. the optional [`neuron-compat` skill](skills/neuron-compat/SKILL.md) can guide the same steps.
 

@@ -1402,6 +1402,31 @@ pub fn auto_def_path(dialect_id: &str, pid: u16) -> PathBuf {
         .join(format!("{dialect_id}-{pid:04x}.toml"))
 }
 
+/// Where a pipe's learned file goes. VIA claims every vendor and QMK boards reuse default pids,
+/// so its files carry the vendor id too; the single-vendor dialects keep [`auto_def_path`].
+#[must_use]
+pub fn auto_def_path_for(dialect_id: &str, vid: u16, pid: u16) -> PathBuf {
+    if dialect_id == "via" {
+        auto_def_path(dialect_id, pid).with_file_name(format!("via-{vid:04x}-{pid:04x}.toml"))
+    } else {
+        auto_def_path(dialect_id, pid)
+    }
+}
+
+/// The learned file for `dialect_id` and `pid`, whichever vendor's it is.
+#[must_use]
+pub fn find_auto_def(dialect_id: &str, pid: u16) -> Option<PathBuf> {
+    let plain = auto_def_path(dialect_id, pid);
+    if plain.exists() {
+        return Some(plain);
+    }
+    let suffix = format!("-{pid:04x}.toml");
+    let prefix = format!("{dialect_id}-");
+    std::fs::read_dir(plain.parent()?).ok()?.flatten().map(|e| e.path()).find(|p| {
+        p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix) && n.ends_with(&suffix))
+    })
+}
+
 /// Find every connected Razer `razer_report` pipe the registry does NOT recognize, synthesize
 /// a def for it, and write `devices/auto/razer-<pid>.toml`. Existing files are never
 /// overwritten (they are the user's config now — a present-but-unloadable one is reported in
@@ -1458,7 +1483,7 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
         if reg.knows_family(i.vid, i.pid, d.id()) || tried.contains(&key) {
             continue;
         }
-        let file = auto_def_path(d.id(), i.pid);
+        let file = auto_def_path_for(d.id(), i.vid, i.pid);
         if file.exists() {
             match retire_stale_auto_def(&file) {
                 Ok(Some(backup)) => out.retired.push(backup),
@@ -1598,7 +1623,7 @@ fn razer_best_pipe(infos: &[HidDeviceInfo], first: &HidDeviceInfo) -> Result<Syn
         let s = match synthesize_explained(&*t, &ctx) {
             Ok(s) => s,
             Err(r) => {
-                if r.rank() > why.rank() || matches!(why, Refusal::OpenFailed(_)) {
+                if r.rank() > why.rank() {
                     why = r;
                 }
                 continue;
@@ -2562,5 +2587,19 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod learned_file_names {
+    use super::*;
+
+    #[test]
+    fn two_makers_via_boards_on_one_pid_get_their_own_files() {
+        let a = auto_def_path_for("via", 0xFEED, 0x0001);
+        let b = auto_def_path_for("via", 0x3434, 0x0001);
+        assert_ne!(a, b);
+        assert!(a.ends_with("via-feed-0001.toml"), "{}", a.display());
+        assert_eq!(auto_def_path_for("razer", 0x1532, 0x024E), auto_def_path("razer", 0x024E));
     }
 }

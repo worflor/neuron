@@ -220,7 +220,7 @@ fn a_via_keyboard_is_adopted_and_its_brightness_read_on_the_recorded_bus() -> Re
     let _deny = transport::deny_hardware();
     let _run_root = IsolatedRunRoot::new()?;
     let pid = 0x0281;
-    let auto_file = synth::auto_def_path("via", pid);
+    let auto_file = synth::auto_def_path_for("via", 0x3434, pid);
 
     let ask = |data: &[u8], reply: &[u8]| Exchange {
         channel: Channel::OutputInput,

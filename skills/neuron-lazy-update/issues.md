@@ -55,7 +55,7 @@ shutdown.
 
 ## Starting from a bug report
 
-SYSTEM → RELIABILITY's **for your agent** button, or `neuron report bug --what "<text>"`, writes a
+SYSTEM → HEALTH's **for your agent** button, or `neuron report bug --what "<text>"`, writes a
 folder `reports/bug-<date>-<time>/` in the config folder, a zip of it beside it, and (from the app)
 copies a prompt that points you here. The folder holds:
 
@@ -124,7 +124,8 @@ better fit than an issue: https://github.com/worflor/neuron/discussions
 ## 3. Draft it (only after a yes)
 
 Pick the template: `bug_report.md` for something broken, or `feature_request.md` for something
-missing. Gather what applies, running only read-only commands:
+missing. A device that isn't learned, stays dark or ignores a setting goes in a device report: ask
+the user to press **check** on its DEVICE row, then **report**, which fills the form in. Gather what applies, running only read-only commands:
 
 | field | how to get it |
 |---|---|

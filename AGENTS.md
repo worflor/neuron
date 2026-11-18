@@ -17,8 +17,8 @@ If you only take three things away, take these:
 ## What this is, in four lines
 
 neuron is a tray-resident replacement for Razer Synapse: an app and CLI over one
-core that speaks `razer_report` HID directly. An experimental Logitech HID++ dialect
-does read-only adoption without hardware verification. No account, no cloud, no telemetry,
+core that speaks `razer_report` HID directly. Experimental Logitech HID++ and QMK VIA
+dialects adopt devices too, not yet run on real hardware. No account, no cloud, no telemetry,
 no kernel driver, no vendor SDK. Windows ships the app and CLI. Linux
 builds both from source, with a GUI and hidraw transport; its release is deferred
 while live input, overlays, audio, and hardware behavior are verified. Runtime
@@ -325,9 +325,9 @@ So:
   worth more than a paragraph. A Slint binding loop only fails when its element is drawn
   in the state that reads it (hover-gated UI hides one from every unit test), so extend the
   render smoke in `apptest.rs` when you add UI that changes on hover.
-- **Device / lighting changes:** the diagnostics bench on the SYSTEM page runs nine
-  read-only probes against real hardware and is always safe. That is the "prove it
-  works" surface. Name the hardware you tested on.
+- **Device / lighting changes:** a device row's **check** and the diagnostics bench on
+  the SYSTEM page (nine probes) are read-only against real hardware and always safe.
+  They are the "prove it works" surface. Name the hardware you tested on.
 - **Things you genuinely cannot verify** (audio output, a device you don't own, a
   platform you're not on): say so explicitly. An honest "unverified on hardware" is
   useful. A confident claim that turns out to have been a compile check is not.

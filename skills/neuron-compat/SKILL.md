@@ -43,6 +43,10 @@ the existing SYSTEM read-only diagnostics and a local research handoff.
 A separate-conversation handoff needs only the executable path, installed version,
 missing command/feature and requested investigation. Do not copy the private dossier.
 
+If the device has a row on the app's DEVICE page, its **check** → **report** opens the
+device report with the device, system and check filled in; for a plain report that is
+the whole job, and the steps below are for going further.
+
 Ask for the model, connection mode (wired, receiver or Bluetooth), and the single
 thing they expected versus what happened. Existing details need not be asked again.
 An unfamiliar device is a valid research target; a recognized device can still
@@ -100,9 +104,9 @@ prepare a draft via the handoff reference; do not manufacture a native finding.
 
 ## A Razer keyboard that is detected but stays dark
 
-When a Razer keyboard shows up in Neuron but its lighting does nothing (or Neuron says no
-device supports brightness), run the read-only lighting probe for that board once the build
-has it (`neuron compat --help` lists `lighting`):
+When a Razer keyboard shows up in Neuron but its lighting does nothing (its row may say
+**lights not landing · check**), run the read-only lighting probe for that board once the build
+has it (`neuron compat --help` lists `lighting`; the row's **check** runs the same probe):
 
 ```text
 neuron compat lighting --pid PID --json

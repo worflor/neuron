@@ -234,7 +234,7 @@ impl DeviceEvidence {
     /// the Dynamic Lighting switch. Missing pieces stay `None`.
     #[must_use]
     pub fn gather(dialect_id: &str, pid: u16) -> Self {
-        let file = std::fs::read_to_string(crate::synth::auto_def_path(dialect_id, pid)).ok();
+        let file = crate::synth::find_auto_def(dialect_id, pid).and_then(|p| std::fs::read_to_string(p).ok());
         let mut device_file = file.as_deref().and_then(definition_summary);
         if let Some(r) = crate::calibrate::record_for(dialect_id, pid) {
             let settle = format!("settled: {:?}\n{}", r.verdict, r.notes.join("\n")).to_lowercase();

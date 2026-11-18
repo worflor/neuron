@@ -1,6 +1,6 @@
 # Compatibility Lab
 
-Compatibility Lab helps investigate devices I don't have on my desk. A basic [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) is already useful; you don't need to collect anything first. If you want to provide more detail, Neuron's CLI can collect read-only HID evidence without changing your device settings.
+Compatibility Lab helps investigate devices I don't have on my desk. You don't need it to report a device: a row's **check** → **report** in the app opens a [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) with the check filled in. For more detail, or a device that never gets a row, Neuron's CLI can collect read-only HID evidence without changing your device settings.
 
 ## try it yourself
 
@@ -146,18 +146,11 @@ answers identity reads but no lighting, a board that answers lighting at one coh
 only, an LED the board lacks, and replies the validator drops. It reports what the
 board answers, never what its LEDs show; physical confirmation stays separate.
 
+In the app, a device row's **check** runs this recipe (or the HID++ or VIA reads) for that one device.
+
 ## Investigation without the hardware
 
-`neuron-core::transport::firmware` models a Razer board's firmware with state:
-writes change it, getters read it back, and the model says what its LEDs display.
-What real firmware does at the edges is a knob each test states: the tx cohort and
-which commands it covers, how a foreign request is refused, the LED set, effect size
-strictness, driver-mode dependence, and decoy collections that answer identity
-getters only. The keyboard conformance suite
-(`crates/neuron-testkit/tests/keyboard_conformance.rs`) builds a unit per keyboard
-atlas wire shape and drives production adoption, the first-light heal, a static
-colour, brightness read-back and a custom frame under each assumption. A pass means
-Neuron reaches a board that behaves that way, not that a real board does.
+How the modelled firmware tests the same paths is in [TDD §5.8](../TDD.md#58-device-identity-discovery-and-input-decode).
 
 `neuron-testkit::compat::RecordedInput` consumes the core recording schema and
 implements `InputReader`. A test can feed the exact report order into a production

@@ -73,8 +73,8 @@ issue text outside the bundle so its manifest hashes remain valid.
 No command uploads evidence or files GitHub issues. For a manual walkthrough,
 see [Compatibility Lab](COMPATIBILITY-LAB.md#try-it-yourself); the
 [neuron-compat skill](../../skills/neuron-compat/SKILL.md) can guide the same steps.
-Existing SYSTEM diagnostics provide deeper recognized-device checks; this collector
-does not claim that a registry capability worked.
+In the app, a device row's **check** runs `lighting` (or the HID++ or VIA reads) for
+that one device. This collector does not claim that a registry capability worked.
 
 ## Conventions
 
@@ -82,7 +82,7 @@ does not claim that a registry capability worked.
 |---|---|
 | Output | `--json` on any verb prints one JSON document on stdout. Reads emit their data; writes emit the resulting state (re-read from disk) plus a `live` field. |
 | Errors | one plain line `error: ...`, or with `--json` `{"error": "..."}`, on stderr. Exit code 1 for a failure (bad value, missing thing, failed run), 2 for a usage error (unknown command, missing or malformed argument). Nothing is written on a rejected command. |
-| Reads | reads never write. `list` reports a device no definition covers as ``new device NAME: run `neuron adopt` to learn it``; only `adopt` writes `devices/auto/`. With several devices, `info` describes the first and says `(1 of 3 devices; --pid to pick)`. |
+| Reads | reads never write. `list` reports a device no definition covers as ``new device NAME (pid PID): run `neuron adopt` to learn it``; only `adopt` writes `devices/auto/`. With several devices, `info` describes the first and says `(1 of 3 devices; --pid to pick)`. |
 | Chatter | engine start-up lines (`[macro host] ...`) are hidden; `--verbose` or `NEURON_DEBUG=1` shows them. |
 | Run root | every config file lives under one directory (`neuron config path`). `NEURON_RUN_DIR` points a session at a scratch directory; tests and dry rehearsals should use it. `neuron status` says whether an app runs and whether it uses this root (`yes, on another run root`). |
 | Live reload | a config write signals the running app, which re-reads within about a second (`live`: `reloaded`, `no-app`, `other-root`, `skipped`, `failed`). The signal only goes to an app that uses the same run root: an app publishes its root in `app.pid`, and when `NEURON_RUN_DIR` is set and no such file matches, nothing is sent (`other-root`). `--no-live` skips the signal; `neuron reload` sends it once. Preferences (`config app`) take effect when the app next starts. |
@@ -373,6 +373,7 @@ dump / apply              a setup document / {sections:[{section, status, detail
 | Settings: accents, notifications, connections, phoenix, launch to tray | `config app ...` |
 | Import wizard | `import` (survey, lists Synapse 3 mapping logs), `import FILE [--apply]` (a Synapse export, or a Synapse 3 `*Mapping*.log`) |
 | Onboard storage, backup, verify | `storage`, `backup`, `verify` |
+| A device row's check (Razer) | `compat lighting --pid PID`; the HID++ and VIA checks and the prefilled device report are app-only |
 | Pockets, audio endpoints | `pocket`, `audio` |
 | Everything authored, at once | `dump`, `apply` |
 

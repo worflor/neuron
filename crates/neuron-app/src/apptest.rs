@@ -1478,7 +1478,7 @@ fn stack_sense_names_the_trouble_and_offers_fixes() {
         assert_eq!(st.get_light_focus_layer(), 1 - i as i32, "pointing at a row shows its layer on the board");
     }
     let quiet = board(&st);
-    for (i, (fx, fy, fw, fh)) in crate::uifit::rects_of(app.window(), "FixText").into_iter().enumerate() {
+    for (i, (fx, fy, fw, fh)) in crate::uifit::shown_rects_of(app.window(), "FixText").into_iter().enumerate() {
         app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(fx + fw / 2.0, fy + fh / 2.0) });
         // the fix plays after a short beat
         std::thread::sleep(std::time::Duration::from_millis(150));

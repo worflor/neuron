@@ -465,12 +465,12 @@ impl AppRuntime {
         let refused = self.synth_refused.lock().map(|r| r.clone()).unwrap_or_default();
         for (&(family, pid), &(_, strikes)) in &self.synth_attempted {
             let why = refused.get(&(family, pid));
-            // A silent device may be waking, so it gets a few tries before it shows; a definite
+            // A silent device may be waking, so it gets a few tries before it shows; any other
             // reason shows at once, and a raw HID collection that isn't a keyboard isn't a device.
             let show = match why {
                 Some(neuron::synth::Refusal::NotKeyboard) => false,
-                Some(r) if !r.transient() => true,
-                _ => strikes >= UNRESPONSIVE_STRIKES,
+                Some(neuron::synth::Refusal::Silent) | None => strikes >= UNRESPONSIVE_STRIKES,
+                Some(_) => true,
             };
             if !show {
                 continue;
@@ -1256,8 +1256,17 @@ impl AppRuntime {
                                 scene.handle = Some(live.handle());
                             }
                             let health = Arc::new(neuron::lighting::StreamHealth::default());
-                            let lit_pid = i.pid;
-                            health.on_change(move |refused| crate::glue::set_light_refused(lit_pid, refused));
+                            let lit_unit = i.instance();
+                            let report_unit = lit_unit.clone();
+                            health.on_change(move |refused| crate::glue::set_light_refused(&report_unit, refused));
+                            // The lamp clears however the stream ends, a panic included.
+                            struct ClearLamp(String);
+                            impl Drop for ClearLamp {
+                                fn drop(&mut self) {
+                                    crate::glue::set_light_refused(&self.0, false);
+                                }
+                            }
+                            let _clear_lamp = ClearLamp(lit_unit);
                             let lights = Lights::new(&d, ldef).with_health(health);
                             let streamed = lights
                                 .animate_frames(
@@ -1272,7 +1281,6 @@ impl AppRuntime {
                                     },
                                 )
                                 .map_err(|e| format!("animate: {e}"));
-                            crate::glue::set_light_refused(lit_pid, false);
                             // CUSTODY RELEASE (the DPI-16000 trap): streaming lighting holds this board
                             // in driver mode (every write flips it via ensure_custody), which defers its
                             // onboard buttons/FN to software AND orphans the wake-reassert duty. Driver
