@@ -24,7 +24,7 @@ neuron can import supported plaintext Synapse exports. encrypted cloud-only prof
 
 ### do i need Razer gear?
 
-not for a lot of it. gamepads, spellweaving and the radial, app-aware profile switching, clipboard pockets and transforms, window, audio and screenshot actions, and macros run on ordinary Windows input, so they don't care what brand your gear is. device settings like DPI and polling, and per-key lighting, need supported Razer hardware. Logitech mice and keyboards and QMK boards with VIA get a few readings and brightness, early and not yet run on real ones.
+not for a lot of it. gamepads, spellweaving and the radial, app-aware profile switching, clipboard pockets and transforms, window, audio and screenshot actions, and macros run on ordinary Windows input, so they don't care what brand your gear is. device settings like DPI and polling, and per-key lighting, need supported Razer hardware. Logitech mice and keyboards read their name, battery and DPI, and QMK boards with VIA get brightness.
 
 ### does it work with anti-cheat?
 
@@ -82,7 +82,7 @@ neuron is a **Windows beta** with device controls tested on the **Naga V2 Pro** 
 
 ### my device isn't recognized, or stays dark. what should i do?
 
-neuron picks a device up when it's plugged in; there's nothing to scan. if neuron can't learn it, its row on **DEVICE** says why (another app holding it is a common one: quit Synapse and other RGB tools). a board whose lighting isn't taking says **lights not landing · check**.
+neuron picks a device up when it's plugged in; there's nothing to scan. if neuron can't learn it, its row on **DEVICE** says why (often another app is holding it, so quit Synapse and other RGB tools). a board whose lighting isn't taking says **lights not landing · check**.
 
 either way, press **check** on the device's row. it asks the device a few read-only questions and shows what answered. press **report** under it and a [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) opens with the device, your system and the check filled in; add what you tried and what happened. no row at all? fill the report in by hand. want to send more? [Compatibility Lab has a walkthrough](reference/COMPATIBILITY-LAB.md#try-it-yourself).
 

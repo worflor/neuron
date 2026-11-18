@@ -6,7 +6,7 @@ labels: bug, needs-triage
 assignees: ''
 ---
 
-describe what happened in your own words; a short report is fine. **report a bug** on neuron's SYSTEM page fills most of this in for you. a device that isn't picked up, stays dark or ignores a setting? press **check** on its row on the DEVICE page, then **report**: that opens the device report instead.
+describe what happened in your own words; a short report is fine. **report a bug** on neuron's SYSTEM page fills most of this in for you. if a device isn't picked up, stays dark or ignores a setting, press **check** on its row on the DEVICE page, then **report**. that opens the device report instead.
 
 **device + connection** (if relevant)
 model, and whether it's wired, dongle or Bluetooth.

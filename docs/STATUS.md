@@ -6,7 +6,7 @@
 - **Other Razer devices:** neuron learns most of them on its own. the tables below say what's been checked on real hardware.
 - **Beyond Razer:** gamepads, spellweaving, the radial, app profiles, clipboard tools and window actions run on ordinary Windows input, not device commands, so they don't depend on your gear's brand. a PowerA gamepad has been tested for input and rumble on Windows. Logitech mice and keyboards, plugged in or on a receiver, and QMK keyboards with VIA are learned too; what each one reads is under device adoption below.
 - **Linux:** the app and CLI build from source and haven't run on Razer hardware yet. **macOS:** no backend.
-- **Got different hardware?** press **check** on its row, then **report** (on `main`; in v0.1.8, [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) by hand), or [collect evidence yourself](reference/COMPATIBILITY-LAB.md#try-it-yourself).
+- **Got different hardware?** press **check** on its row, then **report**. on v0.1.8, [file a device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) by hand, or [collect evidence yourself](reference/COMPATIBILITY-LAB.md#try-it-yourself).
 
 The current downloadable release is [v0.1.8](https://github.com/worflor/neuron/releases/tag/v0.1.8), published 2026-11-14 (Windows and Linux CI passed, checksums, the signed update manifest and the installer's provenance attestation verified). This page tracks v0.1.8 alongside current `main` ([`CHANGELOG.md`](../CHANGELOG.md)).
 
@@ -33,8 +33,8 @@ reports from people trying neuron on hardware i don't have. each one is how a de
 
 | device | reported by | what they saw | since then |
 |---|---|---|---|
-| BlackWidow V4 X (wired) | [@shinobun33t](https://github.com/worflor/neuron/issues/23), 2026-10-15 | detected; lighting and M keys didn't work | v0.1.7 fixes the M keys on a keyboard picked up after launch and the lighting region its generated file used. on `main`, lighting goes to the backlight LED in openrazer's packet layout and adoption checks every control collection for the one that answers lighting. not yet retried on a V4 X |
-| BlackWidow V3 (wired) | [@kurakanai](https://github.com/worflor/neuron/issues/33), 2026-11-01 | hardware game mode worked; lighting and macros didn't; on 0.1.7 and 0.1.8 Neuron said no device supports brightness | macros work on 0.1.8. on `main`, adoption asks for the board's lighting at each transaction id (openrazer reads this board at 0x3F, Neuron asked only at 0x1F) and on each control collection, and rebuilds the old generated file. not yet retried on a V3; its row's **check** shows what it answers |
+| BlackWidow V4 X (wired) | [@shinobun33t](https://github.com/worflor/neuron/issues/23), 2026-10-15 | detected; lighting and M keys didn't work | v0.1.7 fixes the M keys on a keyboard picked up after launch and the lighting region its generated file used. on `main`, lighting goes to the backlight LED in openrazer's packet layout and adoption finds the control collection that answers lighting. not yet retried on a V4 X |
+| BlackWidow V3 (wired) | [@kurakanai](https://github.com/worflor/neuron/issues/33), 2026-11-01 | hardware game mode worked; lighting and macros didn't; on 0.1.7 and 0.1.8 neuron said no device supports brightness | macros work on 0.1.8. on `main`, adoption asks for the board's lighting at each transaction id (openrazer reads this board at 0x3F, neuron asked only at 0x1F) and on each control collection, and rebuilds the old generated file. not yet retried on a V3; its row's **check** shows what it answers |
 
 got one of these, or something else? on `main` (not in v0.1.8), press **check** on its row for a read-only look at what it answers, then **report** to open a [device report](https://github.com/worflor/neuron/issues/new?template=device_report.yml) with the device and the check filled in.
 
