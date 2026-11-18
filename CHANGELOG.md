@@ -1,12 +1,5 @@
 # changelog
 
-## unreleased
-### new
-- **colour on Logitech and QMK.** Logitech keyboards light per key, Logitech mice and headsets per zone, Vial boards per LED, and other QMK boards take one colour for the whole board. every effect and layer plays on them, and nothing is saved to the device.
-
-### fixed
-- **older QMK boards.** a Vial board, or one with VIA firmware from before late 2022, is no longer given a brightness control it never answered.
-
 ## 0.1.9 · 2026-11-18
 plug in and go. neuron learns more devices on its own, and the lighting layers spot what's hiding what and offer a fix.
 ![the stack names Tidepool hidden under Wildlife and offers fixes, while the keyboard previews Wildlife at 50%](docs/media/release-layers-fix.webp)
@@ -14,8 +7,8 @@ plug in and go. neuron learns more devices on its own, and the lighting layers s
 
 ### new
 - **found on plug-in.** devices show up as you plug them in, no scan needed. if neuron can't learn one, its row says why.
-- **Logitech.** mice and keyboards, plugged in or on a receiver, with their name, battery and DPI.
-- **custom keyboards.** QMK boards with VIA turned on, brightness included.
+- **Logitech.** mice and keyboards, plugged in or on a receiver, with their name, battery, DPI and colour, per key on keyboards.
+- **custom keyboards.** QMK boards with VIA turned on, with brightness and colour, per LED on Vial boards.
 - **layers that help.** neuron spots a layer hiding another and offers a fix you can preview.
 - **check any device.** a button on its row shows what the device answers, ready to copy or send as a report.
 

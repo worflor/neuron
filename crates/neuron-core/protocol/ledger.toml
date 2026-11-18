@@ -3241,9 +3241,10 @@ dialect = "hidpp"
 kind = "set"
 class = 0x81
 id = 0x01
-layout = "0x8100 fn2 reads the onboard mode; at 0x01 fn1 [0x02] switches to host; 0x8071 fn5 [0x01, 0x03, 0x05] software control; 0x8081 fn1 [(key id, r, g, b) x 4] per key, only changed keys; fn7 [16 zero bytes] frame end, retried on Busy; at release 0x8071 fn5 [0x01, 0x00, 0x00] and 0x8100 fn1 [the mode read]"
+layout = "0x8100 fn2 reads the onboard mode; at 0x01 fn1 [0x02] switches to host, read back, put back if the claim fails; 0x8071 fn5 [0x01, 0x03, 0x05] software control; 0x8081 fn1 [(key id, r, g, b) x 4] per key, only changed keys, a short report repeating its last key; fn7 [16 zero bytes] frame end, retried on Busy; the first frame after a claim sent twice; at release 0x8071 fn5 [0x01, 0x00, 0x00] and 0x8100 fn1 [the mode read]"
 meaning = "Per-key colour on a Logitech keyboard or mouse."
-grade = "agreed"
+grade = "single"
+conflicts = ["software control flags: Solaar sends 4 and documents 5, OpenRGB settles at 5, its older G915 code sends 7; neuron sends 5"]
 ungated_debt = "Software control and per-key frames are RAM state, and the onboard mode switch writes no profile memory; release gives control back and restores the mode read at take. 0x8081 has no getter, so frames are confirmed by their replies, not read back. 0x8071's own effect write is never sent (its persist byte is disputed). Host mode sets the onboard DPI and button profile aside while neuron holds the lighting. No Logitech device has been on neuron's wire."
 evidence = [
   { kind = "source", src = "solaar", at = "lib/logitech_receiver/rgb_power.py#L48-L56", what = "software control claim [01 03 flags] and release [01 00 00]" },
@@ -3260,9 +3261,10 @@ dialect = "hidpp"
 kind = "set"
 class = 0x70
 id = 0x03
-layout = "0x8070 fn8 [0x01] software control; fn3 [zone, fixed effect index, r, g, b, 0x02 no ramp, 0 x 6, persist 0x00] per changed zone; the first colour read back through fn14 [zone] when ext caps has 0x01; at release fn8 [0x00]"
+layout = "0x8070 fn8 [0x01] software control; fn3 [zone, fixed effect index, r, g, b, 0x02 no ramp, 0 x 6, persist 0x00] per changed zone; colour read back through fn14 [zone] until it matches, when ext caps has 0x01; at release each zone's effect read at take is written back where its index and id agree, then fn8 [0x00]"
 meaning = "A fixed colour per zone on a Logitech mouse or headset, unsaved."
-grade = "agreed"
+grade = "single"
+conflicts = ["the effect byte: Solaar and OpenRGB send the zone's effect index, libratbag the effect id; they agree where index and id are the same"]
 ungated_debt = "Persist byte 0x00 is the live value OpenRGB and Solaar send (libratbag's 0x01 is the one that writes flash); the colour is read back where the device can; release gives control back. No Logitech device has been on neuron's wire."
 evidence = [
   { kind = "source", src = "openrgb-5bcfa9ae", at = "Controllers/LogitechController/LogitechHIDPP20Controller/LogitechHIDPP20Controller.cpp#L6108-L6114", what = "persist byte 0 for live writes, 1 only on save" },

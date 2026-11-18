@@ -288,6 +288,10 @@ pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
     let level = (u16::from(pct.min(100)) * 255 / 100) as u8;
     // VIA writes are always unsaved and checked by their own read-back; `store` has no meaning there.
     if dev.def.dialect == "via" {
+        // while neuron paints a colour on the board, the slider scales what it paints
+        if let Some(r) = crate::family::set_level(dev, level) {
+            return r;
+        }
         return crate::via::set_brightness(dev, level);
     }
     anyhow::ensure!(
@@ -336,8 +340,11 @@ pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
 
 /// Lighting brightness as a percentage. Response arg[2] is raw 0..255 (Synapse shows %).
 pub fn brightness_percent(dev: &Device) -> Result<u8> {
-    let a = dev.run("brightness")?;
-    Ok(((u32::from(a[2]) * 100 + 127) / 255) as u8)
+    let raw = match crate::family::level(dev) {
+        Some(level) => level,
+        None => dev.run("brightness")?[2],
+    };
+    Ok(((u32::from(raw) * 100 + 127) / 255) as u8)
 }
 
 /// The single onboard pool. Everything — macros, profiles, our files — draws from the

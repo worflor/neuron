@@ -335,7 +335,8 @@ pub fn qmk_hsv_to_rgb([h, s, v]: [u8; 3]) -> [u8; 3] {
 
 /// The `[h, s, v]` whose QMK rendering is closest to `c`: a first guess from the usual hexcone,
 /// refined by searching around it with [`qmk_hsv_to_rgb`] itself, so the integer maths' own losses
-/// are accounted for (within 2 of any colour, per channel).
+/// are accounted for: within 3 of any colour, per channel (pure yellow, cyan and magenta top out
+/// at 252).
 #[must_use]
 pub fn rgb_to_qmk_hsv(c: crate::lighting::Rgb) -> [u8; 3] {
     let (r, g, b) = (i32::from(c.r), i32::from(c.g), i32::from(c.b));
@@ -515,8 +516,10 @@ fn family_lighting(
 
 /// What neuron found on the board and puts back at release.
 enum Held {
-    /// One colour for the whole board: the effect, `[h, s]` and brightness read at take.
-    Board { at: Rgb3, effect: Option<u8>, hs: Option<[u8; 2]>, brightness: Option<u8>, sent: Option<[u8; 3]> },
+    /// One colour for the whole board: the effect, `[h, s]` and brightness read at take; the
+    /// brightness slider's level, which scales each frame's value; the last frame's own value; and
+    /// the `[h, s, v]` last written, `v` already scaled.
+    Board { at: Rgb3, effect: Option<u8>, hs: Option<[u8; 2]>, brightness: Option<u8>, level: u8, frame_v: u8, sent: Option<[u8; 3]> },
     /// VialRGB direct mode: the mode read at take (`mode u16 LE, speed, h, s, v`), the board's
     /// brightness cap, and each LED's last `[h, s, v]`.
     Vial { mode: [u8; 6], max: u8, sent: Vec<Option<[u8; 3]>> },
@@ -540,30 +543,37 @@ pub(crate) fn take_lighting(t: &dyn Transport, def: &crate::lighting::LightingDe
             let direct = VIALRGB_DIRECT.to_le_bytes();
             write_value(t, &[VIALRGB_MODE], &[direct[0], direct[1], saved[2], saved[3], saved[4], saved[5]])?;
             let now = vialrgb_get(t, VIALRGB_MODE, &[]).map(|r| u16::from_le_bytes([r[2], r[3]]));
-            anyhow::ensure!(now == Some(VIALRGB_DIRECT), "the board didn't take VialRGB direct mode");
+            if now != Some(VIALRGB_DIRECT) {
+                let _ = write_value(t, &[VIALRGB_MODE], &saved);
+                anyhow::bail!("the board didn't take VialRGB direct mode");
+            }
             Held::Vial { mode: saved, max: info[4].max(1), sent: vec![None; def.leds.len()] }
         }
         _ => {
             let at = Rgb3 { channel: def.channel.ok_or_else(|| anyhow::anyhow!("no lighting channel"))? };
-            let effect = read_value(t, &at.effect(), 1).map(|v| v[0]);
+            // what the board shows has to be read before it is changed, or it can't be put back
+            let effect = Some(read_value(t, &at.effect(), 1).ok_or_else(|| anyhow::anyhow!("the board's effect didn't read"))?[0]);
             let hs = read_value(t, &at.colour(), 2).map(|v| [v[0], v[1]]);
             let brightness = read_value(t, &at.brightness(), 1).map(|v| v[0]);
             write_value(t, &at.effect(), &[SOLID_EFFECT])?;
-            Held::Board { at, effect, hs, brightness, sent: None }
+            let level = brightness.unwrap_or(u8::MAX);
+            Held::Board { at, effect, hs, brightness, level, frame_v: u8::MAX, sent: None }
         }
     };
     Ok(ColourLink { held, verified: false })
 }
 
 impl ColourLink {
-    /// Paint a frame: the whole board takes its mean colour; a VialRGB board takes each LED's own,
-    /// sending only the LEDs that changed. The first colour is read back.
+    /// Paint a frame: the whole board takes its mean colour, its first colour read back; a VialRGB
+    /// board takes each LED's own, sending only the LEDs that changed.
     pub(crate) fn paint(&mut self, t: &dyn Transport, def: &crate::lighting::LightingDef, px: &[crate::lighting::Rgb]) -> crate::dialect::Sent {
         use crate::dialect::Sent;
         let verified = self.verified;
         let result = match &mut self.held {
-            Held::Board { at, sent, .. } => {
+            Held::Board { at, sent, level, frame_v, .. } => {
                 let [h, s, v] = rgb_to_qmk_hsv(crate::family::mean_of(px));
+                *frame_v = v;
+                let v = (u16::from(v) * u16::from(*level) / 255) as u8;
                 let before = *sent;
                 let mut r = Ok(());
                 if before.map(|p| [p[0], p[1]]) != Some([h, s]) {
@@ -625,6 +635,26 @@ impl ColourLink {
                 Sent::Taken
             }
             Err(_) => Sent::Lost,
+        }
+    }
+
+    /// The brightness slider's level (0..=255) on a whole-board colour, applied at once. `None`
+    /// for a VialRGB board, whose LEDs carry their own value.
+    pub(crate) fn set_level(&mut self, t: &dyn Transport, value: u8) -> Option<Result<()>> {
+        let Held::Board { at, level, frame_v, sent, .. } = &mut self.held else { return None };
+        *level = value;
+        let Some([h, s, _]) = *sent else { return Some(Ok(())) };
+        let scaled = (u16::from(*frame_v) * u16::from(value) / 255) as u8;
+        let r = write_value(t, &at.brightness(), &[at.brightness_wire(scaled)]);
+        *sent = r.is_ok().then_some([h, s, scaled]);
+        Some(r)
+    }
+
+    /// The slider's level on a whole-board colour.
+    pub(crate) fn level(&self) -> Option<u8> {
+        match &self.held {
+            Held::Board { level, .. } => Some(*level),
+            Held::Vial { .. } => None,
         }
     }
 

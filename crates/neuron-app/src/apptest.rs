@@ -1320,6 +1320,54 @@ fn layer_stack_controls_preserve_identity_and_draw_a_large_scrollable_stack() {
     }
 }
 
+/// The lighting page draws the shapes the other families' devices learn: one colour for a whole
+/// QMK board, a row of Logitech zones, and a Vial board's matrix, each lit, at the window's minimum
+/// width and a wide one.
+#[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
+fn the_lighting_page_draws_family_boards() {
+    let _cwd = crate::testsupport::cwd_guard("family_boards");
+    std::env::set_var("SLINT_BACKEND", "winit-software");
+    std::env::set_var("SLINT_SCALE_FACTOR", "1");
+    let Some(app) = try_window() else { return };
+    let _shared = glue::install(&app);
+    let st = app.global::<State>();
+    st.set_writes_paused(true);
+    st.set_window_shown(true);
+    let shots = std::env::var_os("NEURON_INSPECTOR_SHOTS").map(std::path::PathBuf::from);
+    for (rows, cols, kind, name) in [
+        (1, 1, "keyboard", "QMK board"),
+        (1, 3, "mouse", "Logitech G502 X"),
+        (5, 15, "keyboard", "Vial board"),
+    ] {
+        st.set_selected_device(0);
+        st.set_selected_device_name(name.into());
+        st.set_sel_can_light(true);
+        st.set_grid_rows(rows);
+        st.set_grid_cols(cols);
+        st.set_grid_kind(kind.into());
+        let n = (rows * cols) as usize;
+        let px: Vec<slint::Color> = (0..n)
+            .map(|i| {
+                let t = i as f32 / n.max(2) as f32;
+                slint::Color::from_rgb_u8((255.0 * t) as u8, 80, (255.0 * (1.0 - t)) as u8)
+            })
+            .collect();
+        st.set_grid_px(slint::ModelRc::new(slint::VecModel::from(px)));
+        st.set_page(1);
+        for width in [900.0, 1240.0] {
+            app.window().set_size(slint::LogicalSize::new(width, 900.0));
+            app.show().expect("show the window");
+            let f = snap(&app).expect("a family board draws");
+            if let Some(dir) = &shots {
+                std::fs::create_dir_all(dir).unwrap();
+                let file = format!("family-{rows}x{cols}-{width}.png");
+                image::save_buffer(dir.join(file), f.as_bytes(), f.width(), f.height(), image::ColorType::Rgba8).unwrap();
+            }
+        }
+    }
+}
+
 /// Stack sense end to end: over a full-board wave, an opaque Wildlife keeps the wave's light from the
 /// board, so pointing at the wave's row shows it lost, and Wildlife's shows it burying the wave. The
 /// trouble and its fixes sit in a strip above the rows; resting on a fix plays it on the board and

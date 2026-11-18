@@ -124,8 +124,10 @@ export component DeviceRender inherits Rectangle {
             property <length> cell: max(2px, min(
                 (self.width - 2 * self.pad - (root.cols - 1) * self.gap) / max(1, root.cols),
                 (self.height - 2 * self.pad - (root.rows - 1) * self.gap) / max(1, root.rows)));
+            // a board that takes one colour for all its keys is one cell, drawn as a board-shaped slab
+            property <length> cw: root.rows * root.cols == 1 ? min(self.width - 2 * self.pad, self.cell * 3) : self.cell;
             // center the lattice in the field so odd aspect ratios don't pile keys in a corner
-            property <length> ox: (self.width - root.cols * self.cell - (root.cols - 1) * self.gap) / 2;
+            property <length> ox: (self.width - root.cols * self.cw - (root.cols - 1) * self.gap) / 2;
             property <length> oy: (self.height - root.rows * self.cell - (root.rows - 1) * self.gap) / 2;
 
             // under-bloom: an oversized translucent twin behind each cap — lit caps glow,
@@ -133,9 +135,9 @@ export component DeviceRender inherits Rectangle {
             for p[i] in root.px : Rectangle {
                 property <int> gr: floor(i / root.cols);
                 property <int> gc: mod(i, root.cols);
-                x: field.ox + gc * (field.cell + field.gap) - 4px;
+                x: field.ox + gc * (field.cw + field.gap) - 4px;
                 y: field.oy + gr * (field.cell + field.gap) - 4px;
-                width: field.cell + 8px;
+                width: field.cw + 8px;
                 height: field.cell + 8px;
                 border-radius: field.cell / 2;
                 background: p.with-alpha(Theme.bloom * root.shown(i) * root.shown(i));
@@ -144,9 +146,9 @@ export component DeviceRender inherits Rectangle {
             for p[i] in root.px : Rectangle {
                 property <int> gr: floor(i / root.cols);
                 property <int> gc: mod(i, root.cols);
-                x: field.ox + gc * (field.cell + field.gap);
+                x: field.ox + gc * (field.cw + field.gap);
                 y: field.oy + gr * (field.cell + field.gap);
-                width: field.cell;
+                width: field.cw;
                 height: field.cell;
                 border-radius: max(1px, field.cell / 4);
                 background: p.mix(Theme.well, root.shown(i));
@@ -168,9 +170,9 @@ export component DeviceRender inherits Rectangle {
                 property <int> c0: self.live ? min(placer.ac, placer.cc) : root.place-c0;
                 property <int> r1: self.live ? max(placer.ar, placer.cr) : root.place-r1;
                 property <int> c1: self.live ? max(placer.ac, placer.cc) : root.place-c1;
-                x: field.ox + self.c0 * (field.cell + field.gap) - 3px;
+                x: field.ox + self.c0 * (field.cw + field.gap) - 3px;
                 y: field.oy + self.r0 * (field.cell + field.gap) - 3px;
-                width: (self.c1 - self.c0) * (field.cell + field.gap) + field.cell + 6px;
+                width: (self.c1 - self.c0) * (field.cw + field.gap) + field.cw + 6px;
                 height: (self.r1 - self.r0) * (field.cell + field.gap) + field.cell + 6px;
                 border-radius: Theme.radius-sm;
                 border-width: Theme.hair-2;
@@ -185,10 +187,10 @@ export component DeviceRender inherits Rectangle {
                 // the key under the pointer; the pad, the margins and the gaps between keys point at
                 // nothing
                 property <length> pitch: field.cell + field.gap;
-                property <int> kc: floor((self.mouse-x - field.ox) / self.pitch);
+                property <int> kc: floor((self.mouse-x - field.ox) / (field.cw + field.gap));
                 property <int> kr: floor((self.mouse-y - field.oy) / self.pitch);
                 property <bool> on-key: self.kc >= 0 && self.kc < root.cols && self.kr >= 0 && self.kr < root.rows
-                    && self.mouse-x - field.ox - self.kc * self.pitch < field.cell
+                    && self.mouse-x - field.ox - self.kc * (field.cw + field.gap) < field.cw
                     && self.mouse-y - field.oy - self.kr * self.pitch < field.cell;
                 property <int> at: self.has-hover && self.on-key ? self.kr * root.cols + self.kc : -1;
                 changed at => { root.pointed-cell = self.at; }
@@ -200,7 +202,7 @@ export component DeviceRender inherits Rectangle {
                 property <int> hover-cell: self.cell-at(self.mouse-x, self.mouse-y);
                 function cell-at(mx: length, my: length) -> int {
                     return clamp(floor((my - field.oy) / (field.cell + field.gap)), 0, root.rows - 1) * root.cols
-                         + clamp(floor((mx - field.ox) / (field.cell + field.gap)), 0, root.cols - 1);
+                         + clamp(floor((mx - field.ox) / (field.cw + field.gap)), 0, root.cols - 1);
                 }
                 pointer-event(ev) => {
                     if (ev.kind == PointerEventKind.down) {
@@ -230,7 +232,7 @@ export component DeviceRender inherits Rectangle {
                     return clamp(floor((my - field.oy) / (field.cell + field.gap)), 0, root.rows - 1);
                 }
                 function col-at(mx: length) -> int {
-                    return clamp(floor((mx - field.ox) / (field.cell + field.gap)), 0, root.cols - 1);
+                    return clamp(floor((mx - field.ox) / (field.cw + field.gap)), 0, root.cols - 1);
                 }
                 pointer-event(ev) => {
                     if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {

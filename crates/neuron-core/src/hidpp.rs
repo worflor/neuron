@@ -770,6 +770,10 @@ const KEYS_PER_REPORT: usize = 4;
 /// A key id is its HID Keyboard usage minus 3; G1-G5 and the logo sit outside that range.
 const KEY_ID_USAGE_OFFSET: u16 = 3;
 const KEY_ID_G1: u16 = 180;
+/// Left Control to Right GUI (usages 0xE0-0xE7) take ids 104-111 (Solaar `special_keys.py`
+/// L1425-L1545).
+const KEY_ID_MODIFIERS: std::ops::RangeInclusive<u16> = 104..=111;
+const USAGE_LEFT_CONTROL: u16 = 0xE0;
 const KEY_ID_LOGO: u16 = 210;
 /// frameEnd answers Busy while the firmware is still taking keys; it is retried, not failed.
 const BUSY: u8 = 0x08;
@@ -816,25 +820,32 @@ fn key_id_cell(id: u16) -> Option<(u8, u8)> {
     let name = match id {
         KEY_ID_LOGO => "LOGO",
         g if (KEY_ID_G1..KEY_ID_G1 + 5).contains(&g) => ["M1", "M2", "M3", "M4", "M5"][usize::from(g - KEY_ID_G1)],
+        m if KEY_ID_MODIFIERS.contains(&m) => crate::lighting::hid_usage_key(USAGE_LEFT_CONTROL + m - KEY_ID_MODIFIERS.start())?,
         _ => crate::lighting::hid_usage_key(id + KEY_ID_USAGE_OFFSET)?,
     };
     crate::lighting::razer_key_cell(name)
 }
 
 /// Each 0x8070 zone's index of the fixed-colour effect, or `None` for a zone without one.
-fn fixed_effect_indices(t: &dyn Transport, index: u8, feature: u8) -> Option<(Vec<Option<u8>>, u16)> {
+/// Each 0x8070 zone's effect ids, by index, and the device's extended capabilities.
+fn zone_effects(t: &dyn Transport, index: u8, feature: u8) -> Option<(Vec<Vec<u16>>, u16)> {
     let info = call(t, index, feature, FN_8070_GET_INFO, &[]).ok()?;
     let zones = info[4];
     let ext = be16(info[7], info[8]);
-    let mut fixed = Vec::new();
+    let mut effects = Vec::new();
     for zone in 0..zones {
         let count = call(t, index, feature, FN_8070_GET_ZONE_INFO, &[zone]).map_or(0, |r| r[7]);
-        let found = (0..count).find(|&i| {
-            call(t, index, feature, FN_8070_GET_EFFECT_INFO, &[zone, i]).is_ok_and(|r| be16(r[6], r[7]) == EFFECT_FIXED)
-        });
-        fixed.push(found);
+        let ids = (0..count)
+            .map_while(|i| call(t, index, feature, FN_8070_GET_EFFECT_INFO, &[zone, i]).ok().map(|r| be16(r[6], r[7])))
+            .collect();
+        effects.push(ids);
     }
-    Some((fixed, ext))
+    Some((effects, ext))
+}
+
+/// The index of the fixed-colour effect in a zone's effect list.
+fn fixed_index(ids: &[u16]) -> Option<u8> {
+    ids.iter().position(|&id| id == EFFECT_FIXED).map(|i| i as u8)
 }
 
 /// What a HID++ device's lighting is, read-only: per-key on the keyboard grid (or one cell per key
@@ -879,11 +890,11 @@ pub(crate) fn probe_lighting(t: &dyn Transport, index: u8) -> Option<crate::ligh
         }
     }
     let zones = get_feature_index(t, index, FEATURE_COLOR_LED_EFFECTS)?;
-    let (fixed, ext) = fixed_effect_indices(t, index, zones)?;
+    let (effects, ext) = zone_effects(t, index, zones)?;
     if ext & EXT_MONOCHROME_ONLY != 0 {
         return None;
     }
-    let lit: Vec<u8> = (0..fixed.len() as u8).filter(|&z| fixed[usize::from(z)].is_some()).collect();
+    let lit: Vec<u8> = (0..effects.len() as u8).filter(|&z| fixed_index(&effects[usize::from(z)]).is_some()).collect();
     if lit.is_empty() {
         return None;
     }
@@ -894,7 +905,9 @@ pub(crate) fn probe_lighting(t: &dyn Transport, index: u8) -> Option<crate::ligh
 /// How neuron holds a HID++ device's lighting.
 enum Held {
     PerKey { keys: u8, rgb: u8 },
-    Zones { feature: u8, fixed: Vec<Option<u8>>, readback: bool },
+    /// Each zone's effect ids by index, and the effect each zone showed at take (`[index, 10
+    /// parameter bytes]`), where reading it back names the effect without doubt.
+    Zones { feature: u8, effects: Vec<Vec<u16>>, readback: bool, before: Vec<Option<[u8; 11]>> },
 }
 
 /// Neuron's hold on a HID++ device's lighting: the features it paints through, the colours it last
@@ -905,35 +918,75 @@ pub(crate) struct ColourLink {
     sent: std::collections::HashMap<u16, crate::lighting::Rgb>,
     onboard: Option<(u8, u8)>,
     verified: bool,
+    /// The first frame after a claim goes out twice: a device may drop it while it leaves onboard
+    /// mode (Solaar `settings_templates.py` L4092-L4096).
+    replayed: bool,
+}
+
+/// The effect a zone shows now, as `[index, 10 parameter bytes]`, when the device reads it back and
+/// the byte it answers is the same whether it means an index or an id.
+fn zone_now(t: &dyn Transport, index: u8, feature: u8, zone: u8, ids: &[u16]) -> Option<[u8; 11]> {
+    let r = call(t, index, feature, FN_8070_GET_ZONE_EFFECT, &[zone]).ok()?;
+    if r[4] != zone || ids.get(usize::from(r[5])) != Some(&u16::from(r[5])) {
+        return None;
+    }
+    let mut out = [0u8; 11];
+    out.copy_from_slice(&r[5..16]);
+    Some(out)
+}
+
+fn refused(what: &str, e: Option<u8>) -> anyhow::Error {
+    anyhow::anyhow!("{what} refused ({})", e.map_or("silent", |c| err_name(ERR_HIDPP20, c)))
 }
 
 /// Take the device's lighting: leave onboard mode when it is in it (the mode read first is kept to
 /// put back), then take software control. No write here reaches the device's memory.
 pub(crate) fn take_lighting(t: &dyn Transport, def: &crate::registry::DeviceDef) -> Result<ColourLink> {
     let index = address_of(def.transaction_id);
-    let onboard = get_feature_index(t, index, FEATURE_ONBOARD_PROFILES).and_then(|f| {
-        let mode = call(t, index, f, FN_8100_GET_MODE, &[]).ok()?[4];
-        (mode == ONBOARD_MODE && call(t, index, f, FN_8100_SET_MODE, &[HOST_MODE]).is_ok()).then_some((f, mode))
-    });
+    // Everything that can fail before a write is asked first.
     let held = match (
         get_feature_index(t, index, FEATURE_PER_KEY_LIGHTING_V2),
         get_feature_index(t, index, FEATURE_RGB_EFFECTS),
     ) {
-        (Some(keys), Some(rgb)) => {
-            call(t, index, rgb, FN_8071_SW_CONTROL, &SW_CONTROL_TAKE)
-                .map_err(|e| anyhow::anyhow!("software control refused ({})", e.map_or("silent", |c| err_name(ERR_HIDPP20, c))))?;
-            Held::PerKey { keys, rgb }
-        }
+        (Some(keys), Some(rgb)) => Held::PerKey { keys, rgb },
         _ => {
             let feature = get_feature_index(t, index, FEATURE_COLOR_LED_EFFECTS)
                 .ok_or_else(|| anyhow::anyhow!("no colour lighting feature answered"))?;
-            let (fixed, ext) = fixed_effect_indices(t, index, feature).ok_or_else(|| anyhow::anyhow!("zone info unanswered"))?;
-            call(t, index, feature, FN_8070_SET_SW_CONTROL, &[0x01])
-                .map_err(|e| anyhow::anyhow!("software control refused ({})", e.map_or("silent", |c| err_name(ERR_HIDPP20, c))))?;
-            Held::Zones { feature, fixed, readback: ext & EXT_HAS_ZONE_EFFECT != 0 }
+            let (effects, ext) = zone_effects(t, index, feature).ok_or_else(|| anyhow::anyhow!("zone info unanswered"))?;
+            let readback = ext & EXT_HAS_ZONE_EFFECT != 0;
+            let before = (0..effects.len() as u8)
+                .map(|z| if readback { zone_now(t, index, feature, z, &effects[usize::from(z)]) } else { None })
+                .collect();
+            Held::Zones { feature, effects, readback, before }
         }
     };
-    Ok(ColourLink { index, held, sent: std::collections::HashMap::new(), onboard, verified: false })
+    // Onboard mode gives way to the host, read back; a failure after it puts the mode back.
+    let mut onboard = None;
+    if let Some(f) = get_feature_index(t, index, FEATURE_ONBOARD_PROFILES) {
+        let mode = call(t, index, f, FN_8100_GET_MODE, &[]).map_err(|e| refused("onboard mode read", e))?[4];
+        if mode == ONBOARD_MODE {
+            call(t, index, f, FN_8100_SET_MODE, &[HOST_MODE]).map_err(|e| refused("host mode", e))?;
+            onboard = Some((f, mode));
+            let now = call(t, index, f, FN_8100_GET_MODE, &[]).map(|r| r[4]);
+            if now != Ok(HOST_MODE) {
+                let _ = call(t, index, f, FN_8100_SET_MODE, &[mode]);
+                anyhow::bail!("the device stayed in onboard mode");
+            }
+        }
+    }
+    let claimed = match &held {
+        Held::PerKey { rgb, .. } => call(t, index, *rgb, FN_8071_SW_CONTROL, &SW_CONTROL_TAKE),
+        Held::Zones { feature, .. } => call(t, index, *feature, FN_8070_SET_SW_CONTROL, &[0x01]),
+    };
+    if let Err(e) = claimed {
+        if let Some((f, mode)) = onboard {
+            let _ = call(t, index, f, FN_8100_SET_MODE, &[mode]);
+        }
+        return Err(refused("software control", e));
+    }
+    // only per-key frames are reported dropped after a claim
+    let replayed = matches!(held, Held::Zones { .. });
+    Ok(ColourLink { index, held, sent: std::collections::HashMap::new(), onboard, verified: false, replayed })
 }
 
 impl ColourLink {
@@ -951,7 +1004,12 @@ impl ColourLink {
                 let keys = *keys;
                 let mut verdict = Sent::Taken;
                 for chunk in changed.chunks(KEYS_PER_REPORT) {
-                    let params: Vec<u8> = chunk.iter().flat_map(|(id, c)| [*id as u8, c.r, c.g, c.b]).collect();
+                    // a short report repeats its last key, so no slot reads as key 0
+                    let last = chunk[chunk.len() - 1];
+                    let params: Vec<u8> = (0..KEYS_PER_REPORT)
+                        .map(|i| chunk.get(i).copied().unwrap_or(last))
+                        .flat_map(|(id, c)| [id as u8, c.r, c.g, c.b])
+                        .collect();
                     verdict = worst(verdict, sent_of(call(t, self.index, keys, FN_8081_SET_INDIVIDUAL, &params)));
                     if verdict == Sent::Lost {
                         break;
@@ -962,11 +1020,11 @@ impl ColourLink {
                 }
                 verdict
             }
-            Held::Zones { feature, fixed, readback } => {
+            Held::Zones { feature, effects, readback, .. } => {
                 let (feature, readback) = (*feature, *readback);
                 let mut verdict = Sent::Taken;
                 for &(zone, c) in &changed {
-                    let Some(Some(effect)) = fixed.get(usize::from(zone)).copied() else { continue };
+                    let Some(effect) = effects.get(usize::from(zone)).and_then(|ids| fixed_index(ids)) else { continue };
                     let mut params = [0u8; 13];
                     params[0] = zone as u8;
                     params[1] = effect;
@@ -974,21 +1032,25 @@ impl ColourLink {
                     params[5] = FIXED_NO_RAMP;
                     verdict = worst(verdict, sent_of(call(t, self.index, feature, FN_8070_SET_ZONE_EFFECT, &params)));
                     if readback && !self.verified && verdict == Sent::Taken {
-                        let back = call(t, self.index, feature, FN_8070_GET_ZONE_EFFECT, &[zone as u8]);
-                        if back.is_ok_and(|r| r[4] == zone as u8 && r[6..9] != [c.r, c.g, c.b]) {
-                            verdict = Sent::Lost;
+                        match call(t, self.index, feature, FN_8070_GET_ZONE_EFFECT, &[zone as u8]) {
+                            Ok(r) if r[4] == zone as u8 && r[6..9] == [c.r, c.g, c.b] => self.verified = true,
+                            Ok(_) => verdict = Sent::Lost,
+                            Err(_) => verdict = Sent::Unconfirmed,
                         }
-                        self.verified = true;
                     }
                 }
                 verdict
             }
         };
-        if verdict == Sent::Taken {
-            self.sent.extend(changed);
-        } else {
+        if verdict != Sent::Taken {
             self.sent.clear();
+            return verdict;
         }
+        if !self.replayed {
+            self.replayed = true;
+            return self.paint(t, colours);
+        }
+        self.sent.extend(changed);
         verdict
     }
 
@@ -1005,14 +1067,22 @@ impl ColourLink {
         Sent::Unconfirmed
     }
 
-    /// Give the lighting back: release software control, then restore the onboard mode read at
-    /// take. The device shows its own lighting again.
+    /// Give the lighting back: each zone's effect read at take, where it could be read without
+    /// doubt; then software control and the onboard mode read at take.
     pub(crate) fn release(&self, t: &dyn Transport) {
         match &self.held {
             Held::PerKey { rgb, .. } => {
                 let _ = call(t, self.index, *rgb, FN_8071_SW_CONTROL, &SW_CONTROL_GIVE);
             }
-            Held::Zones { feature, .. } => {
+            Held::Zones { feature, before, .. } => {
+                for (zone, was) in before.iter().enumerate() {
+                    if let Some(was) = was {
+                        let mut params = [0u8; 13];
+                        params[0] = zone as u8;
+                        params[1..12].copy_from_slice(was);
+                        let _ = call(t, self.index, *feature, FN_8070_SET_ZONE_EFFECT, &params);
+                    }
+                }
                 let _ = call(t, self.index, *feature, FN_8070_SET_SW_CONTROL, &[0x00]);
             }
         }

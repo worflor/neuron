@@ -199,8 +199,7 @@ fn a_matrix_board_gets_one_colour_and_puts_everything_back() {
     lights.paint_frame(&[Rgb::new(0, 0, 255)]).unwrap();
     let st = *q.state.lock().unwrap();
     assert_eq!((st.mode, st.h, st.s), (SOLID_EFFECT, 170, 255), "solid blue: QMK's hue 170");
-    // RGB matrix brightness is stored as `x*255 >> 8`, so VIA reaches 254 at most
-    assert_eq!(qmk_hsv_to_rgb([st.h, st.s, st.v]), [0, 0, 254], "the board shows the colour asked, a step short at full");
+    assert_eq!(qmk_hsv_to_rgb([st.h, st.s, st.v]), [0, 0, 200], "full blue at the board's own brightness");
 
     let before = q.requests().len();
     lights.paint_frame(&[Rgb::new(0, 0, 255)]).unwrap();
@@ -210,6 +209,26 @@ fn a_matrix_board_gets_one_colour_and_puts_everything_back() {
     let st = *q.state.lock().unwrap();
     assert_eq!((st.enabled, st.mode, st.h, st.s, st.v), (true, 7, 30, 40, 200), "effect, colour and brightness put back");
     assert!(q.requests().iter().all(|r| r[0] != 0x09), "never the EEPROM save");
+}
+
+#[test]
+fn the_brightness_slider_scales_the_colour_neuron_paints() {
+    let q = matrix_board(State { enabled: true, mode: 1, h: 0, s: 0, v: 255 });
+    let d = device(&q, "unit-slider");
+    let lights = Lights::new(&d, d.def.lighting.clone().unwrap());
+    lights.paint_frame(&[Rgb::new(255, 0, 0)]).unwrap();
+    crate::capability::set_brightness(&d, 50, crate::capability::Store::Volatile).unwrap();
+    let half = q.state.lock().unwrap().v;
+    assert!((120..=130).contains(&half), "half of full red, at once: {half}");
+    assert_eq!(crate::capability::brightness_percent(&d).unwrap(), 50, "the readout shows the slider, not the frame");
+    lights.paint_frame(&[Rgb::new(255, 0, 0)]).unwrap();
+    assert_eq!(q.state.lock().unwrap().v, half, "the next frame keeps the slider's level");
+    lights.paint_frame(&[Rgb::new(128, 0, 0)]).unwrap();
+    let quarter = q.state.lock().unwrap().v;
+    assert!((60..=66).contains(&quarter), "a dimmer frame, scaled the same: {quarter}");
+    d.release_custody().ok();
+    // an RGB matrix stores VIA brightness as `x*255 >> 8`, so 254 is as close to 255 as VIA gets
+    assert_eq!(q.state.lock().unwrap().v, 254, "the board's own brightness put back");
 }
 
 #[test]
@@ -234,7 +253,7 @@ fn a_flat_board_takes_colour_on_its_flat_ids() {
     let lights = Lights::new(&d, d.def.lighting.clone().unwrap());
     lights.paint_frame(&[Rgb::new(0, 255, 0)]).unwrap();
     let st = *q.state.lock().unwrap();
-    assert_eq!(qmk_hsv_to_rgb([st.h, st.s, st.v]), [0, 255, 0]);
+    assert_eq!(qmk_hsv_to_rgb([st.h, st.s, st.v]), [0, 153, 0], "green at the 60% set before");
     d.release_custody().ok();
 }
 

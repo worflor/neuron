@@ -27,6 +27,8 @@ struct Logi {
     monochrome: bool,
     zone_rgb: Mutex<Vec<[u8; 3]>>,
     busy_frame_ends: Mutex<u32>,
+    refuse_claim: bool,
+    zone_effect: Mutex<Vec<[u8; 11]>>,
     writes: Mutex<Vec<Vec<u8>>>,
     inbox: Mutex<VecDeque<Vec<u8>>>,
 }
@@ -60,6 +62,11 @@ impl Logi {
                     }
                 }
             }
+            (IDX_RGB, FN_8071_SW_CONTROL) if self.refuse_claim && p[1] == 0x03 => {
+                let mut e = vec![REPORT_ID_LONG, req[1], ERR_HIDPP20, feature, req[3], 0x09];
+                e.resize(LONG_LEN, 0);
+                return e;
+            }
             (IDX_KEYS, FN_8081_FRAME_END) => {
                 let mut busy = self.busy_frame_ends.lock().unwrap();
                 if *busy > 0 {
@@ -79,11 +86,14 @@ impl Logi {
                 r[6..8].copy_from_slice(&id.to_be_bytes());
             }
             (IDX_ZONES, FN_8070_SET_ZONE_EFFECT) => {
-                self.zone_rgb.lock().unwrap()[usize::from(p[0])] = [p[2], p[3], p[4]];
+                let zone = usize::from(p[0]);
+                self.zone_rgb.lock().unwrap()[zone] = [p[2], p[3], p[4]];
+                self.zone_effect.lock().unwrap()[zone].copy_from_slice(&p[1..12]);
             }
             (IDX_ZONES, FN_8070_GET_ZONE_EFFECT) => {
+                let zone = usize::from(p[0]);
                 r[4] = p[0];
-                r[6..9].copy_from_slice(&self.zone_rgb.lock().unwrap()[usize::from(p[0])]);
+                r[5..16].copy_from_slice(&self.zone_effect.lock().unwrap()[zone]);
             }
             _ => {}
         }
@@ -124,8 +134,8 @@ fn keyboard() -> Arc<Logi> {
             (FEATURE_PER_KEY_LIGHTING_V2, IDX_KEYS),
         ],
         mode: Mutex::new(ONBOARD_MODE),
-        // A (usage 0x04), Esc (0x29), G1, the logo, and a key the grid has no cell for
-        keys: vec![1, 0x29 - 3, KEY_ID_G1, KEY_ID_LOGO, 150],
+        // A (usage 0x04), Esc (0x29), G1, the logo, a key the grid has no cell for, Left Shift
+        keys: vec![1, 0x29 - 3, KEY_ID_G1, KEY_ID_LOGO, 150, 105],
         ..Logi::default()
     })
 }
@@ -133,9 +143,12 @@ fn keyboard() -> Arc<Logi> {
 fn mouse_zones(monochrome: bool) -> Arc<Logi> {
     Arc::new(Logi {
         features: vec![(FEATURE_COLOR_LED_EFFECTS, IDX_ZONES)],
-        zone_effects: vec![vec![0x0000, EFFECT_FIXED, 0x0003], vec![0x0000, 0x0003, EFFECT_FIXED]],
+        zone_effects: vec![vec![0x0000, EFFECT_FIXED, 0x0002, 0x0003], vec![0x0000, 0x0003, EFFECT_FIXED]],
         monochrome,
         zone_rgb: Mutex::new(vec![[0; 3]; 2]),
+        // zone 0 cycles: index 3, id 3, so the byte means the same either way; zone 1 cycles at
+        // index 1, id 3, which a read-back cannot name for sure
+        zone_effect: Mutex::new(vec![[3, 0, 0, 0, 0, 0, 0x0B, 0xB8, 64, 0, 0], [1, 0, 0, 0, 0, 0, 0x0B, 0xB8, 64, 0, 0]]),
         ..Logi::default()
     })
 }
@@ -170,6 +183,7 @@ fn keys_land_on_their_keyboard_cells_and_an_unknown_key_shows_the_mean() {
     assert_eq!(at(KEY_ID_G1), cell("M1"));
     assert_eq!(at(KEY_ID_LOGO), cell("LOGO"));
     assert_eq!(at(150)[0], NO_CELL);
+    assert_eq!(at(105), cell("LSHIFT"), "modifiers have their own id range");
     assert_eq!(crate::defcheck::check(&def(Some(l))), Ok(()), "what adoption learns loads");
 }
 
@@ -183,19 +197,20 @@ fn a_frame_goes_out_once_and_only_its_changed_keys_follow() {
     assert_eq!(*logi.mode.lock().unwrap(), HOST_MODE, "onboard mode gives way to the host");
     assert_eq!(logi.to(IDX_RGB, FN_8071_SW_CONTROL)[0][4..7], SW_CONTROL_TAKE);
     let sets = logi.to(IDX_KEYS, FN_8081_SET_INDIVIDUAL);
-    assert_eq!(sets.len(), 2, "five keys, four to a report");
+    assert_eq!(sets.len(), 4, "six keys, four to a report, and the first frame sent twice");
     assert_eq!(&sets[0][4..8], &[1, 10, 20, 30]);
-    assert_eq!(logi.to(IDX_KEYS, FN_8081_FRAME_END).len(), 1);
+    assert_eq!(&sets[1][12..16], &sets[1][8..12], "a short report repeats its last key, never key 0");
+    assert_eq!(logi.to(IDX_KEYS, FN_8081_FRAME_END).len(), 2);
 
     lights.paint_frame(&frame).unwrap();
-    assert_eq!(logi.to(IDX_KEYS, FN_8081_SET_INDIVIDUAL).len(), 2, "an unchanged frame sends nothing");
+    assert_eq!(logi.to(IDX_KEYS, FN_8081_SET_INDIVIDUAL).len(), 4, "an unchanged frame sends nothing");
 
     let (r, c) = crate::lighting::razer_key_cell("A").unwrap();
     frame[usize::from(r) * 22 + usize::from(c)] = Rgb::new(255, 0, 0);
     lights.paint_frame(&frame).unwrap();
     let sets = logi.to(IDX_KEYS, FN_8081_SET_INDIVIDUAL);
-    assert_eq!(sets.len(), 3, "A and the unknown key, whose mean moved with it, share one report");
-    assert_eq!(&sets[2][4..8], &[1, 255, 0, 0]);
+    assert_eq!(sets.len(), 5, "A and the unknown key, whose mean moved with it, share one report");
+    assert_eq!(&sets[4][4..8], &[1, 255, 0, 0]);
 
     d.release_custody().ok();
     assert_eq!(logi.to(IDX_RGB, FN_8071_SW_CONTROL).last().unwrap()[4..7], SW_CONTROL_GIVE);
@@ -214,8 +229,18 @@ fn a_busy_frame_end_is_waited_out() {
     let d = device(&logi, "unit-busy");
     let lights = Lights::new(&d, d.def.lighting.clone().unwrap());
     lights.paint_frame(&vec![Rgb::new(1, 2, 3); 6 * 22]).unwrap();
-    assert_eq!(logi.to(IDX_KEYS, FN_8081_FRAME_END).len(), 4);
+    assert_eq!(logi.to(IDX_KEYS, FN_8081_FRAME_END).len(), 5, "three busy, the frame, its replay");
     d.release_custody().ok();
+}
+
+#[test]
+fn a_refused_claim_puts_the_onboard_mode_back() {
+    let logi = Arc::new(Logi { refuse_claim: true, ..Arc::try_unwrap(keyboard()).ok().unwrap() });
+    let d = device(&logi, "unit-refused");
+    let lights = Lights::new(&d, d.def.lighting.clone().unwrap());
+    assert!(lights.paint_frame(&vec![Rgb::new(1, 2, 3); 6 * 22]).is_err());
+    assert_eq!(*logi.mode.lock().unwrap(), ONBOARD_MODE, "nothing is left changed");
+    assert!(logi.to(IDX_KEYS, FN_8081_SET_INDIVIDUAL).is_empty());
 }
 
 #[test]
@@ -231,10 +256,12 @@ fn zones_take_their_fixed_effect_index_in_ram_and_read_back() {
     assert_eq!(&sets[0][4..10], &[0, 1, 255, 0, 0, FIXED_NO_RAMP], "zone 0's fixed effect is index 1");
     assert_eq!(&sets[1][4..10], &[1, 2, 0, 0, 255, FIXED_NO_RAMP], "zone 1's is index 2");
     assert!(sets.iter().all(|s| s[16] == 0), "the persist byte keeps it out of flash");
-    assert_eq!(logi.to(IDX_ZONES, FN_8070_GET_ZONE_EFFECT).len(), 1, "the first colour is read back");
+    assert_eq!(logi.to(IDX_ZONES, FN_8070_GET_ZONE_EFFECT).len(), 3, "each zone read at take, then the first colour read back");
     assert_eq!(logi.to(IDX_ZONES, FN_8070_SET_SW_CONTROL)[0][4..6], [1, 0]);
     d.release_custody().ok();
     assert_eq!(logi.to(IDX_ZONES, FN_8070_SET_SW_CONTROL).last().unwrap()[4], 0);
+    assert_eq!(logi.zone_effect.lock().unwrap()[0], [3, 0, 0, 0, 0, 0, 0x0B, 0xB8, 64, 0, 0], "zone 0 cycles again");
+    assert_eq!(logi.zone_effect.lock().unwrap()[1][0], 2, "zone 1 is not guessed at");
 }
 
 #[test]
