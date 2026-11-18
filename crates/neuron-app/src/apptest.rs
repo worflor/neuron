@@ -2656,17 +2656,17 @@ fn the_real_release_notes_draw_in_the_update_drawer() {
         }
         f
     };
-    let top = frame("update-real-notes");
+    frame("update-real-notes");
+    // a short window: the notes give way before the footer does, and the wheel reaches the rest
+    app.window().set_size(slint::LogicalSize::new(1240.0, 520.0));
+    let top = frame("update-real-notes-short");
     // the drawer hangs under the pill at the window's right
-    let at = slint::LogicalPosition::new(1000.0, 400.0);
+    let at = slint::LogicalPosition::new(1000.0, 300.0);
     for _ in 0..40 {
         app.window().dispatch_event(WindowEvent::PointerScrolled { position: at, delta_x: 0.0, delta_y: -120.0 });
     }
     let bottom = frame("update-real-notes-scrolled");
     assert_ne!(top.as_bytes(), bottom.as_bytes(), "the wheel scrolls the notes");
-    // a short window: the notes give way before the footer does
-    app.window().set_size(slint::LogicalSize::new(1240.0, 520.0));
-    frame("update-real-notes-short");
 }
 
 /// A device neuron learned on its own asks what works on its row, and the SYSTEM nameplate's star

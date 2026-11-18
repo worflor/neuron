@@ -116,7 +116,10 @@ pub(crate) fn rows(r: &notes::Release) -> Vec<(String, String, String)> {
         }
     }
     if !r.thanks.is_empty() {
-        out.push(("thanks".into(), String::new(), format!("thanks: {}", r.thanks.join(" "))));
+        // The changelog's own line usually opens with "thanks to"; the label is only for one that doesn't.
+        let said = r.thanks.join(" ");
+        let line = if said.trim_start().to_lowercase().starts_with("thanks") { said } else { format!("thanks: {said}") };
+        out.push(("thanks".into(), String::new(), line));
     }
     out
 }
@@ -1141,6 +1144,9 @@ mod tests {
             ("item".to_string(), "luma-t.".to_string()),
             ("thanks".to_string(), String::new()),
         ]);
+        assert_eq!(rows(&r).last().map(|row| row.2.as_str()), Some("thanks: @a"), "a bare list gets its label");
+        let r = notes::parse_section("## 0.1.9 · 2026-11-18\nx.\n### thanks\nthanks to @b for c.").unwrap();
+        assert_eq!(rows(&r).last().map(|row| row.2.as_str()), Some("thanks to @b for c."), "a line that already says thanks isn't labelled twice");
         let r = notes::parse_section("## 0.1.8 · 2026-11-20\nthe picker grew a brain: Luma-T. and fixes.").unwrap();
         assert_eq!(&rows(&r)[0], &("head".to_string(), "the picker grew a brain".to_string(), "Luma-T. and fixes.".to_string()));
     }
