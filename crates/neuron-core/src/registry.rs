@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// A single vendor command: class / id / requested data size, plus any fixed leading
 /// argument bytes (e.g. varstore + `led_id` for lighting).
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct CommandSpec {
     pub class: u8,
     pub id: u8,

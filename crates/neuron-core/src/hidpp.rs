@@ -512,8 +512,8 @@ impl Dialect for HidppDialect {
                 interface: None,
             },
             commands,
-            // No lighting: HID++ lighting (feature 0x8070/…) is unspecified this wave.
-            lighting: None,
+            // Colour lighting, read from its features: per-key (0x8081) or zones (0x8070).
+            lighting: probe_lighting(t, index),
             side_plates: None,
             side_plate_binds: std::collections::BTreeMap::new(),
             fn_binds: std::collections::BTreeMap::new(),
@@ -726,6 +726,320 @@ fn hidpp_name(product: &str, pid: u16) -> String {
     }
 }
 
+// ── lighting ─────────────────────────────────────────────────────────────────────────────────────
+// Layouts from libratbag `src/hidpp20.c` @8235b5bb, Solaar `lib/logitech_receiver/hidpp20.py`,
+// `settings_templates.py` and `rgb_power.py` @e7304c4c, and OpenRGB's `LogitechHIDPP20Controller`
+// @5bcfa9ae. Only the writes those sources agree on are sent: per-key frames (0x8081) under 0x8071
+// software control, and a zone's fixed colour (0x8070) with the persist byte 0, which keeps it out
+// of flash. 0x8071's own effect write is never sent: the sources disagree on its persist byte.
+
+pub const FEATURE_COLOR_LED_EFFECTS: u16 = 0x8070;
+pub const FEATURE_RGB_EFFECTS: u16 = 0x8071;
+pub const FEATURE_PER_KEY_LIGHTING_V2: u16 = 0x8081;
+pub const FEATURE_ONBOARD_PROFILES: u16 = 0x8100;
+
+const FN_8070_GET_INFO: u8 = 0x0;
+const FN_8070_GET_ZONE_INFO: u8 = 0x1;
+const FN_8070_GET_EFFECT_INFO: u8 = 0x2;
+const FN_8070_SET_ZONE_EFFECT: u8 = 0x3;
+const FN_8070_SET_SW_CONTROL: u8 = 0x8;
+const FN_8070_GET_ZONE_EFFECT: u8 = 0xE;
+const FN_8071_SW_CONTROL: u8 = 0x5;
+const FN_8081_GET_INFO: u8 = 0x0;
+const FN_8081_SET_INDIVIDUAL: u8 = 0x1;
+const FN_8081_FRAME_END: u8 = 0x7;
+const FN_8100_SET_MODE: u8 = 0x1;
+const FN_8100_GET_MODE: u8 = 0x2;
+
+/// 0x8070 extended capabilities: getZoneEffect reads back; the device ignores hue.
+const EXT_HAS_ZONE_EFFECT: u16 = 0x0001;
+const EXT_MONOCHROME_ONLY: u16 = 0x0008;
+const EFFECT_FIXED: u16 = 0x0001;
+/// Fixed colour's ramp byte: 2 = change at once, with no fade between frames.
+const FIXED_NO_RAMP: u8 = 0x02;
+const ONBOARD_MODE: u8 = 0x01;
+const HOST_MODE: u8 = 0x02;
+/// 0x8071 software control: set, mode 3 (the host owns the LEDs), flags effect (bit 0) and NV
+/// config (bit 2); Solaar's documented call and OpenRGB's steady state. Released as mode 0.
+const SW_CONTROL_TAKE: [u8; 3] = [0x01, 0x03, 0x05];
+const SW_CONTROL_GIVE: [u8; 3] = [0x01, 0x00, 0x00];
+/// 0x8081 key ids: the bitmap's three pages of 14 bytes, ids above 254 unaddressable.
+const PERKEY_PAGES: u8 = 3;
+const PERKEY_PAGE_BYTES: usize = 14;
+const KEYS_PER_REPORT: usize = 4;
+/// A key id is its HID Keyboard usage minus 3; G1-G5 and the logo sit outside that range.
+const KEY_ID_USAGE_OFFSET: u16 = 3;
+const KEY_ID_G1: u16 = 180;
+const KEY_ID_LOGO: u16 = 210;
+/// frameEnd answers Busy while the firmware is still taking keys; it is retried, not failed.
+const BUSY: u8 = 0x08;
+const FRAME_END_TRIES: u32 = 8;
+const FRAME_END_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+/// The row a per-key id with no keyboard cell takes in the LED map: it shows the frame's mean.
+pub const NO_CELL: u16 = 255;
+
+/// One request and its answer: `Ok(reply)`, `Err(Some(code))` for a HID++ error, `Err(None)` silent.
+fn call(t: &dyn Transport, index: u8, feature: u8, fn_id: u8, params: &[u8]) -> std::result::Result<[u8; LONG_LEN], Option<u8>> {
+    let wire = t.wire_lock();
+    let _wire = wire.as_ref().map(|w| w.acquire());
+    t.write_output(&build_long(index, feature, fn_id, params)).map_err(|_| None)?;
+    match await_reply(t, index, feature, fn_id) {
+        Answer::Reply(r) => Ok(r),
+        Answer::Error { code, .. } => Err(Some(code)),
+        Answer::Silent => Err(None),
+    }
+}
+
+fn be16(hi: u8, lo: u8) -> u16 {
+    u16::from_be_bytes([hi, lo])
+}
+
+/// The per-key ids a 0x8081 device lights, from its getInfo bitmap.
+fn perkey_ids(t: &dyn Transport, index: u8, feature: u8) -> Vec<u16> {
+    let mut ids = Vec::new();
+    for page in 0..PERKEY_PAGES {
+        let Ok(r) = call(t, index, feature, FN_8081_GET_INFO, &[0x00, page, 0x00]) else { break };
+        for (byte, bits) in r[6..6 + PERKEY_PAGE_BYTES].iter().enumerate() {
+            for bit in 0..8 {
+                let id = u16::from(page) * 112 + (byte * 8 + bit) as u16;
+                if bits & (1 << bit) != 0 && (1..=254).contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// The keyboard cell a 0x8081 key id lights.
+fn key_id_cell(id: u16) -> Option<(u8, u8)> {
+    let name = match id {
+        KEY_ID_LOGO => "LOGO",
+        g if (KEY_ID_G1..KEY_ID_G1 + 5).contains(&g) => ["M1", "M2", "M3", "M4", "M5"][usize::from(g - KEY_ID_G1)],
+        _ => crate::lighting::hid_usage_key(id + KEY_ID_USAGE_OFFSET)?,
+    };
+    crate::lighting::razer_key_cell(name)
+}
+
+/// Each 0x8070 zone's index of the fixed-colour effect, or `None` for a zone without one.
+fn fixed_effect_indices(t: &dyn Transport, index: u8, feature: u8) -> Option<(Vec<Option<u8>>, u16)> {
+    let info = call(t, index, feature, FN_8070_GET_INFO, &[]).ok()?;
+    let zones = info[4];
+    let ext = be16(info[7], info[8]);
+    let mut fixed = Vec::new();
+    for zone in 0..zones {
+        let count = call(t, index, feature, FN_8070_GET_ZONE_INFO, &[zone]).map_or(0, |r| r[7]);
+        let found = (0..count).find(|&i| {
+            call(t, index, feature, FN_8070_GET_EFFECT_INFO, &[zone, i]).is_ok_and(|r| be16(r[6], r[7]) == EFFECT_FIXED)
+        });
+        fixed.push(found);
+    }
+    Some((fixed, ext))
+}
+
+/// What a HID++ device's lighting is, read-only: per-key on the keyboard grid (or one cell per key
+/// for a device whose keys aren't keyboard keys), or one cell per colour zone. `None` without a
+/// colour lighting feature neuron drives.
+pub(crate) fn probe_lighting(t: &dyn Transport, index: u8) -> Option<crate::lighting::LightingDef> {
+    use crate::lighting::{LightingDef, Protocol};
+    let blank = |rows: u8, cols: u8, leds: Vec<[u16; 3]>| LightingDef {
+        protocol: Protocol::Hidpp,
+        rows,
+        cols,
+        varstore: 0,
+        led_id: 0,
+        effects: std::collections::BTreeMap::new(),
+        custom_id: 0,
+        effect: crate::registry::CommandSpec::default(),
+        custom_frame: None,
+        brightness: None,
+        framing: crate::lighting::Framing::default(),
+        display_args: None,
+        channel: None,
+        leds,
+    };
+    if let (Some(keys), Some(_)) = (
+        get_feature_index(t, index, FEATURE_PER_KEY_LIGHTING_V2),
+        get_feature_index(t, index, FEATURE_RGB_EFFECTS),
+    ) {
+        let ids = perkey_ids(t, index, keys);
+        if !ids.is_empty() {
+            let cells: Vec<Option<(u8, u8)>> = ids.iter().map(|&id| key_id_cell(id)).collect();
+            if cells.iter().any(Option::is_some) {
+                let leds = ids
+                    .iter()
+                    .zip(&cells)
+                    .map(|(&id, c)| c.map_or([id, NO_CELL, 0], |(r, col)| [id, u16::from(r), u16::from(col)]))
+                    .collect();
+                return Some(blank(6, 22, leds));
+            }
+            let cols = ids.len().min(255) as u8;
+            let leds = ids.iter().take(255).enumerate().map(|(i, &id)| [id, 0, i as u16]).collect();
+            return Some(blank(1, cols, leds));
+        }
+    }
+    let zones = get_feature_index(t, index, FEATURE_COLOR_LED_EFFECTS)?;
+    let (fixed, ext) = fixed_effect_indices(t, index, zones)?;
+    if ext & EXT_MONOCHROME_ONLY != 0 {
+        return None;
+    }
+    let lit: Vec<u8> = (0..fixed.len() as u8).filter(|&z| fixed[usize::from(z)].is_some()).collect();
+    if lit.is_empty() {
+        return None;
+    }
+    let leds = lit.iter().enumerate().map(|(i, &z)| [u16::from(z), 0, i as u16]).collect();
+    Some(blank(1, lit.len() as u8, leds))
+}
+
+/// How neuron holds a HID++ device's lighting.
+enum Held {
+    PerKey { keys: u8, rgb: u8 },
+    Zones { feature: u8, fixed: Vec<Option<u8>>, readback: bool },
+}
+
+/// Neuron's hold on a HID++ device's lighting: the features it paints through, the colours it last
+/// sent, and the onboard mode to put back.
+pub(crate) struct ColourLink {
+    index: u8,
+    held: Held,
+    sent: std::collections::HashMap<u16, crate::lighting::Rgb>,
+    onboard: Option<(u8, u8)>,
+    verified: bool,
+}
+
+/// Take the device's lighting: leave onboard mode when it is in it (the mode read first is kept to
+/// put back), then take software control. No write here reaches the device's memory.
+pub(crate) fn take_lighting(t: &dyn Transport, def: &crate::registry::DeviceDef) -> Result<ColourLink> {
+    let index = address_of(def.transaction_id);
+    let onboard = get_feature_index(t, index, FEATURE_ONBOARD_PROFILES).and_then(|f| {
+        let mode = call(t, index, f, FN_8100_GET_MODE, &[]).ok()?[4];
+        (mode == ONBOARD_MODE && call(t, index, f, FN_8100_SET_MODE, &[HOST_MODE]).is_ok()).then_some((f, mode))
+    });
+    let held = match (
+        get_feature_index(t, index, FEATURE_PER_KEY_LIGHTING_V2),
+        get_feature_index(t, index, FEATURE_RGB_EFFECTS),
+    ) {
+        (Some(keys), Some(rgb)) => {
+            call(t, index, rgb, FN_8071_SW_CONTROL, &SW_CONTROL_TAKE)
+                .map_err(|e| anyhow::anyhow!("software control refused ({})", e.map_or("silent", |c| err_name(ERR_HIDPP20, c))))?;
+            Held::PerKey { keys, rgb }
+        }
+        _ => {
+            let feature = get_feature_index(t, index, FEATURE_COLOR_LED_EFFECTS)
+                .ok_or_else(|| anyhow::anyhow!("no colour lighting feature answered"))?;
+            let (fixed, ext) = fixed_effect_indices(t, index, feature).ok_or_else(|| anyhow::anyhow!("zone info unanswered"))?;
+            call(t, index, feature, FN_8070_SET_SW_CONTROL, &[0x01])
+                .map_err(|e| anyhow::anyhow!("software control refused ({})", e.map_or("silent", |c| err_name(ERR_HIDPP20, c))))?;
+            Held::Zones { feature, fixed, readback: ext & EXT_HAS_ZONE_EFFECT != 0 }
+        }
+    };
+    Ok(ColourLink { index, held, sent: std::collections::HashMap::new(), onboard, verified: false })
+}
+
+impl ColourLink {
+    /// Paint `(id, colour)` pairs: only those that changed since the last paint go out. Per-key
+    /// frames commit with frameEnd; a zone's first colour is read back where the device can.
+    pub(crate) fn paint(&mut self, t: &dyn Transport, colours: &[(u16, crate::lighting::Rgb)]) -> crate::dialect::Sent {
+        use crate::dialect::Sent;
+        let changed: Vec<(u16, crate::lighting::Rgb)> =
+            colours.iter().copied().filter(|(id, c)| self.sent.get(id) != Some(c)).collect();
+        if changed.is_empty() {
+            return Sent::Taken;
+        }
+        let verdict = match &self.held {
+            Held::PerKey { keys, .. } => {
+                let keys = *keys;
+                let mut verdict = Sent::Taken;
+                for chunk in changed.chunks(KEYS_PER_REPORT) {
+                    let params: Vec<u8> = chunk.iter().flat_map(|(id, c)| [*id as u8, c.r, c.g, c.b]).collect();
+                    verdict = worst(verdict, sent_of(call(t, self.index, keys, FN_8081_SET_INDIVIDUAL, &params)));
+                    if verdict == Sent::Lost {
+                        break;
+                    }
+                }
+                if verdict != Sent::Lost {
+                    verdict = worst(verdict, self.frame_end(t, keys));
+                }
+                verdict
+            }
+            Held::Zones { feature, fixed, readback } => {
+                let (feature, readback) = (*feature, *readback);
+                let mut verdict = Sent::Taken;
+                for &(zone, c) in &changed {
+                    let Some(Some(effect)) = fixed.get(usize::from(zone)).copied() else { continue };
+                    let mut params = [0u8; 13];
+                    params[0] = zone as u8;
+                    params[1] = effect;
+                    params[2..5].copy_from_slice(&[c.r, c.g, c.b]);
+                    params[5] = FIXED_NO_RAMP;
+                    verdict = worst(verdict, sent_of(call(t, self.index, feature, FN_8070_SET_ZONE_EFFECT, &params)));
+                    if readback && !self.verified && verdict == Sent::Taken {
+                        let back = call(t, self.index, feature, FN_8070_GET_ZONE_EFFECT, &[zone as u8]);
+                        if back.is_ok_and(|r| r[4] == zone as u8 && r[6..9] != [c.r, c.g, c.b]) {
+                            verdict = Sent::Lost;
+                        }
+                        self.verified = true;
+                    }
+                }
+                verdict
+            }
+        };
+        if verdict == Sent::Taken {
+            self.sent.extend(changed);
+        } else {
+            self.sent.clear();
+        }
+        verdict
+    }
+
+    fn frame_end(&self, t: &dyn Transport, keys: u8) -> crate::dialect::Sent {
+        use crate::dialect::Sent;
+        for _ in 0..FRAME_END_TRIES {
+            match call(t, self.index, keys, FN_8081_FRAME_END, &[0u8; 16]) {
+                Ok(_) => return Sent::Taken,
+                Err(Some(BUSY)) => std::thread::sleep(FRAME_END_BACKOFF),
+                Err(Some(_)) => return Sent::Lost,
+                Err(None) => return Sent::Unconfirmed,
+            }
+        }
+        Sent::Unconfirmed
+    }
+
+    /// Give the lighting back: release software control, then restore the onboard mode read at
+    /// take. The device shows its own lighting again.
+    pub(crate) fn release(&self, t: &dyn Transport) {
+        match &self.held {
+            Held::PerKey { rgb, .. } => {
+                let _ = call(t, self.index, *rgb, FN_8071_SW_CONTROL, &SW_CONTROL_GIVE);
+            }
+            Held::Zones { feature, .. } => {
+                let _ = call(t, self.index, *feature, FN_8070_SET_SW_CONTROL, &[0x00]);
+            }
+        }
+        if let Some((feature, mode)) = self.onboard {
+            let _ = call(t, self.index, feature, FN_8100_SET_MODE, &[mode]);
+        }
+    }
+}
+
+fn sent_of(r: std::result::Result<[u8; LONG_LEN], Option<u8>>) -> crate::dialect::Sent {
+    use crate::dialect::Sent;
+    match r {
+        Ok(_) => Sent::Taken,
+        Err(Some(BUSY)) | Err(None) => Sent::Unconfirmed,
+        Err(Some(_)) => Sent::Lost,
+    }
+}
+
+fn worst(a: crate::dialect::Sent, b: crate::dialect::Sent) -> crate::dialect::Sent {
+    use crate::dialect::Sent;
+    match (a, b) {
+        (Sent::Lost, _) | (_, Sent::Lost) => Sent::Lost,
+        (Sent::Unconfirmed, _) | (_, Sent::Unconfirmed) => Sent::Unconfirmed,
+        _ => Sent::Taken,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +1215,10 @@ mod tests {
             frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x00]),
             frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x09]),
             frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x00]),
+            // the lighting features 0x8081, 0x8071 and 0x8070: absent
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x00]),
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x00]),
+            frame(&[0x11, 0xFF, 0x00, func_swid(IROOT_FN_GET_FEATURE), 0x00]),
             frame(&[0x11, 0xFF, 0x08, func_swid(FN_UNIFIED_GET_STATUS), 64, 0x04, 0x00]),
             frame(&[0x11, 0xFF, 0x09, func_swid(FN_EXTENDED_GET_SENSOR_DPI), 0x00, 0x06, 0x40, 0x03, 0x20, 0x03, 0x20]),
         ]);
@@ -1013,6 +1331,10 @@ mod tests {
             frame(&[0x11, 0x02, 0x05, func_swid(FN_NAME_COUNT), 17]),
             frame(&name[..LONG_LEN.min(name.len())]),
             frame(&[0x11, 0x02, 0x05, func_swid(FN_NAME_FRAGMENT), b'D']),
+            // the lighting features 0x8081, 0x8071 and 0x8070: absent
+            frame(&[0x11, 0x02, 0x00, feat_fn, 0x00]),
+            frame(&[0x11, 0x02, 0x00, feat_fn, 0x00]),
+            frame(&[0x11, 0x02, 0x00, feat_fn, 0x00]),
             frame(&[0x11, 0x02, 0x06, func_swid(FN_GET_BATTERY_STATUS), 50]),
         ]);
         let ctx = crate::synth::SynthCtx { pid: 0xC547, product: "USB Receiver".into(), ..hidpp_ctx("") };
@@ -1110,6 +1432,9 @@ mod tests {
             frame(&[0x11, 0xFF, 0x00, 0x0C, 0x06]),                   // getFeature(0x1000) → idx 6
             frame(&[0x11, 0xFF, 0x00, 0x0C, 0x07]),                   // getFeature(0x2201) → idx 7
             frame(&[0x11, 0xFF, 0x00, 0x0C, 0x00]),                   // getFeature(0x0005) → absent
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x00]),                   // getFeature(0x8081) → absent
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x00]),                   // getFeature(0x8071) → absent
+            frame(&[0x11, 0xFF, 0x00, 0x0C, 0x00]),                   // getFeature(0x8070) → absent
             frame(&[0x11, 0xFF, 0x06, func_swid(FN_GET_BATTERY_STATUS), 85]), // battery: 85%
         ]);
         let s = HidppDialect
@@ -1340,3 +1665,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "hidpp_lighting_tests.rs"]
+mod lighting_tests;

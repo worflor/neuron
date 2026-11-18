@@ -61,6 +61,7 @@ pub mod dialect;
 pub mod dpi_origin;
 pub mod devcheck;
 pub mod dynlight;
+pub mod family;
 pub mod discover;
 pub mod effects;
 pub mod engine;

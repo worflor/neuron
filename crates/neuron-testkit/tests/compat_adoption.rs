@@ -71,6 +71,14 @@ fn tape(exchanges: Vec<Exchange>) -> Result<RecordedProtocol> {
     RecordedProtocol::new(ProtocolTape { schema: 1, vid: 0x046D, pid: 0xF201, exchanges })
 }
 
+/// IRoot.getFeature for `feature`, as neuron frames it.
+fn feature_index(feature: u16) -> [u8; 20] {
+    let mut r = [0u8; 20];
+    r[..4].copy_from_slice(&[0x11, 0xFF, 0x00, 0x0C]);
+    r[4..6].copy_from_slice(&feature.to_be_bytes());
+    r
+}
+
 fn exchange(request: [u8; 20], replies: Vec<Reply>) -> Exchange {
     Exchange { channel: Channel::OutputInput, request: request.to_vec(), replies }
 }
@@ -137,6 +145,10 @@ fn adoption_and_reloaded_hidpp_getters_use_the_recorded_bus() -> Result<()> {
         exchange(BATTERY_INDEX, vec![Reply::Bytes(vec![0x10, 0xFF, 0x00, 0x0C, 0x06, 0x00, 0x00])]),
         exchange(DPI_INDEX, vec![Reply::Bytes(vec![0x10, 0xFF, 0x00, 0x0C, 0x07, 0x00, 0x00])]),
         exchange(NAME_INDEX, vec![Reply::Bytes(vec![0x10, 0xFF, 0x00, 0x0C, 0x00, 0x00, 0x00])]),
+        // the lighting features 0x8081, 0x8071 and 0x8070: absent
+        exchange(feature_index(0x8081), vec![Reply::Bytes(vec![0x10, 0xFF, 0x00, 0x0C, 0x00, 0x00, 0x00])]),
+        exchange(feature_index(0x8071), vec![Reply::Bytes(vec![0x10, 0xFF, 0x00, 0x0C, 0x00, 0x00, 0x00])]),
+        exchange(feature_index(0x8070), vec![Reply::Bytes(vec![0x10, 0xFF, 0x00, 0x0C, 0x00, 0x00, 0x00])]),
         exchange(
             [
                 0x11, 0xFF, 0x06, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -233,7 +245,11 @@ fn a_via_keyboard_is_adopted_and_its_brightness_read_on_the_recorded_bus() -> Re
         pid,
         exchanges: vec![
             ask(&[0x01], &[0x01, 0x00, 0x0C]),
-            ask(&[0x08, 0x03, 0x01], &[0x08, 0x03, 0x01, 200]),
+            // each lighting read goes out with two fillers; an answer writes over them
+            ask(&[0x08, 0x03, 0x01, 0xA5], &[0x08, 0x03, 0x01, 200]),
+            ask(&[0x08, 0x03, 0x01, 0x5A], &[0x08, 0x03, 0x01, 200]),
+            ask(&[0x08, 0x03, 0x04, 0xA5, 0xA5], &[0x08, 0x03, 0x04, 0x30, 0xFF]),
+            ask(&[0x08, 0x03, 0x04, 0x5A, 0x5A], &[0x08, 0x03, 0x04, 0x30, 0xFF]),
             ask(&[0x08, 0x03, 0x01], &[0x08, 0x03, 0x01, 200]),
         ],
     })?;
@@ -255,6 +271,11 @@ fn a_via_keyboard_is_adopted_and_its_brightness_read_on_the_recorded_bus() -> Re
         def.commands.keys().map(String::as_str).collect::<Vec<_>>() == ["brightness", "set_brightness"],
         "{:?}",
         def.commands.keys()
+    );
+    let lighting = def.lighting.as_ref().ok_or_else(|| anyhow::anyhow!("the board's colour was learned"))?;
+    ensure!(
+        lighting.protocol == neuron::lighting::Protocol::Via && lighting.channel == Some(0x03),
+        "one colour on the RGB matrix channel"
     );
     let device = Device::open(def.clone(), pid)?;
     ensure!(capability::brightness_percent(&device)? == 78, "200/255 reads as 78%");

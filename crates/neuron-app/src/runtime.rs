@@ -1120,7 +1120,7 @@ impl AppRuntime {
             .and_then(|d| d.lighting)
             .map(|l| match l.protocol {
                 neuron::lighting::Protocol::Legacy => (30, true),
-                neuron::lighting::Protocol::Matrix => (30, false),
+                _ => (30, false),
             })
     }
 

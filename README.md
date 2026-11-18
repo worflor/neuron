@@ -242,6 +242,7 @@ on linux, [OpenRazer](https://github.com/openrazer/openrazer) is the mature opti
 | idle/sleep timer | **proven**: set/read round-trip on the Naga (enabled in shipped binaries via `idle-power-write`) |
 | thumb-grid binds in firmware (`02/0C`) | **proven** on the Naga V2 Pro: volatile, **normal mode only**, read back via `02/8C` and re-applied on connect/wake |
 | in-game hi-res polling · scroll *stage* table · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested |
+| colour on Logitech (HID++ per-key and zones) and QMK (VIA, VialRGB) | **source-derived**: RAM-only writes the open-source projects agree on, read back where the protocol can; not yet run on a real device |
 | debounce | **no known opcode**: bails with a "needs RE" note, never a blind write |
 | saving binds into an onboard slot | **known, unused**: `02/0C` slots 1–5 persist across power cycles, but neuron keeps binds volatile |
 

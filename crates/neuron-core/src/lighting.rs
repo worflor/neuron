@@ -245,6 +245,20 @@ pub enum Protocol {
     Legacy,
     /// class 0x0F — newer devices (per-LED matrix).
     Matrix,
+    /// QMK VIA: one colour for the whole board on a lighting channel ([`crate::via`]).
+    Via,
+    /// Vial's per-LED lighting over VIA ([`crate::via`]).
+    Vialrgb,
+    /// Logitech HID++ 2.0: zone colour (0x8070) or per-key (0x8081) ([`crate::hidpp`]).
+    Hidpp,
+}
+
+impl Protocol {
+    /// Speaks `razer_report` lighting: effect and frame commands, settling, custom frames.
+    #[must_use]
+    pub fn is_razer(self) -> bool {
+        matches!(self, Protocol::Legacy | Protocol::Matrix)
+    }
 }
 
 /// Per-device lighting definition (registry TOML `[lighting]`). Semantics are in code; these
@@ -270,7 +284,8 @@ pub struct LightingDef {
     /// and the stream flickers. Extended-matrix devices MUST set `custom_id = 0x08` in their TOML.
     #[serde(default = "default_custom_id")]
     pub custom_id: u8,
-    /// command to set a whole-device effect.
+    /// command to set a whole-device effect (Razer protocols).
+    #[serde(default)]
     pub effect: CommandSpec,
     /// command to set one custom frame row (optional; enables custom/emulated effects).
     #[serde(default)]
@@ -286,6 +301,13 @@ pub struct LightingDef {
     /// the backlight LED.
     #[serde(default)]
     pub display_args: Option<Vec<u8>>,
+    /// QMK lighting channel the colour is set on (`protocol = "via"`).
+    #[serde(default)]
+    pub channel: Option<u8>,
+    /// The device's own LEDs in wire order, `[id, row, col]`: the id its protocol addresses
+    /// (Vial LED index, HID++ key or zone id) and the cell of the `rows`×`cols` frame it shows.
+    #[serde(default)]
+    pub leds: Vec<[u16; 3]>,
 }
 
 /// How matrix (class 0x0F) effect reports are laid out.
@@ -325,7 +347,9 @@ impl LightingDef {
         let (args, size) = match self.protocol {
             // OpenRazer standard_matrix_effect_custom_frame: [CUSTOMFRAME, varstore], data_size 0x02.
             Protocol::Legacy => (vec![self.custom_id, self.varstore], Some(0x02u8)),
-            Protocol::Matrix => {
+            // The families never display a Razer custom frame; `Lights` routes them to their own
+            // protocol, so their arm only has to be total.
+            Protocol::Matrix | Protocol::Via | Protocol::Vialrgb | Protocol::Hidpp => {
                 let a = self.display_args.clone().unwrap_or_else(|| {
                     let mut a = self.effect.args.clone();
                     a.push(self.custom_id);
@@ -375,6 +399,7 @@ impl LightingDef {
     pub fn native_effect_report(&self, e: Effect, color: Option<Rgb>, persist: bool) -> Option<Report> {
         let id = *self.effects.get(e.name())?;
         match self.protocol {
+            Protocol::Via | Protocol::Vialrgb | Protocol::Hidpp => None,
             Protocol::Matrix => {
                 let mut args = self.effect.args.clone(); // [varstore, led]
                 args.push(id);
@@ -503,7 +528,7 @@ impl LightingDef {
         }
         let size = match self.protocol {
             Protocol::Legacy => Some(cf.size),
-            Protocol::Matrix => None,
+            Protocol::Matrix | Protocol::Via | Protocol::Vialrgb | Protocol::Hidpp => None,
         };
         Some(Report {
             class: cf.class,
@@ -865,6 +890,70 @@ pub fn vk_to_name(vk: i32) -> Option<&'static str> {
         0x6D => "NUMSUBTRACT",
         0x6E => "NUMDECIMAL",
         0x6F => "NUMDIVIDE",
+        _ => return None,
+    })
+}
+
+/// The key name a HID Keyboard-page usage (0x07) carries in [`razer_key_cell`]'s ANSI table.
+#[must_use]
+pub fn hid_usage_key(usage: u16) -> Option<&'static str> {
+    const LETTERS: [&str; 26] = [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U",
+        "V", "W", "X", "Y", "Z",
+    ];
+    const DIGITS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+    const FKEYS: [&str; 12] = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"];
+    const NUMPAD: [&str; 11] = ["NUM1", "NUM2", "NUM3", "NUM4", "NUM5", "NUM6", "NUM7", "NUM8", "NUM9", "NUM0", "NUMDECIMAL"];
+    let u = usize::from(usage);
+    Some(match usage {
+        0x04..=0x1D => LETTERS[u - 0x04],
+        0x1E..=0x27 => DIGITS[u - 0x1E],
+        0x28 => "ENTER",
+        0x29 => "ESC",
+        0x2A => "BACKSPACE",
+        0x2B => "TAB",
+        0x2C => "SPACE",
+        0x2D => "MINUS",
+        0x2E => "EQUALS",
+        0x2F => "LEFTBRACKET",
+        0x30 => "RIGHTBRACKET",
+        0x31 => "BACKSLASH",
+        0x33 => "SEMICOLON",
+        0x34 => "QUOTE",
+        0x35 => "BACKTICK",
+        0x36 => "COMMA",
+        0x37 => "PERIOD",
+        0x38 => "SLASH",
+        0x39 => "CAPSLOCK",
+        0x3A..=0x45 => FKEYS[u - 0x3A],
+        0x46 => "PRINTSCREEN",
+        0x47 => "SCROLLLOCK",
+        0x48 => "PAUSE",
+        0x49 => "INSERT",
+        0x4A => "HOME",
+        0x4B => "PAGEUP",
+        0x4C => "DELETE",
+        0x4D => "END",
+        0x4E => "PAGEDOWN",
+        0x4F => "RIGHT",
+        0x50 => "LEFT",
+        0x51 => "DOWN",
+        0x52 => "UP",
+        0x53 => "NUMLOCK",
+        0x54 => "NUMDIVIDE",
+        0x55 => "NUMMULTIPLY",
+        0x56 => "NUMSUBTRACT",
+        0x57 => "NUMADD",
+        0x58 => "NUMENTER",
+        0x59..=0x63 => NUMPAD[u - 0x59],
+        0x65 => "MENU",
+        0xE0 => "LCTRL",
+        0xE1 => "LSHIFT",
+        0xE2 => "LALT",
+        0xE3 => "WIN",
+        0xE4 => "RCTRL",
+        0xE5 => "RSHIFT",
+        0xE6 => "RALT",
         _ => return None,
     })
 }
@@ -1412,6 +1501,11 @@ impl<'a> Lights<'a> {
         if self.controlled.get() {
             return Ok(());
         }
+        if !self.def.protocol.is_razer() {
+            crate::family::take(self.dev, &self.def)?;
+            self.controlled.set(true);
+            return Ok(());
+        }
         if self.dev.def.custody() == crate::registry::Custody::Firmware
             || crate::writes::refuses_mode_writes(&self.dev.def)
         {
@@ -1430,6 +1524,17 @@ impl<'a> Lights<'a> {
     /// an ERROR, not a silent flat-fill approximation: `set_effect` must agree with `available()`.
     pub fn set_effect(&self, e: Effect, color: Option<Rgb>, persist: bool) -> anyhow::Result<()> {
         self.ensure_control()?;
+        if !self.def.protocol.is_razer() {
+            // The families take frames only: off is black, every other effect a rendered frame.
+            let frame = match e {
+                Effect::Off => vec![Rgb::new(0, 0, 0); self.def.led_count()],
+                _ if e.is_emulatable() => {
+                    render_frame(e, self.def.rows, self.def.cols, 0.0, color.unwrap_or(Rgb::new(0, 255, 0)))
+                }
+                _ => anyhow::bail!("effect '{}' is not available on this device", e.name()),
+            };
+            return self.paint_px(&frame);
+        }
         if let Some(rep) = self.def.native_effect_report(e, color, persist) {
             self.dev.apply_lighting(&rep)?;
         } else if e.is_emulatable() {
@@ -1467,6 +1572,12 @@ impl<'a> Lights<'a> {
         // Driver mode is a render-path guarantee, not caller homework (memoized — free after the
         // first call on this handle). Without it the firmware ACKs every row and paints nothing.
         self.ensure_control()?;
+        if !self.def.protocol.is_razer() {
+            return match crate::family::paint(self.dev, &self.def, px)? {
+                crate::dialect::Sent::Lost => anyhow::bail!("the device refused the colour"),
+                _ => Ok(()),
+            };
+        }
         for r in self.def.frame_reports(px) {
             self.dev.apply_lighting(&r)?;
         }
@@ -1514,6 +1625,9 @@ impl<'a> Lights<'a> {
     ) -> anyhow::Result<()> {
         use std::time::{Duration, Instant};
         self.ensure_control()?;
+        if !self.def.protocol.is_razer() {
+            return self.animate_family(fps, produce, secs, stop);
+        }
         let display = self.def.custom_display_report();
         let cols = self.def.cols as usize;
         // TUNABLE rate: `fps()` is read EVERY frame (not captured once) so the user can re-pace a
@@ -1601,6 +1715,41 @@ impl<'a> Lights<'a> {
         }
         Ok(())
     }
+
+    /// [`animate_frames`](Self::animate_frames) for a VIA, Vial or HID++ device: the same pacing,
+    /// stop and health reporting, with each frame handed to its family, which sends only the LEDs
+    /// that changed.
+    fn animate_family(
+        &self,
+        fps: impl Fn() -> u32,
+        mut produce: impl FnMut(std::time::Duration, u32) -> anyhow::Result<std::sync::Arc<[Rgb]>>,
+        secs: u64,
+        mut stop: impl FnMut() -> bool,
+    ) -> anyhow::Result<()> {
+        use std::time::{Duration, Instant};
+        let run_start = Instant::now();
+        let mut next = run_start;
+        while !stop() && run_start.elapsed().as_secs_f64() < secs as f64 {
+            let fps = fps().clamp(1, MAX_STREAM_FPS);
+            let dt = Duration::from_millis(1000 / u64::from(fps));
+            let frame = produce(crate::pattern::render_elapsed_time(), fps)?;
+            anyhow::ensure!(frame.len() == self.def.led_count(), "producer frame shape mismatch");
+            if stop() {
+                break;
+            }
+            let sent = crate::family::paint(self.dev, &self.def, &frame)?;
+            if let Some(h) = &self.health {
+                h.record(sent);
+            }
+            next += dt;
+            let (nd, nap) = pace(next, Instant::now(), dt);
+            next = nd;
+            if !nap.is_zero() {
+                std::thread::sleep(nap);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1644,6 +1793,8 @@ mod tests {
             }),
             framing: Framing::Compact,
             display_args: None,
+            channel: None,
+            leds: Vec::new(),
         }
     }
 
@@ -1698,6 +1849,8 @@ mod tests {
             }),
             framing: Framing::Compact,
             display_args: None,
+            channel: None,
+            leds: Vec::new(),
         }
     }
 

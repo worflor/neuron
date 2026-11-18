@@ -235,8 +235,14 @@ impl Device {
     /// receiving a razer-framed mode packet it would misread. FAIL CLOSED on an unknown dialect,
     /// exactly like [`exec_dynamic_tx`](Self::exec_dynamic_tx) — a def we can't identify gets no bytes.
     pub fn release_custody(&self) -> Result<()> {
+        crate::family::release(self);
         self.dialect()?
             .release_custody(self.transport.as_ref(), &self.def)
+    }
+
+    /// The open pipe, for a family's own lighting framing ([`crate::family`]).
+    pub(crate) fn transport(&self) -> &dyn crate::transport::Transport {
+        self.transport.as_ref()
     }
 
     /// Run a named command from the device's registry command map.

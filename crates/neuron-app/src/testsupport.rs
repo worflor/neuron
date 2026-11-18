@@ -230,6 +230,10 @@ mod conventions {
     /// Braces inside line comments and string literals are ignored, since either would unbalance the
     /// count and swallow the rest of the file — reinstating the very bug this replaces.
     fn strip_test_region(src: &str) -> String {
+        // a file that is all tests says so at its top
+        if src.lines().any(|l| l.trim() == "#![cfg(test)]") {
+            return String::new();
+        }
         let lines: Vec<&str> = src.lines().collect();
         let mut kept = String::with_capacity(src.len());
         let mut i = 0;

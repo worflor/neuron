@@ -431,6 +431,8 @@ fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool) -> LightingDef {
         brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, 0x04])),
         framing: crate::lighting::Framing::Compact,
         display_args: None,
+        channel: None,
+        leds: Vec::new(),
     }
 }
 
@@ -462,6 +464,8 @@ fn keyboard_lighting(rows: u8, cols: u8, led: u8, brightness_proven: bool) -> Li
         brightness: brightness_proven.then(|| cmd(0x0F, 0x04, 0x03, &[0x00, led])),
         framing: crate::lighting::Framing::Fixed,
         display_args: Some(vec![0x00, 0x00, 0x08]),
+        channel: None,
+        leds: Vec::new(),
     }
 }
 
@@ -494,6 +498,8 @@ fn legacy_lighting(rows: u8, cols: u8, brightness_proven: bool, lighting_tx: u8)
         brightness: brightness_proven.then(|| cmd(0x03, 0x03, 0x03, &[0x01, 0x05])),
         framing: crate::lighting::Framing::Compact,
         display_args: None,
+        channel: None,
+        leds: Vec::new(),
     }
 }
 
@@ -1015,10 +1021,13 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
     for (name, c) in &d.commands {
         emit_cmd(&mut out, &format!("commands.{name}"), c);
     }
-    if let Some(l) = &d.lighting {
+    if let Some(l) = d.lighting.as_ref().filter(|l| !l.protocol.is_razer()) {
+        out.push_str(&family_lighting_toml(l));
+    }
+    if let Some(l) = d.lighting.as_ref().filter(|l| l.protocol.is_razer()) {
         let proto = match l.protocol {
-            Protocol::Matrix => "matrix",
             Protocol::Legacy => "legacy",
+            _ => "matrix",
         };
         let pid = d.modes.first().map_or(0, |m| m.product_id);
         let dims_note = match crate::atlas::lookup(d.vendor_id, pid).map(crate::atlas::Keyboard::dims) {
@@ -1051,6 +1060,30 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
         }
     }
     with_digest(&out)
+}
+
+/// A VIA, Vial or HID++ lighting block: its protocol, frame size, channel and LED map. These carry
+/// no command specs; their family's code frames every write.
+fn family_lighting_toml(l: &crate::lighting::LightingDef) -> String {
+    let proto = match l.protocol {
+        Protocol::Via => "via",
+        Protocol::Vialrgb => "vialrgb",
+        _ => "hidpp",
+    };
+    let mut out = format!("[lighting]\nprotocol = \"{proto}\"\nrows = {}\ncols = {}\n", l.rows, l.cols);
+    if let Some(c) = l.channel {
+        out.push_str(&format!("channel = {c}\n"));
+    }
+    if !l.leds.is_empty() {
+        let leds: Vec<String> = l.leds.iter().map(|[id, r, c]| format!("[{id}, {r}, {c}]")).collect();
+        out.push_str("leds = [\n");
+        for chunk in leds.chunks(8) {
+            out.push_str(&format!("  {},\n", chunk.join(", ")));
+        }
+        out.push_str("]\n");
+    }
+    out.push('\n');
+    out
 }
 
 /// `def` with its lighting effects and frame rows at `tx`, as overrides on those two commands.
@@ -1303,8 +1336,11 @@ fn settle_refusals(out: &mut Adoption) {
 /// Bumped when synthesis changes the bytes it emits for hardware it may already have adopted.
 /// 2: keyboard lighting left the Naga logo region. 3: keyboard lighting reads retried across tx
 /// cohorts, effects on the backlight LED at openrazer's sizes, atlas matrix sizes. 4: mice take
-/// their matrix size and reply wait from the mouse atlas.
-pub const SYNTH_VERSION: u32 = 4;
+/// their matrix size and reply wait from the mouse atlas. 5: VIA and HID++ devices learn colour
+/// lighting, and VIA reads tell an answer from an echo.
+pub const SYNTH_VERSION: u32 = 5;
+/// Razer files from before this version are checked for the razer changes above.
+const RAZER_RETIRE_BELOW: u32 = 4;
 
 /// The emitted header line carrying [`SYNTH_VERSION`].
 const VERSION_MARK: &str = "# synth-version: ";
@@ -1331,10 +1367,13 @@ fn stale_backup_path(path: &Path, version: u32) -> PathBuf {
 /// detectable; they survive in the backup. Pure: touches nothing.
 pub(crate) fn is_stale_auto_def(path: &Path, text: &str, def: &DeviceDef) -> bool {
     let version = synth_version(text);
-    if version >= SYNTH_VERSION || def.dialect != "razer" {
+    if stale_backup_path(path, version).exists() {
         return false;
     }
-    if stale_backup_path(path, version).exists() {
+    if matches!(def.dialect.as_str(), "via" | "hidpp") {
+        return version < SYNTH_VERSION && def.lighting.is_none();
+    }
+    if version >= RAZER_RETIRE_BELOW || def.dialect != "razer" {
         return false;
     }
     if def.commands.contains_key("dpi") {

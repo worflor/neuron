@@ -102,7 +102,7 @@ pub fn check(def: &DeviceDef) -> Result<(), String> {
     // HID++ commands address feature indices the device reports at runtime, which no static
     // table can describe; that dialect is bounded by its vendor and its own read-only adoption.
     if def.dialect == "hidpp" {
-        return Ok(());
+        return check_family_lighting(def, &[crate::lighting::Protocol::Hidpp]);
     }
     let k = knowledge();
     let reads = k.reads.get(&def.dialect);
@@ -136,11 +136,34 @@ fn check_via(def: &DeviceDef) -> Result<(), String> {
     if let Some((name, _)) = def.commands.iter().find(|(_, c)| !crate::via::is_adopted_command(c)) {
         return Err(format!("command `{name}` is not a command VIA adoption sends"));
     }
-    if def.lighting.is_some() {
-        return Err("a VIA definition carries no lighting writes".into());
-    }
+    check_family_lighting(def, &[crate::lighting::Protocol::Via, crate::lighting::Protocol::Vialrgb])?;
     if let Some((table, usage, action)) = binds_of(def).next() {
         return Err(format!("{table} binds {usage} to `{action}`, which a VIA definition cannot carry"));
+    }
+    Ok(())
+}
+
+/// A VIA, Vial or HID++ lighting block: its own family's protocol, no Razer command specs (the
+/// family frames every write), a VIA channel QMK defines, and every LED on the frame.
+fn check_family_lighting(def: &DeviceDef, allowed: &[crate::lighting::Protocol]) -> Result<(), String> {
+    let Some(l) = &def.lighting else { return Ok(()) };
+    if !allowed.contains(&l.protocol) {
+        return Err(format!("a {} definition can't carry {:?} lighting", def.dialect, l.protocol));
+    }
+    if l.effect != crate::registry::CommandSpec::default() || l.custom_frame.is_some() || l.brightness.is_some() {
+        return Err("a family lighting block carries no command specs".into());
+    }
+    if l.rows == 0 || l.cols == 0 {
+        return Err("lighting has no frame".into());
+    }
+    if l.protocol == crate::lighting::Protocol::Via && !l.channel.is_some_and(crate::via::is_lighting_channel) {
+        return Err(format!("{:?} is not a QMK lighting channel", l.channel));
+    }
+    for &[id, row, col] in &l.leds {
+        let off_frame = row != crate::hidpp::NO_CELL && (row >= u16::from(l.rows) || col >= u16::from(l.cols));
+        if id > 0xFF || off_frame {
+            return Err(format!("LED [{id}, {row}, {col}] is outside the {}x{} frame", l.rows, l.cols));
+        }
     }
     Ok(())
 }

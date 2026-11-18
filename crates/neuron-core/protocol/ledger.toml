@@ -242,6 +242,36 @@ license = "GPL-2.0-or-later"
 sha = "e7304c4c451cc9bb4f206a914844525e67856a28"
 note = "Standard short/long report sizes and report-ID-specific length validation in base.py; Centurion uses a separate extended framing."
 
+[sources.qmk-a69ab05d]
+url = "https://github.com/qmk/qmk_firmware"
+license = "GPL-2.0-or-later"
+sha = "a69ab05dd687cb9aa38e0c125e4f64956c7da6c7"
+note = "QMK firmware before VIA's lighting channels: the flat lighting ids of protocol 0x000B and earlier."
+
+[sources.qmk-7f805cc7]
+url = "https://github.com/qmk/qmk_firmware"
+license = "GPL-2.0-or-later"
+sha = "7f805cc7799deb0ca75f751cebd32c6640058af9"
+note = "QMK firmware at VIA protocol 0x000C, the first with channelled lighting ids throughout."
+
+[sources.vial-qmk-dd43959a]
+url = "https://github.com/vial-kb/vial-qmk"
+license = "GPL-2.0-or-later"
+sha = "dd43959ae5c08d8a28d38a1acf7b04e86b14a344"
+note = "Vial firmware: VIA protocol 9 with flat lighting ids, the Vial keyboard id, and VialRGB."
+
+[sources.libratbag-8235b5bb]
+url = "https://github.com/libratbag/libratbag"
+license = "MIT"
+sha = "8235b5bb6032dea15901ab58a8218956f4494d08"
+note = "libratbag's HID++ 2.0 lighting and onboard-profile features (src/hidpp20.c, hidpp20.h)."
+
+[sources.openrgb-5bcfa9ae]
+url = "https://gitlab.com/CalcProgrammer1/OpenRGB"
+license = "GPL-2.0-only"
+sha = "5bcfa9ae01536d2dd45b0c6e5b15677513f7a6d5"
+note = "OpenRGB's Logitech HID++ 2.0 and QMK VialRGB controllers."
+
 [sources.microsoft-hid-samples]
 url = "https://github.com/microsoft/Windows-driver-samples"
 license = "MS-PL"
@@ -2976,7 +3006,7 @@ evidence = [
 key = "via/enum/custom-get-brightness"
 dialect = "via"
 kind = "enum"
-layout = "0x08 [channel, 0x01] -> [0x08, channel, 0x01, level 0..255]; channels asked in order 3 RGB matrix, 2 RGB light, 5 LED matrix, 1 backlight; reshaped to args[2]"
+layout = "0x08 [channel, 0x01] -> [0x08, channel, 0x01, level 0..255]; channels asked in order 3 RGB matrix, 2 RGB light, 5 LED matrix, 1 backlight; on flat boards (via/frame/lighting-ids) 0x08 [0x80] RGB, else [0x09] backlight; reshaped to args[2]; asked twice with different fillers, so an echo is not taken for a level"
 meaning = "Lighting brightness read."
 grade = "single"
 evidence = [
@@ -3005,7 +3035,7 @@ evidence = [
 key = "via/mode/never-sent"
 dialect = "via"
 kind = "mode"
-layout = "never sent: 0x05, 0x06, 0x09, 0x0A, 0x0F, 0x10, 0x13, 0x15 (EEPROM and keymap writes), 0x0B (bootloader jump), keyboard value 0x03 (live switch matrix); the only write is the unsaved brightness set (via/07/03)"
+layout = "never sent: 0x05, 0x06, 0x09, 0x0A, 0x0F, 0x10, 0x13, 0x15 (EEPROM and keymap writes), 0x0B (bootloader jump), keyboard value 0x03 (live switch matrix); the writes are the unsaved brightness set (via/07/03), whole-board colour (via/07/03#colour) and VialRGB direct (via/07/42#vialrgb-direct)"
 meaning = "Nothing VIA sends is saved to the board; the matrix read is a keylogger surface."
 grade = "derived"
 evidence = [
@@ -3114,4 +3144,130 @@ devices = ["24c6:543a"]
 grade = "live"
 evidence = [
   { kind = "live", date = "2026-09-30", what = "PowerA 24c6:543a through these slots: device callback, info (vid 24c6, pid 543a), gamepad state (buttons, both sticks, both triggers), battery state; rumble slot accepted without moving motors (gameinput/mode/rumble-unreliable)" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# VIA and Vial colour lighting.
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "via/frame/lighting-ids"
+dialect = "via"
+kind = "frame"
+layout = "protocol >= 0x000C: 0x07/0x08 [channel, value, data]; protocol <= 0x000A and every Vial build: [id, data] with flat ids (RGB light and matrix 0x80 brightness, 0x81 effect, 0x83 colour; backlight 0x09); 0x000B shipped both ways and is asked with 0x08 [0x80], which channelled firmware answers 0xFF. A known channel's unknown value echoes the request with no 0xFF, so every lighting read is asked with two different filler bytes and an answer must overwrite them"
+meaning = "Which lighting ids a board takes, and telling an answer from an echo."
+grade = "single"
+evidence = [
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.h#L42", what = "protocol 0x000D with channelled lighting" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L523-L542", what = "the get switch has no default: an unknown value leaves the buffer unchanged" },
+  { kind = "source", src = "qmk-7f805cc7", at = "quantum/via.h#L61", what = "protocol 0x000C" },
+  { kind = "source", src = "qmk-a69ab05d", at = "quantum/via.h#L61", what = "protocol 0x000B with the flat lighting ids" },
+  { kind = "source", src = "vial-qmk-dd43959a", at = "quantum/via.h#L42", what = "Vial builds report protocol 0x0009" },
+  { kind = "source", src = "vial-qmk-dd43959a", at = "quantum/via.c#L475-L654", what = "flat ids 0x80-0x83 for RGB light and RGB matrix" },
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/via.rs", what = "channelled, read_value" },
+]
+
+[[fact]]
+key = "via/07/03#colour"
+dialect = "via"
+kind = "set"
+class = 0x07
+id = 0x03
+layout = "0x07 [channel 3 or 2, 0x02, 0x01] solid effect (flat 0x81 [0x01]), then 0x07 [channel, 0x04, h, s] colour (flat 0x83 [h, s]) and 0x07 [channel, 0x01, x] brightness (flat 0x80 [x]); h and s on QMK's 255-period wheel; RGB matrix stores x*255>>8, so x is rounded up; the first colour is read back through 0x08; at release the effect, colour and brightness read at take are written back"
+meaning = "One colour for a whole RGB light or RGB matrix board, unsaved."
+grade = "single"
+ungated_debt = "Every value goes through QMK's *_noeeprom calls and neuron never sends 0x09, so a reboot shows the board's stored lighting; the colour is read back, and release puts back what was read. A later save on the board itself (an RGB key, VIA's or Vial's save) can store neuron's colour, which neuron can't prevent. No VIA board has been on neuron's wire."
+evidence = [
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L696-L740", what = "RGB matrix brightness, effect and colour [h, s] get and set, all _noeeprom" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/via.c#L608-L652", what = "RGB light brightness, effect and colour, all _noeeprom" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/rgb_matrix/animations/solid_color_anim.h#L1-L13", what = "SOLID_COLOR is unguarded, so effect 1 on every build" },
+  { kind = "source", src = "qmk-8252b630", at = "quantum/color.c#L22-L110", what = "hsv_to_rgb: the integer maths neuron inverts" },
+  { kind = "source", src = "vial-qmk-dd43959a", at = "quantum/via.c#L577-L651", what = "the same values on the flat ids" },
+]
+
+[[fact]]
+key = "via/enum/vialrgb"
+dialect = "via"
+kind = "enum"
+layout = "0xFE [0x00] keyboard id, not an echo: bytes 0-3 Vial protocol u32 LE (>= 4), byte 12 bit 0 VialRGB; then on the flat lighting get, subcommand at byte 1: 0x40 info [ver u16 LE == 1, max brightness], 0x41 mode [mode u16 LE, speed, h, s, v], 0x43 LED count u16 LE (<= 256), 0x44 [index, 0] LED info [x, y, flags, row, col] with 0xFF row/col for an LED that isn't a key"
+meaning = "VialRGB detection and the per-LED map."
+grade = "single"
+evidence = [
+  { kind = "source", src = "vial-qmk-dd43959a", at = "quantum/vial.c#L94-L107", what = "keyboard id reply layout and the VialRGB flag" },
+  { kind = "source", src = "vial-qmk-dd43959a", at = "quantum/vialrgb.c#L114-L156", what = "info, mode, LED count and LED info" },
+  { kind = "source", src = "vial-qmk-dd43959a", at = "quantum/vialrgb.c#L146", what = "LED info ignores the index's high byte: LEDs 0-255 only" },
+  { kind = "source", src = "vial-gui-aef8222a", at = "src/main/python/keyboard_comm.py#L242-L248", what = "requires VialRGB version 1" },
+]
+
+[[fact]]
+key = "via/07/42#vialrgb-direct"
+dialect = "via"
+kind = "set"
+class = 0x07
+id = 0x42
+layout = "0x07 [0x41, 0x01, 0x00, speed, h, s, v] direct mode, read back through 0x08 [0x41]; 0x07 [0x42, first u16 LE, n <= 9, (h, s, v) x n] per-LED colour, v scaled to the board's max brightness; only changed LEDs are sent; at release the mode read at take is written back"
+meaning = "Per-LED colour on a Vial board, unsaved."
+grade = "single"
+ungated_debt = "Mode and LED colours live in RAM (rgb_matrix *_noeeprom and a RAM buffer) and neuron never sends 0x09; direct mode is read back after it is set, and release restores the mode read at take exactly. A save on the board while neuron holds it would boot into a dark direct mode until the mode is changed. No Vial board has been on neuron's wire."
+evidence = [
+  { kind = "source", src = "vial-qmk-dd43959a", at = "quantum/vialrgb.c#L66-L110", what = "set_mode and direct_fastset, n <= 9" },
+  { kind = "source", src = "vial-qmk-dd43959a", at = "quantum/rgb_matrix/animations/vialrgb_direct_anim.h#L8-L16", what = "direct mode draws each LED's HSV, capped at the max brightness" },
+  { kind = "source", src = "openrgb-5bcfa9ae", at = "Controllers/QMKController/QMKVialRGBController.cpp#L366-L399", what = "the same fastset framing" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# HID++ colour lighting. A HID++ write has no class byte, so its set facts are keyed by the
+# feature id's low byte and the function: hidpp/81/01 is feature 0x8081 function 1.
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "hidpp/enum/lighting-discovery"
+dialect = "hidpp"
+kind = "enum"
+layout = "0x8081 fn0 [0x00, page 0..2, 0x00] -> 14-byte key bitmap at params[2], key id = page*112 + bit, id = HID keyboard usage - 3 (G1-G5 180-184, logo 210); 0x8070 fn0 -> zone count, ext caps BE16 at params[3] (0x01 getZoneEffect, 0x08 monochrome); fn1 [zone] -> effect count at params[3]; fn2 [zone, index] -> effect id BE16 at params[2] (0x0001 fixed)"
+meaning = "What a Logitech device lights, read-only at adoption."
+grade = "agreed"
+evidence = [
+  { kind = "source", src = "openrgb-5bcfa9ae", at = "Controllers/LogitechController/LogitechHIDPP20Controller/LogitechHIDPP20Controller.cpp#L3030-L3075", what = "0x8081 getInfo bitmap pages" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/settings_templates.py#L4160-L4175", what = "pages 0-2, ids 1..254" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/special_keys.py#L1425-L1545", what = "key ids are HID usage minus 3" },
+  { kind = "source", src = "libratbag-8235b5bb", at = "src/hidpp20.c#L878-L1016", what = "0x8070 getInfo, getZoneInfo and getZoneEffectInfo replies" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/hidpp20.py#L1332-L1380", what = "the same 0x8070 replies, ext caps big-endian" },
+]
+
+[[fact]]
+key = "hidpp/81/01#perkey"
+dialect = "hidpp"
+kind = "set"
+class = 0x81
+id = 0x01
+layout = "0x8100 fn2 reads the onboard mode; at 0x01 fn1 [0x02] switches to host; 0x8071 fn5 [0x01, 0x03, 0x05] software control; 0x8081 fn1 [(key id, r, g, b) x 4] per key, only changed keys; fn7 [16 zero bytes] frame end, retried on Busy; at release 0x8071 fn5 [0x01, 0x00, 0x00] and 0x8100 fn1 [the mode read]"
+meaning = "Per-key colour on a Logitech keyboard or mouse."
+grade = "agreed"
+ungated_debt = "Software control and per-key frames are RAM state, and the onboard mode switch writes no profile memory; release gives control back and restores the mode read at take. 0x8081 has no getter, so frames are confirmed by their replies, not read back. 0x8071's own effect write is never sent (its persist byte is disputed). Host mode sets the onboard DPI and button profile aside while neuron holds the lighting. No Logitech device has been on neuron's wire."
+evidence = [
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/rgb_power.py#L48-L56", what = "software control claim [01 03 flags] and release [01 00 00]" },
+  { kind = "source", src = "openrgb-5bcfa9ae", at = "Controllers/LogitechController/LogitechHIDPP20Controller/LogitechHIDPP20Controller.cpp#L4078-L4110", what = "claim with mode 3, flags settling at 5" },
+  { kind = "source", src = "openrgb-5bcfa9ae", at = "Controllers/LogitechController/LogitechHIDPP20Controller/LogitechHIDPP20Controller.cpp#L4583-L4626", what = "setIndividualRgbZones, four keys a report" },
+  { kind = "source", src = "openrgb-5bcfa9ae", at = "Controllers/LogitechController/LogitechHIDPP20Controller/LogitechHIDPP20Controller.cpp#L5125-L5181", what = "frameEnd with 16 zero bytes, Busy as back-pressure" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/settings_templates.py#L3332-L3393", what = "host mode taken and returned around software control" },
+  { kind = "source", src = "libratbag-8235b5bb", at = "src/hidpp20.c#L1783-L1799", what = "0x8100 functions; modes 0x01 onboard, 0x02 host" },
+]
+
+[[fact]]
+key = "hidpp/70/03#zone-colour"
+dialect = "hidpp"
+kind = "set"
+class = 0x70
+id = 0x03
+layout = "0x8070 fn8 [0x01] software control; fn3 [zone, fixed effect index, r, g, b, 0x02 no ramp, 0 x 6, persist 0x00] per changed zone; the first colour read back through fn14 [zone] when ext caps has 0x01; at release fn8 [0x00]"
+meaning = "A fixed colour per zone on a Logitech mouse or headset, unsaved."
+grade = "agreed"
+ungated_debt = "Persist byte 0x00 is the live value OpenRGB and Solaar send (libratbag's 0x01 is the one that writes flash); the colour is read back where the device can; release gives control back. No Logitech device has been on neuron's wire."
+evidence = [
+  { kind = "source", src = "openrgb-5bcfa9ae", at = "Controllers/LogitechController/LogitechHIDPP20Controller/LogitechHIDPP20Controller.cpp#L6108-L6114", what = "persist byte 0 for live writes, 1 only on save" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/settings_templates.py#L3293", what = "0x8070 set with no persist byte (0)" },
+  { kind = "source", src = "libratbag-8235b5bb", at = "src/hidpp20.c#L1022-L1040", what = "1 writes RAM and flash" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/hidpp20.py#L1364-L1369", what = "the effect byte is the zone's effect index" },
+  { kind = "source", src = "solaar", at = "lib/logitech_receiver/settings_templates.py#L3204-L3214", what = "software control as one byte" },
 ]

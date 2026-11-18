@@ -2037,6 +2037,9 @@ fn lighting_show(reg: &Registry) -> Result<()> {
             match l.protocol {
                 lighting::Protocol::Legacy => "class 0x03",
                 lighting::Protocol::Matrix => "class 0x0F",
+                lighting::Protocol::Via => "QMK VIA, one colour",
+                lighting::Protocol::Vialrgb => "VialRGB, per LED",
+                lighting::Protocol::Hidpp => "HID++ 2.0",
             },
             l.rows,
             l.cols,
@@ -2300,6 +2303,7 @@ fn lighting_effect(
                         "     ACK-confirmed (no read-back: this board exposes no reliable lighting getter)."
                     );
                 }
+                lighting::Protocol::Via | lighting::Protocol::Vialrgb | lighting::Protocol::Hidpp => {}
             }
         }
         println!();
