@@ -135,6 +135,49 @@ pub fn blend_px_opacity(under: Rgb, over: Rgb, mode: Blend, opacity: f32) -> Rgb
     Rgb::lerp(under, blended, opacity)
 }
 
+/// How far a ducking layer dims what's beneath its brightest light.
+pub const DUCK_DEPTH: f32 = 0.8;
+
+/// A ducking layer's cell this bright (brightest channel, 0..1) ducks fully, like a sidechain's
+/// threshold: a dim layer needs the room as much as a bright one.
+const DUCK_KNEE: f32 = 0.3;
+
+/// Per cell, how hard a ducking layer pushes down what's beneath it, 0..1: full once the cell is lit
+/// past [`DUCK_KNEE`] (brightest channel, so a saturated blue ducks as hard as a white), and half of
+/// its brightest neighbour's, so a lit key gets a little room around it. `covers` is the layer's
+/// region; cells outside it get 0. `px` is row-major on a `rows`×`cols` board.
+pub fn duck_weights(px: &[Rgb], covers: impl Fn(usize) -> bool, rows: usize, cols: usize, out: &mut Vec<f32>) {
+    let n = rows * cols;
+    let own = |i: usize| px.get(i).map_or(0.0, |c| (f32::from(c.r.max(c.g).max(c.b)) / 255.0 / DUCK_KNEE).min(1.0));
+    out.clear();
+    out.resize(n, 0.0);
+    for i in (0..n).filter(|&i| covers(i)) {
+        let (r, c) = (i / cols.max(1), i % cols.max(1));
+        let mut near = 0.0_f32;
+        for (dr, dc) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let (nr, nc) = (r as isize + dr, c as isize + dc);
+            if nr >= 0 && nc >= 0 && (nr as usize) < rows && (nc as usize) < cols {
+                let j = nr as usize * cols + nc as usize;
+                if covers(j) {
+                    near = near.max(own(j));
+                }
+            }
+        }
+        out[i] = own(i).max(0.5 * near);
+    }
+}
+
+/// `under` dimmed by a ducking layer of `weight` (from [`duck_weights`]) at `opacity`.
+#[must_use]
+pub fn duck_px(under: Rgb, weight: f32, opacity: f32) -> Rgb {
+    let keep = 1.0 - DUCK_DEPTH * (weight * opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    if keep >= 1.0 {
+        return under;
+    }
+    let s = |v: u8| (f32::from(v) * keep).round() as u8;
+    Rgb::new(s(under.r), s(under.g), s(under.b))
+}
+
 // ── breathe shape — the shared "living light" envelope ─────────────────────────────────────
 
 /// The breathing envelope every alive effect exhales with: the same period as `sin`, but shaped

@@ -243,6 +243,10 @@ pub struct LayerMods {
     /// a whole spectrum as JSON/TOML
     pub spectrum: Option<String>,
     pub blend: Option<String>,
+    /// coverage of the blended result, 0..1
+    pub opacity: Option<f32>,
+    /// dim what's beneath the layer's lit cells
+    pub duck: Option<bool>,
     /// explicit LED cells (row-major index), empty = leave alone
     pub region: Option<Vec<u32>>,
     /// a rectangle `(r0, c0, r1, c1)` on a `(rows, cols)` board
@@ -348,6 +352,15 @@ pub fn modify_layer(layer: &mut LayerDef, mods: &LayerMods) -> Result<(), String
     }
     if let Some(b) = &mods.blend {
         layer.blend = parse_blend(b)?;
+    }
+    if let Some(o) = mods.opacity {
+        if !o.is_finite() || !(0.0..=1.0).contains(&o) {
+            return Err(format!("opacity is 0..1, not {o}"));
+        }
+        layer.opacity = o;
+    }
+    if let Some(d) = mods.duck {
+        layer.duck = d;
     }
     if let Some(cells) = &mods.region {
         layer.region.clone_from(cells);
@@ -610,10 +623,14 @@ mod tests {
                 motion: Some("drift:0.4".into()),
                 rect: Some(((0, 0, 1, 2), (6, 22))),
                 enabled: Some(false),
+                opacity: Some(0.4),
+                duck: Some(true),
                 ..LayerMods::default()
             },
         )
         .unwrap();
+        assert!((l.opacity - 0.4).abs() < 1e-6 && l.duck);
+        assert!(modify_layer(&mut l, &LayerMods { opacity: Some(1.5), ..LayerMods::default() }).is_err());
         assert_eq!(l.spectrum.seq[0].palette.stops.len(), 2);
         assert_eq!(l.spectrum.seq[0].palette.motion, Motion::Drift { speed: 0.4 });
         assert_eq!(l.region, vec![0, 1, 2, 22, 23, 24]);

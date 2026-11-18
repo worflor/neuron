@@ -135,6 +135,7 @@ pub struct PresentationLayer {
     pub blend: Blend,
     pub opacity: f32,
     pub enabled: bool,
+    pub duck: bool,
 }
 
 /// Versioned presentation revision defining how simulation fields resolve to colors.
@@ -355,6 +356,7 @@ impl LightingSession {
                     blend: s.def.blend,
                     opacity: s.def.opacity,
                     enabled: s.def.enabled,
+                    duck: s.def.duck,
                 }
             })
             .collect();
@@ -606,9 +608,14 @@ impl LightingSession {
                 let rendered_px = &scratch.layer;
 
                 if rendered_px.len() == n {
+                    let covers = |i: usize| pres.region.is_empty() || pres.region.binary_search(&(i as u32)).is_ok();
+                    if pres.duck {
+                        crate::effects::duck_weights(rendered_px, covers, rows as usize, cols as usize, &mut scratch.duck);
+                    }
                     for (i, &pixel) in rendered_px.iter().enumerate() {
-                        if pres.region.is_empty() || pres.region.binary_search(&(i as u32)).is_ok() {
-                            scratch.output[i] = crate::effects::blend_px_opacity(scratch.output[i], pixel, pres.blend, pres.opacity);
+                        if covers(i) {
+                            let under = if pres.duck { crate::effects::duck_px(scratch.output[i], scratch.duck[i], pres.opacity) } else { scratch.output[i] };
+                            scratch.output[i] = crate::effects::blend_px_opacity(under, pixel, pres.blend, pres.opacity);
                         }
                     }
                 }

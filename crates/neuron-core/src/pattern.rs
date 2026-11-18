@@ -412,6 +412,10 @@ pub struct LayerDef {
     #[serde(default = "full_opacity", skip_serializing_if = "is_full_opacity")]
     pub opacity: f32,
     pub enabled: bool,
+    /// Dim what's beneath this layer's lit cells (and a little around them) so its light reads on
+    /// top of a busy stack, like a ducking sidechain; see [`crate::effects::duck_weights`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub duck: bool,
     /// Raw per-LED cells for a `custom` (hand-painted / imported) static-frame layer — one `[R, G, B]`
     /// per LED, row-major. Empty (and omitted from TOML) for every procedural pattern; the `custom`
     /// pattern reads it via [`Pattern::set_frame`]. This is how an imported/painted frame becomes a
@@ -435,6 +439,7 @@ impl Default for LayerDef {
             blend: Blend::Normal,
             opacity: 1.0,
             enabled: true,
+            duck: false,
             frame: Vec::new(),
             attachment: None,
             boundary: None,
@@ -4252,6 +4257,8 @@ pub struct Layer {
     pub blend: Blend,
     pub opacity: f32,
     pub enabled: bool,
+    /// Dims what's beneath its lit cells before blending; see [`LayerDef::duck`].
+    pub duck: bool,
 }
 
 impl Layer {
@@ -4272,6 +4279,7 @@ pub struct Compositor {
 pub struct RenderScratch {
     pub output: Vec<Rgb>,
     layer: Vec<Rgb>,
+    duck: Vec<f32>,
 }
 
 impl RenderScratch {
@@ -4279,6 +4287,7 @@ impl RenderScratch {
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         (self.output.capacity() + self.layer.capacity()) * std::mem::size_of::<Rgb>()
+            + self.duck.capacity() * std::mem::size_of::<f32>()
     }
 }
 
@@ -4311,6 +4320,7 @@ impl Compositor {
                     blend: d.blend,
                     opacity: d.opacity,
                     enabled: d.enabled,
+                    duck: d.duck,
                 }
             })
             .collect();
@@ -4358,9 +4368,13 @@ impl Compositor {
                 &mut scratch.layer,
             );
             let px = &scratch.layer;
+            if layer.duck {
+                crate::effects::duck_weights(px, |i| layer.covers(i), rows as usize, cols as usize, &mut scratch.duck);
+            }
             for i in 0..n {
                 if layer.covers(i) {
-                    out[i] = crate::effects::blend_px_opacity(out[i], px[i], layer.blend, layer.opacity);
+                    let under = if layer.duck { crate::effects::duck_px(out[i], scratch.duck[i], layer.opacity) } else { out[i] };
+                    out[i] = crate::effects::blend_px_opacity(under, px[i], layer.blend, layer.opacity);
                 }
             }
         }
@@ -4391,9 +4405,14 @@ impl Compositor {
             let mut px = Vec::new();
             render_palette_sampled_into(&field, &layer.spectrum, time, layer.palette_addressing,
                 (bbox, cols), self.definitions.get(index).map_or_else(Default::default, palette_sampling), &mut px);
+            let mut duck = Vec::new();
+            if layer.duck {
+                crate::effects::duck_weights(&px, |i| layer.covers(i), rows as usize, cols as usize, &mut duck);
+            }
             for i in 0..n {
                 if layer.covers(i) {
-                    out[i] = crate::effects::blend_px_opacity(out[i], px[i], layer.blend, layer.opacity);
+                    let under = if layer.duck { crate::effects::duck_px(out[i], duck[i], layer.opacity) } else { out[i] };
+                    out[i] = crate::effects::blend_px_opacity(under, px[i], layer.blend, layer.opacity);
                 }
             }
         }
@@ -4602,6 +4621,7 @@ mod tests {
                 blend: Blend::Normal,
                 opacity: 1.0,
                 enabled: true,
+                duck: false,
             }],
             ..Default::default()
         };
@@ -5710,6 +5730,7 @@ mod tests {
                 blend: Blend::Normal,
                 opacity: 1.0,
                 enabled: true,
+                duck: false,
             }],
             ..Default::default()
         };
@@ -5727,6 +5748,7 @@ mod tests {
                 blend: Blend::Normal,
                 opacity: 1.0,
                 enabled: true,
+                duck: false,
             }],
             ..Default::default()
         };
@@ -5763,6 +5785,28 @@ mod tests {
             defs[1].opacity = invalid;
             assert!(comp.plan_update(&defs, Some((1, 2))).is_err());
         }
+    }
+
+    #[test]
+    fn a_ducking_layer_dims_beneath_itself_the_same_on_every_render_path() {
+        let _no_keys = crate::capture::suppress_key_reads();
+        let defs = vec![LayerDef { id: Some(LayerInstanceId(1)), spectrum: Spectrum::solid(Rgb::new(0, 0, 200)), ..Default::default() },
+            LayerDef { id: Some(LayerInstanceId(2)), pattern: "custom".into(), frame: vec![[200, 0, 0], [0, 0, 0], [0, 0, 0]],
+                blend: Blend::Add, duck: true, ..Default::default() }];
+        let mut comp = Compositor::from_defs(&defs);
+        let frame = comp.render_at_time(1, 3, Duration::ZERO);
+        assert_eq!(frame[0], Rgb::new(200, 0, 40), "the key it lights: what's beneath keeps a fifth");
+        assert_eq!(frame[1], Rgb::new(0, 0, 120), "its neighbour is ducked half as hard");
+        assert_eq!(frame[2], Rgb::new(0, 0, 200), "further off, untouched");
+        assert_eq!(comp.render_legacy(1, 3, 0.0), frame);
+        let specs = defs.iter().map(|def| SceneLayerSpec { id: def.id.unwrap(), def: def.clone() }).collect::<Vec<_>>();
+        let mut session = LightingSession::from_specs((1, 3), &specs).unwrap();
+        session.advance_tick(&ProcessInputHub::new(), std::time::Instant::now());
+        assert_eq!(session.resolve_presentation(Duration::ZERO).pixels.as_ref(), frame.as_slice());
+        let encoded = toml::to_string(&defs[1]).unwrap();
+        assert!(encoded.contains("duck = true"));
+        assert_eq!(toml::from_str::<LayerDef>(&encoded).unwrap(), defs[1]);
+        assert!(!toml::to_string(&LayerDef::default()).unwrap().contains("duck"));
     }
 
     #[test]

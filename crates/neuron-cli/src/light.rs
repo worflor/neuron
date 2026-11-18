@@ -64,6 +64,15 @@ pub struct LayerArgs {
     /// normal | add | screen | multiply | cut
     #[arg(long)]
     blend: Option<String>,
+    /// how much of the blended result shows, 0-100
+    #[arg(long, value_name = "PERCENT")]
+    opacity: Option<f32>,
+    /// dim what's beneath the layer's lit keys, so it reads on top of a busy stack
+    #[arg(long, conflicts_with = "no_duck")]
+    duck: bool,
+    /// stop ducking
+    #[arg(long)]
+    no_duck: bool,
     /// explicit LED cells, row-major indexes: 0,1,2
     #[arg(long, value_delimiter = ',')]
     region: Option<Vec<u32>>,
@@ -97,6 +106,9 @@ impl LayerArgs {
             }
             _ => None,
         };
+        if self.opacity.is_some_and(|p| !(0.0..=100.0).contains(&p)) {
+            bail!("--opacity is a percentage, 0-100");
+        }
         let params = self
             .params
             .iter()
@@ -115,6 +127,14 @@ impl LayerArgs {
             motion: self.motion.clone(),
             spectrum: self.spectrum.as_deref().map(crate::spec::read_spec).transpose()?,
             blend: self.blend.clone(),
+            opacity: self.opacity.map(|p| p / 100.0),
+            duck: if self.duck {
+                Some(true)
+            } else if self.no_duck {
+                Some(false)
+            } else {
+                None
+            },
             region: self.region.clone(),
             rect,
             params,
@@ -229,10 +249,12 @@ fn stack_json(t: &LightTarget, stack: &[LayerDef]) -> Value {
 
 fn describe(i: usize, l: &LayerDef) -> String {
     format!(
-        "[{i}] {}{}  blend={}{}{}",
+        "[{i}] {}{}  blend={}{}{}{}{}",
         l.pattern,
         neuron::pattern::slug_for_layer(l).map_or(String::new(), |s| format!(" ({s})")),
         l.blend.as_str(),
+        if l.opacity < 1.0 { format!("  opacity={}%", (l.opacity * 100.0).round()) } else { String::new() },
+        if l.duck { "  ducks" } else { "" },
         if l.region.is_empty() { String::new() } else { format!("  region={} cell(s)", l.region.len()) },
         if l.enabled { "" } else { "  [off]" },
     )

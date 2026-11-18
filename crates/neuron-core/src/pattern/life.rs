@@ -2223,6 +2223,7 @@ mod tests {
                 region: Vec::new(),
                 blend: crate::effects::Blend::Normal, opacity: 1.0,
                 enabled: true,
+                duck: false,
             }],
             ..Default::default()
         };
@@ -2380,6 +2381,7 @@ mod tests {
             region: vec![1, 2, 3],
             blend: crate::effects::Blend::Normal, opacity: 1.0,
             enabled: true,
+            duck: false,
         };
         let mut compositor = super::super::Compositor {
             layers: vec![comp_layer],
@@ -2408,6 +2410,7 @@ mod tests {
                 region: Vec::new(),
                 blend: crate::effects::Blend::Normal, opacity: 1.0,
                 enabled: true,
+                duck: false,
             }],
             ..Default::default()
         };

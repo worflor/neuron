@@ -154,6 +154,7 @@ impl Compositor {
             layer.blend = def.blend;
             layer.opacity = def.opacity;
             layer.enabled = def.enabled;
+            layer.duck = def.duck;
             layer.palette_addressing = pattern_def(&def.pattern).expect("validated pattern").palette_addressing;
             next.push(layer);
         }

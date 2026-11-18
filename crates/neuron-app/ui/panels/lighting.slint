@@ -4,12 +4,12 @@
 
 import { Theme, Signal } from "../theme.slint";
 import { ChromaLab } from "chromalab.slint";
-import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Picker, DefaultChip } from "../widgets/controls.slint";
+import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, SelectTick, GuideButton, FaderRow, Picker, DefaultChip, RampName } from "../widgets/controls.slint";
 import { SensePicker, SenseOffers, RollButton, RollDrawer } from "../widgets/colorsense.slint";
 import { ListView } from "std-widgets.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
-import { EffectTileMeta, EffectParam } from "../models.slint";
+import { EffectTileMeta, EffectParam, LightingStackRow } from "../models.slint";
 
 // LIGHTING — ONE spatial surface. The render IS the page: the live device picture is the calm centre,
 // the truth, and the paint surface. Everything orbits it.
@@ -55,6 +55,110 @@ component LayerVisibility inherits Rectangle {
     eye-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
 }
 
+// A fix in the STACK's suggestion strip. Resting on it reports up to the STACK's beat (which plays it
+// on the board); a click keeps it.
+component FixText inherits Text {
+    in property <int> offer;
+    callback hovered(bool);
+    callback kept();
+    color: fta.has-hover ? Theme.accent : Theme.accent-dim;
+    font-family: Theme.mono;
+    font-size: Theme.fs-small;
+    vertical-alignment: center;
+    animate color { duration: fta.has-hover ? Theme.hover-in : Theme.hover-out; }
+    // ui-lint: allow(bleed) a pointer target a little larger than the words; it draws nothing
+    fta := TouchArea {
+        x: -4px; y: -8px; width: parent.width + 8px; height: parent.height + 16px;
+        mouse-cursor: MouseCursor.pointer;
+        changed has-hover => { root.hovered(self.has-hover); }
+        clicked => { root.kept(); }
+    }
+}
+
+// One layer of the STACK: its name, and its presentation under it. Pointing at the row (once the
+// pointer rests) reports up (`focused`) so the board shows the layer on its own terms; `keyed` is the
+// board pointing back, at a key this layer shows on. A ducking layer's "ducks" is its own setting:
+// pointing at it shows its next value, a click takes it.
+component StackRow inherits Rectangle {
+    in property <LightingStackRow> layer;
+    in property <bool> selected;
+    in property <bool> keyed;
+    callback focused(bool);
+    callback picked();
+    callback toggled();
+    callback removed();
+    callback unducked();
+    property <bool> on-token: false;
+    property <bool> pointed: ta.has-hover || root.on-token;
+    property <bool> lifted: root.pointed || root.keyed;
+    // the board follows a row only once the pointer rests on it, so passing over rows on the way to
+    // another never flickers the board; it lets go at once
+    property <bool> showing: false;
+    changed pointed => {
+        if (!self.pointed && self.showing) {
+            self.showing = false;
+            self.focused(false);
+        }
+    }
+    Timer {
+        interval: 120ms;
+        running: root.pointed && !root.showing;
+        triggered => {
+            root.showing = true;
+            root.focused(true);
+        }
+    }
+    height: 44px;
+    border-radius: Theme.radius-sm;
+    background: root.selected ? Theme.accent.with-alpha(0.1) : (root.lifted ? Theme.well-hi : Theme.bg-2);
+    border-width: Theme.hair;
+    border-color: root.selected ? Theme.accent.with-alpha(0.27) : (root.lifted ? Theme.text-faint : Theme.line);
+    animate background, border-color { duration: root.lifted ? Theme.hover-in : Theme.hover-out; }
+    SelectTick { active: root.selected; y: 6px; height: parent.height - 12px; }
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.picked(); }
+    }
+    HorizontalLayout {
+        padding-left: 11px; padding-right: 9px; spacing: 10px;
+        VerticalLayout {
+            alignment: center; horizontal-stretch: 1; spacing: 2px; min-width: 0px;
+            Text {
+                text: root.layer.name;
+                color: root.selected ? Theme.accent : (root.lifted ? Theme.text : Theme.text-mid);
+                font-family: Theme.mono; font-size: Theme.fs-body; font-weight: 600;
+                vertical-alignment: center; overflow: elide;
+                animate color { duration: Theme.quick; }
+            }
+            HorizontalLayout {
+                alignment: start;
+                spacing: 5px;
+                Mono { text: root.layer.blend + " · " + root.layer.amount + (root.layer.place != "" ? " · " + root.layer.place : ""); color: Theme.text-faint; overflow: elide; }
+                if root.layer.ducks : Mono {
+                    text: dta.has-hover ? "· ducks → off" : "· ducks";
+                    color: dta.has-hover ? Theme.accent : Theme.text-faint;
+                    animate color { duration: dta.has-hover ? Theme.hover-in : Theme.hover-out; }
+                    // ui-lint: allow(bleed) a pointer target a little larger than the word; it draws nothing
+                    dta := TouchArea {
+                        x: -4px; y: -8px; width: parent.width + 8px; height: parent.height + 16px;
+                        mouse-cursor: MouseCursor.pointer;
+                        changed has-hover => { root.on-token = self.has-hover; }
+                        clicked => { root.unducked(); }
+                    }
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            LayerVisibility { shown: root.layer.enabled; clicked => { root.toggled(); } }
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton { glyph: "\u{00d7}"; danger: true; clicked => { root.removed(); } }
+        }
+    }
+}
+
 // One TILE in the grid — a live (or representative) preview swatch + its name, the MATERIAL-card
 // pattern. `data` tiles (mouse battery) and the `stub` (notifications, future) read as first-class
 // siblings of the effects; picking any of them is the SAME gesture.
@@ -70,7 +174,13 @@ component EffectTileCard inherits Rectangle {
     callback picked();
     callback delete-requested();
     callback layer-added(bool);
-    property <bool> card-hovered: ta.has-hover || add-ta.has-hover;
+    // The pairs pill and the delete chip sit above `ta` and take the hover from it; they report theirs
+    // here so the card does not drop its hover state while the pointer is on them.
+    property <bool> pairs-hot: false;
+    property <bool> delete-hot: false;
+    property <bool> card-hovered: ta.has-hover || add-ta.has-hover
+        || (root.pairs-hot && root.tile.pairs.length > 0 && !root.dimmed)
+        || (root.delete-hot && root.deletable);
     border-radius: Theme.radius;
     // ACTIVE > hover > rest. The selected tile wears a clear accent ground + line; a hovered tile
     // lifts to the well with a faint ink edge; everything else rests on the bezel plane.
@@ -128,7 +238,7 @@ component EffectTileCard inherits Rectangle {
         }
         Text {
             text: root.tile.name;
-            color: root.selected ? Theme.accent : (ta.has-hover && !root.dimmed ? Theme.text-mid : Theme.text-dim);
+            color: root.selected ? Theme.accent : (root.card-hovered && !root.dimmed ? Theme.text-mid : Theme.text-dim);
             font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
             letter-spacing: Theme.track-1;
             overflow: elide;
@@ -138,7 +248,7 @@ component EffectTileCard inherits Rectangle {
         // not a guessing wall); two lines of quiet ink, clipped by the card's fixed height.
         Text {
             text: root.tile.blurb;
-            color: ta.has-hover && !root.dimmed ? Theme.text-dim : Theme.text-faint;
+            color: root.card-hovered && !root.dimmed ? Theme.text-dim : Theme.text-faint;
             font-family: Theme.mono; font-size: Theme.fs-small;
             wrap: word-wrap;
             overflow: elide;
@@ -192,7 +302,8 @@ component EffectTileCard inherits Rectangle {
             Mono { width: 100%; height: 100%; horizontal-alignment: center; text: "below this"; font-size: Theme.fs-small; color: Theme.text-mid; }
         }
         add-ta := TouchArea {
-            mouse-cursor: MouseCursor.pointer;
+            mouse-cursor: layer-add.settled && layer-add.at >= 0px && layer-add.at < layer-add.choice-w * 2
+                ? MouseCursor.pointer : MouseCursor.default;
             clicked => {
                 if (layer-add.settled && layer-add.at >= 0px && layer-add.at < layer-add.choice-w * 2) {
                     root.layer-added(layer-add.at < layer-add.choice-w);
@@ -286,6 +397,7 @@ component EffectTileCard inherits Rectangle {
         }
         pta := TouchArea {
             mouse-cursor: MouseCursor.pointer;
+            changed has-hover => { root.pairs-hot = self.has-hover; }
             clicked => { State.pick-pair(root.tile.slug, root.tile.pairs[pairs.hov].pair); }
         }
     }
@@ -297,8 +409,10 @@ component EffectTileCard inherits Rectangle {
     if root.deletable : IconButton {
         x: parent.width - self.width - 3px;
         y: 3px;
-        glyph: root.delete-armed ? "?" : "\u{00d7}";
-        danger: root.delete-armed;
+        glyph: "\u{00d7}";
+        danger: true;
+        armed: root.delete-armed;
+        changed hot => { root.delete-hot = self.hot; }
         clicked => {
             if (root.delete-armed) { root.delete-requested(); }
             else { root.delete-armed = true; }
@@ -496,55 +610,6 @@ component ParamControl inherits VerticalLayout {
         toggled(v) => { State.set-param-toggle(root.p.key, v); }
     }
     // COLOR is rendered by the page (it owns the swatch palette) — handled inline there, not here.
-}
-
-// A name painted in a palette's own colours — one Mono per character, character i sampling the
-// mirrored ramp at (i/n + phase) so the wrap is seamless; hovering lets the gradient drift through
-// the letters and settle back. Without a ramp (a layer with no spectrum) it falls back to the plain
-// `text` in faint ink: a name can only wear a palette its effect actually has. ONE component for
-// every painted name so the instances can't drift.
-component RampName inherits Rectangle {
-    in property <string> text: "";        // the plain-ink fallback when no ramp is loaded
-    in property <[string]> chars;         // the name, one string per character
-    in property <[color]> ramp;           // the palette sampled forward-then-back (a seamless loop)
-    in property <string> prefix: "";      // lead-in ink inside the hover area (the spectrum line's dash)
-    property <bool> painted: root.chars.length > 0 && root.ramp.length >= 2;
-    // The name gives way before whatever shares its row: short of room it keeps its own width and
-    // is cut by this box under a fade, rather than pushing its neighbours out of the column.
-    min-width: 0px;
-    preferred-width: row.preferred-width;
-    max-width: row.preferred-width;
-    preferred-height: row.preferred-height;
-    clip: true;
-    property <bool> cut: row.preferred-width > root.width + 0.5px;
-    row := HorizontalLayout {
-        x: 0px;
-        width: self.preferred-width;
-        height: root.height;
-        spacing: 0px;
-        if root.prefix != "" : Mono { text: root.prefix; color: Theme.text-faint; }
-        if !root.painted : Mono { text: root.text; color: Theme.text-faint; overflow: elide; }
-        if root.painted : ramped := HorizontalLayout {
-            property <int> m: root.ramp.length;
-            spacing: 0px;
-            for ch[i] in root.chars : Mono {
-                property <float> pos: mod((i / max(root.chars.length, 1) * 0.5 + root.phase) * ramped.m, ramped.m);
-                property <int> j: Math.floor(self.pos);
-                color: root.ramp[self.j].mix(root.ramp[mod(self.j + 1, ramped.m)], 1 - (self.pos - self.j));
-                text: ch;
-            }
-        }
-    }
-    // a long fade, solid before the edge: a cut name trails off instead of stopping mid-letter
-    if root.cut : Rectangle {
-        x: root.width - self.width;
-        width: min(44px, root.width);
-        height: root.height;
-        background: @linear-gradient(90deg, Theme.bg.with-alpha(0) 0%, Theme.bg 72%, Theme.bg 100%);
-    }
-    property <float> phase: rta.has-hover ? 0.5 : 0.0;
-    animate phase { duration: 1400ms; easing: ease-in-out; }
-    rta := TouchArea { x: 0px; y: 0px; width: root.width; height: root.height; }
 }
 
 // THE SPECTRUM EDITOR — the active layer's COLOUR PROGRAM (a layer = PATTERN × SPECTRUM; the pattern's
@@ -1150,6 +1215,22 @@ export component LightingPanel inherits VerticalLayout {
                         place-r1: State.light-place-r1;
                         place-c1: State.light-place-c1;
                         place-region(r0, c0, r1, c1) => { State.set-layer-region(r0, c0, r1, c1); }
+                        // a stack row pointed at shows its layer on the board; the focus lingers on the
+                        // last one while it settles out, so leaving never snaps the board
+                        property <int> focus-want: State.light-focus-layer;
+                        property <int> focus-on: -1;
+                        changed focus-want => { if (self.focus-want >= 0) { self.focus-on = self.focus-want; } }
+                        // the stack changed under the focus: what lingers could be another layer's marks
+                        property <int> sense-epoch: State.light-sense-epoch;
+                        changed sense-epoch => { self.focus-on = self.focus-want; }
+                        focusing: State.light-focus-layer >= 0 && !State.light-brush-on && !State.light-place-on;
+                        layer-focus: self.focus-on >= 0 && self.focus-on < State.light-stack-count
+                            ? State.light-stack-rows[State.light-stack-count - 1 - self.focus-on].focus : [];
+                        layer-wide: self.focus-on >= 0 && self.focus-on < State.light-stack-count
+                            && State.light-stack-rows[State.light-stack-count - 1 - self.focus-on].wide;
+                        layer-tier: self.focus-on >= 0 && self.focus-on < State.light-stack-count
+                            ? State.light-stack-rows[State.light-stack-count - 1 - self.focus-on].tier : 1;
+                        changed pointed-cell => { State.light-pointed-cell = self.pointed-cell; }
                         if !root.has-surface : VerticalLayout {
                             width: 100%; height: 100%;
                             padding: 36px; padding-top: 58px; alignment: center; spacing: 12px;
@@ -1350,7 +1431,69 @@ export component LightingPanel inherits VerticalLayout {
                 Divider {}
 
                 // Topmost rows appear first; model indices retain the authored composition order.
-                VerticalLayout {
+                // Stack sense lives inside the controls it would change (see state.slint): every
+                // suggestion reports to the one clock here. Resting on one shows it on the board after
+                // a beat (crossing it on the way to something else shows nothing), moving between
+                // them is immediate, leaving puts the stack back, and a click keeps it.
+                stack-sec := VerticalLayout {
+                    property <int> sense-want: -1;
+                    property <int> sense-shown: -1;
+                    // fixes under the pointer: the strip's own exit doesn't count while one holds it
+                    property <int> fix-hot: 0;
+                    function sense-hover(offer: int, on: bool) {
+                        self.fix-hot = max(0, self.fix-hot + (on ? 1 : -1));
+                        if (on) {
+                            self.sense-want = offer;
+                        } else if (self.sense-want == offer) {
+                            self.sense-want = -1;
+                        }
+                    }
+                    function let-go() {
+                        self.fix-hot = 0;
+                        self.sense-want = -1;
+                    }
+                    // anything that can take the strip from under a resting pointer lets go of the fix:
+                    // a new reading (the strip says something new), the strip going, the page going
+                    property <int> epoch: State.light-sense-epoch;
+                    changed epoch => {
+                        self.sense-shown = -1;
+                        self.let-go();
+                    }
+                    property <bool> strip-on: State.light-sense-trouble != "";
+                    changed strip-on => { if (!self.strip-on) { self.let-go(); } }
+                    property <bool> on-show: State.page == 1 && State.window-shown;
+                    changed on-show => {
+                        if (!self.on-show) {
+                            self.let-go();
+                            State.light-focus-layer = -1;
+                            State.light-pointed-cell = -1;
+                        }
+                    }
+                    function sense-keep(offer: int) {
+                        // the strip is read again once the fix is kept, so nothing may still be wanted
+                        self.sense-shown = -1;
+                        self.sense-want = -1;
+                        State.light-sense-accept(offer);
+                    }
+                    changed sense-want => {
+                        if (self.sense-want < 0) {
+                            if (self.sense-shown >= 0) {
+                                self.sense-shown = -1;
+                                State.light-sense-preview(-1);
+                            }
+                        } else if (self.sense-shown >= 0) {
+                            self.sense-shown = self.sense-want;
+                            State.light-sense-preview(self.sense-want);
+                        }
+                    }
+                    Timer {
+                        interval: 110ms;
+                        running: stack-sec.sense-want >= 0 && stack-sec.sense-shown < 0;
+                        triggered => {
+                            stack-sec.sense-shown = stack-sec.sense-want;
+                            State.light-sense-preview(stack-sec.sense-want);
+                        }
+                    }
                     spacing: 8px;
                     HorizontalLayout {
                         SectionTitle { text: "STACK"; }
@@ -1366,46 +1509,104 @@ export component LightingPanel inherits VerticalLayout {
                         Picker {
                             horizontal-stretch: 1;
                             options: ["Normal", "Screen", "Add", "Multiply", "Cutout"];
+                            // each blend shows the stack as it would look under it
+                            previews: State.light-blend-previews;
+                            face-preview: false;
                             index: State.light-layer-blend;
+                            suggest: State.light-sense-blend;
                             changed(index) => { State.set-layer-blend(index); }
                         }
                     }
-                    if State.light-stack-count > 0 : FaderRow {
-                        label: "opacity"; label-w: 55px; readout-w: 40px;
-                        value: State.light-layer-opacity; unit: "%";
-                        changed(value) => { State.set-layer-opacity(value); }
-                    }
-                    if State.light-cover-index >= 0 : Button {
-                        text: "covered by " + State.light-cover-name + " \u{2191}";
-                        clicked => { State.select-stack(State.light-cover-index); }
+                    if State.light-stack-count > 0 : VerticalLayout {
+                        FaderRow {
+                            label: "opacity"; label-w: 55px; readout-w: 40px;
+                            value: State.light-layer-opacity; unit: "%";
+                            zoned: State.light-opacity-zoned;
+                            zone-cold: State.light-opacity-cold;
+                            zone-warm: State.light-opacity-warm;
+                            zone-hot: State.light-opacity-hot;
+                            changed(value) => { State.set-layer-opacity(value); }
+                        }
+                        // the stack's trouble and what would fix it, apart from the layers themselves. It
+                        // grows in and collapses out (the rows below move, never jump), and leaving it
+                        // always stops a preview, whatever happened under the pointer
+                        Rectangle {
+                            property <bool> on: State.light-sense-trouble != "";
+                            height: self.on ? sense-col.preferred-height + 8px : 0px;
+                            animate height { duration: Theme.settle; easing: ease-out; }
+                            clip: true;
+                            sense-ta := TouchArea {
+                                enabled: parent.on;
+                                changed has-hover => { if (!self.has-hover && stack-sec.fix-hot == 0) { stack-sec.sense-want = -1; } }
+                            }
+                            sense-col := VerticalLayout {
+                                y: 8px;
+                                height: self.preferred-height;
+                                spacing: 3px;
+                                // the line wears its tier, like a linter: a note stays quiet, a warning is
+                                // amber, an error red; every layer it happens to by name when that fits,
+                                // else one and a count
+                                Rectangle {
+                                    property <bool> fits: trouble-full.preferred-width <= self.width;
+                                    property <color> ink: State.light-sense-tier >= 2 ? Theme.danger : State.light-sense-tier == 1 ? Theme.warn : Theme.text-dim;
+                                    animate ink { duration: Theme.settle; }
+                                    height: trouble-full.preferred-height;
+                                    min-width: 0px;
+                                    clip: true;
+                                    trouble-full := Mono {
+                                        visible: parent.fits;
+                                        x: 0px; width: self.preferred-width;
+                                        text: State.light-sense-trouble;
+                                        color: parent.ink;
+                                    }
+                                    Mono {
+                                        visible: !parent.fits;
+                                        width: parent.width;
+                                        text: State.light-sense-trouble-short;
+                                        color: parent.ink;
+                                        overflow: elide;
+                                    }
+                                }
+                                // the fixes share the line, each shortened when they don't all fit, so none
+                                // is ever cut off out of reach
+                                HorizontalLayout {
+                                    alignment: start;
+                                    spacing: 14px;
+                                    for offer in State.light-sense-offers : FixText {
+                                        text: offer.text; offer: offer.offer;
+                                        min-width: 24px;
+                                        overflow: elide;
+                                        hovered(on) => { stack-sec.sense-hover(self.offer, on); }
+                                        kept => { stack-sec.sense-keep(self.offer); }
+                                    }
+                                }
+                            }
+                        }
                     }
                     if State.light-stack-count > 0 : layer-list := ListView {
                         property <int> active-row: State.light-stack-count - 1 - State.selected-layer;
                         changed active-row => {
-                            if (self.active-row * 44px + self.viewport-y < 0px) {
-                                self.viewport-y = -self.active-row * 44px;
-                            } else if ((self.active-row + 1) * 44px + self.viewport-y > self.height) {
-                                self.viewport-y = self.height - (self.active-row + 1) * 44px;
+                            if (self.active-row * 44px + self.content-y < 0px) {
+                                self.content-y = -self.active-row * 44px;
+                            } else if ((self.active-row + 1) * 44px + self.content-y > self.height) {
+                                self.content-y = self.height - (self.active-row + 1) * 44px;
                             }
                         }
                         height: min(State.light-stack-count, 6) * 44px;
                         horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
-                        for row in State.light-stack-rows : SelectableRow {
-                            height: 44px;
-                            label: row.name; desc: row.summary;
+                        for row in State.light-stack-rows : StackRow {
+                            layer: row;
                             selected: row.index == State.selected-layer;
-                            clicked => { State.select-stack(row.index); }
-                            VerticalLayout {
-                                alignment: center;
-                                LayerVisibility {
-                                    shown: row.enabled;
-                                    clicked => { State.toggle-stack(row.index); }
-                                }
+                            keyed: State.light-pointed-cell >= 0 && State.light-pointed-cell < State.light-cell-owner.length
+                                && State.light-cell-owner[State.light-pointed-cell] == row.index;
+                            focused(on) => {
+                                if (on) { State.light-focus-layer = row.index; }
+                                else if (State.light-focus-layer == row.index) { State.light-focus-layer = -1; }
                             }
-                            VerticalLayout {
-                                alignment: center;
-                                IconButton { glyph: "\u{00d7}"; danger: true; clicked => { State.remove-stack(row.index); } }
-                            }
+                            picked => { State.select-stack(row.index); }
+                            toggled => { State.toggle-stack(row.index); }
+                            removed => { State.remove-stack(row.index); }
+                            unducked => { State.set-layer-duck(row.index, false); }
                         }
                     }
                     HorizontalLayout {

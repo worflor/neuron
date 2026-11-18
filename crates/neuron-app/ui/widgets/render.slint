@@ -42,6 +42,25 @@ export component DeviceRender inherits Rectangle {
     in property <int> place-r1: -1;
     in property <int> place-c1: -1;
     callback place-region(int, int, int, int); // (row0, col0, row1, col1) on release — the enclosed rect, normalised
+    // FOCUS — one layer of the stack drawn on its own terms (LightingStackRow.focus): while `focusing`,
+    // cells its light doesn't reach dim toward the well, a cell where it's lost wears a faint ring, and
+    // a cell where it keeps another layer out an amber one; `layer-wide` puts that amber on the case
+    // instead, for harm done nearly everywhere. The live frame keeps playing underneath.
+    in property <[int]> layer-focus;
+    in property <bool> layer-wide: false;
+    // the tier of the trouble the layer causes (0 note, 1 warning, 2 error): the ink of its marks
+    in property <int> layer-tier: 1;
+    property <color> tier-ink: root.layer-tier >= 2 ? Theme.danger : root.layer-tier == 1 ? Theme.warn : Theme.text-dim;
+    in property <bool> focusing: false;
+    // the cell under the pointer while neither brush nor placer holds it (-1: none)
+    out property <int> pointed-cell: -1;
+    // how far the focus has come in, so it settles rather than snaps
+    property <float> veil: root.focusing && root.layer-focus.length == root.px.length ? 1 : 0;
+    animate veil { duration: Theme.quick; }
+    function mark(i: int) -> int { return root.layer-focus.length > i ? root.layer-focus[i] : 1; }
+    function shown(i: int) -> float {
+        return mod(root.mark(i), 2) == 1 ? 1 : 1 - 0.78 * root.veil;
+    }
 
     // a mouse with a handful of LEDs is ZONES on a body, not a lattice (honest geometry).
     property <bool> zone-mode: root.kind == "mouse" && root.rows * root.cols <= 4;
@@ -56,7 +75,7 @@ export component DeviceRender inherits Rectangle {
         height: parent.height * 92%;
         border-radius: Theme.radius-case;
         border-width: Theme.hair;
-        border-color: Theme.line;
+        border-color: root.layer-wide && root.veil > 0 ? root.tier-ink.with-alpha(0.75 * root.veil) : Theme.line;
         background: Theme.bg-2;
 
         HorizontalLayout {
@@ -119,7 +138,7 @@ export component DeviceRender inherits Rectangle {
                 width: field.cell + 8px;
                 height: field.cell + 8px;
                 border-radius: field.cell / 2;
-                background: p.with-alpha(Theme.bloom);
+                background: p.with-alpha(Theme.bloom * root.shown(i) * root.shown(i));
             }
             // the keycaps themselves
             for p[i] in root.px : Rectangle {
@@ -130,10 +149,12 @@ export component DeviceRender inherits Rectangle {
                 width: field.cell;
                 height: field.cell;
                 border-radius: max(1px, field.cell / 4);
-                background: p;
+                background: p.mix(Theme.well, root.shown(i));
                 border-width: Theme.hair;
-                border-color: brush.has-hover && root.editable && i == brush.hover-cell
-                    ? Theme.text-faint : Theme.line-soft;
+                border-color: brush.has-hover && root.editable && i == brush.hover-cell ? Theme.text-faint
+                    : root.veil > 0 && root.mark(i) >= 4 ? root.tier-ink.with-alpha(0.8 * root.veil)
+                    : root.veil > 0 && mod(floor(root.mark(i) / 2), 2) == 1 ? Theme.text-faint.mix(Theme.line-soft, root.veil)
+                    : Theme.line-soft;
             }
 
             // the PLACEMENT rectangle — the live drag (bright) while placing, else the selected layer's
@@ -156,6 +177,21 @@ export component DeviceRender inherits Rectangle {
                 // listening while the drag is in progress; the committed area is live
                 border-color: self.live ? Theme.listen : Theme.accent;
                 background: self.live ? Theme.listen-glow : Theme.accent-glow;
+            }
+
+            // the pointer over a key, for the stack to say which layer shows there; declared first so the
+            // brush and placer sit over it (each is transparent to input while it's off)
+            looker := TouchArea {
+                // the key under the pointer; the pad, the margins and the gaps between keys point at
+                // nothing
+                property <length> pitch: field.cell + field.gap;
+                property <int> kc: floor((self.mouse-x - field.ox) / self.pitch);
+                property <int> kr: floor((self.mouse-y - field.oy) / self.pitch);
+                property <bool> on-key: self.kc >= 0 && self.kc < root.cols && self.kr >= 0 && self.kr < root.rows
+                    && self.mouse-x - field.ox - self.kc * self.pitch < field.cell
+                    && self.mouse-y - field.oy - self.kr * self.pitch < field.cell;
+                property <int> at: self.has-hover && self.on-key ? self.kr * root.cols + self.kc : -1;
+                changed at => { root.pointed-cell = self.at; }
             }
 
             brush := TouchArea {
@@ -258,7 +294,7 @@ export component DeviceRender inherits Rectangle {
                         : i == 1 ? body.height * 52%
                         : body.height * 36%) - 5px;
                     border-radius: self.width / 2;
-                    background: p.with-alpha(Theme.bloom);
+                    background: p.with-alpha(Theme.bloom * root.shown(i) * root.shown(i));
                 }
                 // …then the pads themselves
                 for p[i] in root.px : Rectangle {
@@ -270,14 +306,20 @@ export component DeviceRender inherits Rectangle {
                         : i == 1 ? body.height * 52%
                         : body.height * 36%;
                     border-radius: i == 0 ? 4px : self.width / 2;
-                    background: p;
+                    background: p.mix(Theme.well, root.shown(i));
                     border-width: Theme.hair;
-                    border-color: zta.has-hover && root.editable ? Theme.text-faint : Theme.line-soft;
+                    border-color: zta.has-hover && root.editable ? Theme.text-faint
+                        : root.veil > 0 && root.mark(i) >= 4 ? root.tier-ink.with-alpha(0.8 * root.veil)
+                        : root.veil > 0 && mod(floor(root.mark(i) / 2), 2) == 1 ? Theme.text-faint.mix(Theme.line-soft, root.veil)
+                        : Theme.line-soft;
                     zta := TouchArea {
-                        enabled: root.editable;
                         mouse-cursor: root.editable ? MouseCursor.crosshair : MouseCursor.default;
+                        changed has-hover => {
+                            if (self.has-hover) { root.pointed-cell = root.editable ? -1 : i; }
+                            else if (root.pointed-cell == i) { root.pointed-cell = -1; }
+                        }
                         pointer-event(ev) => {
-                            if (ev.kind == PointerEventKind.down) {
+                            if (root.editable && ev.kind == PointerEventKind.down) {
                                 if (ev.button == PointerEventButton.right) { root.erase(i); }
                                 else if (ev.button == PointerEventButton.left) { root.paint(i); }
                             }

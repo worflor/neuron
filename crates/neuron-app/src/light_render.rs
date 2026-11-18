@@ -82,7 +82,6 @@ pub struct CompletedFrame {
     pub target: Target,
     pub dims: (u8, u8),
     pub content_rev: u64,
-    pub layout_generation: u64,
     pub rgb: Arc<[Rgb]>,
     pub swatch: Option<SharedPixelBuffer<Rgb8Pixel>>,
     pub overlay: Option<SharedPixelBuffer<Rgba8Pixel>>,
@@ -460,9 +459,9 @@ fn specs(layers: &[LayerDef]) -> Vec<SceneLayerSpec> {
 }
 
 fn same_definition(a: &LayerDef, b: &LayerDef) -> bool {
-    let LayerDef { id: _, pattern, params, spectrum, region, blend, opacity, enabled, frame, attachment, boundary } = a;
-    (pattern, params, spectrum, region, blend, opacity, enabled, frame, attachment, boundary)
-        == (&b.pattern, &b.params, &b.spectrum, &b.region, &b.blend, &b.opacity, &b.enabled, &b.frame, &b.attachment, &b.boundary)
+    let LayerDef { id: _, pattern, params, spectrum, region, blend, opacity, enabled, duck, frame, attachment, boundary } = a;
+    (pattern, params, spectrum, region, blend, opacity, enabled, duck, frame, attachment, boundary)
+        == (&b.pattern, &b.params, &b.spectrum, &b.region, &b.blend, &b.opacity, &b.enabled, &b.duck, &b.frame, &b.attachment, &b.boundary)
 }
 
 pub(crate) fn same_configuration(a: &[LayerDef], b: &[LayerDef]) -> bool {
@@ -679,7 +678,7 @@ fn run_lane(shared: Arc<(Mutex<Shared>, Condvar)>, seed: Option<HeroSeed>, hero_
                 } else { TILE_INTERVAL };
                 let frame = CompletedFrame {
                     id: id.clone(), target: desired.target.clone(), dims: entry_dims,
-                    content_rev: desired.content_rev, layout_generation: desired.layout_generation,
+                    content_rev: desired.content_rev,
                     rgb, swatch, overlay, requested: requested_at, render_time: started.elapsed(),
                 };
                 let mut frames = vec![frame];
@@ -696,7 +695,7 @@ fn run_lane(shared: Arc<(Mutex<Shared>, Condvar)>, seed: Option<HeroSeed>, hero_
                         tile_entry.prewarmed = true;
                         tile_entry.due = Instant::now() + TILE_INTERVAL;
                         frames.push(CompletedFrame { id: tile.id.clone(), target: desired.target.clone(), dims: desired.dims,
-                            content_rev: desired.content_rev, layout_generation: desired.layout_generation,
+                            content_rev: desired.content_rev,
                             rgb, swatch: Some(swatch), overlay: None, requested: requested_at, render_time: started.elapsed() });
                     }
                 }
@@ -816,6 +815,41 @@ pub fn render_latency_bench() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// How long stack sense watches a layer, and how often it looks.
+const TAKE_WINDOW: Duration = Duration::from_secs(3);
+pub(crate) const TAKE_STEP: Duration = Duration::from_millis(150);
+/// The first moments of a fresh render are a pattern finding its feet, not what it looks like.
+const TAKE_SETTLE: Duration = Duration::from_millis(600);
+
+/// Record one layer alone on a `dims` board over a short window: its own light in every frame, with
+/// the same stand-in key presses the catalog tiles get, and nothing read from real hardware. Blend,
+/// opacity and ducking don't change what a layer draws, so the take is recorded at full strength in
+/// Normal and stack sense composites it however it likes. The region stays: a placed layer draws to its block.
+pub fn record_layer(layer: &LayerDef, dims: (u8, u8)) -> neuron::stacksense::Take {
+    let _policy = ProviderPolicy::Representative.enter();
+    let _quiet = neuron::capture::suppress_key_reads();
+    let mut solo = layer.clone();
+    solo.blend = neuron::effects::Blend::Normal;
+    solo.opacity = 1.0;
+    solo.enabled = true;
+    solo.duck = false;
+    let start = Instant::now();
+    let mut entry = Cached::new(vec![solo].into(), dims, 0, start);
+    let mut hub = ProcessInputHub::new();
+    let mut keys = None;
+    let mut frames = Vec::new();
+    let mut elapsed = Duration::ZERO;
+    while elapsed <= TAKE_SETTLE + TAKE_WINDOW {
+        sample_representative_keys(&mut hub, &mut keys, elapsed);
+        let rgb = entry.render(&hub, start + elapsed, elapsed, ProviderPolicy::Representative);
+        if elapsed >= TAKE_SETTLE && rgb.len() == usize::from(dims.0) * usize::from(dims.1) {
+            frames.push(rgb.to_vec());
+        }
+        elapsed += TAKE_STEP;
+    }
+    neuron::stacksense::Take { frames }
 }
 
 fn representative(slug: &str, entry: &mut Cached, hub: &ProcessInputHub, now: Instant, elapsed: Duration) -> Arc<[Rgb]> {
@@ -1105,7 +1139,7 @@ mod tests {
             scope.spawn(move || {
                 for revision in 1..=10000 {
                     let frame = CompletedFrame { id: SurfaceId::Hero, target: Target::default(), dims: (1, 2),
-                        content_rev: revision, layout_generation: 0, rgb: vec![Rgb::new(revision as u8, 2, 3); 2].into(),
+                        content_rev: revision, rgb: vec![Rgb::new(revision as u8, 2, 3); 2].into(),
                         swatch: None, overlay: None, requested: now, render_time: Duration::ZERO };
                     if writer_mailbox.lock().unwrap().publish([frame]) { send.send(()).unwrap(); }
                     if revision % 7 == 0 { std::thread::yield_now(); }
