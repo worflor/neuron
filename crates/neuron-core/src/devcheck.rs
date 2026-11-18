@@ -273,7 +273,6 @@ mod tests {
 
     #[test]
     fn a_check_with_no_device_says_so_and_names_what_it_asked() {
-        let _deny = crate::transport::deny_hardware();
         let c = check("razer", 0x02a5, "", "a board");
         assert!(!c.notes.is_empty(), "a check always says something");
         assert!(c.text.contains("device check · razer 02a5 · a board"), "{}", c.text);
