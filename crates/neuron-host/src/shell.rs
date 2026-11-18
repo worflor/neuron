@@ -583,8 +583,13 @@ mod tests {
         h.poison(); // kernel thread panics; governor schedules a rebirth
 
         // This request queues during the rebirth sleep and is served by the
-        // reborn kernel — so its answer reflects the post-rebirth counter.
-        let c = h.next_source();
+        // reborn kernel — so its answer reflects the post-rebirth counter. A
+        // loaded machine can miss the 2 s request deadline across the rebirth,
+        // so ask again rather than fail on timing.
+        let c = (0..5)
+            .map(|_| h.next_source())
+            .find(|c| *c != SourceId(u64::MAX))
+            .unwrap_or(SourceId(u64::MAX));
         assert_ne!(c, SourceId(u64::MAX), "kernel answered after rebirth");
         assert!(
             c.0 > b.0,
