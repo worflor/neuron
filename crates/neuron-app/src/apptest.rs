@@ -2862,9 +2862,18 @@ fn learned_device_ask_and_star_key_draw_and_fit() {
 
         st.set_page(3);
         settle(&app, "system-top");
-        app.window().dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(width / 2.0, 400.0), delta_x: 0.0, delta_y: -20000.0 });
+        // scroll the UPDATES row, where the star sits beside "check now", to the middle of the window
+        let (_, top, _, _) = crate::uifit::rect_of(app.window(), "StarKey").expect("the star key is beside check now");
+        app.window().dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(width / 2.0, 400.0), delta_x: 0.0, delta_y: 400.0 - top });
         settle(&app, &format!("star-rest-{width}"));
-        let (sx, sy, sw, sh) = crate::uifit::rect_of(app.window(), "StarKey").expect("the star key is in the nameplate");
+        let (sx, sy, sw, sh) = crate::uifit::rect_of(app.window(), "StarKey").expect("the star key is beside check now");
+        let (bx, by, _, bh) = crate::uifit::shown_rects_of(app.window(), "Button")
+            .into_iter()
+            .filter(|b| b.0 > sx && (b.1 + b.3 / 2.0 - (sy + sh / 2.0)).abs() < 2.0)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .expect("check now is on the star's line");
+        assert!((by + bh / 2.0 - (sy + sh / 2.0)).abs() < 1.0, "the star and check now share a centre line");
+        assert!((bx - (sx + sw) - 16.0).abs() < 1.0, "a 16px gap parts the star from check now: {}", bx - (sx + sw));
         // the star follows the pointer across the key, then is pressed and clicked
         for x in [sx + 2.0, sx + 14.0, sx + sw / 2.0, sx + sw - 2.0] {
             app.window().dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(x, sy + sh / 2.0) });

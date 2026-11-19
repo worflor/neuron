@@ -882,11 +882,19 @@ export component SettingsPanel inherits VerticalLayout {
                     rule: false;
                     label: "neuron " + (State.app-version == "" ? "unknown" : State.app-version);
                     desc: State.update-status;
-                    Button {
-                        text: "check now";
-                        busy: State.update-checking;
-                        enabled: State.update-enabled;
-                        clicked => { State.update-check-now(); }
+                    // the star sits beside updating, apart from it: both are neuron's dev, not one action
+                    HorizontalLayout {
+                        spacing: 16px;
+                        VerticalLayout {
+                            alignment: center;
+                            StarKey { clicked => { State.open-repo(); } }
+                        }
+                        Button {
+                            text: "check now";
+                            busy: State.update-checking;
+                            enabled: State.update-enabled;
+                            clicked => { State.update-check-now(); }
+                        }
                     }
                 }
                 SwitchRow {
@@ -1421,22 +1429,10 @@ export component SettingsPanel inherits VerticalLayout {
                 }
             }
 
-            // the nameplate, and the one place neuron mentions its GitHub stars
+            // the nameplate
             VerticalLayout {
                 spacing: 3px;
                 padding-bottom: 6px;
-                HorizontalLayout {
-                    spacing: 10px;
-                    padding-bottom: 6px;
-                    StarKey { clicked => { State.open-repo(); } }
-                    Mono {
-                        text: "a star helps people find neuron";
-                        color: Theme.text-faint;
-                        font-size: Theme.fs-small;
-                        vertical-alignment: center;
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
                 Mono {
                     text: "neuron " + (State.app-version == "" ? "unknown" : State.app-version) + " · © 2026 Woflo Labs · github.com/worflor/neuron";
                     color: Theme.text-faint;

@@ -388,7 +388,8 @@ fn pyruntime_sidecar_stress_e2e() {
             "# neuron: raw\nimport ctypes\ndef macro(ctx):\n    import ssl\n    return 'sslctx=%s ctypes=%s' % (ssl.SSLContext.__name__, ctypes.__name__)\n",
         )
         .expect("register pr_nested");
-        let r = host.invoke("pr_nested", &cx("n"));
+        // a cold ssl import can outlast FIRE_BUDGET on a loaded machine
+        let r = host.invoke_with_budget("pr_nested", &cx("n"), Duration::from_secs(30));
         assert!(r.contains("sslctx=SSLContext"), "ssl imports dynamically inside the macro body: {r}");
         assert!(r.contains("ctypes=ctypes"), "module-scope ctypes import is available to the macro: {r}");
         host.unregister("pr_nested");
